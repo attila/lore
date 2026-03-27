@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 0 — Project Infrastructure and Quality Gates"
 type: feat
-status: active
+status: completed
 date: 2026-03-25
 origin: docs/brainstorms/2026-03-24-phase0-project-infrastructure-requirements.md
 deepened: 2026-03-26
@@ -165,7 +165,7 @@ Hand-written fakes for external boundaries:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Cargo.toml and rust-toolchain.toml**
+- [x] **Unit 1: Cargo.toml and rust-toolchain.toml**
 
   **Goal:** Create the project manifest and pin the toolchain.
 
@@ -194,7 +194,7 @@ Hand-written fakes for external boundaries:
   **Verification:**
   - `cargo check` succeeds (requires Unit 2 for source files)
 
-- [ ] **Unit 2: Source skeleton (lib.rs, main.rs, module stubs)**
+- [x] **Unit 2: Source skeleton (lib.rs, main.rs, module stubs)**
 
   **Goal:** Create the minimum compilable source tree.
 
@@ -233,7 +233,7 @@ Hand-written fakes for external boundaries:
   - `cargo clippy --all-targets -- -D warnings` passes with zero warnings
   - Binary is named `lore`
 
-- [ ] **Unit 3: License files**
+- [x] **Unit 3: License files**
 
   **Goal:** Add dual license files.
 
@@ -254,7 +254,7 @@ Hand-written fakes for external boundaries:
   - Files exist at repo root
   - `license = "MIT OR Apache-2.0"` in Cargo.toml matches the files present
 
-- [ ] **Unit 4: .editorconfig**
+- [x] **Unit 4: .editorconfig**
 
   **Goal:** Establish editor-level consistency for all file types.
 
@@ -276,7 +276,7 @@ Hand-written fakes for external boundaries:
   **Verification:**
   - File exists and is well-formed
 
-- [ ] **Unit 5: dprint configuration**
+- [x] **Unit 5: dprint configuration**
 
   **Goal:** Configure unified formatting for Rust, Markdown, TOML, and JSON.
 
@@ -306,7 +306,7 @@ Hand-written fakes for external boundaries:
   - `dprint check` passes on all tracked files (Cargo.toml, dprint.json, docs/_.md, src/_.rs)
   - All Markdown files in `docs/` are consistently formatted
 
-- [ ] **Unit 6: Pre-commit hook**
+- [x] **Unit 6: Pre-commit hook**
 
   **Goal:** Enforce formatting on every commit via a git pre-commit hook.
 
@@ -331,7 +331,7 @@ Hand-written fakes for external boundaries:
   - A properly formatted commit succeeds without delay
   - The hook script is tracked in git and executable
 
-- [ ] **Unit 7: cargo-deny configuration**
+- [x] **Unit 7: cargo-deny configuration**
 
   **Goal:** Configure dependency auditing with all checks enabled.
 
@@ -355,7 +355,7 @@ Hand-written fakes for external boundaries:
   - `cargo deny check` passes with all four check categories enabled
   - If license exceptions are needed, they are documented with rationale
 
-- [ ] **Unit 8: justfile**
+- [x] **Unit 8: justfile**
 
   **Goal:** Create the local CI task runner with all quality gate recipes and a setup recipe for the
   pre-commit hook.
@@ -391,7 +391,7 @@ Hand-written fakes for external boundaries:
   - `just setup` activates the pre-commit hook
   - `just --list` shows all recipes with descriptions
 
-- [ ] **Unit 9: Smoke test**
+- [x] **Unit 9: Smoke test**
 
   **Goal:** Prove the binary builds and the test toolchain works.
 
@@ -417,7 +417,7 @@ Hand-written fakes for external boundaries:
   - `just test` passes
   - `just ci` passes (full pipeline including this test)
 
-- [ ] **Unit 10: Update .gitignore and final CI validation**
+- [x] **Unit 10: Update .gitignore and final CI validation**
 
   **Goal:** Ensure .gitignore is complete and the full CI pipeline passes.
 
