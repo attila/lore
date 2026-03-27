@@ -25,9 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85"
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
       - run: just clippy
@@ -38,8 +35,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
       - run: just test
@@ -59,8 +54,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
       - run: just doc
@@ -73,8 +66,10 @@ jobs:
     steps:
       - name: Check all jobs
         run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]] || \
-             [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more jobs failed or were cancelled"
-            exit 1
-          fi
+          results=("${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.deny.result }}" "${{ needs.doc.result }}")
+          for r in "${results[@]}"; do
+            if [[ "$r" != "success" ]]; then
+              echo "Job failed with result: $r"
+              exit 1
+            fi
+          done
