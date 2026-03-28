@@ -1,7 +1,7 @@
 ---
 title: "feat: Port scaffold into project skeleton"
 type: feat
-status: active
+status: completed
 date: 2026-03-27
 origin: docs/brainstorms/2026-03-27-scaffold-porting-requirements.md
 deepened: 2026-03-27
