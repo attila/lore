@@ -228,7 +228,8 @@ fn cmd_search(config_path: &Path, query: &str) -> anyhow::Result<()> {
             eprintln!("    score:  {:.4}", r.score);
             eprintln!();
             let body = if r.body.len() > 500 {
-                format!("{}...", &r.body[..500])
+                let truncate_at = floor_char_boundary(&r.body, 500);
+                format!("{}...", &r.body[..truncate_at])
             } else {
                 r.body.clone()
             };
@@ -237,6 +238,20 @@ fn cmd_search(config_path: &Path, query: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Find the largest byte index at or before `index` that is a valid UTF-8
+/// char boundary. Equivalent to `str::floor_char_boundary` (stabilized in
+/// Rust 1.86) but works on Rust 1.85.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[allow(clippy::unnecessary_wraps)]

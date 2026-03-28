@@ -5,6 +5,7 @@
 //! Splits markdown content into [`Chunk`]s by heading structure or as a single
 //! whole-document chunk when no headings are present.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A single chunk of knowledge extracted from a markdown file.
@@ -39,13 +40,15 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
     let mut current_body: Vec<&str> = Vec::new();
     let mut current_title = file_stem(source_file);
     let tags = extract_frontmatter_tags(content);
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
 
     let flush = |body: &[&str],
                  title: &str,
                  stack: &[(usize, String)],
                  tags: &str,
                  source_file: &str,
-                 chunks: &mut Vec<Chunk>| {
+                 chunks: &mut Vec<Chunk>,
+                 id_counts: &mut HashMap<String, usize>| {
         let text = body.join("\n").trim().to_string();
         if text.len() < 10 {
             return;
@@ -55,7 +58,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
             .map(|(_, t)| t.as_str())
             .collect::<Vec<_>>()
             .join(" > ");
-        let id = format!(
+        let base_id = format!(
             "{}:{}",
             source_file,
             if heading_path.is_empty() {
@@ -64,6 +67,15 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
                 &heading_path
             }
         );
+
+        // Track duplicate heading paths and append a sequence number.
+        let count = id_counts.entry(base_id.clone()).or_insert(0);
+        *count += 1;
+        let id = if *count > 1 {
+            format!("{base_id}:{count}")
+        } else {
+            base_id
+        };
 
         chunks.push(Chunk {
             id,
@@ -84,6 +96,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
                 &tags,
                 source_file,
                 &mut chunks,
+                &mut id_counts,
             );
             current_body.clear();
 
@@ -103,6 +116,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
         &tags,
         source_file,
         &mut chunks,
+        &mut id_counts,
     );
 
     if chunks.is_empty() {
@@ -174,10 +188,13 @@ fn extract_frontmatter_tags(content: &str) -> String {
     let rest = &fm[start + 5..];
 
     // Inline style: tags: [a, b, c]
-    if let Some(bracket_start) = rest.find('[') {
-        if let Some(bracket_end) = rest.find(']') {
+    // Only look for brackets on the first line after `tags:` to avoid matching
+    // brackets in subsequent YAML fields.
+    let first_line = rest.lines().next().unwrap_or("");
+    if let Some(bracket_start) = first_line.find('[') {
+        if let Some(bracket_end) = first_line.find(']') {
             if bracket_start < bracket_end {
-                return rest[bracket_start + 1..bracket_end]
+                return first_line[bracket_start + 1..bracket_end]
                     .split(',')
                     .map(str::trim)
                     .collect::<Vec<_>>()
@@ -459,5 +476,76 @@ A sufficiently long body describing architecture patterns.
             parse_heading("### Bar Baz"),
             Some((3, "Bar Baz".to_string()))
         );
+    }
+
+    #[test]
+    fn duplicate_headings_get_distinct_ids() {
+        let md = "\
+# Top
+Intro text that is definitely long enough for a chunk.
+
+## Examples
+First set of examples that is long enough for a chunk.
+
+## Examples
+Second set of examples that is long enough for a chunk.
+";
+        let chunks = chunk_by_heading(md, "guide.md");
+        // We should have 3 chunks: Top, Examples (first), Examples (second).
+        assert!(
+            chunks.len() >= 3,
+            "expected at least 3 chunks, got {}",
+            chunks.len()
+        );
+
+        let example_chunks: Vec<_> = chunks.iter().filter(|c| c.title == "Examples").collect();
+        assert_eq!(example_chunks.len(), 2);
+
+        // The two Examples chunks must have distinct IDs.
+        assert_ne!(
+            example_chunks[0].id, example_chunks[1].id,
+            "duplicate heading IDs should be distinct"
+        );
+
+        // First Examples gets the base ID, second gets `:2` suffix.
+        assert_eq!(example_chunks[0].id, "guide.md:Top > Examples");
+        assert_eq!(example_chunks[1].id, "guide.md:Top > Examples:2");
+
+        // Both bodies should be preserved (no data loss).
+        assert!(example_chunks[0].body.contains("First set"));
+        assert!(example_chunks[1].body.contains("Second set"));
+    }
+
+    #[test]
+    fn frontmatter_brackets_in_subsequent_field_not_parsed_as_tags() {
+        let md = "\
+---
+tags:
+  - alpha
+  - beta
+other_field: [not, tags]
+---
+
+# Hello
+Body text that is definitely long enough for a chunk.
+";
+        let tags = extract_frontmatter_tags(md);
+        // Should only pick up alpha and beta, not "not, tags" from other_field.
+        assert_eq!(tags, "alpha, beta");
+    }
+
+    #[test]
+    fn frontmatter_inline_tags_with_brackets_in_later_field() {
+        let md = "\
+---
+tags: [rust, patterns]
+categories: [web, api]
+---
+
+# Hello
+Body text that is definitely long enough for a chunk.
+";
+        let tags = extract_frontmatter_tags(md);
+        assert_eq!(tags, "rust, patterns");
     }
 }

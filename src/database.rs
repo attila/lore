@@ -86,7 +86,9 @@ impl KnowledgeDB {
         register_sqlite_vec();
 
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
 
         Ok(Self { conn, dimensions })
     }
@@ -108,7 +110,8 @@ impl KnowledgeDB {
                 source_file TEXT NOT NULL,
                 heading_path TEXT DEFAULT '',
                 ingested_at TEXT DEFAULT (datetime('now'))
-            )",
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)",
         )?;
 
         self.conn.execute_batch(&format!(
@@ -124,9 +127,11 @@ impl KnowledgeDB {
 
     /// Delete every row from all three tables.
     pub fn clear_all(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
             "DELETE FROM chunks; DELETE FROM patterns_fts; DELETE FROM patterns_vec;",
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -134,26 +139,41 @@ impl KnowledgeDB {
     ///
     /// Used for single-file re-indexing after writes.
     pub fn delete_by_source(&self, source_file: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM patterns_fts WHERE chunk_id IN \
              (SELECT id FROM chunks WHERE source_file = ?1)",
             params![source_file],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM patterns_vec WHERE id IN \
              (SELECT id FROM chunks WHERE source_file = ?1)",
             params![source_file],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM chunks WHERE source_file = ?1",
             params![source_file],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Insert a chunk (with optional embedding) into all three tables.
+    ///
+    /// Uses a transaction to ensure atomicity. Deletes any existing FTS5 and
+    /// vec0 rows for this chunk ID first to prevent ghost rows on duplicate
+    /// inserts.
     pub fn insert_chunk(&self, chunk: &Chunk, embedding: Option<&[f32]>) -> anyhow::Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Delete old FTS and vec rows if they exist to prevent ghost rows.
+        tx.execute(
+            "DELETE FROM patterns_fts WHERE chunk_id = ?1",
+            params![chunk.id],
+        )?;
+        tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
+
+        tx.execute(
             "INSERT OR REPLACE INTO chunks (id, title, body, tags, source_file, heading_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -166,7 +186,7 @@ impl KnowledgeDB {
             ],
         )?;
 
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO patterns_fts (chunk_id, title, body, tags, source_file)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -180,12 +200,13 @@ impl KnowledgeDB {
 
         if let Some(emb) = embedding {
             let blob = vec_to_blob(emb);
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO patterns_vec (id, embedding) VALUES (?1, ?2)",
                 params![chunk.id, blob],
             )?;
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -643,6 +664,40 @@ mod tests {
         // rank-0 from list_b (1/(60+0+1) = 1/61).
         let expected_y = 1.0 / 62.0 + 1.0 / 61.0;
         assert!((merged[0].score - expected_y).abs() < 1e-10);
+    }
+
+    // -- duplicate insert ---------------------------------------------------
+
+    #[test]
+    fn duplicate_insert_produces_single_fts_row() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk(
+            "dup1",
+            "Duplicate Test",
+            "This body is about duplicate insertion testing",
+            "dup.md",
+        );
+        let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+
+        // Insert the same chunk twice.
+        db.insert_chunk(&chunk, Some(&emb)).unwrap();
+        db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        // FTS should return exactly one result for this chunk.
+        let results = db.search_fts("duplicate insertion", 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "expected 1 FTS result after duplicate insert, got {}",
+            results.len()
+        );
+        assert_eq!(results[0].id, "dup1");
+
+        // chunks table should have exactly 1 row.
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.chunks, 1);
     }
 
     // -- vec_to_blob round-trip -------------------------------------------

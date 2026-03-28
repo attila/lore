@@ -8,6 +8,7 @@
 //! on disk, re-index them, and optionally commit via git.
 
 use std::path::Path;
+use std::path::PathBuf;
 
 use walkdir::WalkDir;
 
@@ -34,6 +35,7 @@ pub struct WriteResult {
     pub file_path: String,
     pub chunks_indexed: usize,
     pub committed: bool,
+    pub embedding_failures: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +142,15 @@ pub fn add_pattern(
     body: &str,
     tags: &[&str],
 ) -> anyhow::Result<WriteResult> {
-    let filename = slugify(title) + ".md";
+    let slug = slugify(title);
+    if slug.is_empty() {
+        anyhow::bail!("Title must contain at least one alphanumeric character");
+    }
+    let filename = slug + ".md";
+
+    // Validate slug doesn't contain path traversal components.
+    validate_slug(&filename)?;
+
     let file_path = knowledge_dir.join(&filename);
 
     if file_path.exists() {
@@ -150,7 +160,8 @@ pub fn add_pattern(
     let content = build_file_content(title, body, tags);
     std::fs::write(&file_path, &content)?;
 
-    let chunks = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let (chunks, embedding_failures) =
+        index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
     let committed = try_commit(
         knowledge_dir,
@@ -162,6 +173,7 @@ pub fn add_pattern(
         file_path: filename,
         chunks_indexed: chunks,
         committed,
+        embedding_failures,
     })
 }
 
@@ -180,13 +192,16 @@ pub fn update_pattern(
         anyhow::bail!("File not found: {source_file}");
     }
 
+    validate_within_dir(knowledge_dir, &file_path)?;
+
     let title = extract_title(&std::fs::read_to_string(&file_path)?)
         .unwrap_or_else(|| file_stem(source_file));
 
     let content = build_file_content(&title, body, tags);
     std::fs::write(&file_path, &content)?;
 
-    let chunks = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let (chunks, embedding_failures) =
+        index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
     let committed = try_commit(
         knowledge_dir,
@@ -198,6 +213,7 @@ pub fn update_pattern(
         file_path: source_file.to_string(),
         chunks_indexed: chunks,
         committed,
+        embedding_failures,
     })
 }
 
@@ -216,6 +232,8 @@ pub fn append_to_pattern(
         anyhow::bail!("File not found: {source_file}");
     }
 
+    validate_within_dir(knowledge_dir, &file_path)?;
+
     let existing = std::fs::read_to_string(&file_path)?;
     let title = extract_title(&existing).unwrap_or_else(|| file_stem(source_file));
 
@@ -229,7 +247,8 @@ pub fn append_to_pattern(
 
     std::fs::write(&file_path, &content)?;
 
-    let chunks = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let (chunks, embedding_failures) =
+        index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
     let committed = try_commit(
         knowledge_dir,
@@ -241,6 +260,7 @@ pub fn append_to_pattern(
         file_path: source_file.to_string(),
         chunks_indexed: chunks,
         committed,
+        embedding_failures,
     })
 }
 
@@ -252,13 +272,15 @@ pub fn append_to_pattern(
 ///
 /// The `strategy` parameter selects the chunking approach (`"heading"` or
 /// `"document"`).
+///
+/// Returns `(chunks_indexed, embedding_failures)`.
 fn index_single_file(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     knowledge_dir: &Path,
     file_path: &Path,
     strategy: &str,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, usize)> {
     let content = std::fs::read_to_string(file_path)?;
     let rel_path = file_path
         .strip_prefix(knowledge_dir)
@@ -271,14 +293,53 @@ fn index_single_file(
 
     let chunks = dispatch_chunking(strategy, &content, &rel_path);
     let mut count = 0;
+    let mut embedding_failures = 0;
 
     for chunk in &chunks {
-        let embedding = embedder.embed(&chunk.body).ok();
+        let embedding = if let Ok(emb) = embedder.embed(&chunk.body) {
+            Some(emb)
+        } else {
+            embedding_failures += 1;
+            None
+        };
         db.insert_chunk(chunk, embedding.as_deref())?;
         count += 1;
     }
 
-    Ok(count)
+    Ok((count, embedding_failures))
+}
+
+/// Validate that `file_path` lies within `knowledge_dir` after canonicalization.
+///
+/// This prevents path traversal attacks where a `source_file` like
+/// `../../../etc/passwd` could escape the knowledge directory.
+fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> anyhow::Result<()> {
+    let canon_dir = knowledge_dir.canonicalize()?;
+    let canon_file = file_path.canonicalize()?;
+    if !canon_file.starts_with(&canon_dir) {
+        anyhow::bail!(
+            "Path escapes the knowledge directory: {}",
+            file_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Validate that a slug-derived filename does not contain path traversal components.
+fn validate_slug(filename: &str) -> anyhow::Result<()> {
+    let path = PathBuf::from(filename);
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        ) {
+            anyhow::bail!("Path escapes the knowledge directory: {filename}");
+        }
+    }
+    if filename.contains("..") {
+        anyhow::bail!("Path escapes the knowledge directory: {filename}");
+    }
+    Ok(())
 }
 
 /// Dispatch to the appropriate chunking function based on `strategy`.
@@ -589,7 +650,7 @@ mod tests {
         let db_doc = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let heading_count = index_single_file(
+        let (heading_count, _) = index_single_file(
             &db_heading,
             &embedder,
             dir,
@@ -598,7 +659,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc_count =
+        let (doc_count, _) =
             index_single_file(&db_doc, &embedder, dir, &dir.join("multi.md"), "document").unwrap();
 
         // heading strategy should produce more chunks than document strategy.
@@ -673,5 +734,130 @@ mod tests {
             log.contains("lore: add pattern"),
             "commit message should start with 'lore:', got: {log}"
         );
+    }
+
+    // -- empty slug -------------------------------------------------------
+
+    #[test]
+    fn add_pattern_rejects_all_punctuation_title() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(&db, &embedder, dir, "!@#$%^&*()", "body text", &[]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("alphanumeric"),
+            "error should mention alphanumeric, got: {msg}"
+        );
+    }
+
+    // -- path traversal ---------------------------------------------------
+
+    #[test]
+    fn update_pattern_rejects_path_traversal() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Create a file outside the knowledge directory.
+        let outside_dir = tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.md");
+        fs::write(
+            &outside_file,
+            "# Secret\n\nSecret body that is long enough.\n",
+        )
+        .unwrap();
+
+        // Construct a relative path that escapes the knowledge directory.
+        let rel = pathdiff_relative(dir, &outside_file);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = update_pattern(&db, &embedder, dir, &rel, "new body", &[]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("escapes") || msg.contains("Path"),
+            "error should mention path escaping, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn append_to_pattern_rejects_path_traversal() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Create a file outside the knowledge directory.
+        let outside_dir = tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.md");
+        fs::write(
+            &outside_file,
+            "# Secret\n\nSecret body that is long enough.\n",
+        )
+        .unwrap();
+
+        // Construct a relative path that escapes the knowledge directory.
+        let rel = pathdiff_relative(dir, &outside_file);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = append_to_pattern(&db, &embedder, dir, &rel, "Hacked", "evil body");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("escapes") || msg.contains("Path"),
+            "error should mention path escaping, got: {msg}"
+        );
+    }
+
+    /// Compute a relative path from `base` to `target` using `..` components.
+    fn pathdiff_relative(base: &Path, target: &Path) -> String {
+        let base = fs::canonicalize(base).unwrap();
+        let target = fs::canonicalize(target).unwrap();
+
+        let mut base_parts: Vec<_> = base.components().collect();
+        let target_parts: Vec<_> = target.components().collect();
+
+        // Find common prefix length.
+        let common = base_parts
+            .iter()
+            .zip(target_parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        let ups = base_parts.len() - common;
+        base_parts.clear();
+
+        let mut rel = String::new();
+        for _ in 0..ups {
+            rel.push_str("../");
+        }
+        for part in &target_parts[common..] {
+            rel.push_str(&part.as_os_str().to_string_lossy());
+            rel.push('/');
+        }
+        // Remove trailing slash.
+        if rel.ends_with('/') {
+            rel.pop();
+        }
+        rel
+    }
+
+    // -- validate_slug rejects path traversal components ------------------
+
+    #[test]
+    fn validate_slug_rejects_dot_dot() {
+        let result = validate_slug("../../../etc/passwd.md");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_slug_accepts_normal_filename() {
+        let result = validate_slug("my-pattern.md");
+        assert!(result.is_ok());
     }
 }
