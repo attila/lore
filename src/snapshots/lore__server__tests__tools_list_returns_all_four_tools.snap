@@ -1,0 +1,114 @@
+---
+source: src/server.rs
+expression: resp
+---
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "result": {
+    "tools": [
+      {
+        "description": "Search the knowledge base for software patterns, conventions, and preferences. Use this before implementing new code to check for established patterns. Returns ranked results with source provenance.",
+        "inputSchema": {
+          "properties": {
+            "query": {
+              "description": "Natural language search query",
+              "type": "string"
+            },
+            "top_k": {
+              "description": "Number of results to return (default: from config)",
+              "type": "number"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "name": "search_patterns"
+      },
+      {
+        "description": "Create a new pattern in the knowledge base. Use only when the user explicitly asks to save, record, or document a pattern. Creates a markdown file, indexes it, and commits to git.",
+        "inputSchema": {
+          "properties": {
+            "body": {
+              "description": "Pattern content in markdown",
+              "type": "string"
+            },
+            "tags": {
+              "description": "Optional tags for categorisation",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "description": "Pattern title (used as filename and heading)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "body"
+          ],
+          "type": "object"
+        },
+        "name": "add_pattern"
+      },
+      {
+        "description": "Replace the content of an existing pattern. Use only when the user explicitly asks to update or rewrite a pattern. Overwrites the file, re-indexes, and commits.",
+        "inputSchema": {
+          "properties": {
+            "body": {
+              "description": "New pattern content in markdown (replaces existing body)",
+              "type": "string"
+            },
+            "source_file": {
+              "description": "Relative path of the file to update (from search results)",
+              "type": "string"
+            },
+            "tags": {
+              "description": "Optional updated tags",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "source_file",
+            "body"
+          ],
+          "type": "object"
+        },
+        "name": "update_pattern"
+      },
+      {
+        "description": "Add a new section to an existing pattern without replacing it. Use when the user wants to add examples, edge cases, or notes to an existing pattern. Appends a heading and body, re-indexes, and commits.",
+        "inputSchema": {
+          "properties": {
+            "body": {
+              "description": "Content to append under the heading",
+              "type": "string"
+            },
+            "heading": {
+              "description": "Heading for the new section",
+              "type": "string"
+            },
+            "source_file": {
+              "description": "Relative path of the file to append to (from search results)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_file",
+            "heading",
+            "body"
+          ],
+          "type": "object"
+        },
+        "name": "append_to_pattern"
+      }
+    ]
+  }
+}
