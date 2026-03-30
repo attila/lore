@@ -30,5 +30,9 @@ deny:
 doc:
     cargo doc --no-deps
 
+# Install lore to ~/.cargo/bin
+install:
+    cargo install --path .
+
 # Run the full CI pipeline
 ci: fmt clippy test deny doc

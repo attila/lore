@@ -191,16 +191,15 @@ fn extract_frontmatter_tags(content: &str) -> String {
     // Only look for brackets on the first line after `tags:` to avoid matching
     // brackets in subsequent YAML fields.
     let first_line = rest.lines().next().unwrap_or("");
-    if let Some(bracket_start) = first_line.find('[') {
-        if let Some(bracket_end) = first_line.find(']') {
-            if bracket_start < bracket_end {
-                return first_line[bracket_start + 1..bracket_end]
-                    .split(',')
-                    .map(str::trim)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-            }
-        }
+    if let Some(bracket_start) = first_line.find('[')
+        && let Some(bracket_end) = first_line.find(']')
+        && bracket_start < bracket_end
+    {
+        return first_line[bracket_start + 1..bracket_end]
+            .split(',')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(", ");
     }
 
     // Block style: tags:\n  - a\n  - b

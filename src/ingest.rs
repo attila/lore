@@ -7,6 +7,7 @@
 //! `update_pattern`, `append_to_pattern`) create or modify markdown files
 //! on disk, re-index them, and optionally commit via git.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -241,7 +242,7 @@ pub fn append_to_pattern(
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&format!("\n## {heading}\n\n"));
+    let _ = write!(content, "\n## {heading}\n\n");
     content.push_str(body);
     content.push('\n');
 
@@ -377,10 +378,10 @@ fn build_file_content(title: &str, body: &str, tags: &[&str]) -> String {
     let mut content = String::new();
     if !tags.is_empty() {
         content.push_str("---\n");
-        content.push_str(&format!("tags: [{}]\n", tags.join(", ")));
+        let _ = writeln!(content, "tags: [{}]", tags.join(", "));
         content.push_str("---\n\n");
     }
-    content.push_str(&format!("# {title}\n\n"));
+    let _ = write!(content, "# {title}\n\n");
     content.push_str(body);
     content.push('\n');
     content
