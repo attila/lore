@@ -293,14 +293,13 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
     eprintln!("  sqlite-vec:   ✓ bundled");
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    if let Ok(db) = KnowledgeDB::open(&config.database, ollama.dimensions()) {
-        if db.init().is_ok() {
-            if let Ok(stats) = db.stats() {
-                eprintln!();
-                eprintln!("  Chunks:       {}", stats.chunks);
-                eprintln!("  Sources:      {}", stats.sources);
-            }
-        }
+    if let Ok(db) = KnowledgeDB::open(&config.database, ollama.dimensions())
+        && db.init().is_ok()
+        && let Ok(stats) = db.stats()
+    {
+        eprintln!();
+        eprintln!("  Chunks:       {}", stats.chunks);
+        eprintln!("  Sources:      {}", stats.sources);
     }
 
     Ok(())
