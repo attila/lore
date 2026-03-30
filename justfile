@@ -34,5 +34,10 @@ doc:
 install:
     cargo install --path .
 
+# Regenerate CHANGELOG.md from git history
+changelog:
+    git cliff -o CHANGELOG.md
+    dprint fmt CHANGELOG.md
+
 # Run the full CI pipeline
 ci: fmt clippy test deny doc
