@@ -80,7 +80,11 @@ pub fn provision(ollama_host: &str, model: &str, on_progress: &dyn Fn(&str)) -> 
         on_progress(&format!(
             "  Model not found, pulling '{model}' (this may take a minute)..."
         ));
-        match client.pull_model(&|status| on_progress(&format!("  {status}"))) {
+        match client.pull_model(&|p| {
+            if let Some(status) = &p.status {
+                on_progress(&format!("  {status}"));
+            }
+        }) {
             Ok(()) => {
                 result.model_available = true;
                 result.actions.push(format!("Pulled model '{model}'"));
