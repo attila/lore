@@ -39,6 +39,7 @@ Markdown files (git repo, source of truth)
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) 1.85+ (pinned via `rust-toolchain.toml`)
+- [just](https://github.com/casey/just) — task runner (`cargo install just`)
 - [Ollama](https://ollama.com) — `brew install ollama` or see install options
 
 ### Install
