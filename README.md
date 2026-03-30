@@ -41,19 +41,31 @@ Markdown files (git repo, source of truth)
 - [Rust](https://rustup.rs/) 1.85+ (pinned via `rust-toolchain.toml`)
 - [Ollama](https://ollama.com) — `brew install ollama` or see install options
 
-### Build and Initialize
+### Install
+
+```sh
+just install
+```
+
+This runs `cargo install --path .`, placing the `lore` binary in `~/.cargo/bin/` (which rustup adds
+to PATH during Rust installation). To build without installing:
 
 ```sh
 cargo build --release
+# binary at ./target/release/lore
+```
 
+### Initialize and Use
+
+```sh
 # Point lore at a directory of markdown files (must be a git repo)
-./target/release/lore init --repo ~/my-patterns
+lore init --repo ~/my-patterns
 
 # Test a search
-./target/release/lore search "error handling"
+lore search "error handling"
 
 # Check health
-./target/release/lore status
+lore status
 ```
 
 The `init` command verifies Ollama is running, pulls the embedding model (`nomic-embed-text`,
@@ -63,7 +75,7 @@ The `init` command verifies Ollama is running, pulls the embedding model (`nomic
 
 ```sh
 claude mcp add --scope user --transport stdio lore -- \
-  /path/to/lore serve --config /path/to/lore.toml
+  lore serve --config /path/to/lore.toml
 ```
 
 Then add to your `CLAUDE.md`:
