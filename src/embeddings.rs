@@ -38,9 +38,15 @@ struct PullRequest {
     stream: bool,
 }
 
-#[derive(Deserialize)]
-struct PullProgress {
-    status: Option<String>,
+/// Progress update from Ollama's `/api/pull` NDJSON stream.
+#[derive(Debug, Deserialize)]
+pub struct PullProgress {
+    /// Human-readable status (e.g. "pulling sha256:abc...", "verifying").
+    pub status: Option<String>,
+    /// Total bytes to download for the current layer.
+    pub total: Option<u64>,
+    /// Bytes downloaded so far for the current layer.
+    pub completed: Option<u64>,
 }
 
 impl OllamaClient {
@@ -73,7 +79,7 @@ impl OllamaClient {
     }
 
     /// Pulls the configured model from Ollama, reporting progress via callback.
-    pub fn pull_model(&self, on_progress: &dyn Fn(&str)) -> anyhow::Result<()> {
+    pub fn pull_model(&self, on_progress: &dyn Fn(&PullProgress)) -> anyhow::Result<()> {
         let url = format!("{}/api/pull", self.host);
         let req = PullRequest {
             name: self.model.clone(),
@@ -89,9 +95,7 @@ impl OllamaClient {
                 continue;
             }
             if let Ok(msg) = serde_json::from_str::<PullProgress>(&line) {
-                if let Some(status) = msg.status {
-                    on_progress(&status);
-                }
+                on_progress(&msg);
             }
         }
 
@@ -244,5 +248,32 @@ mod tests {
         let vec = embedder.embed("test").unwrap();
         assert_eq!(vec.len(), 384);
         assert_eq!(embedder.dimensions(), 384);
+    }
+
+    #[test]
+    fn pull_progress_deserializes_all_fields() {
+        let json = r#"{"status":"pulling sha256:abc","total":274000000,"completed":142000000}"#;
+        let p: PullProgress = serde_json::from_str(json).unwrap();
+        assert_eq!(p.status.as_deref(), Some("pulling sha256:abc"));
+        assert_eq!(p.total, Some(274_000_000));
+        assert_eq!(p.completed, Some(142_000_000));
+    }
+
+    #[test]
+    fn pull_progress_deserializes_status_only() {
+        let json = r#"{"status":"verifying sha256:abc"}"#;
+        let p: PullProgress = serde_json::from_str(json).unwrap();
+        assert_eq!(p.status.as_deref(), Some("verifying sha256:abc"));
+        assert_eq!(p.total, None);
+        assert_eq!(p.completed, None);
+    }
+
+    #[test]
+    fn pull_progress_deserializes_completed_without_total() {
+        let json = r#"{"status":"pulling","completed":50000}"#;
+        let p: PullProgress = serde_json::from_str(json).unwrap();
+        assert_eq!(p.status.as_deref(), Some("pulling"));
+        assert_eq!(p.total, None);
+        assert_eq!(p.completed, Some(50_000));
     }
 }
