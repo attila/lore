@@ -147,6 +147,7 @@ Always use Result<T, E> for fallible operations...
 - [just](https://github.com/casey/just) — task runner
 - [dprint](https://dprint.dev/install/) — formatter
 - [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) — dependency auditor
+- [git-cliff](https://git-cliff.org) — changelog generator
 
 ### Commands
 
@@ -155,16 +156,17 @@ just setup    # configure git hooks (run once after clone)
 just ci       # run the full quality gate pipeline
 ```
 
-| Command        | What it does                               |
-| -------------- | ------------------------------------------ |
-| `just setup`   | Configure git hooks (run once after clone) |
-| `just fmt`     | Check formatting                           |
-| `just fmt-fix` | Fix formatting                             |
-| `just clippy`  | Run clippy lints                           |
-| `just test`    | Run tests (88 tests, no Ollama needed)     |
-| `just deny`    | Run dependency audits                      |
-| `just doc`     | Build documentation                        |
-| `just ci`      | Run the full pipeline                      |
+| Command          | What it does                               |
+| ---------------- | ------------------------------------------ |
+| `just setup`     | Configure git hooks (run once after clone) |
+| `just fmt`       | Check formatting                           |
+| `just fmt-fix`   | Fix formatting                             |
+| `just clippy`    | Run clippy lints                           |
+| `just test`      | Run tests (96 tests, no Ollama needed)     |
+| `just deny`      | Run dependency audits                      |
+| `just doc`       | Build documentation                        |
+| `just changelog` | Regenerate CHANGELOG.md from git history   |
+| `just ci`        | Run the full pipeline                      |
 
 ## License
 
