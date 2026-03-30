@@ -1,6 +1,8 @@
+use std::cell::Cell;
+use std::io::{IsTerminal, Write};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::embeddings::OllamaClient;
 
@@ -80,11 +82,8 @@ pub fn provision(ollama_host: &str, model: &str, on_progress: &dyn Fn(&str)) -> 
         on_progress(&format!(
             "  Model not found, pulling '{model}' (this may take a minute)..."
         ));
-        match client.pull_model(&|p| {
-            if let Some(status) = &p.status {
-                on_progress(&format!("  {status}"));
-            }
-        }) {
+
+        match pull_with_progress(&client, model) {
             Ok(()) => {
                 result.model_available = true;
                 result.actions.push(format!("Pulled model '{model}'"));
@@ -100,6 +99,93 @@ pub fn provision(ollama_host: &str, model: &str, on_progress: &dyn Fn(&str)) -> 
     on_progress(&format!("  ✓ Model '{model}' available"));
 
     result
+}
+
+/// Pull a model with TTY-aware progress display.
+///
+/// On a TTY, shows a single line updated in place with `\r`.
+/// On non-TTY (piped/CI), prints a progress line after 1 second, then at most
+/// every 10 seconds.
+fn pull_with_progress(client: &OllamaClient, model: &str) -> anyhow::Result<()> {
+    let is_tty = std::io::stderr().is_terminal();
+    let start = Instant::now();
+    let last_print = Cell::new(None::<Instant>);
+
+    let result = client.pull_model(&|p| {
+        let now = Instant::now();
+
+        if is_tty {
+            render_pull_tty(p, model);
+        } else {
+            render_pull_throttled(p, model, start, now, &last_print);
+        }
+    });
+
+    if is_tty {
+        // Move past the progress line.
+        eprintln!();
+    }
+
+    result
+}
+
+/// Render a single TTY progress line, overwriting in place with `\r`.
+fn render_pull_tty(p: &crate::embeddings::PullProgress, model: &str) {
+    let line = match (p.completed, p.total) {
+        (Some(completed), Some(total)) if total > 0 => {
+            let pct = completed.saturating_mul(100) / total;
+            format!(
+                "\r  Pulling '{model}': {} / {} ({pct}%)",
+                format_bytes(completed),
+                format_bytes(total),
+            )
+        }
+        _ => {
+            let status = p.status.as_deref().unwrap_or("...");
+            // Pad to 60 chars to clear remnants of longer previous lines.
+            format!("\r  {status:<60}")
+        }
+    };
+    eprint!("{line}");
+    let _ = std::io::stderr().flush();
+}
+
+/// Render progress for non-TTY output, throttled by time.
+///
+/// Prints the first line after 1 second, then at most every 10 seconds.
+fn render_pull_throttled(
+    p: &crate::embeddings::PullProgress,
+    model: &str,
+    start: Instant,
+    now: Instant,
+    last_print: &Cell<Option<Instant>>,
+) {
+    let elapsed = now.duration_since(start);
+    let should_print = match last_print.get() {
+        None => elapsed >= Duration::from_secs(1),
+        Some(prev) => now.duration_since(prev) >= Duration::from_secs(10),
+    };
+
+    if !should_print {
+        return;
+    }
+
+    last_print.set(Some(now));
+    match (p.completed, p.total) {
+        (Some(completed), Some(total)) if total > 0 => {
+            let pct = completed.saturating_mul(100) / total;
+            eprintln!(
+                "  Pulling '{model}': {} / {} ({pct}%)",
+                format_bytes(completed),
+                format_bytes(total),
+            );
+        }
+        _ => {
+            if let Some(status) = &p.status {
+                eprintln!("  {status}");
+            }
+        }
+    }
 }
 
 /// Quick read-only health check without side effects.
@@ -171,6 +257,26 @@ fn start_ollama() -> bool {
         .is_ok()
 }
 
+/// Format a byte count as a human-readable string (e.g. "274.0 MB").
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    #[allow(clippy::cast_precision_loss)]
+    let b = bytes as f64;
+
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +296,35 @@ mod tests {
         assert!(!result.model_available);
         assert!(result.errors.is_empty());
         assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn format_bytes_plain_bytes() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_bytes_kilobytes() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn format_bytes_megabytes() {
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(274_000_000), "261.3 MB");
+    }
+
+    #[test]
+    fn format_bytes_gigabytes() {
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
+        assert_eq!(format_bytes(1_288_490_189), "1.2 GB");
     }
 
     /// Verify that `check_ollama_binary` uses `ollama --version` rather than
