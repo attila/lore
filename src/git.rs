@@ -148,12 +148,16 @@ pub fn commit_to_new_branch(
     // c. Resolve HEAD commit.
     let parent_sha = git_output(repo_dir, &["rev-parse", "HEAD"])?;
 
-    // d. Build tree using a temporary index.
-    let tmp_index = repo_dir.join(".git/lore-tmp-index");
+    // d. Build tree using a temporary index unique to this process.
+    let tmp_index = repo_dir.join(format!(
+        ".git/lore-tmp-index-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
     let tmp_index_str = tmp_index.to_string_lossy().to_string();
-
-    // Remove any stale temp index from a previous crashed run.
-    let _ = std::fs::remove_file(&tmp_index);
 
     // Guard ensures the temp index is cleaned up even on early return.
     let tree_sha = {
