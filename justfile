@@ -16,11 +16,11 @@ fmt-fix:
 
 # Run clippy lints
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --features test-support -- -D warnings
 
 # Run tests
 test:
-    cargo test
+    cargo test --features test-support
 
 # Run dependency audits
 deny:

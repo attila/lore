@@ -1009,4 +1009,151 @@ mod tests {
             "expected missing field error, got: {msg}"
         );
     }
+
+    // -- MCP round-trip (chained operations) ---------------------------------
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mcp_round_trip() {
+        let h = TestHarness::new();
+
+        // -- initialize -------------------------------------------------------
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":100,"method":"initialize","params":{}}"#,
+        );
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["result"]["serverInfo"]["name"], "lore");
+
+        // -- tools/list -------------------------------------------------------
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}"#,
+        );
+        assert!(resp["error"].is_null());
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+
+        // -- add_pattern ------------------------------------------------------
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":102,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Concurrency Guidelines",
+                        "body":"Use tokio for async runtime. Prefer channels over shared mutable state. Always use Arc for cross-task ownership."
+                    }
+                }
+            }"#,
+        );
+        assert!(
+            resp["error"].is_null(),
+            "add_pattern should succeed, got: {:?}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("saved to"),
+            "response should confirm save, got: {text}"
+        );
+
+        // -- search_patterns finds the added pattern --------------------------
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":103,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"tokio channels"}
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Concurrency Guidelines"),
+            "search should find added pattern, got: {text}"
+        );
+
+        // -- update_pattern ---------------------------------------------------
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":104,"method":"tools/call",
+                "params":{
+                    "name":"update_pattern",
+                    "arguments":{
+                        "source_file":"concurrency-guidelines.md",
+                        "body":"Use tokio as the async runtime. Prefer message passing via flume channels. Avoid blocking the executor with synchronous IO."
+                    }
+                }
+            }"#,
+        );
+        assert!(
+            resp["error"].is_null(),
+            "update_pattern should succeed, got: {:?}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("updated"),
+            "response should confirm update, got: {text}"
+        );
+
+        // -- search_patterns reflects update ----------------------------------
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":105,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"flume channels"}
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("flume"),
+            "search should find updated content, got: {text}"
+        );
+
+        // -- append_to_pattern ------------------------------------------------
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":106,"method":"tools/call",
+                "params":{
+                    "name":"append_to_pattern",
+                    "arguments":{
+                        "source_file":"concurrency-guidelines.md",
+                        "heading":"Synchronisation Primitives",
+                        "body":"Use RwLock for read-heavy workloads. Prefer parking_lot over std locks for better performance."
+                    }
+                }
+            }"#,
+        );
+        assert!(
+            resp["error"].is_null(),
+            "append should succeed, got: {:?}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("appended"),
+            "response should confirm append, got: {text}"
+        );
+
+        // -- search_patterns finds appended content ---------------------------
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":107,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"parking_lot"}
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("parking_lot"),
+            "search should find appended content, got: {text}"
+        );
+    }
 }
