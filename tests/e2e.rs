@@ -121,9 +121,7 @@ fn full_lifecycle() {
     // -- Hybrid search --------------------------------------------------------
     let query = "error propagation";
     let query_emb = embedder.embed(query).unwrap();
-    let results = db
-        .search_hybrid(query, Some(&query_emb), 5)
-        .unwrap();
+    let results = db.search_hybrid(query, Some(&query_emb), 5).unwrap();
     assert!(
         !results.is_empty(),
         "hybrid search for 'error propagation' should return results"
@@ -164,7 +162,9 @@ fn full_lifecycle() {
         "FTS search for 'tracing' should find the newly added logging pattern"
     );
     assert!(
-        results.iter().any(|r| r.source_file == "logging-guidelines.md"),
+        results
+            .iter()
+            .any(|r| r.source_file == "logging-guidelines.md"),
         "search results should include logging-guidelines.md"
     );
 
@@ -186,14 +186,19 @@ fn full_lifecycle() {
     // Old content should be gone from search results.
     let results = db.search_fts("distributed", 10).unwrap();
     assert!(
-        results.is_empty() || results.iter().all(|r| r.source_file != "logging-guidelines.md"),
+        results.is_empty()
+            || results
+                .iter()
+                .all(|r| r.source_file != "logging-guidelines.md"),
         "old content 'distributed' should not appear in logging-guidelines results"
     );
 
     // New content should be findable.
     let results = db.search_fts("println", 10).unwrap();
     assert!(
-        results.iter().any(|r| r.source_file == "logging-guidelines.md"),
+        results
+            .iter()
+            .any(|r| r.source_file == "logging-guidelines.md"),
         "updated content 'println' should be found in logging-guidelines.md"
     );
 
@@ -214,7 +219,9 @@ fn full_lifecycle() {
     // Appended content should be findable.
     let results = db.search_fts("Prometheus", 10).unwrap();
     assert!(
-        results.iter().any(|r| r.source_file == "logging-guidelines.md"),
+        results
+            .iter()
+            .any(|r| r.source_file == "logging-guidelines.md"),
         "appended content 'Prometheus' should be found in logging-guidelines.md"
     );
 

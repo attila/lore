@@ -1018,16 +1018,14 @@ mod tests {
         let h = TestHarness::new();
 
         // -- initialize -------------------------------------------------------
-        let resp = h.request_value(
-            r#"{"jsonrpc":"2.0","id":100,"method":"initialize","params":{}}"#,
-        );
+        let resp =
+            h.request_value(r#"{"jsonrpc":"2.0","id":100,"method":"initialize","params":{}}"#);
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"]["serverInfo"]["name"], "lore");
 
         // -- tools/list -------------------------------------------------------
-        let resp = h.request_value(
-            r#"{"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}"#,
-        );
+        let resp =
+            h.request_value(r#"{"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}"#);
         assert!(resp["error"].is_null());
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 4);

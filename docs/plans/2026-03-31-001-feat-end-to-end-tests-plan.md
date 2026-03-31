@@ -18,8 +18,8 @@ Closes the primary coverage gap between isolated unit tests and untested cross-m
 The codebase has 96 unit tests covering each module in isolation, and 6 CLI smoke tests covering
 argument parsing. No test verifies that data flows correctly through the entire chain — a write
 operation that indexes correctly in isolation might fail to appear in a subsequent search if the
-database layer, chunking, or embedding pipeline interact incorrectly. The ROADMAP identifies this
-as the next priority item.
+database layer, chunking, or embedding pipeline interact incorrectly. The ROADMAP identifies this as
+the next priority item.
 
 ## Requirements Trace
 
@@ -41,11 +41,11 @@ as the next priority item.
 
 ### Relevant Code and Patterns
 
-- `src/embeddings.rs:142-198` — `FakeEmbedder` is `pub(crate)` under `#[cfg(test)]` at module
-  level (not inside `mod tests`). Produces deterministic vectors via FNV-1a hash + xorshift64.
-  Used by `database`, `ingest`, and `server` unit tests.
-- `src/database.rs:82-94` — `KnowledgeDB::open(path, dims)` + `.init()`. Already `pub`. Accepts
-  both `:memory:` and file paths. Registers sqlite-vec via process-global `Once`.
+- `src/embeddings.rs:142-198` — `FakeEmbedder` is `pub(crate)` under `#[cfg(test)]` at module level
+  (not inside `mod tests`). Produces deterministic vectors via FNV-1a hash + xorshift64. Used by
+  `database`, `ingest`, and `server` unit tests.
+- `src/database.rs:82-94` — `KnowledgeDB::open(path, dims)` + `.init()`. Already `pub`. Accepts both
+  `:memory:` and file paths. Registers sqlite-vec via process-global `Once`.
 - `src/ingest.rs:53-131` — `ingest()` walks a directory, chunks, embeds, inserts. Clears DB first.
 - `src/ingest.rs:138-179` — `add_pattern()` creates file, indexes, commits to git.
 - `src/ingest.rs:181-219` — `update_pattern()` overwrites file, re-indexes, commits.
@@ -59,22 +59,22 @@ as the next priority item.
 ### Institutional Learnings
 
 - `docs/solutions/build-errors/sqlite-vec-no-rust-export-register-via-ffi.md` — sqlite-vec
-  registration is process-global via `Once`; every connection gets it automatically. Tests that
-  open DB connections do not need special setup beyond calling `KnowledgeDB::open()`.
+  registration is process-global via `Once`; every connection gets it automatically. Tests that open
+  DB connections do not need special setup beyond calling `KnowledgeDB::open()`.
 
 ## Key Technical Decisions
 
-- **Cargo feature `test-support` to expose `FakeEmbedder` to integration tests:** Integration
-  tests in `tests/` are separate crates. The library is compiled as a normal dependency for them,
-  so `#[cfg(test)]` items are NOT available (cfg(test) is only set when the library itself is the
-  test target). A Cargo feature `test-support` solves this: gate `FakeEmbedder` with
+- **Cargo feature `test-support` to expose `FakeEmbedder` to integration tests:** Integration tests
+  in `tests/` are separate crates. The library is compiled as a normal dependency for them, so
+  `#[cfg(test)]` items are NOT available (cfg(test) is only set when the library itself is the test
+  target). A Cargo feature `test-support` solves this: gate `FakeEmbedder` with
   `#[cfg(any(test, feature = "test-support"))]` and pass `--features test-support` when running
   tests. Unit tests still see `FakeEmbedder` via `cfg(test)`; integration tests see it via the
   feature flag. The feature is never enabled in release builds.
 
-- **Library-level e2e in `tests/e2e.rs`, not CLI-level:** The CLI's `init` command requires
-  Ollama running. The library API (`ingest::*`, `database::*`) is the actual contract the MCP
-  server calls. CLI argument parsing is already covered by `tests/smoke.rs`.
+- **Library-level e2e in `tests/e2e.rs`, not CLI-level:** The CLI's `init` command requires Ollama
+  running. The library API (`ingest::*`, `database::*`) is the actual contract the MCP server calls.
+  CLI argument parsing is already covered by `tests/smoke.rs`.
 
 - **On-disk temp SQLite DB, not `:memory:`:** Exercises the same WAL mode, file creation, and
   locking behaviour as production. Verifies the DB file is actually created and populated.
@@ -83,19 +83,19 @@ as the next priority item.
   intentionally private. Adding a chained test inside `server::tests` (using the existing
   `TestHarness`) avoids exposing internal types in the public API.
 
-- **Single sequential test for the lifecycle flow, separate test for re-ingest:** The lifecycle
-  flow (R1, R2) is inherently sequential — each mutation depends on prior state. One test with
-  clear assert-per-step is more readable than splitting into independent tests that duplicate
-  setup. The re-ingest scenario (R3) is a distinct concern with its own setup, so it lives in a
-  separate test function.
+- **Single sequential test for the lifecycle flow, separate test for re-ingest:** The lifecycle flow
+  (R1, R2) is inherently sequential — each mutation depends on prior state. One test with clear
+  assert-per-step is more readable than splitting into independent tests that duplicate setup. The
+  re-ingest scenario (R3) is a distinct concern with its own setup, so it lives in a separate test
+  function.
 
 ## Open Questions
 
 ### Resolved During Planning
 
 - **Can `tests/e2e.rs` access `FakeEmbedder`?** Not with `#[cfg(test)]` alone — the library is
-  compiled without `cfg(test)` when used as a dependency of integration tests. Resolved by adding
-  a Cargo feature `test-support` and gating with `#[cfg(any(test, feature = "test-support"))]`.
+  compiled without `cfg(test)` when used as a dependency of integration tests. Resolved by adding a
+  Cargo feature `test-support` and gating with `#[cfg(any(test, feature = "test-support"))]`.
 
 - **Where does the MCP round-trip test live?** Inside `src/server.rs::tests` using existing
   `TestHarness`, keeping `handle_request` and `ServerContext` private.
@@ -175,9 +175,11 @@ as the next priority item.
   - Happy path: ingest 3 markdown files → `IngestResult` has 3 files processed, >0 chunks, no errors
   - Happy path: FTS search for a term unique to one file → returns that file's pattern
   - Happy path: hybrid search with embedding → returns results (non-empty)
-  - Happy path: `add_pattern` → `WriteResult` with file created on disk, chunks indexed > 0, committed to git
+  - Happy path: `add_pattern` → `WriteResult` with file created on disk, chunks indexed > 0,
+    committed to git
   - Happy path: FTS search for newly added pattern's content → found in results
-  - Happy path: `update_pattern` with new body → old body absent from search results, new body present
+  - Happy path: `update_pattern` with new body → old body absent from search results, new body
+    present
   - Happy path: `append_to_pattern` with new section → appended content found in search results
   - Happy path: `db.stats()` at end reflects total chunks/sources from all operations
 
@@ -237,23 +239,24 @@ as the next priority item.
   runtime impact, test-only. Units 2-3 are pure test additions with no production code changes.
 - **Error propagation:** Not applicable — tests only.
 - **Unchanged invariants:** All existing public APIs, module boundaries, and production behaviour
-  remain untouched. `FakeEmbedder` is gated behind `cfg(any(test, feature = "test-support"))`
-  and excluded from release builds.
+  remain untouched. `FakeEmbedder` is gated behind `cfg(any(test, feature = "test-support"))` and
+  excluded from release builds.
 - **Integration coverage:** Units 2 and 3 close the primary gap — cross-module data flow through
   ingest → database → search, and chained MCP tool calls through the server dispatch layer.
 
 ## Risks & Dependencies
 
-| Risk | Mitigation |
-|------|------------|
-| FTS query syntax is sensitive to phrasing — tests may be brittle if fixture terms overlap | Use distinctive, non-overlapping terms in each fixture file (e.g., "anyhow" for error handling, "snake_case" for naming) |
-| On-disk SQLite in tempdir may behave differently across platforms (WAL locking) | `tempfile` creates proper OS-level temp dirs; SQLite WAL is well-tested on all platforms |
-| `test-support` feature adds build config surface | Feature is well-scoped (one purpose), justfile handles the flag, CI inherits via `just test` |
-| `cargo test` without `--features test-support` skips integration tests needing FakeEmbedder | Justfile's `test` recipe always passes the flag; plain `cargo test` still runs unit tests + smoke |
+| Risk                                                                                        | Mitigation                                                                                                               |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| FTS query syntax is sensitive to phrasing — tests may be brittle if fixture terms overlap   | Use distinctive, non-overlapping terms in each fixture file (e.g., "anyhow" for error handling, "snake_case" for naming) |
+| On-disk SQLite in tempdir may behave differently across platforms (WAL locking)             | `tempfile` creates proper OS-level temp dirs; SQLite WAL is well-tested on all platforms                                 |
+| `test-support` feature adds build config surface                                            | Feature is well-scoped (one purpose), justfile handles the flag, CI inherits via `just test`                             |
+| `cargo test` without `--features test-support` skips integration tests needing FakeEmbedder | Justfile's `test` recipe always passes the flag; plain `cargo test` still runs unit tests + smoke                        |
 
 ## Sources & References
 
 - Related code: `src/embeddings.rs` (FakeEmbedder), `src/ingest.rs` (ingest, write ops),
   `src/database.rs` (search), `src/server.rs` (TestHarness, handle_request)
-- Institutional learning: `docs/solutions/build-errors/sqlite-vec-no-rust-export-register-via-ffi.md`
+- Institutional learning:
+  `docs/solutions/build-errors/sqlite-vec-no-rust-export-register-via-ffi.md`
 - ROADMAP item: "End-to-end testing with real data"
