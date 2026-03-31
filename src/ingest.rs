@@ -30,12 +30,23 @@ pub struct IngestResult {
     pub errors: Vec<String>,
 }
 
+/// Outcome of the git step in a write operation.
+#[derive(Debug)]
+pub enum CommitStatus {
+    /// No git repo or commit was not attempted.
+    NotCommitted,
+    /// Committed locally on the checked-out branch.
+    Committed,
+    /// Committed and pushed to a per-submission inbox branch.
+    Pushed { branch: String },
+}
+
 /// Summary returned after a single-file write operation.
 #[derive(Debug)]
 pub struct WriteResult {
     pub file_path: String,
     pub chunks_indexed: usize,
-    pub committed: bool,
+    pub commit_status: CommitStatus,
     pub embedding_failures: usize,
 }
 
@@ -135,6 +146,10 @@ pub fn ingest(
 // ---------------------------------------------------------------------------
 
 /// Create a new pattern file, index it, and commit.
+///
+/// When `inbox_branch_prefix` is `Some`, the file is committed to a
+/// per-submission branch and pushed to the remote instead of being written
+/// to disk and indexed locally.
 pub fn add_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -142,15 +157,37 @@ pub fn add_pattern(
     title: &str,
     body: &str,
     tags: &[&str],
+    inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     let slug = slugify(title);
     if slug.is_empty() {
         anyhow::bail!("Title must contain at least one alphanumeric character");
     }
-    let filename = slug + ".md";
+    let filename = slug.clone() + ".md";
 
     // Validate slug doesn't contain path traversal components.
     validate_slug(&filename)?;
+
+    let content = build_file_content(title, body, tags);
+
+    if let Some(prefix) = inbox_branch_prefix {
+        let branch = git::commit_to_new_branch(
+            knowledge_dir,
+            prefix,
+            &slug,
+            &filename,
+            &content,
+            &format!("lore: add pattern \"{title}\""),
+        )?;
+        push_or_cleanup(knowledge_dir, &branch)?;
+
+        return Ok(WriteResult {
+            file_path: filename,
+            chunks_indexed: 0,
+            commit_status: CommitStatus::Pushed { branch },
+            embedding_failures: 0,
+        });
+    }
 
     let file_path = knowledge_dir.join(&filename);
 
@@ -158,13 +195,12 @@ pub fn add_pattern(
         anyhow::bail!("File already exists: {filename}. Use update_pattern instead.");
     }
 
-    let content = build_file_content(title, body, tags);
     std::fs::write(&file_path, &content)?;
 
     let (chunks, embedding_failures) =
         index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
-    let committed = try_commit(
+    let commit_status = try_commit(
         knowledge_dir,
         &file_path,
         &format!("lore: add pattern \"{title}\""),
@@ -173,12 +209,16 @@ pub fn add_pattern(
     Ok(WriteResult {
         file_path: filename,
         chunks_indexed: chunks,
-        committed,
+        commit_status,
         embedding_failures,
     })
 }
 
 /// Overwrite an existing pattern file, re-index it, and commit.
+///
+/// When `inbox_branch_prefix` is `Some`, the modification is committed to a
+/// per-submission branch and pushed. The file must exist on the working tree
+/// (trunk) — inbox-only files are not supported.
 pub fn update_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -186,6 +226,7 @@ pub fn update_pattern(
     source_file: &str,
     body: &str,
     tags: &[&str],
+    inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     let file_path = knowledge_dir.join(source_file);
 
@@ -199,12 +240,33 @@ pub fn update_pattern(
         .unwrap_or_else(|| file_stem(source_file));
 
     let content = build_file_content(&title, body, tags);
+
+    if let Some(prefix) = inbox_branch_prefix {
+        let slug = file_stem(source_file);
+        let branch = git::commit_to_new_branch(
+            knowledge_dir,
+            prefix,
+            &slug,
+            source_file,
+            &content,
+            &format!("lore: update pattern \"{title}\""),
+        )?;
+        push_or_cleanup(knowledge_dir, &branch)?;
+
+        return Ok(WriteResult {
+            file_path: source_file.to_string(),
+            chunks_indexed: 0,
+            commit_status: CommitStatus::Pushed { branch },
+            embedding_failures: 0,
+        });
+    }
+
     std::fs::write(&file_path, &content)?;
 
     let (chunks, embedding_failures) =
         index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
-    let committed = try_commit(
+    let commit_status = try_commit(
         knowledge_dir,
         &file_path,
         &format!("lore: update pattern \"{title}\""),
@@ -213,12 +275,16 @@ pub fn update_pattern(
     Ok(WriteResult {
         file_path: source_file.to_string(),
         chunks_indexed: chunks,
-        committed,
+        commit_status,
         embedding_failures,
     })
 }
 
 /// Append a new section to an existing pattern file, re-index, and commit.
+///
+/// When `inbox_branch_prefix` is `Some`, the modification is committed to a
+/// per-submission branch and pushed. The file must exist on the working tree
+/// (trunk) — inbox-only files are not supported.
 pub fn append_to_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -226,6 +292,7 @@ pub fn append_to_pattern(
     source_file: &str,
     heading: &str,
     body: &str,
+    inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     let file_path = knowledge_dir.join(source_file);
 
@@ -246,12 +313,32 @@ pub fn append_to_pattern(
     content.push_str(body);
     content.push('\n');
 
+    if let Some(prefix) = inbox_branch_prefix {
+        let slug = file_stem(source_file);
+        let branch = git::commit_to_new_branch(
+            knowledge_dir,
+            prefix,
+            &slug,
+            source_file,
+            &content,
+            &format!("lore: append to \"{title}\" — {heading}"),
+        )?;
+        push_or_cleanup(knowledge_dir, &branch)?;
+
+        return Ok(WriteResult {
+            file_path: source_file.to_string(),
+            chunks_indexed: 0,
+            commit_status: CommitStatus::Pushed { branch },
+            embedding_failures: 0,
+        });
+    }
+
     std::fs::write(&file_path, &content)?;
 
     let (chunks, embedding_failures) =
         index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
-    let committed = try_commit(
+    let commit_status = try_commit(
         knowledge_dir,
         &file_path,
         &format!("lore: append to \"{title}\" — {heading}"),
@@ -260,7 +347,7 @@ pub fn append_to_pattern(
     Ok(WriteResult {
         file_path: source_file.to_string(),
         chunks_indexed: chunks,
-        committed,
+        commit_status,
         embedding_failures,
     })
 }
@@ -352,12 +439,30 @@ fn dispatch_chunking(strategy: &str, content: &str, rel_path: &str) -> Vec<Chunk
     }
 }
 
-/// Attempt a git commit; return `false` if not a git repo or the commit fails.
-fn try_commit(knowledge_dir: &Path, file_path: &Path, message: &str) -> bool {
-    if !git::is_git_repo(knowledge_dir) {
-        return false;
+/// Push a branch to the remote, deleting the local ref if the push fails.
+fn push_or_cleanup(knowledge_dir: &Path, branch: &str) -> anyhow::Result<()> {
+    if let Err(e) = git::push_branch(knowledge_dir, branch) {
+        // Clean up the orphaned local branch ref before propagating.
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "-d", &format!("refs/heads/{branch}")])
+            .current_dir(knowledge_dir)
+            .output();
+        return Err(e);
     }
-    git::add_and_commit(knowledge_dir, file_path, message).is_ok()
+    Ok(())
+}
+
+/// Attempt a git commit; return [`CommitStatus::NotCommitted`] if not a git
+/// repo or the commit fails.
+fn try_commit(knowledge_dir: &Path, file_path: &Path, message: &str) -> CommitStatus {
+    if !git::is_git_repo(knowledge_dir) {
+        return CommitStatus::NotCommitted;
+    }
+    if git::add_and_commit(knowledge_dir, file_path, message).is_ok() {
+        CommitStatus::Committed
+    } else {
+        CommitStatus::NotCommitted
+    }
 }
 
 /// Turn a title into a filename-safe slug.
@@ -538,6 +643,7 @@ mod tests {
             "My Pattern",
             "Pattern body that is long enough for chunking.",
             &["design", "rust"],
+            None,
         )
         .unwrap();
 
@@ -559,7 +665,7 @@ mod tests {
 
         fs::write(dir.join("existing.md"), "# Existing\n").unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "Existing", "body", &[]);
+        let result = add_pattern(&db, &embedder, dir, "Existing", "body", &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("already exists"), "unexpected error: {msg}");
@@ -587,6 +693,7 @@ mod tests {
             "doc.md",
             "Brand new body that is long enough for a chunk.",
             &["updated"],
+            None,
         )
         .unwrap();
 
@@ -623,6 +730,7 @@ mod tests {
             "doc.md",
             "New Section",
             "Appended body that is long enough for a chunk.",
+            None,
         )
         .unwrap();
 
@@ -682,18 +790,24 @@ mod tests {
         let file = dir.join("test.md");
         fs::write(&file, "# Test\n").unwrap();
 
-        assert!(try_commit(dir, &file, "lore: test commit"));
+        assert!(matches!(
+            try_commit(dir, &file, "lore: test commit"),
+            CommitStatus::Committed
+        ));
     }
 
     #[test]
-    fn try_commit_returns_false_without_git() {
+    fn try_commit_returns_not_committed_without_git() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
 
         let file = dir.join("test.md");
         fs::write(&file, "# Test\n").unwrap();
 
-        assert!(!try_commit(dir, &file, "lore: test commit"));
+        assert!(matches!(
+            try_commit(dir, &file, "lore: test commit"),
+            CommitStatus::NotCommitted
+        ));
     }
 
     // -- write operations with git -----------------------------------------
@@ -719,10 +833,11 @@ mod tests {
             "Git Test",
             "Body text that is long enough for a chunk.",
             &["test"],
+            None,
         )
         .unwrap();
 
-        assert!(result.committed);
+        assert!(matches!(result.commit_status, CommitStatus::Committed));
 
         // Verify the commit message prefix was renamed.
         let output = Command::new("git")
@@ -746,7 +861,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = add_pattern(&db, &embedder, dir, "!@#$%^&*()", "body text", &[]);
+        let result = add_pattern(&db, &embedder, dir, "!@#$%^&*()", "body text", &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -777,7 +892,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = update_pattern(&db, &embedder, dir, &rel, "new body", &[]);
+        let result = update_pattern(&db, &embedder, dir, &rel, "new body", &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -806,7 +921,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = append_to_pattern(&db, &embedder, dir, &rel, "Hacked", "evil body");
+        let result = append_to_pattern(&db, &embedder, dir, &rel, "Hacked", "evil body", None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

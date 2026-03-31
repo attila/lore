@@ -11,6 +11,13 @@ pub struct Config {
     pub ollama: OllamaConfig,
     pub search: SearchConfig,
     pub chunking: ChunkingConfig,
+    #[serde(default)]
+    pub git: Option<GitConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitConfig {
+    pub inbox_branch_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,7 +57,12 @@ impl Config {
                 strategy: "heading".to_string(),
                 max_tokens: 1024,
             },
+            git: None,
         }
+    }
+
+    pub fn inbox_branch_prefix(&self) -> Option<&str> {
+        self.git.as_ref().map(|g| g.inbox_branch_prefix.as_str())
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -131,5 +143,43 @@ mod tests {
     #[test]
     fn default_config_path_is_lore_toml() {
         assert_eq!(default_config_path(), PathBuf::from("lore.toml"));
+    }
+
+    #[test]
+    fn round_trip_with_git_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config.toml");
+
+        let mut config = sample_config();
+        config.git = Some(super::GitConfig {
+            inbox_branch_prefix: "inbox/".to_string(),
+        });
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn loads_without_git_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config.toml");
+
+        let config = sample_config();
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.git.is_none());
+    }
+
+    #[test]
+    fn inbox_branch_prefix_accessor() {
+        let mut config = sample_config();
+        assert_eq!(config.inbox_branch_prefix(), None);
+
+        config.git = Some(super::GitConfig {
+            inbox_branch_prefix: "inbox/".to_string(),
+        });
+        assert_eq!(config.inbox_branch_prefix(), Some("inbox/"));
     }
 }

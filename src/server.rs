@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
 use crate::ingest;
+use crate::ingest::CommitStatus;
 
 // ---------------------------------------------------------------------------
 // Context
@@ -402,31 +403,16 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         title,
         body,
         &tags,
+        ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
-            let commit_note = if result.committed {
-                ", committed to git"
-            } else {
-                ""
-            };
-            let embed_note = if result.embedding_failures > 0 {
-                format!(
-                    " ({} embedding{} failed)",
-                    result.embedding_failures,
-                    if result.embedding_failures == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                String::new()
-            };
+            let cn = commit_note(&result.commit_status);
+            let embed_note = embedding_note(result.embedding_failures);
             text_response(
                 req,
                 &format!(
                     "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
-                    title, result.file_path, result.chunks_indexed, commit_note
+                    title, result.file_path, result.chunks_indexed, cn
                 ),
             )
         }
@@ -456,31 +442,16 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         source_file,
         body,
         &tags,
+        ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
-            let commit_note = if result.committed {
-                ", committed to git"
-            } else {
-                ""
-            };
-            let embed_note = if result.embedding_failures > 0 {
-                format!(
-                    " ({} embedding{} failed)",
-                    result.embedding_failures,
-                    if result.embedding_failures == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                String::new()
-            };
+            let cn = commit_note(&result.commit_status);
+            let embed_note = embedding_note(result.embedding_failures);
             text_response(
                 req,
                 &format!(
                     "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
-                    result.file_path, result.chunks_indexed, commit_note
+                    result.file_path, result.chunks_indexed, cn
                 ),
             )
         }
@@ -508,31 +479,16 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         source_file,
         heading,
         body,
+        ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
-            let commit_note = if result.committed {
-                ", committed to git"
-            } else {
-                ""
-            };
-            let embed_note = if result.embedding_failures > 0 {
-                format!(
-                    " ({} embedding{} failed)",
-                    result.embedding_failures,
-                    if result.embedding_failures == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                String::new()
-            };
+            let cn = commit_note(&result.commit_status);
+            let embed_note = embedding_note(result.embedding_failures);
             text_response(
                 req,
                 &format!(
                     "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
-                    heading, result.file_path, result.chunks_indexed, commit_note
+                    heading, result.file_path, result.chunks_indexed, cn
                 ),
             )
         }
@@ -543,6 +499,27 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
+
+fn embedding_note(failures: usize) -> String {
+    if failures > 0 {
+        format!(
+            " ({failures} embedding{} failed)",
+            if failures == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn commit_note(status: &CommitStatus) -> String {
+    match status {
+        CommitStatus::NotCommitted => String::new(),
+        CommitStatus::Committed => ", committed to git".to_string(),
+        CommitStatus::Pushed { branch } => {
+            format!(", pushed to {branch} — pending review")
+        }
+    }
+}
 
 fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
     JsonRpcResponse {
@@ -571,6 +548,7 @@ fn error_response(req: &JsonRpcRequest, message: &str) -> JsonRpcResponse {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use tempfile::tempdir;
 
@@ -1152,6 +1130,111 @@ mod tests {
         assert!(
             text.contains("parking_lot"),
             "search should find appended content, got: {text}"
+        );
+    }
+
+    // -- inbox branch response formatting ---------------------------------
+
+    /// Build a test harness with a git repo, bare remote, and inbox config.
+    fn harness_with_inbox() -> TestHarness {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Init git repo with remote.
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .expect("git command failed");
+        }
+
+        let bare = tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(bare.path())
+            .output()
+            .expect("bare init failed");
+        Command::new("git")
+            .args(["remote", "add", "origin", &bare.path().to_string_lossy()])
+            .current_dir(dir)
+            .output()
+            .expect("remote add failed");
+
+        // Initial commit so HEAD exists.
+        std::fs::write(dir.join("README"), "init\n").unwrap();
+        Command::new("git")
+            .args(["add", "README"])
+            .current_dir(dir)
+            .output()
+            .expect("add failed");
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .expect("commit failed");
+        Command::new("git")
+            .args(["push", "-u", "origin", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("push failed");
+
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config =
+            Config::default_with(dir.to_path_buf(), PathBuf::from(":memory:"), "test-model");
+        config.git = Some(crate::config::GitConfig {
+            inbox_branch_prefix: "inbox/".to_string(),
+        });
+
+        // Keep both tempdirs alive via _tmp (bare is moved into the struct
+        // indirectly — it will be dropped when the test ends since we leak
+        // it here to keep the remote alive).
+        std::mem::forget(bare);
+
+        TestHarness {
+            db,
+            embedder,
+            config,
+            _tmp: tmp,
+        }
+    }
+
+    #[test]
+    fn add_pattern_with_inbox_returns_pending_review() {
+        let h = harness_with_inbox();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":200,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Inbox Test",
+                        "body":"Body for inbox testing.",
+                        "tags":["test"]
+                    }
+                }
+            }"#,
+        );
+        assert!(
+            resp["error"].is_null(),
+            "add_pattern should succeed, got: {:?}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("pending review"),
+            "response should indicate pending review, got: {text}"
+        );
+        assert!(
+            text.contains("inbox/"),
+            "response should include branch name, got: {text}"
         );
     }
 }

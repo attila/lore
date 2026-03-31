@@ -137,6 +137,7 @@ fn full_lifecycle() {
          Always include span context for distributed tracing.\n\
          Log at warn level for recoverable errors, error level for unrecoverable.\n",
         &["observability", "rust"],
+        None,
     )
     .unwrap();
 
@@ -147,7 +148,10 @@ fn full_lifecycle() {
         write_result.chunks_indexed
     );
     assert!(
-        write_result.committed,
+        matches!(
+            write_result.commit_status,
+            lore::ingest::CommitStatus::Committed
+        ),
         "add_pattern should commit in a git repo"
     );
     assert!(
@@ -178,6 +182,7 @@ fn full_lifecycle() {
          Instrument all async functions with tracing spans.\n\
          Never use println for diagnostic output in production.\n",
         &["observability", "production"],
+        None,
     )
     .unwrap();
 
@@ -211,6 +216,7 @@ fn full_lifecycle() {
         "Metrics",
         "Export Prometheus metrics for all critical paths.\n\
          Use histogram buckets aligned to SLO thresholds.\n",
+        None,
     )
     .unwrap();
 
