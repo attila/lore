@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
 use crate::ingest;
+use crate::ingest::CommitStatus;
 
 // ---------------------------------------------------------------------------
 // Context
@@ -402,13 +403,10 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         title,
         body,
         &tags,
+        ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
-            let commit_note = if result.committed {
-                ", committed to git"
-            } else {
-                ""
-            };
+            let cn = commit_note(&result.commit_status);
             let embed_note = if result.embedding_failures > 0 {
                 format!(
                     " ({} embedding{} failed)",
@@ -426,7 +424,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
                 req,
                 &format!(
                     "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
-                    title, result.file_path, result.chunks_indexed, commit_note
+                    title, result.file_path, result.chunks_indexed, cn
                 ),
             )
         }
@@ -456,13 +454,10 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         source_file,
         body,
         &tags,
+        ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
-            let commit_note = if result.committed {
-                ", committed to git"
-            } else {
-                ""
-            };
+            let cn = commit_note(&result.commit_status);
             let embed_note = if result.embedding_failures > 0 {
                 format!(
                     " ({} embedding{} failed)",
@@ -480,7 +475,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 req,
                 &format!(
                     "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
-                    result.file_path, result.chunks_indexed, commit_note
+                    result.file_path, result.chunks_indexed, cn
                 ),
             )
         }
@@ -508,13 +503,10 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         source_file,
         heading,
         body,
+        ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
-            let commit_note = if result.committed {
-                ", committed to git"
-            } else {
-                ""
-            };
+            let cn = commit_note(&result.commit_status);
             let embed_note = if result.embedding_failures > 0 {
                 format!(
                     " ({} embedding{} failed)",
@@ -532,7 +524,7 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 req,
                 &format!(
                     "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
-                    heading, result.file_path, result.chunks_indexed, commit_note
+                    heading, result.file_path, result.chunks_indexed, cn
                 ),
             )
         }
@@ -543,6 +535,16 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
+
+fn commit_note(status: &CommitStatus) -> String {
+    match status {
+        CommitStatus::NotCommitted => String::new(),
+        CommitStatus::Committed => ", committed to git".to_string(),
+        CommitStatus::Pushed { branch } => {
+            format!(", pushed to {branch} — pending review")
+        }
+    }
+}
 
 fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
     JsonRpcResponse {
