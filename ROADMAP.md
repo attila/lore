@@ -16,6 +16,8 @@
 
 ## Future
 
+- [ ] Agent integration hooks (PreToolUse domain map, auto-invocable skill, PostToolUse audit, error
+      hook) — see `tmp/INTEGRATION_STRATEGY.md` for design notes
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
