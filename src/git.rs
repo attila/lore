@@ -38,6 +38,15 @@ pub fn is_git_repo(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Guard that removes a file on drop, ensuring cleanup on all code paths.
+struct TempFileGuard<'a>(&'a Path);
+
+impl Drop for TempFileGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
 /// Run a git command and return its trimmed stdout on success.
 fn git_output(repo_dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let output = Command::new("git")
@@ -143,45 +152,47 @@ pub fn commit_to_new_branch(
     let tmp_index = repo_dir.join(".git/lore-tmp-index");
     let tmp_index_str = tmp_index.to_string_lossy().to_string();
 
-    // Read the current tree into the temp index.
-    let read_tree = Command::new("git")
-        .args(["read-tree", "HEAD^{tree}"])
-        .env("GIT_INDEX_FILE", &tmp_index_str)
-        .current_dir(repo_dir)
-        .output()?;
-    if !read_tree.status.success() {
-        let stderr = String::from_utf8_lossy(&read_tree.stderr);
-        anyhow::bail!("git read-tree failed: {}", stderr.trim());
-    }
-
-    // Add the blob to the temp index.
-    let cacheinfo = format!("100644,{blob_sha},{file_path}");
-    let update_index = Command::new("git")
-        .args(["update-index", "--add", "--cacheinfo", &cacheinfo])
-        .env("GIT_INDEX_FILE", &tmp_index_str)
-        .current_dir(repo_dir)
-        .output()?;
-    if !update_index.status.success() {
-        let stderr = String::from_utf8_lossy(&update_index.stderr);
-        anyhow::bail!("git update-index failed: {}", stderr.trim());
-    }
-
-    // Write the tree from the temp index.
-    let write_tree = Command::new("git")
-        .args(["write-tree"])
-        .env("GIT_INDEX_FILE", &tmp_index_str)
-        .current_dir(repo_dir)
-        .output()?;
-    if !write_tree.status.success() {
-        let stderr = String::from_utf8_lossy(&write_tree.stderr);
-        anyhow::bail!("git write-tree failed: {}", stderr.trim());
-    }
-    let tree_sha = String::from_utf8_lossy(&write_tree.stdout)
-        .trim()
-        .to_string();
-
-    // Clean up the temporary index file.
+    // Remove any stale temp index from a previous crashed run.
     let _ = std::fs::remove_file(&tmp_index);
+
+    // Guard ensures the temp index is cleaned up even on early return.
+    let tree_sha = {
+        let _guard = TempFileGuard(&tmp_index);
+
+        let read_tree = Command::new("git")
+            .args(["read-tree", "HEAD^{tree}"])
+            .env("GIT_INDEX_FILE", &tmp_index_str)
+            .current_dir(repo_dir)
+            .output()?;
+        if !read_tree.status.success() {
+            let stderr = String::from_utf8_lossy(&read_tree.stderr);
+            anyhow::bail!("git read-tree failed: {}", stderr.trim());
+        }
+
+        let cacheinfo = format!("100644,{blob_sha},{file_path}");
+        let update_index = Command::new("git")
+            .args(["update-index", "--add", "--cacheinfo", &cacheinfo])
+            .env("GIT_INDEX_FILE", &tmp_index_str)
+            .current_dir(repo_dir)
+            .output()?;
+        if !update_index.status.success() {
+            let stderr = String::from_utf8_lossy(&update_index.stderr);
+            anyhow::bail!("git update-index failed: {}", stderr.trim());
+        }
+
+        let write_tree = Command::new("git")
+            .args(["write-tree"])
+            .env("GIT_INDEX_FILE", &tmp_index_str)
+            .current_dir(repo_dir)
+            .output()?;
+        if !write_tree.status.success() {
+            let stderr = String::from_utf8_lossy(&write_tree.stderr);
+            anyhow::bail!("git write-tree failed: {}", stderr.trim());
+        }
+        String::from_utf8_lossy(&write_tree.stdout)
+            .trim()
+            .to_string()
+    }; // _guard drops here, removing the temp index file
 
     // e. Create the commit object.
     let commit_sha = git_output(

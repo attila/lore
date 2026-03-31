@@ -179,7 +179,7 @@ pub fn add_pattern(
             &content,
             &format!("lore: add pattern \"{title}\""),
         )?;
-        git::push_branch(knowledge_dir, &branch)?;
+        push_or_cleanup(knowledge_dir, &branch)?;
 
         return Ok(WriteResult {
             file_path: filename,
@@ -251,7 +251,7 @@ pub fn update_pattern(
             &content,
             &format!("lore: update pattern \"{title}\""),
         )?;
-        git::push_branch(knowledge_dir, &branch)?;
+        push_or_cleanup(knowledge_dir, &branch)?;
 
         return Ok(WriteResult {
             file_path: source_file.to_string(),
@@ -323,7 +323,7 @@ pub fn append_to_pattern(
             &content,
             &format!("lore: append to \"{title}\" — {heading}"),
         )?;
-        git::push_branch(knowledge_dir, &branch)?;
+        push_or_cleanup(knowledge_dir, &branch)?;
 
         return Ok(WriteResult {
             file_path: source_file.to_string(),
@@ -437,6 +437,19 @@ fn dispatch_chunking(strategy: &str, content: &str, rel_path: &str) -> Vec<Chunk
     } else {
         chunk_as_document(content, rel_path)
     }
+}
+
+/// Push a branch to the remote, deleting the local ref if the push fails.
+fn push_or_cleanup(knowledge_dir: &Path, branch: &str) -> anyhow::Result<()> {
+    if let Err(e) = git::push_branch(knowledge_dir, branch) {
+        // Clean up the orphaned local branch ref before propagating.
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "-d", &format!("refs/heads/{branch}")])
+            .current_dir(knowledge_dir)
+            .output();
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Attempt a git commit; return [`CommitStatus::NotCommitted`] if not a git

@@ -407,19 +407,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
     ) {
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
-            let embed_note = if result.embedding_failures > 0 {
-                format!(
-                    " ({} embedding{} failed)",
-                    result.embedding_failures,
-                    if result.embedding_failures == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                String::new()
-            };
+            let embed_note = embedding_note(result.embedding_failures);
             text_response(
                 req,
                 &format!(
@@ -458,19 +446,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     ) {
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
-            let embed_note = if result.embedding_failures > 0 {
-                format!(
-                    " ({} embedding{} failed)",
-                    result.embedding_failures,
-                    if result.embedding_failures == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                String::new()
-            };
+            let embed_note = embedding_note(result.embedding_failures);
             text_response(
                 req,
                 &format!(
@@ -507,19 +483,7 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     ) {
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
-            let embed_note = if result.embedding_failures > 0 {
-                format!(
-                    " ({} embedding{} failed)",
-                    result.embedding_failures,
-                    if result.embedding_failures == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                String::new()
-            };
+            let embed_note = embedding_note(result.embedding_failures);
             text_response(
                 req,
                 &format!(
@@ -535,6 +499,17 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
+
+fn embedding_note(failures: usize) -> String {
+    if failures > 0 {
+        format!(
+            " ({failures} embedding{} failed)",
+            if failures == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    }
+}
 
 fn commit_note(status: &CommitStatus) -> String {
     match status {
