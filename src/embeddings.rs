@@ -143,12 +143,12 @@ impl Embedder for OllamaClient {
 ///
 /// Produces vectors of a fixed dimensionality (default 768) seeded by a simple
 /// hash of the input string, so the same input always yields the same vector.
-#[cfg(test)]
-pub(crate) struct FakeEmbedder {
+#[cfg(any(test, feature = "test-support"))]
+pub struct FakeEmbedder {
     dims: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl FakeEmbedder {
     pub fn new() -> Self {
         Self { dims: 768 }
@@ -160,14 +160,14 @@ impl FakeEmbedder {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for FakeEmbedder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Embedder for FakeEmbedder {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
         // Simple FNV-1a-inspired hash to produce a deterministic seed.
