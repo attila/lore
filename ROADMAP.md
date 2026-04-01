@@ -6,10 +6,15 @@
 - [x] Port scaffold into working Rust binary (all modules compile, 96 tests)
 - [x] Progress bar during model pull
 - [x] Dev install via `just install`
+- [x] End-to-end lifecycle tests (ingest → search → add/update/append → verify)
+- [x] Branch push for agent submissions (per-submission branches via git plumbing)
+- [x] XDG config paths and MCP CLI output in `lore init`
+- [x] Integration tests for init output (requires Ollama)
+- [x] Ollama integration tests for semantic search quality
+- [x] CI action versions pinned to full commit SHAs
 
 ## Up Next
 
-- [ ] End-to-end testing with real data (init -> ingest -> search -> add_pattern -> search finds it)
 - [ ] MCP integration testing (wire up to Claude Code, verify tool discovery and invocation)
 - [ ] Edge case handling (empty knowledge dir, non-git dir, Ollama down at query time, duplicate
       titles, unicode filenames)
