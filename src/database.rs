@@ -210,15 +210,18 @@ impl KnowledgeDB {
         Ok(())
     }
 
-    /// Full-text search via FTS5. Returns results ordered by BM25 rank.
+    /// Full-text search via FTS5. Returns results ordered by weighted BM25 rank.
+    ///
+    /// Column weights (positional, matching FTS5 column order):
+    /// `title`=10, `body`=1, `tags`=5, `source_file`=0
     pub fn search_fts(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
-                    rank AS score
+                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score
              FROM patterns_fts f
              JOIN chunks c ON c.id = f.chunk_id
              WHERE patterns_fts MATCH ?1
-             ORDER BY rank
+             ORDER BY score
              LIMIT ?2",
         )?;
 
@@ -708,5 +711,60 @@ mod tests {
         let blob = vec_to_blob(&original);
         let recovered = blob_to_vec(&blob);
         assert_eq!(original, recovered);
+    }
+
+    // -- FTS5 column weighting --------------------------------------------
+
+    #[test]
+    fn fts_title_match_ranks_above_body_match() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Chunk with "typescript" in title and tags.
+        let tagged = Chunk {
+            id: "tagged".to_string(),
+            title: "TypeScript Conventions".to_string(),
+            body: "Follow these coding conventions.".to_string(),
+            tags: "typescript, conventions".to_string(),
+            source_file: "ts.md".to_string(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&tagged, None).unwrap();
+
+        // Chunk with "typescript" only in body text.
+        let body_only = Chunk {
+            id: "body_only".to_string(),
+            title: "Rust Interop".to_string(),
+            body: "When calling Rust from typescript, use wasm-bindgen.".to_string(),
+            tags: "rust, wasm".to_string(),
+            source_file: "rust.md".to_string(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&body_only, None).unwrap();
+
+        let results = db.search_fts("typescript", 10).unwrap();
+        assert!(
+            results.len() >= 2,
+            "should find both chunks, got {}",
+            results.len()
+        );
+        assert_eq!(
+            results[0].id, "tagged",
+            "title/tag match should rank first, got: {}",
+            results[0].id
+        );
+    }
+
+    #[test]
+    fn fts_empty_tags_still_works() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk("c1", "Error Handling", "Use anyhow for errors", "errors.md");
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let results = db.search_fts("error", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Error Handling");
     }
 }

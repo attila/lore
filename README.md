@@ -137,7 +137,8 @@ Always use Result<T, E> for fallible operations...
 ## Search
 
 - **Hybrid** (default): Combines FTS5 lexical search and sqlite-vec vector similarity using
-  Reciprocal Rank Fusion. Finds semantically related patterns even when terminology differs.
+  Reciprocal Rank Fusion. Title and tag matches are weighted above body text, so domain-scoped
+  queries return the right patterns first.
 - **FTS-only**: Set `hybrid = false` in `lore.toml` to skip Ollama at query time.
 
 ## Development
