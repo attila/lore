@@ -268,13 +268,34 @@ fn cmd_search(config_path: &Path, query: &str) -> anyhow::Result<()> {
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
+    let mut embed_failed = false;
+
     let query_embedding = if config.search.hybrid {
-        ollama.embed(query).ok()
+        match ollama.embed(query) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("Warning: Ollama unreachable ({e}), falling back to text search.");
+                embed_failed = true;
+                None
+            }
+        }
     } else {
         None
     };
 
     let results = db.search_hybrid(query, query_embedding.as_deref(), config.search.top_k)?;
+
+    // Apply relevance threshold only for hybrid RRF scores.
+    let apply_threshold =
+        config.search.hybrid && !embed_failed && config.search.min_relevance > 0.0;
+    let results: Vec<_> = if apply_threshold {
+        results
+            .into_iter()
+            .filter(|r| r.score >= config.search.min_relevance)
+            .collect()
+    } else {
+        results
+    };
 
     if results.is_empty() {
         eprintln!("No results found.");

@@ -331,8 +331,17 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Search: \"{query}\" (top_k={top_k})");
 
+    let mut embed_failed = false;
+
     let results = if ctx.config.search.hybrid {
-        let query_embedding = ctx.embedder.embed(query).ok();
+        let query_embedding = match ctx.embedder.embed(query) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("[lore] Embedding failed, falling back to text search: {e}");
+                embed_failed = true;
+                None
+            }
+        };
         ctx.db
             .search_hybrid(query, query_embedding.as_deref(), top_k)
     } else {
@@ -343,6 +352,20 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     match results {
         Ok(results) => {
+            // Apply relevance threshold only when hybrid search with
+            // successful embedding was used (RRF scores). FTS-only results
+            // use a different scale (negative BM25 rank) and bypass filtering.
+            let apply_threshold =
+                ctx.config.search.hybrid && !embed_failed && ctx.config.search.min_relevance > 0.0;
+            let results: Vec<_> = if apply_threshold {
+                results
+                    .into_iter()
+                    .filter(|r| r.score >= ctx.config.search.min_relevance)
+                    .collect()
+            } else {
+                results
+            };
+
             eprintln!("[lore] Found {} results", results.len());
 
             let formatted: String = results
@@ -375,7 +398,15 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "Found matching patterns."
             };
 
-            text_response(req, &format!("{summary}\n\n{formatted}"))
+            let response = if embed_failed {
+                format!(
+                    "Note: Ollama unreachable — results are from text search only.\n\n{summary}\n\n{formatted}"
+                )
+            } else {
+                format!("{summary}\n\n{formatted}")
+            };
+
+            text_response(req, &response)
         }
         Err(e) => error_response(req, &format!("Search failed: {e}")),
     }
@@ -1235,6 +1266,279 @@ mod tests {
         assert!(
             text.contains("inbox/"),
             "response should include branch name, got: {text}"
+        );
+    }
+
+    // -- embed failure warning ------------------------------------------------
+
+    #[test]
+    fn search_with_failing_embedder_shows_warning() {
+        let tmp = tempdir().unwrap();
+        let failing = crate::embeddings::FailingEmbedder::new(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), failing.dimensions()).unwrap();
+        db.init().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            PathBuf::from(":memory:"),
+            "test-model",
+        );
+
+        // Insert a chunk so FTS has something to return.
+        let chunk = crate::chunking::Chunk {
+            id: "warn1".into(),
+            title: "Warning Test".into(),
+            body: "Content for the embed failure warning test".into(),
+            tags: String::new(),
+            source_file: "warn.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let ctx = ServerContext {
+            db: &db,
+            embedder: &failing,
+            config: &config,
+        };
+
+        let req: JsonRpcRequest = serde_json::from_str(
+            r#"{
+                "jsonrpc":"2.0","id":20,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"embed failure"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resp = handle_request(&req, &ctx).expect("expected a response");
+        let val = serde_json::to_value(&resp).unwrap();
+        assert!(val["error"].is_null(), "should not be a JSON-RPC error");
+        let text = val["result"]["content"][0]["text"].as_str().unwrap();
+
+        assert!(
+            text.contains("Ollama unreachable"),
+            "response should contain embed failure warning, got: {text}"
+        );
+        assert!(
+            text.contains("text search only"),
+            "warning should mention text search fallback, got: {text}"
+        );
+        assert!(
+            text.contains("Warning Test"),
+            "FTS results should still be returned, got: {text}"
+        );
+    }
+
+    #[test]
+    fn search_with_working_embedder_has_no_warning() {
+        let h = TestHarness::new();
+
+        let chunk = crate::chunking::Chunk {
+            id: "nowarn1".into(),
+            title: "No Warning Test".into(),
+            body: "Content that should be found without any warning".into(),
+            tags: String::new(),
+            source_file: "nowarn.md".into(),
+            heading_path: String::new(),
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":21,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"content found"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("Ollama unreachable"),
+            "should not contain warning when embedder works, got: {text}"
+        );
+    }
+
+    // -- relevance threshold filtering ----------------------------------------
+
+    #[test]
+    fn search_filters_low_relevance_results() {
+        let mut h = TestHarness::new();
+        h.config.search.min_relevance = 0.02;
+
+        // Insert a chunk with embedding so it can participate in hybrid search.
+        let chunk = crate::chunking::Chunk {
+            id: "rel1".into(),
+            title: "Relevant Result".into(),
+            body: "Highly relevant content about specific unique topic xylophone".into(),
+            tags: String::new(),
+            source_file: "relevant.md".into(),
+            heading_path: String::new(),
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        // Search for something completely unrelated — the chunk may appear
+        // in one list but with a low RRF score below the threshold.
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":22,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"completely unrelated basketball"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No matching patterns"),
+            "low-relevance results should be filtered, got: {text}"
+        );
+    }
+
+    #[test]
+    fn search_with_zero_threshold_returns_all() {
+        let mut h = TestHarness::new();
+        h.config.search.min_relevance = 0.0;
+
+        let chunk = crate::chunking::Chunk {
+            id: "all1".into(),
+            title: "Always Visible".into(),
+            body: "Content that should always appear with zero threshold".into(),
+            tags: String::new(),
+            source_file: "always.md".into(),
+            heading_path: String::new(),
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":23,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"unrelated query"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Always Visible"),
+            "zero threshold should return all results, got: {text}"
+        );
+    }
+
+    #[test]
+    fn search_fts_only_bypasses_threshold() {
+        let tmp = tempdir().unwrap();
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            PathBuf::from(":memory:"),
+            "test-model",
+        );
+        config.search.hybrid = false;
+        config.search.min_relevance = 0.02;
+
+        let chunk = crate::chunking::Chunk {
+            id: "fts2".into(),
+            title: "FTS Bypass".into(),
+            body: "FTS results should bypass threshold filtering entirely".into(),
+            tags: String::new(),
+            source_file: "fts-bypass.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let ctx = ServerContext {
+            db: &db,
+            embedder: &embedder,
+            config: &config,
+        };
+
+        let req: JsonRpcRequest = serde_json::from_str(
+            r#"{
+                "jsonrpc":"2.0","id":24,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"FTS results bypass"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resp = handle_request(&req, &ctx).expect("expected a response");
+        let val = serde_json::to_value(&resp).unwrap();
+        assert!(val["error"].is_null());
+        let text = val["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("FTS Bypass"),
+            "FTS-only mode should bypass threshold, got: {text}"
+        );
+    }
+
+    #[test]
+    fn search_embed_failure_bypasses_threshold() {
+        let tmp = tempdir().unwrap();
+        let failing = crate::embeddings::FailingEmbedder::new(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), failing.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            PathBuf::from(":memory:"),
+            "test-model",
+        );
+        config.search.min_relevance = 0.02;
+
+        let chunk = crate::chunking::Chunk {
+            id: "fallback1".into(),
+            title: "Fallback Result".into(),
+            body: "This should appear even with threshold when embed fails".into(),
+            tags: String::new(),
+            source_file: "fallback.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let ctx = ServerContext {
+            db: &db,
+            embedder: &failing,
+            config: &config,
+        };
+
+        let req: JsonRpcRequest = serde_json::from_str(
+            r#"{
+                "jsonrpc":"2.0","id":25,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"fallback result"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resp = handle_request(&req, &ctx).expect("expected a response");
+        let val = serde_json::to_value(&resp).unwrap();
+        assert!(val["error"].is_null());
+        let text = val["result"]["content"][0]["text"].as_str().unwrap();
+
+        assert!(
+            text.contains("Ollama unreachable"),
+            "should show embed failure warning, got: {text}"
+        );
+        assert!(
+            text.contains("Fallback Result"),
+            "FTS fallback should bypass threshold, got: {text}"
         );
     }
 }

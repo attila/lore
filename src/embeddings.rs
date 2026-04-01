@@ -197,6 +197,31 @@ impl Embedder for FakeEmbedder {
     }
 }
 
+/// An embedder that always fails. Used to test the search fallback path
+/// when Ollama is unreachable.
+#[cfg(any(test, feature = "test-support"))]
+pub struct FailingEmbedder {
+    dims: usize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FailingEmbedder {
+    pub fn new(dims: usize) -> Self {
+        Self { dims }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Embedder for FailingEmbedder {
+    fn embed(&self, _input: &str) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("Ollama is unreachable")
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
