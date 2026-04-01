@@ -139,6 +139,9 @@ fn cmd_init(
     config.bind = bind.to_string();
 
     config.save(config_path)?;
+    // Canonicalize after save so the output path is clean (no ".." hops).
+    let config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
     eprintln!("Config written to {}\n", config_path.display());
 
     // provision
