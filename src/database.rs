@@ -361,6 +361,9 @@ fn reciprocal_rank_fusion(
             .or_insert_with(|| (r.clone(), rrf));
     }
 
+    // Normalize to 0–1 by dividing by the max possible RRF score (rank 0 in both lists).
+    let max_rrf = 2.0 / (k + 1.0);
+
     let mut merged: Vec<_> = scores.into_values().collect();
     merged.sort_by(|a, b| b.1.total_cmp(&a.1));
 
@@ -368,7 +371,7 @@ fn reciprocal_rank_fusion(
         .into_iter()
         .take(limit)
         .map(|(mut r, s)| {
-            r.score = s;
+            r.score = s / max_rrf;
             r
         })
         .collect()
@@ -663,9 +666,11 @@ mod tests {
         // "y" appears in both lists so should have the highest RRF score.
         assert_eq!(merged[0].id, "y");
 
-        // "y" gets rank-1 from list_a (1/(60+1+1) = 1/62) plus
-        // rank-0 from list_b (1/(60+0+1) = 1/61).
-        let expected_y = 1.0 / 62.0 + 1.0 / 61.0;
+        // "y" gets rank-1 from list_a (1/62) plus rank-0 from list_b (1/61),
+        // normalized by max possible RRF (2/61).
+        let raw = 1.0 / 62.0 + 1.0 / 61.0;
+        let max_rrf = 2.0 / 61.0;
+        let expected_y = raw / max_rrf;
         assert!((merged[0].score - expected_y).abs() < 1e-10);
     }
 

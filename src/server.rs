@@ -1368,7 +1368,7 @@ mod tests {
     #[test]
     fn search_filters_low_relevance_results() {
         let mut h = TestHarness::new();
-        h.config.search.min_relevance = 0.02;
+        h.config.search.min_relevance = 0.6;
 
         // Insert a chunk with embedding so it can participate in hybrid search.
         let chunk = crate::chunking::Chunk {
@@ -1448,7 +1448,7 @@ mod tests {
             "test-model",
         );
         config.search.hybrid = false;
-        config.search.min_relevance = 0.02;
+        config.search.min_relevance = 0.6;
 
         let chunk = crate::chunking::Chunk {
             id: "fts2".into(),
@@ -1498,7 +1498,7 @@ mod tests {
             PathBuf::from(":memory:"),
             "test-model",
         );
-        config.search.min_relevance = 0.02;
+        config.search.min_relevance = 0.6;
 
         let chunk = crate::chunking::Chunk {
             id: "fallback1".into(),
