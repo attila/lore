@@ -83,8 +83,47 @@ impl Config {
     }
 }
 
-pub fn default_config_path() -> PathBuf {
-    PathBuf::from("lore.toml")
+/// Resolve the XDG base directory for the given variable, falling back to `$HOME/<subpath>`.
+fn resolve_xdg_base(
+    xdg_value: Option<String>,
+    home_value: Option<String>,
+    home_subpath: &str,
+    purpose: &str,
+) -> anyhow::Result<PathBuf> {
+    if let Some(val) = xdg_value
+        && !val.is_empty()
+    {
+        return Ok(PathBuf::from(val));
+    }
+    let home = home_value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot determine {purpose} directory: $HOME is not set. \
+             Use --config to specify a path."
+        )
+    })?;
+    Ok(PathBuf::from(home).join(home_subpath))
+}
+
+/// Default config file path: `$XDG_CONFIG_HOME/lore/lore.toml` or `~/.config/lore/lore.toml`.
+pub fn default_config_path() -> anyhow::Result<PathBuf> {
+    let dir = resolve_xdg_base(
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+        ".config",
+        "config",
+    )?;
+    Ok(dir.join("lore").join("lore.toml"))
+}
+
+/// Default database file path: `$XDG_DATA_HOME/lore/knowledge.db` or `~/.local/share/lore/knowledge.db`.
+pub fn default_database_path() -> anyhow::Result<PathBuf> {
+    let dir = resolve_xdg_base(
+        std::env::var("XDG_DATA_HOME").ok(),
+        std::env::var("HOME").ok(),
+        ".local/share",
+        "data",
+    )?;
+    Ok(dir.join("lore").join("knowledge.db"))
 }
 
 #[cfg(test)]
@@ -141,8 +180,68 @@ mod tests {
     }
 
     #[test]
-    fn default_config_path_is_lore_toml() {
-        assert_eq!(default_config_path(), PathBuf::from("lore.toml"));
+    fn xdg_config_home_set() {
+        let path = resolve_xdg_base(
+            Some("/custom/config".to_string()),
+            Some("/home/user".to_string()),
+            ".config",
+            "config",
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/custom/config"));
+    }
+
+    #[test]
+    fn xdg_data_home_set() {
+        let path = resolve_xdg_base(
+            Some("/custom/data".to_string()),
+            Some("/home/user".to_string()),
+            ".local/share",
+            "data",
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/custom/data"));
+    }
+
+    #[test]
+    fn xdg_var_unset_falls_back_to_home() {
+        let path =
+            resolve_xdg_base(None, Some("/home/user".to_string()), ".config", "config").unwrap();
+        assert_eq!(path, PathBuf::from("/home/user/.config"));
+    }
+
+    #[test]
+    fn xdg_var_empty_falls_back_to_home() {
+        let path = resolve_xdg_base(
+            Some(String::new()),
+            Some("/home/user".to_string()),
+            ".config",
+            "config",
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/home/user/.config"));
+    }
+
+    #[test]
+    fn home_unset_returns_error() {
+        let result = resolve_xdg_base(None, None, ".config", "config");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("$HOME is not set"),
+            "error should mention $HOME, got: {msg}"
+        );
+        assert!(
+            msg.contains("--config"),
+            "error should mention --config, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn xdg_data_falls_back_to_home_local_share() {
+        let path =
+            resolve_xdg_base(None, Some("/home/user".to_string()), ".local/share", "data").unwrap();
+        assert_eq!(path, PathBuf::from("/home/user/.local/share"));
     }
 
     #[test]

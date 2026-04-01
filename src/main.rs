@@ -5,7 +5,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
-use lore::config::{Config, default_config_path};
+use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient};
 use lore::{ingest, provision, server};
@@ -17,9 +17,9 @@ use lore::{ingest, provision, server};
     version
 )]
 struct Cli {
-    /// Path to config file
-    #[arg(long, global = true, default_value_os_t = default_config_path())]
-    config: PathBuf,
+    /// Path to config file [default: ~/.config/lore/lore.toml]
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -40,6 +40,10 @@ enum Commands {
         /// MCP server bind address
         #[arg(long, default_value = "localhost:3100")]
         bind: String,
+
+        /// Path to database file [default: ~/.local/share/lore/knowledge.db]
+        #[arg(long)]
+        database: Option<PathBuf>,
     },
 
     /// Re-index the knowledge base from markdown files
@@ -61,12 +65,38 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    let user_provided_config = cli.config.is_some();
+    let config_path = match cli.config {
+        Some(p) => std::path::absolute(p).map_err(anyhow::Error::from),
+        None => default_config_path(),
+    };
+
+    let config_path = match config_path {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
     let result = match cli.command {
-        Commands::Init { repo, model, bind } => cmd_init(&cli.config, &repo, &model, &bind),
-        Commands::Ingest => cmd_ingest(&cli.config),
-        Commands::Serve => cmd_serve(&cli.config),
-        Commands::Search { query } => cmd_search(&cli.config, &query.join(" ")),
-        Commands::Status => cmd_status(&cli.config),
+        Commands::Init {
+            repo,
+            model,
+            bind,
+            database,
+        } => cmd_init(
+            &config_path,
+            user_provided_config,
+            database.as_deref(),
+            &repo,
+            &model,
+            &bind,
+        ),
+        Commands::Ingest => cmd_ingest(&config_path),
+        Commands::Serve => cmd_serve(&config_path),
+        Commands::Search { query } => cmd_search(&config_path, &query.join(" ")),
+        Commands::Status => cmd_status(&config_path),
     };
 
     if let Err(e) = result {
@@ -75,7 +105,14 @@ fn main() {
     }
 }
 
-fn cmd_init(config_path: &Path, repo: &Path, model: &str, bind: &str) -> anyhow::Result<()> {
+fn cmd_init(
+    config_path: &Path,
+    user_provided_config: bool,
+    database_override: Option<&Path>,
+    repo: &Path,
+    model: &str,
+    bind: &str,
+) -> anyhow::Result<()> {
     eprintln!("=== lore init ===\n");
 
     let knowledge_dir = std::fs::canonicalize(repo)
@@ -85,12 +122,26 @@ fn cmd_init(config_path: &Path, repo: &Path, model: &str, bind: &str) -> anyhow:
         anyhow::bail!("{} is not a directory", knowledge_dir.display());
     }
 
-    let db_path = std::env::current_dir()?.join("knowledge.db");
+    let db_path = match database_override {
+        Some(p) => std::path::absolute(p)?,
+        None => default_database_path()?,
+    };
+
+    // Create parent directories for config and database
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let mut config = Config::default_with(knowledge_dir, db_path, model);
     config.bind = bind.to_string();
 
     config.save(config_path)?;
+    // Canonicalize after save so the output path is clean (no ".." hops).
+    let config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
     eprintln!("Config written to {}\n", config_path.display());
 
     // provision
@@ -140,18 +191,31 @@ fn cmd_init(config_path: &Path, repo: &Path, model: &str, bind: &str) -> anyhow:
         eprintln!("  Errors: {}", ingest_result.errors.len());
     }
 
+    // MCP setup instructions
     eprintln!("\nTo use with Claude Code, add this to your MCP config:\n");
     eprintln!("  {{");
     eprintln!("    \"mcpServers\": {{");
     eprintln!("      \"lore\": {{");
     eprintln!("        \"command\": \"lore\",");
-    eprintln!(
-        "        \"args\": [\"serve\", \"--config\", \"{}\"]",
-        config_path.display()
-    );
+    if user_provided_config {
+        eprintln!(
+            "        \"args\": [\"serve\", \"--config\", \"{}\"]",
+            config_path.display()
+        );
+    } else {
+        eprintln!("        \"args\": [\"serve\"]");
+    }
     eprintln!("      }}");
     eprintln!("    }}");
     eprintln!("  }}");
+
+    eprintln!("\nOr run:\n");
+    if user_provided_config {
+        eprintln!("  claude mcp add --scope user --transport stdio lore -- \\",);
+        eprintln!("    lore serve --config {}", config_path.display());
+    } else {
+        eprintln!("  claude mcp add --scope user --transport stdio lore -- lore serve");
+    }
 
     Ok(())
 }
