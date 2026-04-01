@@ -30,6 +30,12 @@ pub struct OllamaConfig {
 pub struct SearchConfig {
     pub hybrid: bool,
     pub top_k: usize,
+    #[serde(default = "default_min_relevance")]
+    pub min_relevance: f64,
+}
+
+fn default_min_relevance() -> f64 {
+    0.02
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,6 +58,7 @@ impl Config {
             search: SearchConfig {
                 hybrid: true,
                 top_k: 5,
+                min_relevance: default_min_relevance(),
             },
             chunking: ChunkingConfig {
                 strategy: "heading".to_string(),
@@ -159,6 +166,7 @@ mod tests {
         assert_eq!(config.ollama.model, "nomic-embed-text");
         assert!(config.search.hybrid);
         assert_eq!(config.search.top_k, 5);
+        assert!((config.search.min_relevance - 0.02).abs() < f64::EPSILON);
         assert_eq!(config.chunking.strategy, "heading");
         assert_eq!(config.chunking.max_tokens, 1024);
     }

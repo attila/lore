@@ -12,17 +12,28 @@
 - [x] Integration tests for init output (requires Ollama)
 - [x] Ollama integration tests for semantic search quality
 - [x] CI action versions pinned to full commit SHAs
+- [x] MCP integration testing with Claude Code (tool discovery, invocation, edge cases)
+- [x] Ollama fallback warning and min_relevance threshold for search quality
 
 ## Up Next
 
-- [ ] MCP integration testing (wire up to Claude Code, verify tool discovery and invocation)
-- [ ] Edge case handling (empty knowledge dir, non-git dir, Ollama down at query time, duplicate
-      titles, unicode filenames)
+- [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 
 ## Future
 
-- [ ] Agent integration hooks (PreToolUse domain map, auto-invocable skill, PostToolUse audit, error
-      hook) — see `tmp/INTEGRATION_STRATEGY.md` for design notes
+- [ ] Agent integration — layered strategy for reliable pattern delivery to agents
+  - [ ] Layer 1: PreToolUse domain hook — deterministic injection of relevant patterns as
+        `additionalContext` before tool execution, driven by a configurable domain map in
+        `lore.toml`
+  - [ ] Layer 2: Auto-invocable skill — `.claude/skills/` entry for novel situations the domain map
+        doesn't cover
+  - [ ] Layer 3: PostToolUse audit hook — review agent output against patterns, catch taste
+        violations that produce working code
+  - [ ] Layer 4: Error hook — search lore on build/test failures for known gotchas
+  - [ ] `lore hooks install` command — generate agent-specific hook/skill files from the domain map
+  - [ ] See `tmp/INTEGRATION_STRATEGY.md` for full design notes
+- [ ] Search ranking improvements — normalize scores to 0–1 range, boost tag matches via FTS5 column
+      weighting, leverage frontmatter structure for relevance signals
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
