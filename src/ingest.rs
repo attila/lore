@@ -19,6 +19,18 @@ use crate::embeddings::Embedder;
 use crate::git;
 
 // ---------------------------------------------------------------------------
+// Embedding helpers
+// ---------------------------------------------------------------------------
+
+/// Build the composite text used for embedding a chunk.
+///
+/// Includes title and tags alongside the body so that vector search
+/// carries domain signal, not just body content.
+fn embed_text(chunk: &Chunk) -> String {
+    format!("{}\n{}\n{}", chunk.title, chunk.tags, chunk.body)
+}
+
+// ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
@@ -115,7 +127,7 @@ pub fn ingest(
         let chunks = dispatch_chunking(strategy, &content, &rel_path);
 
         for chunk in &chunks {
-            let embedding = match embedder.embed(&chunk.body) {
+            let embedding = match embedder.embed(&embed_text(chunk)) {
                 Ok(emb) => Some(emb),
                 Err(e) => {
                     result
@@ -384,7 +396,7 @@ fn index_single_file(
     let mut embedding_failures = 0;
 
     for chunk in &chunks {
-        let embedding = if let Ok(emb) = embedder.embed(&chunk.body) {
+        let embedding = if let Ok(emb) = embedder.embed(&embed_text(chunk)) {
             Some(emb)
         } else {
             embedding_failures += 1;
@@ -515,6 +527,37 @@ mod tests {
 
     use super::*;
     use crate::database::KnowledgeDB;
+
+    // -- embed_text -------------------------------------------------------
+
+    #[test]
+    fn embed_text_includes_title_tags_body() {
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Error Handling".into(),
+            body: "Use anyhow for errors".into(),
+            tags: "rust, anyhow".into(),
+            source_file: "errors.md".into(),
+            heading_path: String::new(),
+        };
+        assert_eq!(
+            embed_text(&chunk),
+            "Error Handling\nrust, anyhow\nUse anyhow for errors"
+        );
+    }
+
+    #[test]
+    fn embed_text_with_empty_tags() {
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Title".into(),
+            body: "Body".into(),
+            tags: String::new(),
+            source_file: "test.md".into(),
+            heading_path: String::new(),
+        };
+        assert_eq!(embed_text(&chunk), "Title\n\nBody");
+    }
     use crate::embeddings::FakeEmbedder;
 
     /// Open an in-memory `KnowledgeDB` with 768-dimension embeddings.
