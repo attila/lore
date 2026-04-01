@@ -39,5 +39,9 @@ changelog:
     git cliff -o CHANGELOG.md
     dprint fmt CHANGELOG.md
 
+# Run integration tests that require Ollama
+test-integration:
+    cargo test --features test-support -- --ignored
+
 # Run the full CI pipeline
 ci: fmt clippy test deny doc
