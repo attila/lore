@@ -187,7 +187,7 @@ Branch naming:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Config — add `[git]` section**
+- [x] **Unit 1: Config — add `[git]` section**
 
   **Goal:** Add optional `GitConfig` with `inbox_branch_prefix` field to `Config`.
 
@@ -220,7 +220,7 @@ Branch naming:
   - `round_trip_save_and_load` passes for configs with and without `[git]`
   - Existing tests unchanged
 
-- [ ] **Unit 2: Git plumbing — commit to per-submission branch**
+- [x] **Unit 2: Git plumbing — commit to per-submission branch**
 
   **Goal:** Add git plumbing functions that create a commit on a uniquely-named branch forked from
   HEAD, without touching the working tree, index, or HEAD.
@@ -270,7 +270,7 @@ Branch naming:
   - Tests use `tempdir` + `git init` + bare remote pattern
   - Test helpers disable GPG signing (use the `ingest.rs` variant with `commit.gpgsign false`)
 
-- [ ] **Unit 3: WriteResult — replace `committed: bool` with enum**
+- [x] **Unit 3: WriteResult — replace `committed: bool` with enum**
 
   **Goal:** Extend `WriteResult` to express three commit states: not committed, committed locally,
   pushed to a branch.
@@ -305,7 +305,7 @@ Branch naming:
   - All existing server and e2e tests pass without text changes
   - Response text for pushed patterns is clearly distinguishable
 
-- [ ] **Unit 4: Ingest — branch push path in write operations**
+- [x] **Unit 4: Ingest — branch push path in write operations**
 
   **Goal:** Add the branch push code path to `add_pattern`, `update_pattern`, and
   `append_to_pattern`.
@@ -360,7 +360,7 @@ Branch naming:
   - SQLite DB has no chunks for branch-pushed content
   - Default (no prefix) behavior identical to before
 
-- [ ] **Unit 5: Server handlers — thread config through**
+- [x] **Unit 5: Server handlers — thread config through**
 
   **Goal:** Wire `inbox_branch_prefix` from config into the ingest function calls and ensure MCP
   responses reflect the commit status.
@@ -389,7 +389,7 @@ Branch naming:
   **Verification:**
   - Snapshot tests cover both configured and unconfigured cases
 
-- [ ] **Unit 6: Integration tests**
+- [x] **Unit 6: Integration tests**
 
   **Goal:** End-to-end tests proving the branch push flow works with real git repos, including push
   to a bare remote.

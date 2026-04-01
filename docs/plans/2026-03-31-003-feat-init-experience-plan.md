@@ -1,7 +1,7 @@
 ---
 title: "feat: Improve init experience with XDG config and MCP CLI output"
 type: feat
-status: active
+status: completed
 date: 2026-03-31
 origin: docs/brainstorms/2026-03-31-init-experience-requirements.md
 ---
@@ -128,7 +128,7 @@ dispatch to cmd_* with resolved &Path
 
 ## Implementation Units
 
-- [ ] **Unit 1: XDG path resolution helpers**
+- [x] **Unit 1: XDG path resolution helpers**
 
 **Goal:** Add functions that resolve default config and data directory paths using XDG env vars with
 `$HOME` fallback.
@@ -170,7 +170,7 @@ dispatch to cmd_* with resolved &Path
 
 ---
 
-- [ ] **Unit 2: CLI restructuring**
+- [x] **Unit 2: CLI restructuring**
 
 **Goal:** Change `--config` to `Option<PathBuf>`, add `--database` to Init, resolve paths in main()
 before dispatching to command functions.
@@ -217,7 +217,7 @@ before dispatching to command functions.
 
 ---
 
-- [ ] **Unit 3: Init path defaults and directory creation**
+- [x] **Unit 3: Init path defaults and directory creation**
 
 **Goal:** Update `cmd_init` to use XDG default paths for config and database, create parent
 directories, and handle `--database` override.
@@ -263,7 +263,7 @@ directories, and handle `--database` override.
 
 ---
 
-- [ ] **Unit 4: Init MCP output**
+- [x] **Unit 4: Init MCP output**
 
 **Goal:** Display both JSON MCP config and `claude mcp add` CLI command after init, with conditional
 `--config` based on whether user provided it.
@@ -310,7 +310,7 @@ directories, and handle `--database` override.
 
 ---
 
-- [ ] **Unit 5: Test updates and smoke tests**
+- [x] **Unit 5: Test updates and smoke tests**
 
 **Goal:** Update existing tests broken by the path change and add smoke tests for new behavior.
 

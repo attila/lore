@@ -1,7 +1,7 @@
 ---
 title: "feat: Add end-to-end lifecycle tests"
 type: feat
-status: active
+status: completed
 date: 2026-03-31
 ---
 
@@ -107,7 +107,7 @@ the next priority item.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `test-support` feature and expose `FakeEmbedder` to integration tests**
+- [x] **Unit 1: Add `test-support` feature and expose `FakeEmbedder` to integration tests**
 
   **Goal:** Make `FakeEmbedder` accessible from `tests/e2e.rs` via a Cargo feature, without
   including it in release builds.
@@ -143,7 +143,7 @@ the next priority item.
   - `cargo clippy --all-targets --features test-support -- -D warnings` clean
   - `cargo build --release` succeeds (FakeEmbedder excluded)
 
-- [ ] **Unit 2: Add library-level e2e tests in `tests/e2e.rs`**
+- [x] **Unit 2: Add library-level e2e tests in `tests/e2e.rs`**
 
   **Goal:** Test the full lifecycle (ingest → search → add → search → update → search → append →
   search) and re-ingest data replacement, using the library API with on-disk SQLite.
@@ -194,7 +194,7 @@ the next priority item.
   - `cargo test --features test-support --test e2e` passes
   - `cargo clippy --all-targets --features test-support -- -D warnings` clean
 
-- [ ] **Unit 3: Add MCP round-trip test in `src/server.rs`**
+- [x] **Unit 3: Add MCP round-trip test in `src/server.rs`**
 
   **Goal:** Test chained JSON-RPC operations through the server dispatch layer, verifying that a
   pattern created via `add_pattern` is discoverable via `search_patterns`, and that `update_pattern`

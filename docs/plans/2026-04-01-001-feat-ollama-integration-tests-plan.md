@@ -107,7 +107,7 @@ also lack end-to-end coverage of the MCP server wired to a real Ollama backend. 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Test file scaffold and helpers**
+- [x] **Unit 1: Test file scaffold and helpers**
 
   **Goal:** Create `tests/ollama_integration.rs` with helper functions and the `#[ignore]` pattern
   established.
@@ -140,7 +140,7 @@ also lack end-to-end coverage of the MCP server wired to a real Ollama backend. 
   - File compiles with `cargo test --features test-support --no-run`
   - `just test` still passes (ignored tests skipped)
 
-- [ ] **Unit 2: Semantic lifecycle test (R1-R5)**
+- [x] **Unit 2: Semantic lifecycle test (R1-R5)**
 
   **Goal:** Single test function `ollama_lifecycle` covering ingest, vector search, hybrid search
   with FTS-negative proof, add_pattern, update_pattern, and append_to_pattern with real Ollama
@@ -187,7 +187,7 @@ also lack end-to-end coverage of the MCP server wired to a real Ollama backend. 
   - `just test-integration` passes with Ollama running
   - Each R1-R5 assertion exercises real embeddings, not FakeEmbedder
 
-- [ ] **Unit 3: Stale embedding removal test (R6)**
+- [x] **Unit 3: Stale embedding removal test (R6)**
 
   **Goal:** Verify that re-ingest after file deletion removes stale vector embeddings.
 
@@ -215,7 +215,7 @@ also lack end-to-end coverage of the MCP server wired to a real Ollama backend. 
   - `just test-integration` passes
   - Stale vector data is confirmed gone (not just FTS data)
 
-- [ ] **Unit 4: MCP subprocess round-trip (R7)**
+- [x] **Unit 4: MCP subprocess round-trip (R7)**
 
   **Goal:** Send a `tools/call` JSON-RPC request to a real `lore serve` process and receive a valid
   search result backed by real Ollama embeddings.
@@ -258,7 +258,7 @@ also lack end-to-end coverage of the MCP server wired to a real Ollama backend. 
   - `just test-integration` passes
   - The test exercises the real binary, real config, real Ollama, real DB — full stack
 
-- [ ] **Unit 5: Ollama unreachable error handling (R8)**
+- [x] **Unit 5: Ollama unreachable error handling (R8)**
 
   **Goal:** Verify that operations return errors (not panics or hangs) when Ollama is unreachable.
 
