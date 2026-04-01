@@ -35,7 +35,7 @@ pub struct SearchConfig {
 }
 
 fn default_min_relevance() -> f64 {
-    0.02
+    0.6
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(config.ollama.model, "nomic-embed-text");
         assert!(config.search.hybrid);
         assert_eq!(config.search.top_k, 5);
-        assert!((config.search.min_relevance - 0.02).abs() < f64::EPSILON);
+        assert!((config.search.min_relevance - 0.6).abs() < f64::EPSILON);
         assert_eq!(config.chunking.strategy, "heading");
         assert_eq!(config.chunking.max_tokens, 1024);
     }

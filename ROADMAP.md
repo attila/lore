@@ -15,6 +15,7 @@
 - [x] MCP integration testing with Claude Code (tool discovery, invocation, edge cases)
 - [x] Ollama fallback warning and min_relevance threshold for search quality
 - [x] Search relevance boosting (FTS5 column weights + embedding enrichment)
+- [x] Score normalization (RRF scores mapped to 0–1 range)
 
 ## Up Next
 
@@ -33,7 +34,6 @@
   - [ ] Layer 4: Error hook — search lore on build/test failures for known gotchas
   - [ ] `lore hooks install` command — generate agent-specific hook/skill files from the domain map
   - [ ] See `tmp/INTEGRATION_STRATEGY.md` for full design notes
-- [ ] Score normalization — normalize RRF scores to 0–1 range for intuitive thresholds and display
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
