@@ -12,12 +12,12 @@
 - [x] Integration tests for init output (requires Ollama)
 - [x] Ollama integration tests for semantic search quality
 - [x] CI action versions pinned to full commit SHAs
+- [x] MCP integration testing with Claude Code (tool discovery, invocation, edge cases)
+- [x] Ollama fallback warning and min_relevance threshold for search quality
 
 ## Up Next
 
-- [ ] MCP integration testing (wire up to Claude Code, verify tool discovery and invocation)
-- [ ] Edge case handling (empty knowledge dir, non-git dir, Ollama down at query time, duplicate
-      titles, unicode filenames)
+- [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 
 ## Future
 
