@@ -155,6 +155,11 @@ origin: `docs/brainstorms/2026-04-01-agent-integration-claude-code-requirements.
 - **Code content analysis for query enrichment**: Extracting meaningful terms from the code being
   written/edited (the `content` or `new_string` fields) would improve search relevance but requires
   term extraction heuristics.
+- **Universal patterns via tag-based SessionStart injection**: Patterns tagged `universal` (or
+  similar well-known tag) get full content injected at SessionStart, not just titles. Covers
+  process-level conventions (branching, PRs, CI, agent behavior) that don't naturally surface
+  through file-edit hooks. Language-specific patterns stay hook-injected per edit. Keeps the
+  decision with pattern authors — they tag what's session-wide, lore injects it.
 
 ## High-Level Technical Design
 
