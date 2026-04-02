@@ -120,6 +120,17 @@ pub fn ingest(
         return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
     }
 
+    // Capture HEAD once to avoid TOCTOU between diff and recording.
+    let head = match git::head_commit(knowledge_dir) {
+        Ok(h) => h,
+        Err(e) => {
+            on_progress(&format!(
+                "Failed to resolve HEAD ({e}) — running full ingest"
+            ));
+            return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+        }
+    };
+
     // Run delta detection.
     let changes = match git::diff_name_status(knowledge_dir, &last_commit) {
         Ok(c) => c,
@@ -139,7 +150,15 @@ pub fn ingest(
         };
     }
 
-    delta_ingest(db, embedder, knowledge_dir, strategy, &changes, on_progress)
+    delta_ingest(
+        db,
+        embedder,
+        knowledge_dir,
+        strategy,
+        &changes,
+        &head,
+        on_progress,
+    )
 }
 
 /// Process only the files that changed since the last ingest.
@@ -149,6 +168,7 @@ fn delta_ingest(
     knowledge_dir: &Path,
     strategy: &str,
     changes: &[git::FileChange],
+    head: &str,
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
     // Count unchanged files: existing sources minus those being modified/deleted/renamed.
@@ -210,11 +230,11 @@ fn delta_ingest(
         result.files_processed += 1;
     }
 
-    // Record the new HEAD on success (no errors).
+    // Record the pre-captured HEAD on success (no errors).
     if result.errors.is_empty()
-        && let Ok(head) = git::head_commit(knowledge_dir)
+        && let Err(e) = db.set_metadata(META_LAST_COMMIT, head)
     {
-        let _ = db.set_metadata(META_LAST_COMMIT, &head);
+        on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
 
     result
@@ -306,8 +326,9 @@ pub fn full_ingest(
     if result.errors.is_empty()
         && git::is_git_repo(knowledge_dir)
         && let Ok(head) = git::head_commit(knowledge_dir)
+        && let Err(e) = db.set_metadata(META_LAST_COMMIT, &head)
     {
-        let _ = db.set_metadata(META_LAST_COMMIT, &head);
+        on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
 
     result
@@ -1313,6 +1334,54 @@ mod tests {
         // Alpha chunks should be gone, beta chunks should remain.
         let stats = db.stats().unwrap();
         assert_eq!(stats.sources, 1, "only beta should remain");
+    }
+
+    #[test]
+    fn delta_ingest_handles_renamed_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let old_name = dir.join("old-name.md");
+        fs::write(
+            &old_name,
+            "# Rename Test\n\nBody text that is long enough for rename detection by git.\n\nThis extra paragraph makes the content substantial.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &old_name, "add file").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Verify old-name chunks exist.
+        let stats_before = db.stats().unwrap();
+        assert_eq!(stats_before.sources, 1);
+
+        // Rename via git mv.
+        Command::new("git")
+            .args(["mv", "old-name.md", "new-name.md"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "rename file"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(matches!(result.mode, IngestMode::Delta { .. }));
+        assert!(result.errors.is_empty());
+
+        // Old source should be gone, new source should exist.
+        let stats_after = db.stats().unwrap();
+        assert_eq!(stats_after.sources, 1, "should still have exactly 1 source");
+
+        // Search should find chunks under the new source file.
+        let results = db.search_fts("rename", 10).unwrap();
+        assert!(!results.is_empty(), "should find chunks from renamed file");
+        assert_eq!(results[0].source_file, "new-name.md");
     }
 
     #[test]

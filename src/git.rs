@@ -226,6 +226,12 @@ pub fn push_branch(repo_dir: &Path, branch: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check whether a path has a markdown extension (`.md` or `.markdown`).
+fn is_markdown_path(path: &str) -> bool {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str());
+    matches!(ext, Some("md" | "markdown"))
+}
+
 /// A file-level change detected by `git diff --name-status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChange {
@@ -286,14 +292,25 @@ pub fn diff_name_status(repo_dir: &Path, from_commit: &str) -> anyhow::Result<Ve
         };
 
         if let Some(c) = change {
-            // Filter to markdown files only.
-            let path = match &c {
-                FileChange::Added(p) | FileChange::Modified(p) | FileChange::Deleted(p) => p,
-                FileChange::Renamed { to, .. } => to,
-            };
-            let ext = Path::new(path).extension().and_then(|e| e.to_str());
-            if matches!(ext, Some("md" | "markdown")) {
-                changes.push(c);
+            // Filter to markdown files only. For renames, check both sides:
+            // .md → .md = Renamed, .md → .txt = Deleted, .txt → .md = Added.
+            match &c {
+                FileChange::Renamed { from, to } => {
+                    let from_md = is_markdown_path(from);
+                    let to_md = is_markdown_path(to);
+                    if from_md && to_md {
+                        changes.push(c);
+                    } else if from_md {
+                        changes.push(FileChange::Deleted(from.clone()));
+                    } else if to_md {
+                        changes.push(FileChange::Added(to.clone()));
+                    }
+                }
+                FileChange::Added(p) | FileChange::Modified(p) | FileChange::Deleted(p) => {
+                    if is_markdown_path(p) {
+                        changes.push(c);
+                    }
+                }
             }
         }
     }
