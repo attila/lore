@@ -291,24 +291,24 @@ fn cmd_search(config_path: &Path, query: &str, top_k: Option<usize>) -> anyhow::
         eprintln!("No results found.");
     } else {
         for (i, r) in results.iter().enumerate() {
-            eprintln!("\n{}", "─".repeat(60));
-            eprintln!("[{}] {}", i + 1, r.title);
-            eprintln!("    source: {}", r.source_file);
+            println!("\n{}", "─".repeat(60));
+            println!("[{}] {}", i + 1, r.title);
+            println!("    source: {}", r.source_file);
             if !r.heading_path.is_empty() {
-                eprintln!("    path:   {}", r.heading_path);
+                println!("    path:   {}", r.heading_path);
             }
             if !r.tags.is_empty() {
-                eprintln!("    tags:   {}", r.tags);
+                println!("    tags:   {}", r.tags);
             }
-            eprintln!("    score:  {:.4}", r.score);
-            eprintln!();
+            println!("    score:  {:.4}", r.score);
+            println!();
             let body = if r.body.len() > 500 {
                 let truncate_at = floor_char_boundary(&r.body, 500);
                 format!("{}...", &r.body[..truncate_at])
             } else {
                 r.body.clone()
             };
-            eprintln!("{body}");
+            println!("{body}");
         }
     }
 
@@ -367,9 +367,9 @@ fn cmd_list(config_path: &Path) -> anyhow::Result<()> {
     let patterns = db.list_patterns()?;
     for p in &patterns {
         if p.tags.is_empty() {
-            eprintln!("{}", p.title);
+            println!("{}", p.title);
         } else {
-            eprintln!("{} [{}]", p.title, p.tags);
+            println!("{} [{}]", p.title, p.tags);
         }
     }
 

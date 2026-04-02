@@ -315,10 +315,20 @@ impl KnowledgeDB {
     /// Return one entry per source document (the shallowest chunk per file).
     ///
     /// Used by `lore list` to show a compact pattern index.
+    /// Selects the chunk with the shortest `heading_path` per source file,
+    /// which corresponds to the root or top-level section.
     pub fn list_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_file, title, tags FROM chunks
-             WHERE id IN (SELECT MIN(id) FROM chunks GROUP BY source_file)
+             WHERE id IN (
+                 SELECT id FROM chunks c1
+                 WHERE LENGTH(c1.heading_path) = (
+                     SELECT MIN(LENGTH(c2.heading_path))
+                     FROM chunks c2
+                     WHERE c2.source_file = c1.source_file
+                 )
+                 GROUP BY source_file
+             )
              ORDER BY source_file",
         )?;
 

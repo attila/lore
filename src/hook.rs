@@ -100,7 +100,7 @@ pub fn handle_hook(
 fn handle_session_start(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Option<HookOutput>> {
     let dedup_path = session_dedup_path(input);
     if let Some(ref path) = dedup_path
-        && let Err(e) = create_dedup(path)
+        && let Err(e) = reset_dedup(path)
     {
         eprintln!("lore hook: failed to create dedup file: {e}");
     }
@@ -200,7 +200,7 @@ fn handle_pre_tool_use(
 fn handle_post_compact(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Option<HookOutput>> {
     let dedup_path = session_dedup_path(input);
     if let Some(ref path) = dedup_path
-        && let Err(e) = truncate_dedup(path)
+        && let Err(e) = reset_dedup(path)
     {
         eprintln!("lore hook: failed to truncate dedup file: {e}");
     }
@@ -398,14 +398,8 @@ pub fn write_dedup(path: &Path, ids: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Truncate the dedup file (clear all tracked IDs).
-pub fn truncate_dedup(path: &Path) -> anyhow::Result<()> {
-    std::fs::write(path, "")?;
-    Ok(())
-}
-
-/// Create or truncate the dedup file.
-pub fn create_dedup(path: &Path) -> anyhow::Result<()> {
+/// Create or truncate the dedup file (clear all tracked IDs).
+pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
     std::fs::write(path, "")?;
     Ok(())
 }
@@ -453,17 +447,20 @@ pub fn extract_query(input: &HookInput) -> Option<String> {
     // 4. Clean terms
     let cleaned = clean_terms(&terms);
 
-    if cleaned.is_empty() {
-        return None;
-    }
-
     // 5. Assemble FTS5 query
-    let or_clause = cleaned.join(" OR ");
-    Some(if let Some(lang) = language {
-        format!("{lang} AND ({or_clause})")
-    } else {
-        or_clause
-    })
+    match (language, cleaned.is_empty()) {
+        // Language anchor + enrichment terms: `lang AND (term1 OR term2 OR ...)`
+        (Some(lang), false) => {
+            let or_clause = cleaned.join(" OR ");
+            Some(format!("{lang} AND ({or_clause})"))
+        }
+        // Language anchor only (no enrichment survived cleaning): just the language
+        (Some(lang), true) => Some(lang),
+        // No language anchor, but enrichment terms: OR-only query
+        (None, false) => Some(cleaned.join(" OR ")),
+        // Nothing useful extracted
+        (None, true) => None,
+    }
 }
 
 /// Returns `true` if the agent type is read-only and should not receive
@@ -583,14 +580,15 @@ fn last_user_message(path: &Path) -> Option<String> {
     None
 }
 
-/// Truncate a string to at most `max_chars` characters (on a char boundary).
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
+/// Truncate a string to at most `max_bytes` bytes (on a valid UTF-8 char
+/// boundary).
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
         return s;
     }
-    // Find the largest byte offset that is both <= max_chars bytes and a
-    // valid char boundary.
-    let mut end = max_chars;
+    // Find the largest byte offset that is both <= max_bytes and a valid
+    // char boundary.
+    let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -1064,7 +1062,8 @@ mod tests {
 
     #[test]
     fn last_user_message_missing_file() {
-        assert!(last_user_message(Path::new("/tmp/nonexistent-transcript.jsonl")).is_none());
+        let path = std::env::temp_dir().join("lore-nonexistent-transcript.jsonl");
+        assert!(last_user_message(&path).is_none());
     }
 
     // -- dedup_file_path ------------------------------------------------------
@@ -1100,11 +1099,12 @@ mod tests {
         assert!(filename.starts_with("lore-session-"));
     }
 
-    // -- read_dedup / write_dedup / truncate_dedup ----------------------------
+    // -- read_dedup / write_dedup / reset_dedup --------------------------------
 
     #[test]
     fn read_dedup_missing_file_returns_empty() {
-        let set = read_dedup(Path::new("/tmp/lore-nonexistent-dedup-file"));
+        let path = std::env::temp_dir().join("lore-nonexistent-dedup-file");
+        let set = read_dedup(&path);
         assert!(set.is_empty());
     }
 
@@ -1135,35 +1135,35 @@ mod tests {
     }
 
     #[test]
-    fn truncate_dedup_clears_file() {
+    fn reset_dedup_clears_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dedup");
 
         write_dedup(&path, &["c1", "c2"]).unwrap();
-        truncate_dedup(&path).unwrap();
+        reset_dedup(&path).unwrap();
         let ids = read_dedup(&path);
-        assert!(ids.is_empty(), "should be empty after truncation");
+        assert!(ids.is_empty(), "should be empty after reset");
     }
 
     #[test]
-    fn create_dedup_creates_empty_file() {
+    fn reset_dedup_creates_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dedup");
 
-        create_dedup(&path).unwrap();
+        reset_dedup(&path).unwrap();
         assert!(path.exists());
         let ids = read_dedup(&path);
         assert!(ids.is_empty());
     }
 
     #[test]
-    fn create_dedup_truncates_existing() {
+    fn reset_dedup_truncates_existing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dedup");
 
         write_dedup(&path, &["c1"]).unwrap();
-        create_dedup(&path).unwrap();
+        reset_dedup(&path).unwrap();
         let ids = read_dedup(&path);
-        assert!(ids.is_empty(), "create should truncate existing content");
+        assert!(ids.is_empty(), "reset should truncate existing content");
     }
 }

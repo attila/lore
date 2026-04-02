@@ -151,7 +151,7 @@ fn search_top_k_limits_results() {
         .assert()
         .success();
     // Both patterns mention "rust" so at least 2 results expected.
-    out.stderr(predicate::str::contains("[2]"));
+    out.stdout(predicate::str::contains("[2]"));
 
     // With --top-k 1, only one result.
     let out = Command::cargo_bin("lore")
@@ -166,8 +166,8 @@ fn search_top_k_limits_results() {
         ])
         .assert()
         .success();
-    out.stderr(predicate::str::contains("[1]"))
-        .stderr(predicate::str::contains("[2]").not());
+    out.stdout(predicate::str::contains("[1]"))
+        .stdout(predicate::str::contains("[2]").not());
 }
 
 #[test]
@@ -202,8 +202,8 @@ fn list_outputs_pattern_titles() {
         .args(["list", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Rust Testing"))
-        .stderr(predicate::str::contains("Error Handling"));
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stdout(predicate::str::contains("Error Handling"));
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn list_empty_database_exits_cleanly() {
         .assert()
         .success()
         // No output (empty database).
-        .stderr(predicate::str::is_empty());
+        .stdout(predicate::str::is_empty());
 }
 
 // -- FTS5 sanitization ------------------------------------------------------
