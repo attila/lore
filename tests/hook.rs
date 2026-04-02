@@ -242,10 +242,9 @@ fn hook_session_start_returns_meta_instruction() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    let hso = &parsed["hookSpecificOutput"];
-    assert_eq!(hso["hookEventName"], "SessionStart");
-
-    let ctx = hso["additionalContext"].as_str().unwrap();
+    let ctx = parsed["systemMessage"]
+        .as_str()
+        .expect("SessionStart should return a top-level systemMessage");
     assert!(
         ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
@@ -284,10 +283,9 @@ fn hook_post_compact_returns_session_context() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    let hso = &parsed["hookSpecificOutput"];
-    assert_eq!(hso["hookEventName"], "PostCompact");
-
-    let ctx = hso["additionalContext"].as_str().unwrap();
+    let ctx = parsed["systemMessage"]
+        .as_str()
+        .expect("PostCompact should return a top-level systemMessage");
     assert!(
         ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
@@ -591,9 +589,9 @@ fn hook_full_lifecycle_session_dedup_compact_reinject() {
     );
 
     let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
-    assert_eq!(
-        start_parsed["hookSpecificOutput"]["hookEventName"],
-        "SessionStart"
+    assert!(
+        start_parsed["systemMessage"].is_string(),
+        "SessionStart should return a systemMessage"
     );
 
     // 2. PreToolUse — first call should inject patterns.
@@ -717,16 +715,12 @@ fn hook_session_start_and_post_compact_return_same_content() {
     assert!(!start_stdout.is_empty());
     assert!(!compact_stdout.is_empty());
 
-    // The additionalContext content should be the same (event names differ).
+    // Both use systemMessage — content should be identical.
     let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
     let compact_parsed: serde_json::Value = serde_json::from_str(&compact_stdout).unwrap();
 
-    let start_ctx = start_parsed["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    let compact_ctx = compact_parsed["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let start_ctx = start_parsed["systemMessage"].as_str().unwrap();
+    let compact_ctx = compact_parsed["systemMessage"].as_str().unwrap();
     assert_eq!(
         start_ctx, compact_ctx,
         "SessionStart and PostCompact should return the same context content"

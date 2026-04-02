@@ -48,13 +48,26 @@ pub struct HookInput {
 }
 
 /// Written to stdout as JSON.
+///
+/// Two variants:
+/// - `HookSpecific` — for events that support `hookSpecificOutput`
+///   (`PreToolUse`, `PostToolUse`).
+/// - `SystemMessage` — for events where Claude Code only accepts a top-level
+///   `systemMessage` field (`SessionStart`, `PostCompact`).
 #[derive(Debug, Serialize)]
-pub struct HookOutput {
-    #[serde(rename = "hookSpecificOutput")]
-    pub hook_specific_output: HookSpecificOutput,
+#[serde(untagged)]
+pub enum HookOutput {
+    HookSpecific {
+        #[serde(rename = "hookSpecificOutput")]
+        hook_specific_output: HookSpecificOutput,
+    },
+    SystemMessage {
+        #[serde(rename = "systemMessage")]
+        system_message: String,
+    },
 }
 
-/// The payload nested inside `HookOutput`.
+/// The payload nested inside `HookOutput::HookSpecific`.
 #[derive(Debug, Serialize)]
 pub struct HookSpecificOutput {
     #[serde(rename = "hookEventName")]
@@ -106,11 +119,8 @@ fn handle_session_start(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<O
     }
 
     let context = format_session_context(db)?;
-    Ok(Some(HookOutput {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "SessionStart".to_string(),
-            additional_context: context,
-        },
+    Ok(Some(HookOutput::SystemMessage {
+        system_message: context,
     }))
 }
 
@@ -188,7 +198,7 @@ fn handle_pre_tool_use(
         }
     }
 
-    Ok(Some(HookOutput {
+    Ok(Some(HookOutput::HookSpecific {
         hook_specific_output: HookSpecificOutput {
             hook_event_name: "PreToolUse".to_string(),
             additional_context: context,
@@ -206,11 +216,8 @@ fn handle_post_compact(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Op
     }
 
     let context = format_session_context(db)?;
-    Ok(Some(HookOutput {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PostCompact".to_string(),
-            additional_context: context,
-        },
+    Ok(Some(HookOutput::SystemMessage {
+        system_message: context,
     }))
 }
 
@@ -272,7 +279,7 @@ fn handle_post_tool_use(
     }
 
     let context = format_imperative(&results);
-    Ok(Some(HookOutput {
+    Ok(Some(HookOutput::HookSpecific {
         hook_specific_output: HookSpecificOutput {
             hook_event_name: "PostToolUse".to_string(),
             additional_context: context,

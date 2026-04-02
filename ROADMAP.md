@@ -27,11 +27,28 @@
 
 ## Up Next
 
+- [ ] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
+      full re-embed. Use `git diff --name-status` against the last-ingested commit to detect
+      changes. Eliminates the Ollama round-trip penalty for unchanged files.
+- [ ] Bounded transcript read — `last_user_message()` reads entire JSONL into memory; use
+      reverse-seek or tail-read to cap memory and latency for long sessions
+- [ ] `--json` flag on `lore search` and `lore list` for structured machine-readable output
 - [ ] `LORE_DEBUG=1` verbose logging for hook pipeline troubleshooting
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 
 ## Future
 
+- [ ] Cycle-based dedup TTL — re-inject a pattern after N tool call cycles since last injection, so
+      long sessions don't bury early conventions deep in context
+- [ ] Deny-first-touch mode — block the first Edit/Write per domain with conventions as the deny
+      reason, forcing Claude to retry with conventions visible. Requires solid dedup to avoid
+      infinite loops (see
+      `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
+- [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
+      content at SessionStart, not just titles. Covers process-level conventions that don't surface
+      through file-edit hooks
+- [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
+      `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
 - [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
