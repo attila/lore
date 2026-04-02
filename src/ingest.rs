@@ -151,15 +151,18 @@ fn delta_ingest(
     changes: &[git::FileChange],
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
-    // Count existing sources before processing to report unchanged files.
+    // Count unchanged files: existing sources minus those being modified/deleted/renamed.
     let sources_before = db.stats().map(|s| s.sources).unwrap_or(0);
+    let existing_changed = changes
+        .iter()
+        .filter(|c| !matches!(c, git::FileChange::Added(_)))
+        .count();
+    let unchanged = sources_before.saturating_sub(existing_changed);
 
     on_progress(&format!("Delta ingest: {} file(s) changed", changes.len()));
 
     let mut result = IngestResult {
-        mode: IngestMode::Delta {
-            unchanged: sources_before,
-        },
+        mode: IngestMode::Delta { unchanged },
         files_processed: 0,
         chunks_created: 0,
         errors: Vec::new(),
