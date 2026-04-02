@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient};
+use lore::hook;
 use lore::{ingest, provision, server};
 
 #[derive(Parser)]
@@ -56,7 +57,17 @@ enum Commands {
     Search {
         /// Search query
         query: Vec<String>,
+
+        /// Override the number of results to return
+        #[arg(long)]
+        top_k: Option<usize>,
     },
+
+    /// Process a Claude Code lifecycle hook (reads JSON from stdin)
+    Hook,
+
+    /// List all patterns in the knowledge base
+    List,
 
     /// Check health of all components
     Status,
@@ -95,7 +106,9 @@ fn main() {
         ),
         Commands::Ingest => cmd_ingest(&config_path),
         Commands::Serve => cmd_serve(&config_path),
-        Commands::Search { query } => cmd_search(&config_path, &query.join(" ")),
+        Commands::Search { query, top_k } => cmd_search(&config_path, &query.join(" "), top_k),
+        Commands::Hook => cmd_hook(&config_path),
+        Commands::List => cmd_list(&config_path),
         Commands::Status => cmd_status(&config_path),
     };
 
@@ -258,44 +271,21 @@ fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
     server::start_mcp_server(&config, &ollama)
 }
 
-fn cmd_search(config_path: &Path, query: &str) -> anyhow::Result<()> {
+fn cmd_search(config_path: &Path, query: &str, top_k: Option<usize>) -> anyhow::Result<()> {
     if query.is_empty() {
         anyhow::bail!("Usage: lore search <query>");
     }
 
-    let config = Config::load(config_path)?;
+    let mut config = Config::load(config_path)?;
+    if let Some(k) = top_k {
+        config.search.top_k = k;
+    }
+
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
-    let mut embed_failed = false;
-
-    let query_embedding = if config.search.hybrid {
-        match ollama.embed(query) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("Warning: Ollama unreachable ({e}), falling back to text search.");
-                embed_failed = true;
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let results = db.search_hybrid(query, query_embedding.as_deref(), config.search.top_k)?;
-
-    // Apply relevance threshold only for hybrid RRF scores.
-    let apply_threshold =
-        config.search.hybrid && !embed_failed && config.search.min_relevance > 0.0;
-    let results: Vec<_> = if apply_threshold {
-        results
-            .into_iter()
-            .filter(|r| r.score >= config.search.min_relevance)
-            .collect()
-    } else {
-        results
-    };
+    let results = hook::search_with_threshold(&db, &ollama, &config, query)?;
 
     if results.is_empty() {
         eprintln!("No results found.");
@@ -337,6 +327,53 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+/// Process a Claude Code lifecycle hook.
+///
+/// **Error handling contract**: Unlike all other `cmd_*` functions, this one
+/// catches ALL errors and exits 0 regardless. Hooks must never break Claude
+/// Code. On any error, a diagnostic is logged to stderr and no stdout output
+/// is produced.
+#[allow(clippy::unnecessary_wraps)]
+fn cmd_hook(config_path: &Path) -> anyhow::Result<()> {
+    if let Err(e) = cmd_hook_inner(config_path) {
+        eprintln!("lore hook: {e}");
+    }
+    Ok(())
+}
+
+fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
+    let input = hook::read_input()?;
+    let config = Config::load(config_path)?;
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    db.init()?;
+
+    if let Some(output) = hook::handle_hook(&input, &db, &ollama, &config)? {
+        let json = serde_json::to_string(&output)?;
+        println!("{json}");
+    }
+
+    Ok(())
+}
+
+fn cmd_list(config_path: &Path) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    db.init()?;
+
+    let patterns = db.list_patterns()?;
+    for p in &patterns {
+        if p.tags.is_empty() {
+            eprintln!("{}", p.title);
+        } else {
+            eprintln!("{} [{}]", p.title, p.tags);
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::unnecessary_wraps)]
