@@ -1008,51 +1008,6 @@ mod tests {
         );
     }
 
-    /// Reproduce the hook test scenario: FTS5 query with AND operator and
-    /// terms that don't appear in the test data.
-    #[test]
-    fn fts_golang_and_query_returns_empty_for_rust_ts_data() {
-        let db = open_memory_db(4);
-        db.init().unwrap();
-
-        // Same data as the hook integration test seed.
-        let c1 = Chunk {
-            id: "c1".into(),
-            title: "Rust Conventions".into(),
-            body: "tags: rust, conventions\n\n\
-                   Use anyhow for application-level error propagation.\n\
-                   Reserve thiserror for library crates that need typed error variants.\n\
-                   Never use unwrap in production paths.\n"
-                .into(),
-            tags: String::new(),
-            source_file: "rust-conventions.md".into(),
-            heading_path: "Rust Conventions".into(),
-        };
-        let c2 = Chunk {
-            id: "c2".into(),
-            title: "TypeScript Conventions".into(),
-            body: "tags: typescript, conventions\n\n\
-                   Prefer type over interface for object shapes.\n\
-                   Use arrow functions for all callbacks.\n\
-                   Always use named exports, never default exports.\n"
-                .into(),
-            tags: String::new(),
-            source_file: "typescript-conventions.md".into(),
-            heading_path: "TypeScript Conventions".into(),
-        };
-        db.insert_chunk(&c1, None).unwrap();
-        db.insert_chunk(&c2, None).unwrap();
-
-        let results = db
-            .search_fts("golang AND (quantum OR physics OR simulation)", 10)
-            .unwrap();
-        assert!(
-            results.is_empty(),
-            "golang AND query should not match rust/ts data, got {} results",
-            results.len()
-        );
-    }
-
     #[test]
     fn list_patterns_includes_tags() {
         let db = open_memory_db(4);

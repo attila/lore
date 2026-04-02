@@ -34,11 +34,7 @@ fn setup_populated_env(dir: &Path) -> std::path::PathBuf {
     .unwrap();
 
     let db_path = dir.join("knowledge.db");
-    let config = Config::default_with(
-        knowledge_dir.clone(),
-        db_path,
-        "nomic-embed-text",
-    );
+    let config = Config::default_with(knowledge_dir.clone(), db_path, "nomic-embed-text");
 
     let config_path = dir.join("lore.toml");
     config.save(&config_path).unwrap();
@@ -217,11 +213,7 @@ fn list_empty_database_exits_cleanly() {
     let knowledge_dir = tmp.path().join("knowledge");
     std::fs::create_dir_all(&knowledge_dir).unwrap();
 
-    let config = Config::default_with(
-        knowledge_dir,
-        db_path,
-        "nomic-embed-text",
-    );
+    let config = Config::default_with(knowledge_dir, db_path, "nomic-embed-text");
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
 
