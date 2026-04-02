@@ -20,7 +20,7 @@ jobs:
           tool: just
       - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          tool: dprint
+          tool: dprint@0.53.1
       - run: just fmt
 
   clippy:
