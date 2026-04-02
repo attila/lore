@@ -16,6 +16,14 @@
 - [x] Ollama fallback warning and min_relevance threshold for search quality
 - [x] Search relevance boosting (FTS5 column weights + embedding enrichment)
 - [x] Score normalization (RRF scores mapped to 0–1 range)
+- [x] Agent integration — Claude Code plugin with deterministic pattern injection
+  - [x] Validation spike — confirmed `additionalContext` influences agent behavior
+  - [x] `lore hook` subcommand — unified hook handler for all lifecycle events
+  - [x] `lore list` subcommand + `--top-k` CLI flag + FTS5 query sanitization fix
+  - [x] Plugin assembly (`integrations/claude-code/`)
+  - [x] SessionStart priming, session dedup, PostCompact reset, error hook
+  - [x] Hook unit tests + search relevance regression tests (CI)
+  - [x] See `docs/plans/2026-04-01-005-feat-agent-integration-claude-code-plan.md`
 
 ## Up Next
 
@@ -23,14 +31,6 @@
 
 ## Future
 
-- [ ] Agent integration — Claude Code plugin with deterministic pattern injection
-  - [ ] Validation spike — confirm `additionalContext` influences agent behavior
-  - [ ] `lore hook` subcommand — unified hook handler for all lifecycle events
-  - [ ] `lore list` subcommand + `--top-k` CLI flag
-  - [ ] Plugin assembly (`integrations/claude-code/`)
-  - [ ] SessionStart priming, session dedup, PostCompact reset, error hook
-  - [ ] Hook unit tests + search relevance regression tests (CI)
-  - [ ] See `docs/plans/2026-04-01-005-feat-agent-integration-claude-code-plan.md`
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
 - [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
