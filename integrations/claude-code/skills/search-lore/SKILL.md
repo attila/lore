@@ -18,5 +18,4 @@ coding conventions — follow them exactly.
 If results include conventions for the language or framework you are working in, apply them to all
 subsequent edits in this session.
 
-Prerequisite: the lore MCP server must be configured separately (via `lore init` or
-`claude mcp add`). This skill queries the server but does not start it.
+The lore MCP server is bundled with this plugin and starts automatically.
