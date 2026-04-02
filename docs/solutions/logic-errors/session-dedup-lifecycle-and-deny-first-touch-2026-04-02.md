@@ -33,9 +33,9 @@ an infinite loop, and (2) dedup without gating on SessionStart causes false stat
 - **Deny-first-touch loop**: Blocking the first Edit/Write with conventions as the deny reason
   forces Claude to retry — but without tracking which patterns were already denied, every retry is
   also blocked. Claude retries indefinitely.
-- **Stale dedup from CLI**: Running `echo '{"hook_event_name":"PreToolUse",...}' | lore hook` from
-  a terminal with session_id `"test"` creates a dedup file at `$TMPDIR/lore-session-test`. Later,
-  a real Claude Code session with the same or similar session_id reads this stale file and skips
+- **Stale dedup from CLI**: Running `echo '{"hook_event_name":"PreToolUse",...}' | lore hook` from a
+  terminal with session_id `"test"` creates a dedup file at `$TMPDIR/lore-session-test`. Later, a
+  real Claude Code session with the same or similar session_id reads this stale file and skips
   injecting patterns that were never actually seen by Claude.
 
 ## What Didn't Work
@@ -69,6 +69,7 @@ let (results, dedup_active) = if let Some(ref path) = dedup_path
 ```
 
 The lifecycle is:
+
 1. **SessionStart** creates the dedup file (empty) via `reset_dedup()`
 2. **PreToolUse** checks `path.exists()` — only filters and appends if the file exists
 3. **PostCompact** truncates the file and re-emits SessionStart content
@@ -98,9 +99,9 @@ This is deferred to v2 as a configuration option once the dedup mechanism is bat
   from ad-hoc CLI invocations (no file created, no dedup applied)
 - **Dedup file lifecycle** (create → append → truncate → re-create) maps exactly to the Claude Code
   session lifecycle (start → tool calls → compaction → resume)
-- **Deny-first-touch + dedup** is a two-phase pattern: first deny injects conventions into
-  the conversation, second pass (with IDs in dedup) allows the tool through. Without the second
-  piece, the system has no memory that it already denied.
+- **Deny-first-touch + dedup** is a two-phase pattern: first deny injects conventions into the
+  conversation, second pass (with IDs in dedup) allows the tool through. Without the second piece,
+  the system has no memory that it already denied.
 
 ## Prevention
 

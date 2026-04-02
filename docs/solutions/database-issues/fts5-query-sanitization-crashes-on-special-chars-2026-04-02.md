@@ -50,8 +50,7 @@ pub fn sanitize_fts_query(query: &str) -> String {
     let cleaned: String = query
         .chars()
         .map(|c| match c {
-            '.' | '/' | '\\' | ':' | '{' | '}' | '[' | ']'
-            | '"' | '\'' | '*' | '^' => ' ',
+            '.' | '/' | '\\' | ':' | '{' | '}' | '[' | ']' | '"' | '\'' | '*' | '^' => ' ',
             _ => c,
         })
         .collect();
@@ -68,6 +67,7 @@ pub fn sanitize_fts_query(query: &str) -> String {
 ```
 
 **Key decisions:**
+
 - Parentheses `()` and keywords `AND`, `OR`, `NOT` are preserved so callers can construct structured
   FTS5 queries (e.g., `rust AND (error OR handling)`)
 - Leading minus is stripped because FTS5 treats it as the NOT operator
@@ -77,6 +77,7 @@ pub fn sanitize_fts_query(query: &str) -> String {
 ## Why This Works
 
 FTS5 has its own query grammar where certain characters are operators:
+
 - `.` is a column filter separator
 - `*` is a prefix search operator
 - `^` is a phrase start marker

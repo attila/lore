@@ -25,7 +25,7 @@ tags:
 ## Problem
 
 When building a PreToolUse hook that injects coding conventions via `additionalContext`, the
-conventions are visible to Claude *after* the tool call has been composed, not before. Claude cannot
+conventions are visible to Claude _after_ the tool call has been composed, not before. Claude cannot
 retroactively change the tool call it already constructed. This means the first edit in a new domain
 may not follow the injected conventions.
 
@@ -68,10 +68,11 @@ means even the first PreToolUse in a sequence benefits from the user's intent si
 ## Why This Works
 
 Claude Code hooks fire synchronously before tool execution, but the `additionalContext` they return
-becomes part of the tool call's *response context*, not its *composition context*. The agent sees
-the injected content in its transcript *after* the tool runs, not while planning the next tool call.
+becomes part of the tool call's _response context_, not its _composition context_. The agent sees
+the injected content in its transcript _after_ the tool runs, not while planning the next tool call.
 
 The Bash-first pattern works because:
+
 1. Agents naturally explore before editing (checking file existence, reading existing code)
 2. Each tool call's `additionalContext` enters the transcript
 3. By the time the Edit call is composed, prior hook responses are visible

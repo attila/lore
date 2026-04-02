@@ -28,8 +28,8 @@ tags:
 ## Problem
 
 Building effective FTS5 search queries from Claude Code hook input signals required iterative
-experimentation. Single keywords, raw file paths, and naive term extraction all produced poor results
-or outright failures.
+experimentation. Single keywords, raw file paths, and naive term extraction all produced poor
+results or outright failures.
 
 ## Symptoms
 
@@ -129,5 +129,5 @@ Chunk IDs are `source_file:heading_path` (e.g., `conventions.md:Error Handling`)
 
 - Always use explicit OR when combining multiple optional search terms in FTS5
 - Never use `MIN(id)` on text IDs to find "first" or "shallowest" — use a semantic ordering column
-- Test query construction with edge cases: all terms filtered, language-only, no language, file paths
-  with special characters
+- Test query construction with edge cases: all terms filtered, language-only, no language, file
+  paths with special characters

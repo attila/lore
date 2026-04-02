@@ -84,8 +84,8 @@ integrations/claude-code/
 **3. Disable auto-invocation when hooks handle injection.**
 
 If PreToolUse hooks already inject patterns via `additionalContext`, an auto-invocable skill calling
-the same MCP search tool doubles the work. Set `disable-model-invocation: true` in the skill's
-YAML frontmatter to make it user-invocable only:
+the same MCP search tool doubles the work. Set `disable-model-invocation: true` in the skill's YAML
+frontmatter to make it user-invocable only:
 
 ```yaml
 ---
