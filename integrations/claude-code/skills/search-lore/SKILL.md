@@ -1,7 +1,7 @@
 ---
 name: search-lore
 description: Search the lore knowledge base for coding conventions and patterns relevant to the current task. Use when entering a new domain, creating new files, or when you need comprehensive pattern coverage beyond what PreToolUse hooks inject.
-disable-model-invocation: false
+disable-model-invocation: true
 user-invocable: true
 ---
 
