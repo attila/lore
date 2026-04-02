@@ -31,12 +31,32 @@ fn embed_text(chunk: &Chunk) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Metadata keys
+// ---------------------------------------------------------------------------
+
+/// Key used to store the last successfully ingested commit SHA.
+const META_LAST_COMMIT: &str = "last_ingested_commit";
+
+// ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
-/// Summary returned after a full directory ingest.
+/// Whether the ingest ran in full or delta mode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IngestMode {
+    /// Full re-index (cleared database and re-embedded everything).
+    Full,
+    /// Delta update — only changed files were processed.
+    Delta {
+        /// Number of files that were unchanged and skipped.
+        unchanged: usize,
+    },
+}
+
+/// Summary returned after a directory ingest.
 #[derive(Debug)]
 pub struct IngestResult {
+    pub mode: IngestMode,
     pub files_processed: usize,
     pub chunks_created: usize,
     pub errors: Vec<String>,
@@ -63,16 +83,18 @@ pub struct WriteResult {
 }
 
 // ---------------------------------------------------------------------------
-// Full-directory ingest
+// Directory ingest (delta and full)
 // ---------------------------------------------------------------------------
 
-/// Walk `knowledge_dir` for markdown files, chunk, embed, and insert them.
+/// Ingest the knowledge base, using delta mode when possible.
 ///
-/// The `strategy` parameter selects the chunking function:
-/// - `"heading"` — split on markdown headings via [`chunk_by_heading`]
-/// - anything else — treat each file as a single document via [`chunk_as_document`]
+/// Tries to detect changes via `git diff --name-status` against the last
+/// successfully ingested commit. Falls back to a full re-index when:
+/// - `knowledge_dir` is not a git repository
+/// - No previous commit SHA is stored in the database
+/// - The stored commit no longer exists in the repository history
 ///
-/// Calls `on_progress` with human-readable status messages.
+/// Use [`full_ingest`] directly to force a complete re-index.
 pub fn ingest(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -80,7 +102,134 @@ pub fn ingest(
     strategy: &str,
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
+    // Not a git repo — full ingest is the only option.
+    if !git::is_git_repo(knowledge_dir) {
+        on_progress("Not a git repository — running full ingest");
+        return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+    }
+
+    // No stored commit — first ingest or metadata was cleared.
+    let Ok(Some(last_commit)) = db.get_metadata(META_LAST_COMMIT) else {
+        on_progress("No previous ingest recorded — running full ingest");
+        return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+    };
+
+    // Stored commit no longer exists (history rewrite, shallow clone, etc.).
+    if !git::commit_exists(knowledge_dir, &last_commit) {
+        on_progress("Previous commit not found in history — running full ingest");
+        return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+    }
+
+    // Run delta detection.
+    let changes = match git::diff_name_status(knowledge_dir, &last_commit) {
+        Ok(c) => c,
+        Err(e) => {
+            on_progress(&format!("git diff failed ({e}) — running full ingest"));
+            return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+        }
+    };
+
+    if changes.is_empty() {
+        on_progress("Already up to date — no files changed since last ingest");
+        return IngestResult {
+            mode: IngestMode::Delta { unchanged: 0 },
+            files_processed: 0,
+            chunks_created: 0,
+            errors: Vec::new(),
+        };
+    }
+
+    delta_ingest(db, embedder, knowledge_dir, strategy, &changes, on_progress)
+}
+
+/// Process only the files that changed since the last ingest.
+fn delta_ingest(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    strategy: &str,
+    changes: &[git::FileChange],
+    on_progress: &dyn Fn(&str),
+) -> IngestResult {
+    // Count existing sources before processing to report unchanged files.
+    let sources_before = db.stats().map(|s| s.sources).unwrap_or(0);
+
+    on_progress(&format!("Delta ingest: {} file(s) changed", changes.len()));
+
     let mut result = IngestResult {
+        mode: IngestMode::Delta {
+            unchanged: sources_before,
+        },
+        files_processed: 0,
+        chunks_created: 0,
+        errors: Vec::new(),
+    };
+
+    for change in changes {
+        match change {
+            git::FileChange::Added(path) | git::FileChange::Modified(path) => {
+                let file_path = knowledge_dir.join(path);
+                match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
+                    Ok((chunks, _)) => {
+                        result.chunks_created += chunks;
+                        on_progress(&format!("  {path} → {chunks} chunks"));
+                    }
+                    Err(e) => {
+                        result.errors.push(format!("Failed to index {path}: {e}"));
+                    }
+                }
+            }
+            git::FileChange::Deleted(path) => {
+                if let Err(e) = db.delete_by_source(path) {
+                    result.errors.push(format!("Failed to delete {path}: {e}"));
+                } else {
+                    on_progress(&format!("  {path} (deleted)"));
+                }
+            }
+            git::FileChange::Renamed { from, to } => {
+                if let Err(e) = db.delete_by_source(from) {
+                    result
+                        .errors
+                        .push(format!("Failed to delete old path {from}: {e}"));
+                }
+                let file_path = knowledge_dir.join(to);
+                match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
+                    Ok((chunks, _)) => {
+                        result.chunks_created += chunks;
+                        on_progress(&format!("  {from} → {to} ({chunks} chunks)"));
+                    }
+                    Err(e) => {
+                        result.errors.push(format!("Failed to index {to}: {e}"));
+                    }
+                }
+            }
+        }
+        result.files_processed += 1;
+    }
+
+    // Record the new HEAD on success (no errors).
+    if result.errors.is_empty()
+        && let Ok(head) = git::head_commit(knowledge_dir)
+    {
+        let _ = db.set_metadata(META_LAST_COMMIT, &head);
+    }
+
+    result
+}
+
+/// Clear the database and re-index every markdown file from scratch.
+///
+/// Records the current HEAD commit SHA on success so that subsequent
+/// [`ingest`] calls can use delta mode.
+pub fn full_ingest(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    strategy: &str,
+    on_progress: &dyn Fn(&str),
+) -> IngestResult {
+    let mut result = IngestResult {
+        mode: IngestMode::Full,
         files_processed: 0,
         chunks_created: 0,
         errors: Vec::new(),
@@ -148,6 +297,14 @@ pub fn ingest(
 
         result.files_processed += 1;
         on_progress(&format!("  {} → {} chunks", rel_path, chunks.len()));
+    }
+
+    // Record the HEAD commit for future delta ingests.
+    if result.errors.is_empty()
+        && git::is_git_repo(knowledge_dir)
+        && let Ok(head) = git::head_commit(knowledge_dir)
+    {
+        let _ = db.set_metadata(META_LAST_COMMIT, &head);
     }
 
     result
@@ -1018,5 +1175,206 @@ mod tests {
     fn validate_slug_accepts_normal_filename() {
         let result = validate_slug("my-pattern.md");
         assert!(result.is_ok());
+    }
+
+    // -- full_ingest records commit SHA ------------------------------------
+
+    #[test]
+    fn full_ingest_records_head_commit() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("doc.md");
+        fs::write(
+            &file,
+            "# Doc\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &file, "initial").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert_eq!(result.mode, IngestMode::Full);
+        assert!(result.errors.is_empty());
+
+        let stored = db.get_metadata(META_LAST_COMMIT).unwrap();
+        assert!(stored.is_some(), "should have stored a commit SHA");
+        assert_eq!(stored.unwrap().len(), 40);
+    }
+
+    // -- delta ingest tests ------------------------------------------------
+
+    #[test]
+    fn delta_ingest_processes_only_changed_files() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        // Create two files and do initial full ingest.
+        let alpha = dir.join("alpha.md");
+        let beta = dir.join("beta.md");
+        fs::write(
+            &alpha,
+            "# Alpha\n\nAlpha body text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        fs::write(
+            &beta,
+            "# Beta\n\nBeta body text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &alpha, "add alpha").unwrap();
+        git::add_and_commit(dir, &beta, "add beta").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        let initial_chunks = result.chunks_created;
+
+        // Modify only alpha.
+        fs::write(
+            &alpha,
+            "# Alpha\n\nUpdated alpha body that is long enough.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &alpha, "update alpha").unwrap();
+
+        // Delta ingest should only process the modified file.
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(
+            matches!(result.mode, IngestMode::Delta { .. }),
+            "expected Delta mode, got {:?}",
+            result.mode
+        );
+        assert_eq!(
+            result.files_processed, 1,
+            "should only process the modified file"
+        );
+        assert!(result.errors.is_empty());
+
+        // Beta chunks should still be in the database.
+        let stats = db.stats().unwrap();
+        assert!(
+            stats.chunks >= initial_chunks,
+            "beta chunks should be preserved"
+        );
+    }
+
+    #[test]
+    fn delta_ingest_handles_deleted_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let alpha = dir.join("alpha.md");
+        let beta = dir.join("beta.md");
+        fs::write(
+            &alpha,
+            "# Alpha\n\nAlpha body text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        fs::write(
+            &beta,
+            "# Beta\n\nBeta body text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &alpha, "add alpha").unwrap();
+        git::add_and_commit(dir, &beta, "add beta").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Delete alpha.
+        fs::remove_file(&alpha).unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "delete alpha"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(matches!(result.mode, IngestMode::Delta { .. }));
+        assert_eq!(result.files_processed, 1);
+        assert!(result.errors.is_empty());
+
+        // Alpha chunks should be gone, beta chunks should remain.
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.sources, 1, "only beta should remain");
+    }
+
+    #[test]
+    fn delta_ingest_no_changes_returns_early() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("doc.md");
+        fs::write(
+            &file,
+            "# Doc\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &file, "initial").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // No changes — delta should return immediately.
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(matches!(result.mode, IngestMode::Delta { .. }));
+        assert_eq!(result.files_processed, 0);
+        assert_eq!(result.chunks_created, 0);
+    }
+
+    #[test]
+    fn ingest_falls_back_to_full_without_git() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        fs::write(
+            dir.join("doc.md"),
+            "# Doc\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert_eq!(result.mode, IngestMode::Full);
+        assert_eq!(result.files_processed, 1);
+    }
+
+    #[test]
+    fn ingest_falls_back_to_full_without_stored_commit() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("doc.md");
+        fs::write(
+            &file,
+            "# Doc\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &file, "initial").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // First ingest() call with no stored commit falls back to full.
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(result.mode, IngestMode::Full);
     }
 }

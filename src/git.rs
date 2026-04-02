@@ -226,6 +226,81 @@ pub fn push_branch(repo_dir: &Path, branch: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A file-level change detected by `git diff --name-status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChange {
+    Added(String),
+    Modified(String),
+    Deleted(String),
+    Renamed { from: String, to: String },
+}
+
+/// Return the full SHA of HEAD.
+pub fn head_commit(repo_dir: &Path) -> anyhow::Result<String> {
+    git_output(repo_dir, &["rev-parse", "HEAD"])
+}
+
+/// Check whether a commit object exists in the repository.
+pub fn commit_exists(repo_dir: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-t", sha])
+        .current_dir(repo_dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run `git diff --name-status` between `from_commit` and HEAD, returning
+/// only changes to markdown files (`.md` / `.markdown`).
+pub fn diff_name_status(repo_dir: &Path, from_commit: &str) -> anyhow::Result<Vec<FileChange>> {
+    let raw = git_output(
+        repo_dir,
+        &["diff", "--name-status", &format!("{from_commit}..HEAD")],
+    )?;
+
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut changes = Vec::new();
+    for line in raw.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let status = parts[0];
+        let change = if status == "A" && parts.len() >= 2 {
+            Some(FileChange::Added(parts[1].to_string()))
+        } else if status == "M" && parts.len() >= 2 {
+            Some(FileChange::Modified(parts[1].to_string()))
+        } else if status == "D" && parts.len() >= 2 {
+            Some(FileChange::Deleted(parts[1].to_string()))
+        } else if status.starts_with('R') && parts.len() >= 3 {
+            Some(FileChange::Renamed {
+                from: parts[1].to_string(),
+                to: parts[2].to_string(),
+            })
+        } else {
+            None // Ignore unknown status codes (C, T, U, X, etc.)
+        };
+
+        if let Some(c) = change {
+            // Filter to markdown files only.
+            let path = match &c {
+                FileChange::Added(p) | FileChange::Modified(p) | FileChange::Deleted(p) => p,
+                FileChange::Renamed { to, .. } => to,
+            };
+            let ext = Path::new(path).extension().and_then(|e| e.to_str());
+            if matches!(ext, Some("md" | "markdown")) {
+                changes.push(c);
+            }
+        }
+    }
+
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +563,193 @@ mod tests {
 
         let result = commit_to_new_branch(dir, "test/", "nope", "file.txt", "data", "should fail");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn head_commit_returns_sha() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("seed.md");
+        fs::write(&file, "# Seed\n").unwrap();
+        add_and_commit(dir, &file, "initial").unwrap();
+
+        let sha = head_commit(dir).unwrap();
+        assert_eq!(sha.len(), 40, "expected 40-char SHA, got: {sha}");
+    }
+
+    #[test]
+    fn commit_exists_true_for_valid_sha() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("seed.md");
+        fs::write(&file, "# Seed\n").unwrap();
+        add_and_commit(dir, &file, "initial").unwrap();
+
+        let sha = head_commit(dir).unwrap();
+        assert!(commit_exists(dir, &sha));
+    }
+
+    #[test]
+    fn commit_exists_false_for_bogus_sha() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("seed.md");
+        fs::write(&file, "# Seed\n").unwrap();
+        add_and_commit(dir, &file, "initial").unwrap();
+
+        assert!(!commit_exists(
+            dir,
+            "0000000000000000000000000000000000000000"
+        ));
+    }
+
+    #[test]
+    fn diff_name_status_added_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        // Initial commit.
+        let seed = dir.join("seed.md");
+        fs::write(&seed, "# Seed\n").unwrap();
+        add_and_commit(dir, &seed, "initial").unwrap();
+        let base = head_commit(dir).unwrap();
+
+        // Add a new file.
+        let new_file = dir.join("added.md");
+        fs::write(&new_file, "# Added\n").unwrap();
+        add_and_commit(dir, &new_file, "add file").unwrap();
+
+        let changes = diff_name_status(dir, &base).unwrap();
+        assert_eq!(changes, vec![FileChange::Added("added.md".to_string())]);
+    }
+
+    #[test]
+    fn diff_name_status_modified_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("doc.md");
+        fs::write(&file, "# Original\n").unwrap();
+        add_and_commit(dir, &file, "initial").unwrap();
+        let base = head_commit(dir).unwrap();
+
+        fs::write(&file, "# Modified\n").unwrap();
+        add_and_commit(dir, &file, "modify").unwrap();
+
+        let changes = diff_name_status(dir, &base).unwrap();
+        assert_eq!(changes, vec![FileChange::Modified("doc.md".to_string())]);
+    }
+
+    #[test]
+    fn diff_name_status_deleted_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("doc.md");
+        fs::write(&file, "# Doc\n").unwrap();
+        add_and_commit(dir, &file, "initial").unwrap();
+        let base = head_commit(dir).unwrap();
+
+        fs::remove_file(&file).unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "delete file"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        let changes = diff_name_status(dir, &base).unwrap();
+        assert_eq!(changes, vec![FileChange::Deleted("doc.md".to_string())]);
+    }
+
+    #[test]
+    fn diff_name_status_renamed_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let old = dir.join("old-name.md");
+        fs::write(&old, "# Content that is long enough for git to detect rename\n\nThis body has enough content for similarity detection.\n").unwrap();
+        add_and_commit(dir, &old, "initial").unwrap();
+        let base = head_commit(dir).unwrap();
+
+        Command::new("git")
+            .args(["mv", "old-name.md", "new-name.md"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "rename file"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        let changes = diff_name_status(dir, &base).unwrap();
+        assert_eq!(
+            changes,
+            vec![FileChange::Renamed {
+                from: "old-name.md".to_string(),
+                to: "new-name.md".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_name_status_no_changes() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let file = dir.join("doc.md");
+        fs::write(&file, "# Doc\n").unwrap();
+        add_and_commit(dir, &file, "initial").unwrap();
+        let base = head_commit(dir).unwrap();
+
+        let changes = diff_name_status(dir, &base).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn diff_name_status_filters_non_markdown() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let seed = dir.join("seed.md");
+        fs::write(&seed, "# Seed\n").unwrap();
+        add_and_commit(dir, &seed, "initial").unwrap();
+        let base = head_commit(dir).unwrap();
+
+        // Add both markdown and non-markdown files.
+        let md_file = dir.join("new.md");
+        let txt_file = dir.join("notes.txt");
+        fs::write(&md_file, "# New\n").unwrap();
+        fs::write(&txt_file, "plain text\n").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add files"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        let changes = diff_name_status(dir, &base).unwrap();
+        assert_eq!(changes, vec![FileChange::Added("new.md".to_string())]);
     }
 }
