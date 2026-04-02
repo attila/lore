@@ -16,24 +16,24 @@
 - [x] Ollama fallback warning and min_relevance threshold for search quality
 - [x] Search relevance boosting (FTS5 column weights + embedding enrichment)
 - [x] Score normalization (RRF scores mapped to 0–1 range)
+- [x] Agent integration — Claude Code plugin with deterministic pattern injection
+  - [x] Validation spike — confirmed `additionalContext` influences agent behavior
+  - [x] `lore hook` subcommand — unified hook handler for all lifecycle events
+  - [x] `lore list` subcommand + `--top-k` CLI flag + FTS5 query sanitization fix
+  - [x] Plugin assembly (`integrations/claude-code/`)
+  - [x] SessionStart priming, session dedup, PostCompact reset, error hook
+  - [x] Hook unit tests + search relevance regression tests (CI)
+  - [x] See `docs/plans/2026-04-01-005-feat-agent-integration-claude-code-plan.md`
 
 ## Up Next
 
+- [ ] `LORE_DEBUG=1` verbose logging for hook pipeline troubleshooting
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 
 ## Future
 
-- [ ] Agent integration — layered strategy for reliable pattern delivery to agents
-  - [ ] Layer 1: PreToolUse domain hook — deterministic injection of relevant patterns as
-        `additionalContext` before tool execution, driven by a configurable domain map in
-        `lore.toml`
-  - [ ] Layer 2: Auto-invocable skill — `.claude/skills/` entry for novel situations the domain map
-        doesn't cover
-  - [ ] Layer 3: PostToolUse audit hook — review agent output against patterns, catch taste
-        violations that produce working code
-  - [ ] Layer 4: Error hook — search lore on build/test failures for known gotchas
-  - [ ] `lore hooks install` command — generate agent-specific hook/skill files from the domain map
-  - [ ] See `tmp/INTEGRATION_STRATEGY.md` for full design notes
+- [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
+- [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions

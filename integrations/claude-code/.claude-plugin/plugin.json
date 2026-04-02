@@ -1,0 +1,7 @@
+{
+  "name": "lore",
+  "version": "0.1.0",
+  "description": "Deterministic coding convention injection via lore knowledge base",
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json"
+}

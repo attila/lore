@@ -75,6 +75,14 @@ pub struct DBStats {
     pub sources: usize,
 }
 
+/// One entry per source document, used by `lore list`.
+#[derive(Debug, Clone)]
+pub struct PatternSummary {
+    pub title: String,
+    pub source_file: String,
+    pub tags: String,
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -214,7 +222,15 @@ impl KnowledgeDB {
     ///
     /// Column weights (positional, matching FTS5 column order):
     /// `title`=10, `body`=1, `tags`=5, `source_file`=0
+    ///
+    /// The query is sanitized before passing to FTS5 `MATCH` so that
+    /// arbitrary user input (file paths, dotted names, etc.) never crashes.
     pub fn search_fts(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
+        let query = sanitize_fts_query(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
                     bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score
@@ -296,6 +312,75 @@ impl KnowledgeDB {
         Ok(reciprocal_rank_fusion(&fts_results, &vec_results, limit))
     }
 
+    /// Return one entry per source document (the shallowest chunk per file).
+    ///
+    /// Used by `lore list` to show a compact pattern index.
+    /// Selects the chunk with the shortest `heading_path` per source file,
+    /// which corresponds to the root or top-level section.
+    pub fn list_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_file, title, tags FROM chunks
+             WHERE id IN (
+                 SELECT id FROM chunks c1
+                 WHERE LENGTH(c1.heading_path) = (
+                     SELECT MIN(LENGTH(c2.heading_path))
+                     FROM chunks c2
+                     WHERE c2.source_file = c1.source_file
+                 )
+                 GROUP BY source_file
+             )
+             ORDER BY source_file",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(PatternSummary {
+                source_file: row.get(0)?,
+                title: row.get(1)?,
+                tags: row.get(2)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Return all chunks from the given source files.
+    ///
+    /// Used by the hook pipeline to expand search results to include all sibling
+    /// chunks from matched documents (e.g., if the Error Handling section matched,
+    /// also inject Functions, Naming, Exports sections from the same file).
+    pub fn chunks_by_sources(&self, source_files: &[&str]) -> anyhow::Result<Vec<SearchResult>> {
+        if source_files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: Vec<String> = (1..=source_files.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score \
+             FROM chunks WHERE source_file IN ({}) ORDER BY source_file, id",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = source_files
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(SearchResult {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                tags: row.get(3)?,
+                source_file: row.get(4)?,
+                heading_path: row.get(5)?,
+                score: row.get(6)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Return aggregate statistics about the database.
     #[allow(clippy::cast_sign_loss)]
     pub fn stats(&self) -> anyhow::Result<DBStats> {
@@ -320,6 +405,36 @@ impl KnowledgeDB {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Make arbitrary user input safe for FTS5 `MATCH`.
+///
+/// FTS5 crashes on dots, slashes, colons, braces, quotes, asterisks, and
+/// carets. This function replaces those characters with spaces, strips
+/// leading minus from terms (FTS5 `NOT` operator), then collapses runs of
+/// whitespace and trims.
+///
+/// Parentheses and the keywords `AND`, `OR`, `NOT` are preserved so that
+/// callers (like the hook pipeline) can construct structured FTS5 queries
+/// with grouping. Raw user input from `lore search` never contains these
+/// operators in a meaningful way, so preserving them is safe.
+pub fn sanitize_fts_query(query: &str) -> String {
+    let cleaned: String = query
+        .chars()
+        .map(|c| match c {
+            '.' | '/' | '\\' | ':' | '{' | '}' | '[' | ']' | '"' | '\'' | '*' | '^' => ' ',
+            _ => c,
+        })
+        .collect();
+
+    // Strip leading minus from each term (FTS5 treats it as a NOT operator).
+    let result: Vec<&str> = cleaned
+        .split_whitespace()
+        .map(|term| term.trim_start_matches('-'))
+        .filter(|term| !term.is_empty())
+        .collect();
+
+    result.join(" ")
+}
 
 /// Convert an `f32` slice to a little-endian byte blob for sqlite-vec.
 fn vec_to_blob(v: &[f32]) -> Vec<u8> {
@@ -771,5 +886,193 @@ mod tests {
         let results = db.search_fts("error", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Error Handling");
+    }
+
+    // -- sanitize_fts_query ------------------------------------------------
+
+    #[test]
+    fn sanitize_strips_dots_and_slashes() {
+        assert_eq!(sanitize_fts_query("path/to/file.ts"), "path to file ts");
+    }
+
+    #[test]
+    fn sanitize_strips_special_chars() {
+        assert_eq!(
+            sanitize_fts_query("foo:bar {qux} [quux] \"quoted\" 'single'"),
+            "foo bar qux quux quoted single"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_parentheses() {
+        assert_eq!(
+            sanitize_fts_query("rust AND (error OR handling)"),
+            "rust AND (error OR handling)"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_leading_minus() {
+        assert_eq!(sanitize_fts_query("-NOT this -term"), "NOT this term");
+    }
+
+    #[test]
+    fn sanitize_collapses_whitespace() {
+        assert_eq!(sanitize_fts_query("  lots   of   space  "), "lots of space");
+    }
+
+    #[test]
+    fn sanitize_pure_special_returns_empty() {
+        assert_eq!(sanitize_fts_query("...///"), "");
+    }
+
+    #[test]
+    fn sanitize_asterisk_and_caret() {
+        assert_eq!(sanitize_fts_query("foo* ^bar"), "foo bar");
+    }
+
+    #[test]
+    fn fts_search_with_dots_does_not_crash() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk("c1", "Dotted", "Some dotted content", "a.md");
+        db.insert_chunk(&chunk, None).unwrap();
+
+        // This would crash FTS5 without sanitization.
+        let results = db.search_fts("file.with.dots", 10).unwrap();
+        // May or may not find results, but must not crash.
+        drop(results);
+    }
+
+    #[test]
+    fn fts_search_with_path_does_not_crash() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk("c1", "Path", "Some path content", "a.md");
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let results = db.search_fts("path/to/file.ts", 10).unwrap();
+        drop(results);
+    }
+
+    #[test]
+    fn fts_search_empty_after_sanitize_returns_empty() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk("c1", "Title", "Body content", "a.md");
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let results = db.search_fts("...", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // -- list_patterns -----------------------------------------------------
+
+    #[test]
+    fn list_patterns_returns_one_per_source() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Two chunks from same source, one from another.
+        db.insert_chunk(&make_chunk("c1", "Alpha", "Body A1", "alpha.md"), None)
+            .unwrap();
+        db.insert_chunk(&make_chunk("c2", "Alpha Sub", "Body A2", "alpha.md"), None)
+            .unwrap();
+        db.insert_chunk(&make_chunk("c3", "Beta", "Body B1", "beta.md"), None)
+            .unwrap();
+
+        let patterns = db.list_patterns().unwrap();
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0].source_file, "alpha.md");
+        assert_eq!(patterns[0].title, "Alpha");
+        assert_eq!(patterns[1].source_file, "beta.md");
+        assert_eq!(patterns[1].title, "Beta");
+    }
+
+    #[test]
+    fn list_patterns_empty_db() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let patterns = db.list_patterns().unwrap();
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn fts_and_or_query_non_matching_returns_empty() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let c1 = Chunk {
+            id: "c1".into(),
+            title: "Rust Conventions".into(),
+            body: "Use anyhow for errors.".into(),
+            tags: "rust, conventions".into(),
+            source_file: "rust.md".into(),
+            heading_path: String::new(),
+        };
+        let c2 = Chunk {
+            id: "c2".into(),
+            title: "TypeScript Conventions".into(),
+            body: "Prefer type over interface.".into(),
+            tags: "typescript, conventions".into(),
+            source_file: "ts.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&c1, None).unwrap();
+        db.insert_chunk(&c2, None).unwrap();
+
+        // This query has no overlapping terms with the data.
+        let results = db
+            .search_fts("golang AND (quantum OR physics OR simulation)", 10)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "expected no results for non-matching AND/OR query, got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn fts_and_operator_requires_all_terms() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk("c1", "Rust Guide", "Ownership and borrowing", "rust.md");
+        db.insert_chunk(&chunk, None).unwrap();
+
+        // "rust" matches, but "xyznotreal" does not.
+        // FTS5 AND should require both.
+        let results = db
+            .search_fts("xyznotreal AND (rust OR ownership)", 10)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "AND should require all operands to match, got {} results",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn list_patterns_includes_tags() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = Chunk {
+            id: "c1".into(),
+            title: "Rust Conventions".into(),
+            body: "Use snake_case".into(),
+            tags: "rust, style".into(),
+            source_file: "rust.md".into(),
+            heading_path: "Naming".into(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let patterns = db.list_patterns().unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].tags, "rust, style");
     }
 }
