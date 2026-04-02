@@ -136,7 +136,7 @@ fn hook_pretooluse_edit_rs_returns_context() {
         );
         let ctx = hso["additionalContext"].as_str().unwrap();
         assert!(
-            ctx.contains("REQUIRED CONVENTIONS"),
+            ctx.contains("PROJECT CONVENTIONS"),
             "should contain imperative header: {ctx}"
         );
     }
@@ -247,12 +247,12 @@ fn hook_session_start_returns_meta_instruction() {
 
     let ctx = hso["additionalContext"].as_str().unwrap();
     assert!(
-        ctx.contains("lore for coding conventions"),
+        ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
     );
     assert!(
-        ctx.contains("REQUIRED CONVENTIONS"),
-        "should mention required conventions: {ctx}"
+        ctx.contains("strong coding preferences"),
+        "should describe convention authority: {ctx}"
     );
     assert!(
         ctx.contains("Available patterns:"),
@@ -289,7 +289,7 @@ fn hook_post_compact_returns_session_context() {
 
     let ctx = hso["additionalContext"].as_str().unwrap();
     assert!(
-        ctx.contains("lore for coding conventions"),
+        ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
     );
     assert!(
@@ -812,7 +812,7 @@ fn hook_pretooluse_edit_test_ts_returns_typescript_testing() {
     assert_eq!(hso["hookEventName"], "PreToolUse");
     let ctx = hso["additionalContext"].as_str().unwrap();
     assert!(
-        ctx.contains("REQUIRED CONVENTIONS"),
+        ctx.contains("PROJECT CONVENTIONS"),
         "should contain imperative header: {ctx}"
     );
 

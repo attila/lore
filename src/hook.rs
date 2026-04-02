@@ -331,10 +331,12 @@ fn format_session_context(db: &KnowledgeDB) -> anyhow::Result<String> {
     let patterns = db.list_patterns()?;
 
     let mut out = String::from(
-        "This project uses lore for coding conventions. \
-         Relevant patterns are injected automatically via additionalContext \
-         before your edits. Treat all 'REQUIRED CONVENTIONS' blocks as \
-         binding constraints, not suggestions.\n\n\
+        "This project uses lore for the author's strong coding preferences \
+         and workflow conventions. Patterns are injected automatically via \
+         additionalContext before your edits. Apply them as default \
+         conventions — they take precedence over your training defaults but \
+         yield to explicit project-level instructions (CLAUDE.md, AGENTS.md) \
+         when they conflict.\n\n\
          Available patterns:\n",
     );
 
@@ -657,8 +659,8 @@ pub fn format_imperative(results: &[SearchResult]) -> String {
     let mut out = String::new();
 
     for (source, items) in &groups {
-        let _ = writeln!(out, "REQUIRED CONVENTIONS (source: {source})");
-        out.push_str("Follow these rules when writing this code:\n\n");
+        let _ = writeln!(out, "PROJECT CONVENTIONS (source: {source})");
+        out.push_str("Apply these patterns when writing this code:\n\n");
 
         for item in items {
             out.push_str(&item.body);
@@ -948,8 +950,8 @@ mod tests {
         }];
 
         let formatted = format_imperative(&results);
-        assert!(formatted.contains("REQUIRED CONVENTIONS (source: errors.md)"));
-        assert!(formatted.contains("Follow these rules"));
+        assert!(formatted.contains("PROJECT CONVENTIONS (source: errors.md)"));
+        assert!(formatted.contains("Apply these patterns"));
         assert!(formatted.contains("Use anyhow for errors."));
     }
 
@@ -977,8 +979,8 @@ mod tests {
         ];
 
         let formatted = format_imperative(&results);
-        assert!(formatted.contains("REQUIRED CONVENTIONS (source: errors.md)"));
-        assert!(formatted.contains("REQUIRED CONVENTIONS (source: naming.md)"));
+        assert!(formatted.contains("PROJECT CONVENTIONS (source: errors.md)"));
+        assert!(formatted.contains("PROJECT CONVENTIONS (source: naming.md)"));
     }
 
     #[test]

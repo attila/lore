@@ -12,8 +12,9 @@ Search the lore knowledge base for all patterns relevant to $ARGUMENTS.
 Use the `search_patterns` MCP tool to query lore. If the tool is not available, run
 `lore search "$ARGUMENTS"` via Bash instead.
 
-Treat ALL results as binding constraints when writing code in this domain. These are the project's
-coding conventions — follow them exactly.
+Apply ALL results as project conventions when writing code in this domain. These are the author's
+strong coding preferences — follow them unless they conflict with explicit project-level
+instructions.
 
 If results include conventions for the language or framework you are working in, apply them to all
 subsequent edits in this session.
