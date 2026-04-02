@@ -135,17 +135,40 @@ fn handle_pre_tool_use(
         return Ok(None);
     }
 
+    // Expand: fetch all sibling chunks from matched source files.
+    // If Error Handling matched, also inject Functions, Naming, etc. from the
+    // same document.
+    let source_files: Vec<&str> = {
+        let mut seen = HashSet::new();
+        results
+            .iter()
+            .filter_map(|r| {
+                if seen.insert(r.source_file.as_str()) {
+                    Some(r.source_file.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let results = db.chunks_by_sources(&source_files).unwrap_or(results);
+
+    if results.is_empty() {
+        return Ok(None);
+    }
+
     // Dedup: filter out already-injected chunk IDs for this session.
+    // Only activate dedup when the dedup file exists (SessionStart ran).
+    // Manual CLI calls and sessions without SessionStart skip dedup entirely.
     let dedup_path = session_dedup_path(input);
-    let (results, dedup_ok) = if let Some(ref path) = dedup_path {
+    let (results, dedup_active) = if let Some(ref path) = dedup_path
+        && path.exists()
+    {
         let seen = read_dedup(path);
         let filtered: Vec<SearchResult> = results
             .into_iter()
             .filter(|r| !seen.contains(&r.id))
             .collect();
-        // Track whether dedup read succeeded (non-empty seen set or file
-        // exists). We consider dedup "ok" if the file is readable; an empty
-        // set from a missing file means we should still write.
         (filtered, true)
     } else {
         (results, false)
@@ -158,7 +181,7 @@ fn handle_pre_tool_use(
     let context = format_imperative(&results);
 
     // Append newly injected chunk IDs to dedup file.
-    if dedup_ok && let Some(ref path) = dedup_path {
+    if dedup_active && let Some(ref path) = dedup_path {
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         if let Err(e) = write_dedup(path, &ids) {
             eprintln!("lore hook: failed to update dedup file: {e}");

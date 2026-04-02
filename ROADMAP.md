@@ -27,6 +27,7 @@
 
 ## Up Next
 
+- [ ] `LORE_DEBUG=1` verbose logging for hook pipeline troubleshooting
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 
 ## Future

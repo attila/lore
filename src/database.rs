@@ -333,6 +333,44 @@ impl KnowledgeDB {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Return all chunks from the given source files.
+    ///
+    /// Used by the hook pipeline to expand search results to include all sibling
+    /// chunks from matched documents (e.g., if the Error Handling section matched,
+    /// also inject Functions, Naming, Exports sections from the same file).
+    pub fn chunks_by_sources(&self, source_files: &[&str]) -> anyhow::Result<Vec<SearchResult>> {
+        if source_files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: Vec<String> = (1..=source_files.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score \
+             FROM chunks WHERE source_file IN ({}) ORDER BY source_file, id",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = source_files
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(SearchResult {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                tags: row.get(3)?,
+                source_file: row.get(4)?,
+                heading_path: row.get(5)?,
+                score: row.get(6)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Return aggregate statistics about the database.
     #[allow(clippy::cast_sign_loss)]
     pub fn stats(&self) -> anyhow::Result<DBStats> {

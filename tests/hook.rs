@@ -830,6 +830,19 @@ fn hook_pretooluse_all_results_deduped_no_output() {
     let (_tmp, config_path) = setup_test_env();
     let session_id = format!("all-dedup-test-{}", std::process::id());
 
+    // SessionStart creates the dedup file — dedup only activates when this
+    // file exists (no SessionStart → no dedup).
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
     // First call: inject patterns from an .rs file edit.
     let input = serde_json::json!({
         "hook_event_name": "PreToolUse",
