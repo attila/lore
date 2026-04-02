@@ -27,9 +27,10 @@
 
 ## Up Next
 
-- [ ] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
+- [x] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
       full re-embed. Use `git diff --name-status` against the last-ingested commit to detect
-      changes. Eliminates the Ollama round-trip penalty for unchanged files.
+      changes. Eliminates the Ollama round-trip penalty for unchanged files. See
+      `docs/plans/2026-04-02-001-feat-delta-ingest-plan.md`
 - [ ] Bounded transcript read — `last_user_message()` reads entire JSONL into memory; use
       reverse-seek or tail-read to cap memory and latency for long sessions
 - [ ] `--json` flag on `lore search` and `lore list` for structured machine-readable output
