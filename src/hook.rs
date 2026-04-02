@@ -2,15 +2,16 @@
 
 //! Hook pipeline for Claude Code lifecycle events.
 //!
-//! Reads JSON from stdin, dispatches on `hook_event_name`, and for
-//! `PreToolUse` events: extracts a search query from tool input signals,
-//! runs the search pipeline, formats results as imperative directives, and
-//! returns `additionalContext` JSON on stdout.
+//! Reads JSON from stdin, dispatches on `hook_event_name`, and handles:
+//! - `SessionStart`: creates a dedup file, returns meta-instruction + pattern index
+//! - `PreToolUse`: extracts a search query, searches, dedup-filters, formats imperatives
+//! - `PostToolUse`: on Bash errors, searches with stderr, returns relevant patterns
+//! - `PostCompact`: resets dedup, re-emits `SessionStart` content
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +44,6 @@ pub struct HookInput {
     pub tool_input: Option<serde_json::Value>,
     pub agent_type: Option<String>,
     pub transcript_path: Option<String>,
-    // PostToolUse fields (Unit 4 -- ignore for now)
-    #[allow(dead_code)]
     pub tool_response: Option<serde_json::Value>,
 }
 
@@ -84,10 +83,44 @@ pub fn handle_hook(
     embedder: &dyn Embedder,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
-    if input.hook_event_name != "PreToolUse" {
-        return Ok(None);
+    match input.hook_event_name.as_str() {
+        "SessionStart" => handle_session_start(input, db),
+        "PreToolUse" => handle_pre_tool_use(input, db, embedder, config),
+        "PostToolUse" => handle_post_tool_use(input, db, embedder, config),
+        "PostCompact" => handle_post_compact(input, db),
+        _ => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event handlers
+// ---------------------------------------------------------------------------
+
+/// Handle `SessionStart`: create dedup file, return meta-instruction + pattern index.
+fn handle_session_start(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Option<HookOutput>> {
+    let dedup_path = session_dedup_path(input);
+    if let Some(ref path) = dedup_path
+        && let Err(e) = create_dedup(path)
+    {
+        eprintln!("lore hook: failed to create dedup file: {e}");
     }
 
+    let context = format_session_context(db)?;
+    Ok(Some(HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "SessionStart".to_string(),
+            additional_context: context,
+        },
+    }))
+}
+
+/// Handle `PreToolUse`: extract query, search, dedup-filter, format imperatives.
+fn handle_pre_tool_use(
+    input: &HookInput,
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+) -> anyhow::Result<Option<HookOutput>> {
     if skip_agent(input) {
         return Ok(None);
     }
@@ -102,10 +135,123 @@ pub fn handle_hook(
         return Ok(None);
     }
 
+    // Dedup: filter out already-injected chunk IDs for this session.
+    let dedup_path = session_dedup_path(input);
+    let (results, dedup_ok) = if let Some(ref path) = dedup_path {
+        let seen = read_dedup(path);
+        let filtered: Vec<SearchResult> = results
+            .into_iter()
+            .filter(|r| !seen.contains(&r.id))
+            .collect();
+        // Track whether dedup read succeeded (non-empty seen set or file
+        // exists). We consider dedup "ok" if the file is readable; an empty
+        // set from a missing file means we should still write.
+        (filtered, true)
+    } else {
+        (results, false)
+    };
+
+    if results.is_empty() {
+        return Ok(None);
+    }
+
     let context = format_imperative(&results);
+
+    // Append newly injected chunk IDs to dedup file.
+    if dedup_ok && let Some(ref path) = dedup_path {
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        if let Err(e) = write_dedup(path, &ids) {
+            eprintln!("lore hook: failed to update dedup file: {e}");
+        }
+    }
+
     Ok(Some(HookOutput {
         hook_specific_output: HookSpecificOutput {
             hook_event_name: "PreToolUse".to_string(),
+            additional_context: context,
+        },
+    }))
+}
+
+/// Handle `PostCompact`: truncate dedup, re-emit `SessionStart` content.
+fn handle_post_compact(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Option<HookOutput>> {
+    let dedup_path = session_dedup_path(input);
+    if let Some(ref path) = dedup_path
+        && let Err(e) = truncate_dedup(path)
+    {
+        eprintln!("lore hook: failed to truncate dedup file: {e}");
+    }
+
+    let context = format_session_context(db)?;
+    Ok(Some(HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PostCompact".to_string(),
+            additional_context: context,
+        },
+    }))
+}
+
+/// Handle `PostToolUse`: on Bash errors, search with stderr and return patterns.
+fn handle_post_tool_use(
+    input: &HookInput,
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+) -> anyhow::Result<Option<HookOutput>> {
+    // Only handle Bash tool errors.
+    if input.tool_name.as_deref() != Some("Bash") {
+        return Ok(None);
+    }
+
+    let Some(ref response) = input.tool_response else {
+        return Ok(None);
+    };
+
+    // Check for non-zero exit code. Handle both `exit_code` and `exitCode`.
+    let exit_code = response
+        .get("exit_code")
+        .or_else(|| response.get("exitCode"))
+        .and_then(serde_json::Value::as_i64);
+
+    match exit_code {
+        Some(0) | None => return Ok(None),
+        Some(_) => {} // non-zero — proceed
+    }
+
+    // Extract stderr. Try top-level `stderr`, then nested under `result`.
+    let stderr = response
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            response
+                .get("result")
+                .and_then(|r| r.get("stderr"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+
+    if stderr.is_empty() {
+        return Ok(None);
+    }
+
+    // Use stderr as a search query (clean it into terms).
+    let terms = split_into_words(stderr);
+    let cleaned = clean_terms(&terms);
+    if cleaned.is_empty() {
+        return Ok(None);
+    }
+
+    let query = cleaned.join(" OR ");
+    let results = search_with_threshold(db, embedder, config, &query)?;
+
+    if results.is_empty() {
+        return Ok(None);
+    }
+
+    let context = format_imperative(&results);
+    Ok(Some(HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PostToolUse".to_string(),
             additional_context: context,
         },
     }))
@@ -150,6 +296,95 @@ pub fn search_with_threshold(
     };
 
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Session context formatting
+// ---------------------------------------------------------------------------
+
+/// Format the meta-instruction + compact pattern index returned at session
+/// start and after compaction.
+fn format_session_context(db: &KnowledgeDB) -> anyhow::Result<String> {
+    let patterns = db.list_patterns()?;
+
+    let mut out = String::from(
+        "This project uses lore for coding conventions. \
+         Relevant patterns are injected automatically via additionalContext \
+         before your edits. Treat all 'REQUIRED CONVENTIONS' blocks as \
+         binding constraints, not suggestions.\n\n\
+         Available patterns:\n",
+    );
+
+    for p in &patterns {
+        if p.tags.is_empty() {
+            let _ = writeln!(out, "- {}", p.title);
+        } else {
+            let _ = writeln!(out, "- {} [{}]", p.title, p.tags);
+        }
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Dedup file helpers
+// ---------------------------------------------------------------------------
+
+/// Derive the dedup file path from the session ID in the input.
+/// Returns `None` if no session ID is present.
+fn session_dedup_path(input: &HookInput) -> Option<PathBuf> {
+    input.session_id.as_deref().map(dedup_file_path)
+}
+
+/// Return the dedup file path for a given session ID.
+///
+/// Sanitizes the session ID for filename safety by replacing
+/// non-alphanumeric characters with `-`.
+pub fn dedup_file_path(session_id: &str) -> PathBuf {
+    let sanitized: String = session_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    std::env::temp_dir().join(format!("lore-session-{sanitized}"))
+}
+
+/// Read chunk IDs from the dedup file. Returns an empty set on any error
+/// (missing file, permission denied, etc.).
+pub fn read_dedup(path: &Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Append chunk IDs to the dedup file (one per line).
+pub fn write_dedup(path: &Path, ids: &[&str]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for id in ids {
+        writeln!(file, "{id}")?;
+    }
+    Ok(())
+}
+
+/// Truncate the dedup file (clear all tracked IDs).
+pub fn truncate_dedup(path: &Path) -> anyhow::Result<()> {
+    std::fs::write(path, "")?;
+    Ok(())
+}
+
+/// Create or truncate the dedup file.
+pub fn create_dedup(path: &Path) -> anyhow::Result<()> {
+    std::fs::write(path, "")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -807,5 +1042,105 @@ mod tests {
     #[test]
     fn last_user_message_missing_file() {
         assert!(last_user_message(Path::new("/tmp/nonexistent-transcript.jsonl")).is_none());
+    }
+
+    // -- dedup_file_path ------------------------------------------------------
+
+    #[test]
+    fn dedup_file_path_sanitizes_uuid() {
+        let path = dedup_file_path("60de87ba-e944-42c0-91f5-3cd3c38938de");
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            filename,
+            "lore-session-60de87ba-e944-42c0-91f5-3cd3c38938de"
+        );
+        assert!(path.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn dedup_file_path_sanitizes_special_chars() {
+        let path = dedup_file_path("bad/session\\.id:with*special");
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        // All non-alphanumeric chars should be replaced with '-'.
+        assert!(
+            !filename.contains('/'),
+            "should not contain slashes: {filename}"
+        );
+        assert!(
+            !filename.contains('\\'),
+            "should not contain backslashes: {filename}"
+        );
+        assert!(
+            !filename.contains(':'),
+            "should not contain colons: {filename}"
+        );
+        assert!(filename.starts_with("lore-session-"));
+    }
+
+    // -- read_dedup / write_dedup / truncate_dedup ----------------------------
+
+    #[test]
+    fn read_dedup_missing_file_returns_empty() {
+        let set = read_dedup(Path::new("/tmp/lore-nonexistent-dedup-file"));
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn write_dedup_read_dedup_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        write_dedup(&path, &["c1", "c2", "c3"]).unwrap();
+        let ids = read_dedup(&path);
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains("c1"));
+        assert!(ids.contains("c2"));
+        assert!(ids.contains("c3"));
+    }
+
+    #[test]
+    fn write_dedup_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        write_dedup(&path, &["c1"]).unwrap();
+        write_dedup(&path, &["c2"]).unwrap();
+        let ids = read_dedup(&path);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("c1"));
+        assert!(ids.contains("c2"));
+    }
+
+    #[test]
+    fn truncate_dedup_clears_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        write_dedup(&path, &["c1", "c2"]).unwrap();
+        truncate_dedup(&path).unwrap();
+        let ids = read_dedup(&path);
+        assert!(ids.is_empty(), "should be empty after truncation");
+    }
+
+    #[test]
+    fn create_dedup_creates_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        create_dedup(&path).unwrap();
+        assert!(path.exists());
+        let ids = read_dedup(&path);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn create_dedup_truncates_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        write_dedup(&path, &["c1"]).unwrap();
+        create_dedup(&path).unwrap();
+        let ids = read_dedup(&path);
+        assert!(ids.is_empty(), "create should truncate existing content");
     }
 }
