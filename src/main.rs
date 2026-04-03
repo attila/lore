@@ -355,12 +355,10 @@ fn cmd_search(
     let results = hook::search_with_threshold(&db, &ollama, &config, query)?;
     lore_debug!("search: {} results", results.len());
 
-    if results.is_empty() {
-        eprintln!("No results found.");
-    }
-
     if json {
         println!("{}", serde_json::to_string(&results)?);
+    } else if results.is_empty() {
+        eprintln!("No results found.");
     } else {
         for (i, r) in results.iter().enumerate() {
             println!("\n{}", "─".repeat(60));
