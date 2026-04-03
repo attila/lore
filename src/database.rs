@@ -15,6 +15,8 @@ use std::sync::Once;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use serde::Serialize;
+
 use crate::chunking::Chunk;
 
 // ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ pub struct KnowledgeDB {
 }
 
 /// A single search result returned by FTS, vector, or hybrid queries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub id: String,
     pub title: String,
@@ -76,7 +78,7 @@ pub struct DBStats {
 }
 
 /// One entry per source document, used by `lore list`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PatternSummary {
     pub title: String,
     pub source_file: String,
