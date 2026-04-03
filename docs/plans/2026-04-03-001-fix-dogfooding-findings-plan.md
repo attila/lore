@@ -65,8 +65,8 @@ Alternatively, set a minimum body-length threshold for the root chunk.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Fix FTS5 hyphen/column-name crash**
-- [ ] **Unit 3: Suppress empty frontmatter chunks from search results**
+- [x] **Unit 1: Fix FTS5 hyphen/column-name crash**
+- [x] **Unit 3: Suppress empty frontmatter chunks from search results**
 
 ## Sources & References
 

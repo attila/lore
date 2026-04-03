@@ -445,7 +445,7 @@ pub fn sanitize_fts_query(query: &str) -> String {
     let cleaned: String = query
         .chars()
         .map(|c| match c {
-            '.' | '/' | '\\' | ':' | '{' | '}' | '[' | ']' | '"' | '\'' | '*' | '^' => ' ',
+            '.' | '/' | '\\' | ':' | '{' | '}' | '[' | ']' | '"' | '\'' | '*' | '^' | '-' => ' ',
             _ => c,
         })
         .collect();
@@ -956,6 +956,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_hyphens() {
+        assert_eq!(sanitize_fts_query("pre-commit hook"), "pre commit hook");
+    }
+
+    #[test]
+    fn sanitize_strips_hyphens_with_column_name() {
+        // "pre-commit" must not produce bare "commit" which FTS5 could
+        // interpret as a column filter prefix.
+        let result = sanitize_fts_query("dprint formatting pre-commit hook");
+        assert_eq!(result, "dprint formatting pre commit hook");
+        assert!(!result.contains("pre-commit"));
+    }
+
+    #[test]
     fn fts_search_with_dots_does_not_crash() {
         let db = open_memory_db(4);
         db.init().unwrap();
@@ -979,6 +993,28 @@ mod tests {
 
         let results = db.search_fts("path/to/file.ts", 10).unwrap();
         drop(results);
+    }
+
+    #[test]
+    fn fts_search_with_hyphenated_term_does_not_crash() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk = make_chunk(
+            "c1",
+            "Git Hooks",
+            "Run dprint check as a pre-commit hook",
+            "hooks.md",
+        );
+        db.insert_chunk(&chunk, None).unwrap();
+
+        // This would crash FTS5 without hyphen sanitization: "commit" could be
+        // interpreted as a column filter prefix.
+        let results = db.search_fts("pre-commit hook", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "should find the hook pattern after hyphen sanitization"
+        );
     }
 
     #[test]

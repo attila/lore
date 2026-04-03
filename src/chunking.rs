@@ -34,7 +34,8 @@ pub struct Chunk {
 /// Falls back to [`chunk_as_document`] when no heading-based chunks are
 /// produced (e.g. when the body under every heading is shorter than 10 chars).
 pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
-    let lines: Vec<&str> = content.lines().collect();
+    let stripped = strip_frontmatter(content);
+    let lines: Vec<&str> = stripped.lines().collect();
     let mut chunks = Vec::new();
     let mut heading_stack: Vec<(usize, String)> = Vec::new();
     let mut current_body: Vec<&str> = Vec::new();
@@ -450,11 +451,58 @@ tags: [design, patterns]
 A sufficiently long body describing architecture patterns.
 ";
         let chunks = chunk_by_heading(md, "arch.md");
-        // The frontmatter lines before the heading form a chunk too (if >= 10 chars).
-        // Find the Architecture chunk and verify its tags.
         let arch_chunk = chunks.iter().find(|c| c.title == "Architecture");
         assert!(arch_chunk.is_some(), "expected an Architecture chunk");
         assert_eq!(arch_chunk.unwrap().tags, "design, patterns");
+    }
+
+    #[test]
+    fn frontmatter_only_root_chunk_is_suppressed() {
+        let md = "\
+---
+tags: [rust, clippy, linting, code-quality]
+---
+
+# Clippy Pedantic
+Enable pedantic at warn level with priority -1, then selectively allow noisy lints.
+
+## Common pedantic fixes
+Use map_or instead of map().unwrap_or() for cleaner code.
+";
+        let chunks = chunk_by_heading(md, "clippy.md");
+        // Frontmatter should NOT produce a root chunk.
+        assert!(
+            chunks.iter().all(|c| !c.body.contains("tags:")),
+            "no chunk should contain raw frontmatter YAML, got: {:#?}",
+            chunks.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+        // Real content chunks should still exist with tags propagated.
+        assert!(
+            chunks.iter().any(|c| c.title == "Clippy Pedantic"),
+            "should have a Clippy Pedantic chunk"
+        );
+        assert_eq!(
+            chunks[0].tags, "rust, clippy, linting, code-quality",
+            "tags should still be extracted from frontmatter"
+        );
+    }
+
+    #[test]
+    fn pre_heading_prose_still_produces_root_chunk() {
+        let md = "\
+This is a preamble paragraph with enough text to be meaningful content.
+
+# Main Section
+The main section body text that is long enough for a chunk.
+";
+        let chunks = chunk_by_heading(md, "with-preamble.md");
+        // Pre-heading prose (not frontmatter) should still produce a root chunk.
+        let root = chunks.iter().find(|c| c.heading_path.is_empty());
+        assert!(
+            root.is_some(),
+            "pre-heading prose should produce a root chunk"
+        );
+        assert!(root.unwrap().body.contains("preamble paragraph"));
     }
 
     #[test]
