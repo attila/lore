@@ -457,6 +457,7 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
             eprintln!("  Last commit:  {}", &sha[..sha.len().min(12)]);
         }
+        eprintln!();
     }
 
     Ok(())
