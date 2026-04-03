@@ -9,6 +9,7 @@ use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient};
 use lore::hook;
+use lore::lore_debug;
 use lore::{git, ingest, provision, server};
 
 #[derive(Parser)]
@@ -21,6 +22,10 @@ struct Cli {
     /// Path to config file [default: ~/.config/lore/lore.toml]
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Output results as JSON (for search and list commands)
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -94,6 +99,8 @@ fn main() {
         }
     };
 
+    let json = cli.json;
+
     let result = match cli.command {
         Commands::Init {
             repo,
@@ -110,9 +117,11 @@ fn main() {
         ),
         Commands::Ingest { force } => cmd_ingest(&config_path, force),
         Commands::Serve => cmd_serve(&config_path),
-        Commands::Search { query, top_k } => cmd_search(&config_path, &query.join(" "), top_k),
+        Commands::Search { query, top_k } => {
+            cmd_search(&config_path, &query.join(" "), top_k, json)
+        }
         Commands::Hook => cmd_hook(&config_path),
-        Commands::List => cmd_list(&config_path),
+        Commands::List => cmd_list(&config_path, json),
         Commands::Status => cmd_status(&config_path),
     };
 
@@ -239,6 +248,13 @@ fn cmd_init(
 
 fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
+    lore_debug!(
+        "ingest: dir={} mode={} strategy={}",
+        config.knowledge_dir.display(),
+        if force { "full" } else { "delta" },
+        config.chunking.strategy,
+    );
+
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
@@ -267,6 +283,13 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
         )
     };
 
+    lore_debug!(
+        "ingest: processed={} chunks_created={} errors={}",
+        result.files_processed,
+        result.chunks_created,
+        result.errors.len(),
+    );
+
     match &result.mode {
         ingest::IngestMode::Full => {
             eprintln!(
@@ -275,6 +298,7 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
             );
         }
         ingest::IngestMode::Delta { unchanged } => {
+            lore_debug!("ingest delta: unchanged={unchanged}");
             if result.files_processed == 0 {
                 eprintln!("\nAlready up to date.");
             } else {
@@ -302,7 +326,12 @@ fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
     server::start_mcp_server(&config, &ollama)
 }
 
-fn cmd_search(config_path: &Path, query: &str, top_k: Option<usize>) -> anyhow::Result<()> {
+fn cmd_search(
+    config_path: &Path,
+    query: &str,
+    top_k: Option<usize>,
+    json: bool,
+) -> anyhow::Result<()> {
     if query.is_empty() {
         anyhow::bail!("Usage: lore search <query>");
     }
@@ -312,14 +341,26 @@ fn cmd_search(config_path: &Path, query: &str, top_k: Option<usize>) -> anyhow::
         config.search.top_k = k;
     }
 
+    lore_debug!(
+        "search: query={query:?} top_k={} hybrid={} min_relevance={:.4}",
+        config.search.top_k,
+        config.search.hybrid,
+        config.search.min_relevance,
+    );
+
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
     let results = hook::search_with_threshold(&db, &ollama, &config, query)?;
+    lore_debug!("search: {} results", results.len());
 
     if results.is_empty() {
         eprintln!("No results found.");
+    }
+
+    if json {
+        println!("{}", serde_json::to_string(&results)?);
     } else {
         for (i, r) in results.iter().enumerate() {
             println!("\n{}", "─".repeat(60));
@@ -370,12 +411,19 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 fn cmd_hook(config_path: &Path) -> anyhow::Result<()> {
     if let Err(e) = cmd_hook_inner(config_path) {
         eprintln!("lore hook: {e}");
+        lore_debug!("hook pipeline error (swallowed): {e:#}");
     }
     Ok(())
 }
 
 fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
     let input = hook::read_input()?;
+    lore_debug!(
+        "hook stdin: event={} tool={}",
+        input.hook_event_name,
+        input.tool_name.as_deref().unwrap_or("none"),
+    );
+
     let config = Config::load(config_path)?;
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
@@ -389,18 +437,23 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_list(config_path: &Path) -> anyhow::Result<()> {
+fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
     let patterns = db.list_patterns()?;
-    for p in &patterns {
-        if p.tags.is_empty() {
-            println!("{}", p.title);
-        } else {
-            println!("{} [{}]", p.title, p.tags);
+
+    if json {
+        println!("{}", serde_json::to_string(&patterns)?);
+    } else {
+        for p in &patterns {
+            if p.tags.is_empty() {
+                println!("{}", p.title);
+            } else {
+                println!("{} [{}]", p.title, p.tags);
+            }
         }
     }
 

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::Embedder;
+use crate::lore_debug;
 
 // ---------------------------------------------------------------------------
 // Stop words
@@ -96,13 +97,31 @@ pub fn handle_hook(
     embedder: &dyn Embedder,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
-    match input.hook_event_name.as_str() {
+    lore_debug!(
+        "hook event={} session={} tool={}",
+        input.hook_event_name,
+        input.session_id.as_deref().unwrap_or("none"),
+        input.tool_name.as_deref().unwrap_or("none"),
+    );
+
+    let result = match input.hook_event_name.as_str() {
         "SessionStart" => handle_session_start(input, db),
         "PreToolUse" => handle_pre_tool_use(input, db, embedder, config),
         "PostToolUse" => handle_post_tool_use(input, db, embedder, config),
         "PostCompact" => handle_post_compact(input, db),
-        _ => Ok(None),
+        _ => {
+            lore_debug!("unknown event, producing no output");
+            Ok(None)
+        }
+    };
+
+    match &result {
+        Ok(Some(_)) => lore_debug!("hook producing output"),
+        Ok(None) => lore_debug!("hook producing no output"),
+        Err(e) => lore_debug!("hook error: {e}"),
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +135,7 @@ fn handle_session_start(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<O
         && let Err(e) = reset_dedup(path)
     {
         eprintln!("lore hook: failed to create dedup file: {e}");
+        lore_debug!("SessionStart dedup reset error: {e}");
     }
 
     let context = format_session_context(db)?;
@@ -132,16 +152,21 @@ fn handle_pre_tool_use(
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
     if skip_agent(input) {
+        lore_debug!("skipping subagent");
         return Ok(None);
     }
 
     let Some(query) = extract_query(input) else {
+        lore_debug!("no query extracted from tool input");
         return Ok(None);
     };
+
+    lore_debug!("extracted query: {query}");
 
     let results = search_with_threshold(db, embedder, config, &query)?;
 
     if results.is_empty() {
+        lore_debug!("search returned no results");
         return Ok(None);
     }
 
@@ -161,6 +186,8 @@ fn handle_pre_tool_use(
             })
             .collect()
     };
+
+    lore_debug!("expanding {} source files", source_files.len());
     let results = db.chunks_by_sources(&source_files).unwrap_or(results);
 
     if results.is_empty() {
@@ -171,18 +198,31 @@ fn handle_pre_tool_use(
     // Only activate dedup when the dedup file exists (SessionStart ran).
     // Manual CLI calls and sessions without SessionStart skip dedup entirely.
     let dedup_path = session_dedup_path(input);
+    let pre_dedup_count = results.len();
     let (results, dedup_active) = if let Some(ref path) = dedup_path
         && path.exists()
     {
         let seen = read_dedup(path);
+        lore_debug!(
+            "dedup active: {} seen IDs in {}",
+            seen.len(),
+            path.display()
+        );
         let filtered: Vec<SearchResult> = results
             .into_iter()
             .filter(|r| !seen.contains(&r.id))
             .collect();
         (filtered, true)
     } else {
+        lore_debug!("dedup inactive (no session file)");
         (results, false)
     };
+
+    lore_debug!(
+        "dedup: {} before, {} after filtering",
+        pre_dedup_count,
+        results.len()
+    );
 
     if results.is_empty() {
         return Ok(None);
@@ -195,8 +235,16 @@ fn handle_pre_tool_use(
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         if let Err(e) = write_dedup(path, &ids) {
             eprintln!("lore hook: failed to update dedup file: {e}");
+            lore_debug!("dedup write error: {e}");
         }
     }
+
+    let sources: HashSet<&str> = results.iter().map(|r| r.source_file.as_str()).collect();
+    lore_debug!(
+        "injecting {} chunks from {} sources",
+        results.len(),
+        sources.len()
+    );
 
     Ok(Some(HookOutput::HookSpecific {
         hook_specific_output: HookSpecificOutput {
@@ -213,6 +261,7 @@ fn handle_post_compact(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Op
         && let Err(e) = reset_dedup(path)
     {
         eprintln!("lore hook: failed to truncate dedup file: {e}");
+        lore_debug!("PostCompact dedup reset error: {e}");
     }
 
     let context = format_session_context(db)?;
@@ -261,6 +310,7 @@ fn handle_post_tool_use(
         .unwrap_or("");
 
     if stderr.is_empty() {
+        lore_debug!("PostToolUse: empty stderr, skipping");
         return Ok(None);
     }
 
@@ -272,12 +322,18 @@ fn handle_post_tool_use(
     }
 
     let query = cleaned.join(" OR ");
+    lore_debug!("PostToolUse: error query: {query}");
     let results = search_with_threshold(db, embedder, config, &query)?;
 
     if results.is_empty() {
+        lore_debug!("PostToolUse: no results for error query");
         return Ok(None);
     }
 
+    lore_debug!(
+        "PostToolUse: injecting {} error-context chunks",
+        results.len()
+    );
     let context = format_imperative(&results);
     Ok(Some(HookOutput::HookSpecific {
         hook_specific_output: HookSpecificOutput {
@@ -297,13 +353,24 @@ pub fn search_with_threshold(
     config: &Config,
     query: &str,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    lore_debug!(
+        "search: query={query:?} hybrid={} top_k={} min_relevance={:.4}",
+        config.search.hybrid,
+        config.search.top_k,
+        config.search.min_relevance,
+    );
+
     let mut embed_failed = false;
 
     let query_embedding = if config.search.hybrid {
         match embedder.embed(query) {
-            Ok(v) => Some(v),
+            Ok(v) => {
+                lore_debug!("search: embedding succeeded ({} dims)", v.len());
+                Some(v)
+            }
             Err(e) => {
                 eprintln!("Warning: Ollama unreachable ({e}), falling back to text search.");
+                lore_debug!("search: embedding failed: {e}");
                 embed_failed = true;
                 None
             }
@@ -313,15 +380,30 @@ pub fn search_with_threshold(
     };
 
     let results = db.search_hybrid(query, query_embedding.as_deref(), config.search.top_k)?;
+    lore_debug!("search: {} raw results", results.len());
 
     let apply_threshold =
         config.search.hybrid && !embed_failed && config.search.min_relevance > 0.0;
     let results: Vec<_> = if apply_threshold {
-        results
+        let before = results.len();
+        let filtered: Vec<_> = results
             .into_iter()
             .filter(|r| r.score >= config.search.min_relevance)
-            .collect()
+            .collect();
+        lore_debug!(
+            "search: threshold={:.4} filtered {} -> {}",
+            config.search.min_relevance,
+            before,
+            filtered.len(),
+        );
+        for r in &filtered {
+            lore_debug!("  {:.4} {}", r.score, r.title);
+        }
+        filtered
     } else {
+        for r in &results {
+            lore_debug!("  {:.4} {}", r.score, r.title);
+        }
         results
     };
 

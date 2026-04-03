@@ -267,3 +267,189 @@ fn search_with_path_does_not_crash() {
         .assert()
         .success();
 }
+
+// -- --json flag ------------------------------------------------------------
+
+#[test]
+fn search_json_outputs_valid_array() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_populated_env(tmp.path());
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "search",
+            "--json",
+            "--config",
+            config_path.to_str().unwrap(),
+            "rust",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+
+    assert!(arr.len() >= 2, "expected at least 2 results");
+
+    // Verify expected fields are present.
+    let first = &arr[0];
+    assert!(first.get("title").is_some());
+    assert!(first.get("body").is_some());
+    assert!(first.get("tags").is_some());
+    assert!(first.get("source_file").is_some());
+    assert!(first.get("score").is_some());
+}
+
+#[test]
+fn search_json_includes_full_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+
+    // Create a pattern with body longer than the 500-byte human truncation.
+    let long_body = "x".repeat(800);
+    std::fs::write(
+        knowledge_dir.join("long-body.md"),
+        format!("# Long Body\n\ntags: test\n\n{long_body}\n"),
+    )
+    .unwrap();
+
+    let db_path = tmp.path().join("knowledge.db");
+    let config = Config::default_with(knowledge_dir.clone(), db_path, "nomic-embed-text");
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
+    drop(db);
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "search",
+            "--json",
+            "--config",
+            config_path.to_str().unwrap(),
+            "long body",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert!(!arr.is_empty(), "expected at least 1 result");
+
+    // Body should not be truncated.
+    let body = arr[0]["body"].as_str().unwrap();
+    assert!(
+        body.len() >= 800,
+        "JSON body should not be truncated (got {} bytes)",
+        body.len()
+    );
+}
+
+#[test]
+fn search_json_empty_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_populated_env(tmp.path());
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "search",
+            "--json",
+            "--config",
+            config_path.to_str().unwrap(),
+            "xyznonexistent",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.trim(), "[]");
+}
+
+#[test]
+fn search_json_respects_top_k() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_populated_env(tmp.path());
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "search",
+            "--json",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--top-k",
+            "1",
+            "rust",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "expected exactly 1 result with --top-k 1");
+}
+
+#[test]
+fn list_json_outputs_valid_array() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_populated_env(tmp.path());
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["list", "--json", "--config", config_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+
+    assert!(arr.len() >= 2, "expected at least 2 patterns");
+
+    let first = &arr[0];
+    assert!(first.get("title").is_some());
+    assert!(first.get("source_file").is_some());
+    assert!(first.get("tags").is_some());
+}
+
+#[test]
+fn list_json_empty_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("empty.db");
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+
+    let config = Config::default_with(knowledge_dir, db_path, "nomic-embed-text");
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    drop(db);
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["list", "--json", "--config", config_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.trim(), "[]");
+}
