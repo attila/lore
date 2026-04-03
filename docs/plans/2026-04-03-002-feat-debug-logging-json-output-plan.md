@@ -1,7 +1,7 @@
 ---
 title: "feat: Add LORE_DEBUG verbose logging and --json structured output"
 type: feat
-status: active
+status: completed
 date: 2026-04-03
 deepened: 2026-04-03
 ---
@@ -113,7 +113,7 @@ from scripts or other tools.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Debug macro infrastructure**
+- [x] **Unit 1: Debug macro infrastructure**
 
   **Goal:** Create a lightweight `debug!()` macro that conditionally emits diagnostics to stderr
   based on `LORE_DEBUG` env var.
@@ -147,7 +147,7 @@ from scripts or other tools.
   **Verification:**
   - `debug!("test message")` compiles and emits to stderr only when `LORE_DEBUG=1`
 
-- [ ] **Unit 2: Instrument hook pipeline with debug logging**
+- [x] **Unit 2: Instrument hook pipeline with debug logging**
 
   **Goal:** Add `debug!()` calls at key decision points in the hook pipeline.
 
@@ -188,7 +188,7 @@ from scripts or other tools.
   - Running a hook with `LORE_DEBUG=1` produces visible diagnostic output on stderr showing the full
     pipeline flow
 
-- [ ] **Unit 3: Instrument cmd_search and cmd_ingest with debug logging**
+- [x] **Unit 3: Instrument cmd_search and cmd_ingest with debug logging**
 
   **Goal:** Add debug output for search and ingest commands so users can troubleshoot outside the
   hook context too.
@@ -216,7 +216,7 @@ from scripts or other tools.
   **Verification:**
   - Debug output visible on stderr when `LORE_DEBUG=1` is set for both commands
 
-- [ ] **Unit 4: Add Serialize to SearchResult and PatternSummary**
+- [x] **Unit 4: Add Serialize to SearchResult and PatternSummary**
 
   **Goal:** Enable JSON serialization of the data types used by search and list.
 
@@ -240,7 +240,7 @@ from scripts or other tools.
   **Verification:**
   - `serde_json::to_string(&result)` compiles for both types
 
-- [ ] **Unit 5: Add --json flag to search and list commands**
+- [x] **Unit 5: Add --json flag to search and list commands**
 
   **Goal:** Add `--json` CLI flag that switches output to a JSON array on stdout.
 
