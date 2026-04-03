@@ -145,6 +145,31 @@ filtered by dedup or relevance threshold.
 results, dedup decisions, and injection content to stderr. Use this during a real working session to
 trace exactly what happens.
 
+### Incident: `gh pr edit --body` failure despite existing pattern
+
+**Context:** Agent attempted to update a PR description using `gh pr edit --body` with an inline
+heredoc, then with inline escaped markdown. Both were blocked by don't-ask mode permissions. A
+pattern at `agents/unattended-work.md` → "GitHub Pull Requests" explicitly says: "use
+`--body-file /tmp/pr-body.md` instead of `--body` with inline strings or heredocs. Write the body to
+a tmp file first, then reference it."
+
+**Search confirmed the pattern exists** with relevance 1.0 for the query "gh pr create body file
+tmp". So either: (a) the hook injected the pattern but the agent didn't comply, or (b) query
+extraction from the compound heredoc command didn't produce good enough terms to find it.
+
+**Significance:** This is a concrete case where a pattern exists, is discoverable via search, but
+still failed to prevent the exact mistake it documents. Two possible root causes:
+
+1. **Injection gap** — the query extraction from the Bash command didn't surface the pattern at the
+   right moment. Needs `LORE_DEBUG=1` to verify.
+2. **Compliance gap** — the pattern injected but used suggestive language ("use X instead of Y")
+   rather than prohibitive language ("NEVER use Y"). Agent reasoning may deprioritize suggestions
+   under time pressure. This is another data point for the pattern authoring guide: imperative
+   phrasing ("always", "never") may drive stronger agent compliance than descriptive alternatives.
+
+Without `LORE_DEBUG=1` tracing, we cannot distinguish these cases. This incident strengthens the
+priority of both the debug logging roadmap item and the pattern authoring guide.
+
 ## Scope Boundaries
 
 - This plan captures findings only — it does not propose architectural changes to the search
