@@ -268,6 +268,48 @@ fn search_with_path_does_not_crash() {
         .success();
 }
 
+// -- LORE_DEBUG -------------------------------------------------------------
+
+#[test]
+fn lore_debug_emits_to_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_populated_env(tmp.path());
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .env("LORE_DEBUG", "1")
+        .args(["search", "--config", config_path.to_str().unwrap(), "rust"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("[lore debug]"),
+        "expected debug output on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn lore_debug_off_no_debug_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_populated_env(tmp.path());
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_path.to_str().unwrap(), "rust"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("[lore debug]"),
+        "unexpected debug output on stderr: {stderr}"
+    );
+}
+
 // -- --json flag ------------------------------------------------------------
 
 #[test]
