@@ -36,8 +36,16 @@
 - [ ] `--json` flag on `lore search` and `lore list` for structured machine-readable output
 - [ ] `LORE_DEBUG=1` verbose logging for hook pipeline troubleshooting
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
+- [ ] Dogfooding fixes — FTS5 hyphen crash, search relevance gaps, frontmatter chunk noise,
+      false-positive cross-domain injection. See
+      `docs/plans/2026-04-03-001-fix-dogfooding-findings-plan.md`
 
 ## Future
+
+- [ ] Pattern authoring guide — product documentation on how to write effective lore patterns.
+      Covers descriptive vs. imperative content, incident context, tag strategy, chunking awareness,
+      query-friendly vocabulary, and anti-patterns. Based on dogfooding evidence, not speculation.
+      Iterated through real memory→lore migration cycles
 
 - [ ] Cycle-based dedup TTL — re-inject a pattern after N tool call cycles since last injection, so
       long sessions don't bury early conventions deep in context

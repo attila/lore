@@ -453,6 +453,10 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!();
         eprintln!("  Chunks:       {}", stats.chunks);
         eprintln!("  Sources:      {}", stats.sources);
+
+        if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
+            eprintln!("  Last commit:  {}", &sha[..sha.len().min(12)]);
+        }
     }
 
     Ok(())
