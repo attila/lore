@@ -110,6 +110,7 @@ user-invocable: true
 
 - Test plugin loading with `claude --plugin-dir <path>` and check the plugin page for errors before
   shipping
-- Use `/reload-plugins` after config changes (restarting Claude is not necessary)
+- Use `/reload-plugins` after config changes (restarting Claude is not necessary for config, but
+  [binary updates require a full session restart for MCP servers](reload-plugins-does-not-restart-mcp-servers-2026-04-03.md))
 - When a plugin has both hooks and skills targeting the same data, default to
   `disable-model-invocation: true` on the skill
