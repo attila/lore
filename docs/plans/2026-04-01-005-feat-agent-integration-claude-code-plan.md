@@ -497,7 +497,7 @@ everything together.
 
 ---
 
-- [ ] **Unit 6: Testing Infrastructure**
+- [x] **Unit 6: Testing Infrastructure** (landed via PRs #17 and #18)
 
 **Goal:** CI-ready tests for the hook pipeline and search relevance regression.
 
