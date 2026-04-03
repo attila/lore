@@ -41,9 +41,13 @@
 - [ ] Bounded transcript read — `last_user_message()` reads entire JSONL into memory; use
       reverse-seek or tail-read to cap memory and latency for long sessions
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] Dogfooding fixes — FTS5 hyphen crash, search relevance gaps, frontmatter chunk noise,
-      false-positive cross-domain injection. See
+- [ ] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise. See
       `docs/plans/2026-04-03-001-fix-dogfooding-findings-plan.md`
+- [ ] FTS5 porter stemming — enable stemming tokenizer to improve recall for naturally-worded
+      queries without requiring exact vocabulary overlap in patterns. Addresses the search relevance
+      gaps found during dogfooding (e.g., "fake" not matching "fakes")
+- [ ] Dogfooding deferred — search relevance regression tests, pattern strengthening, memory→lore
+      migration evaluation. See `docs/plans/2026-04-03-002-fix-dogfooding-deferred-plan.md`
 
 ## Future
 
