@@ -41,7 +41,7 @@
 - [ ] Bounded transcript read — `last_user_message()` reads entire JSONL into memory; use
       reverse-seek or tail-read to cap memory and latency for long sessions
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise. See
+- [x] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise. See
       `docs/plans/2026-04-03-001-fix-dogfooding-findings-plan.md`
 - [ ] FTS5 porter stemming — enable stemming tokenizer to improve recall for naturally-worded
       queries without requiring exact vocabulary overlap in patterns. Addresses the search relevance

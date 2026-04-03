@@ -1,7 +1,7 @@
 ---
 title: "fix: FTS5 hyphen crash and frontmatter chunk noise"
 type: fix
-status: active
+status: completed
 date: 2026-04-03
 ---
 
