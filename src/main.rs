@@ -9,7 +9,7 @@ use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient};
 use lore::hook;
-use lore::{ingest, provision, server};
+use lore::{git, ingest, provision, server};
 
 #[derive(Parser)]
 #[command(
@@ -48,7 +48,11 @@ enum Commands {
     },
 
     /// Re-index the knowledge base from markdown files
-    Ingest,
+    Ingest {
+        /// Force a full re-index instead of delta
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Start the MCP server (stdio transport for Claude Code)
     Serve,
@@ -104,7 +108,7 @@ fn main() {
             &model,
             &bind,
         ),
-        Commands::Ingest => cmd_ingest(&config_path),
+        Commands::Ingest { force } => cmd_ingest(&config_path, force),
         Commands::Serve => cmd_serve(&config_path),
         Commands::Search { query, top_k } => cmd_search(&config_path, &query.join(" "), top_k),
         Commands::Hook => cmd_hook(&config_path),
@@ -187,7 +191,7 @@ fn cmd_init(
 
     eprintln!("Search mode: hybrid (FTS5 + vector)\n");
 
-    let ingest_result = ingest::ingest(
+    let ingest_result = ingest::full_ingest(
         &db,
         &ollama,
         &config.knowledge_dir,
@@ -233,28 +237,55 @@ fn cmd_init(
     Ok(())
 }
 
-fn cmd_ingest(config_path: &Path) -> anyhow::Result<()> {
+fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
-    eprintln!("Ingesting knowledge base...\n");
+    let on_progress = &|msg: &str| {
+        eprintln!("{msg}");
+    };
 
-    let result = ingest::ingest(
-        &db,
-        &ollama,
-        &config.knowledge_dir,
-        &config.chunking.strategy,
-        &|msg| {
-            eprintln!("{msg}");
-        },
-    );
+    let result = if force {
+        eprintln!("Full ingest (--force)...\n");
+        ingest::full_ingest(
+            &db,
+            &ollama,
+            &config.knowledge_dir,
+            &config.chunking.strategy,
+            on_progress,
+        )
+    } else {
+        eprintln!("Ingesting knowledge base...\n");
+        ingest::ingest(
+            &db,
+            &ollama,
+            &config.knowledge_dir,
+            &config.chunking.strategy,
+            on_progress,
+        )
+    };
 
-    eprintln!(
-        "\nDone: {} files → {} chunks",
-        result.files_processed, result.chunks_created
-    );
+    match &result.mode {
+        ingest::IngestMode::Full => {
+            eprintln!(
+                "\nDone (full): {} files → {} chunks",
+                result.files_processed, result.chunks_created
+            );
+        }
+        ingest::IngestMode::Delta { unchanged } => {
+            if result.files_processed == 0 {
+                eprintln!("\nAlready up to date.");
+            } else {
+                eprintln!(
+                    "\nDone (delta): {} files changed, {} unchanged",
+                    result.files_processed, unchanged
+                );
+            }
+        }
+    }
+
     if !result.errors.is_empty() {
         eprintln!("Errors: {}", result.errors.len());
         for err in &result.errors {
@@ -422,6 +453,12 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!();
         eprintln!("  Chunks:       {}", stats.chunks);
         eprintln!("  Sources:      {}", stats.sources);
+
+        if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
+            let short = git::short_sha(&config.knowledge_dir, &sha);
+            eprintln!("  Last commit:  {short}");
+        }
+        eprintln!();
     }
 
     Ok(())

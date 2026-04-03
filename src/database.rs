@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::chunking::Chunk;
 
@@ -129,6 +129,10 @@ impl KnowledgeDB {
             )",
             self.dimensions
         ))?;
+
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)",
+        )?;
 
         Ok(())
     }
@@ -399,6 +403,24 @@ impl KnowledgeDB {
             #[allow(clippy::cast_possible_truncation)]
             sources: sources as usize,
         })
+    }
+
+    /// Read a metadata value by key.
+    pub fn get_metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM ingest_metadata WHERE key = ?1")?;
+        let result = stmt.query_row(params![key], |row| row.get(0)).optional()?;
+        Ok(result)
+    }
+
+    /// Write a metadata key-value pair (upsert).
+    pub fn set_metadata(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ingest_metadata (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }
 
@@ -1074,5 +1096,42 @@ mod tests {
         let patterns = db.list_patterns().unwrap();
         assert_eq!(patterns.len(), 1);
         assert_eq!(patterns[0].tags, "rust, style");
+    }
+
+    // -- ingest_metadata -----------------------------------------------
+
+    #[test]
+    fn metadata_round_trip() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        db.set_metadata("last_commit", "abc123").unwrap();
+        assert_eq!(
+            db.get_metadata("last_commit").unwrap(),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_overwrite() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        db.set_metadata("key", "first").unwrap();
+        db.set_metadata("key", "second").unwrap();
+        assert_eq!(db.get_metadata("key").unwrap(), Some("second".to_string()));
+    }
+
+    #[test]
+    fn metadata_missing_key_returns_none() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        assert_eq!(db.get_metadata("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn metadata_empty_value() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        db.set_metadata("key", "").unwrap();
+        assert_eq!(db.get_metadata("key").unwrap(), Some(String::new()));
     }
 }
