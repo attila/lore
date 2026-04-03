@@ -9,7 +9,7 @@ use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient};
 use lore::hook;
-use lore::{ingest, provision, server};
+use lore::{git, ingest, provision, server};
 
 #[derive(Parser)]
 #[command(
@@ -455,7 +455,8 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  Sources:      {}", stats.sources);
 
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
-            eprintln!("  Last commit:  {}", &sha[..sha.len().min(12)]);
+            let short = git::short_sha(&config.knowledge_dir, &sha);
+            eprintln!("  Last commit:  {short}");
         }
         eprintln!();
     }

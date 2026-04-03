@@ -246,6 +246,14 @@ pub fn head_commit(repo_dir: &Path) -> anyhow::Result<String> {
     git_output(repo_dir, &["rev-parse", "HEAD"])
 }
 
+/// Abbreviate a SHA to git's default short form (respects `core.abbrev`).
+///
+/// Falls back to the first 7 characters if the git command fails.
+pub fn short_sha(repo_dir: &Path, sha: &str) -> String {
+    git_output(repo_dir, &["rev-parse", "--short", sha])
+        .unwrap_or_else(|_| sha[..sha.len().min(7)].to_string())
+}
+
 /// Check whether a commit object exists in the repository.
 pub fn commit_exists(repo_dir: &Path, sha: &str) -> bool {
     Command::new("git")
