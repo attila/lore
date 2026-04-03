@@ -1,7 +1,7 @@
 ---
 title: "feat: Delta ingest via git diff"
 type: feat
-status: active
+status: complete
 date: 2026-04-02
 ---
 
@@ -123,7 +123,7 @@ lore ingest [--force]
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `ingest_metadata` table to database**
+- [x] **Unit 1: Add `ingest_metadata` table to database**
 
 **Goal:** Create a key-value metadata table in SQLite for storing ingest state.
 
@@ -161,7 +161,7 @@ lore ingest [--force]
 - `get_metadata` / `set_metadata` round-trip correctly in tests
 - `init()` still succeeds on existing databases (IF NOT EXISTS)
 
-- [ ] **Unit 2: Add git diff helper to `git.rs`**
+- [x] **Unit 2: Add git diff helper to `git.rs`**
 
 **Goal:** Add a function that runs `git diff --name-status` between two commits and parses the
 output into structured change records.
@@ -208,7 +208,7 @@ output into structured change records.
 
 - All status codes (A/M/D/R) correctly parsed in real git repos (tempdir tests)
 
-- [ ] **Unit 3: Implement delta ingest logic in `ingest.rs`**
+- [x] **Unit 3: Implement delta ingest logic in `ingest.rs`**
 
 **Goal:** Add a `delta_ingest()` function that processes only changed files, and refactor the
 existing `ingest()` to become `full_ingest()` (called by delta when fallback is needed).
@@ -263,7 +263,7 @@ existing `ingest()` to become `full_ingest()` (called by delta when fallback is 
 - Database contains correct chunks after delta (no orphans, no missing)
 - Metadata table has correct commit SHA after each ingest variant
 
-- [ ] **Unit 4: Add `--force` flag to CLI and wire up delta/full dispatch**
+- [x] **Unit 4: Add `--force` flag to CLI and wire up delta/full dispatch**
 
 **Goal:** Add `--force` flag to `lore ingest` command and update `cmd_ingest()` and `cmd_init()` to
 use the new ingest functions.
