@@ -217,30 +217,26 @@ fn cmd_init(
         eprintln!("  Errors: {}", ingest_result.errors.len());
     }
 
-    // MCP setup instructions
-    eprintln!("\nTo use with Claude Code, add this to your MCP config:\n");
-    eprintln!("  {{");
-    eprintln!("    \"mcpServers\": {{");
-    eprintln!("      \"lore\": {{");
-    eprintln!("        \"command\": \"lore\",");
+    // Claude Code plugin instructions
+    eprintln!("\nTo use with Claude Code, install the lore plugin:\n");
+    eprintln!("  claude --plugin-dir <lore-repo>/integrations/claude-code/\n");
+    eprintln!("Replace <lore-repo> with the path to your lore source checkout.");
+    eprintln!("This includes the MCP server, lifecycle hooks, and the /search-lore skill.");
+
     if user_provided_config {
+        eprintln!();
         eprintln!(
-            "        \"args\": [\"serve\", \"--config\", \"{}\"]",
+            "Note: you are using a custom config at {}",
             config_path.display()
         );
-    } else {
-        eprintln!("        \"args\": [\"serve\"]");
-    }
-    eprintln!("      }}");
-    eprintln!("    }}");
-    eprintln!("  }}");
-
-    eprintln!("\nOr run:\n");
-    if user_provided_config {
-        eprintln!("  claude mcp add --scope user --transport stdio lore -- \\",);
-        eprintln!("    lore serve --config {}", config_path.display());
-    } else {
-        eprintln!("  claude mcp add --scope user --transport stdio lore -- lore serve");
+        eprintln!("The plugin's mcp.json uses the default config. Either:");
+        eprintln!(
+            "  1. Edit integrations/claude-code/mcp.json to add: \"--config\", \"{}\"",
+            config_path.display()
+        );
+        eprintln!("  2. Or add the MCP server manually (without hooks or skills):\n");
+        eprintln!("     claude mcp add --scope user --transport stdio lore -- \\");
+        eprintln!("       lore serve --config {}", config_path.display());
     }
 
     Ok(())

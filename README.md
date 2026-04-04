@@ -44,6 +44,8 @@ Markdown files (git repo, source of truth)
 
 ### Install
 
+Prebuilt binaries and package manager installs are planned. For now, build from source:
+
 ```sh
 just install
 ```
@@ -74,17 +76,23 @@ The `init` command verifies Ollama is running, pulls the embedding model (`nomic
 
 ### Use with Claude Code
 
+Install the lore plugin to get the MCP server, lifecycle hooks, and the `/search-lore` skill:
+
+```sh
+claude --plugin-dir /path/to/lore/integrations/claude-code/
+```
+
+The plugin assumes `lore` is on PATH and uses the default config (`~/.config/lore/lore.toml`). If
+you use a custom config path, either edit `integrations/claude-code/mcp.json` to add your `--config`
+flag, or add the MCP server manually:
+
 ```sh
 claude mcp add --scope user --transport stdio lore -- \
   lore serve --config /path/to/lore.toml
 ```
 
-Then add to your `CLAUDE.md`:
-
-```markdown
-Before implementing any new module, function, or test, use the search_patterns tool to check for
-established patterns. Do not skip this step.
-```
+The manual approach gives only the MCP server. The plugin also includes hooks that inject relevant
+patterns before edits and a `/search-lore` skill for on-demand queries.
 
 ## Commands
 
