@@ -511,7 +511,7 @@ pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
 ///
 /// Takes results by reference so the caller retains ownership and can fall
 /// back to the unfiltered set on error.
-pub fn dedup_filter_and_record(
+fn dedup_filter_and_record(
     path: &Path,
     results: &[SearchResult],
 ) -> anyhow::Result<Vec<SearchResult>> {

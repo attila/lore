@@ -342,6 +342,20 @@ fn check_limit(
     }
 }
 
+/// Return an error response if the serialised `tags` array exceeds the limit.
+fn check_tags_limit(req: &JsonRpcRequest, args: &Value) -> Option<JsonRpcResponse> {
+    if let Some(tags_val) = args.get("tags") {
+        let serialised = serde_json::to_string(tags_val).unwrap_or_default();
+        if serialised.len() > MAX_TAGS_BYTES {
+            return Some(error_response(
+                req,
+                &format!("tags exceeds maximum serialised size of {MAX_TAGS_BYTES} bytes"),
+            ));
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tool handlers
 // ---------------------------------------------------------------------------
@@ -474,14 +488,8 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
-    if let Some(tags_val) = args.get("tags") {
-        let serialised = serde_json::to_string(tags_val).unwrap_or_default();
-        if serialised.len() > MAX_TAGS_BYTES {
-            return error_response(
-                req,
-                &format!("tags exceeds maximum serialised size of {MAX_TAGS_BYTES} bytes"),
-            );
-        }
+    if let Some(err) = check_tags_limit(req, args) {
+        return err;
     }
 
     eprintln!("[lore] Add pattern: \"{title}\"");
@@ -531,14 +539,8 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
-    if let Some(tags_val) = args.get("tags") {
-        let serialised = serde_json::to_string(tags_val).unwrap_or_default();
-        if serialised.len() > MAX_TAGS_BYTES {
-            return error_response(
-                req,
-                &format!("tags exceeds maximum serialised size of {MAX_TAGS_BYTES} bytes"),
-            );
-        }
+    if let Some(err) = check_tags_limit(req, args) {
+        return err;
     }
 
     eprintln!("[lore] Update pattern: \"{source_file}\"");
