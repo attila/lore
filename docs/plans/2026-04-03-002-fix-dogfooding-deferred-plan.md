@@ -116,7 +116,7 @@ still failed to prevent the exact mistake it documents. Two possible root causes
 
 ## Implementation Units
 
-- [ ] **Unit 2: Add search relevance regression tests for query reformulation**
+- [x] **Unit 2: Add search relevance regression tests for query reformulation**
 - [ ] **Unit 4: Strengthen `rust/tooling.md` with behavioral mandates**
 - [ ] **Unit 5: Strengthen `workflows/git-branch-pr.md` with merge ownership context**
 - [ ] **Unit 6: Re-evaluate memory→lore substitution after strengthening**

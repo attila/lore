@@ -106,6 +106,20 @@ fn seed_patterns(dir: &Path) {
          Use conventional commit messages in branch commits.\n",
     )
     .unwrap();
+
+    // Agent conventions
+    fs::create_dir_all(dir.join("agents")).unwrap();
+    fs::write(
+        dir.join("agents/unattended-work.md"),
+        "# Unattended Work\n\n\
+         tags: agent, unattended, command, bash, composite, git, gh\n\n\
+         When running unattended or in composite shell commands, prefer \
+         file-based arguments over inline strings. Use --body-file for \
+         GitHub CLI operations instead of --body with heredocs.\n\
+         Always verify exit codes in chained commands.\n\
+         Never use interactive prompts in unattended agent workflows.\n",
+    )
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +142,8 @@ fn setup_test_env() -> (tempfile::TempDir, Config, KnowledgeDB) {
 
     let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
     assert!(
-        result.chunks_created >= 7,
-        "expected at least 7 chunks from 7 pattern files, got {}",
+        result.chunks_created >= 8,
+        "expected at least 8 chunks from 8 pattern files, got {}",
         result.chunks_created
     );
 
@@ -455,4 +469,68 @@ fn stemming_structured_query_with_and() {
         "structured AND query should work with stemming"
     );
     assert_has_source(&results, "rust/testing-strategy", "rust AND testing");
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Dogfooding regression — query reformulation gaps (PR #19 findings)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dogfooding_natural_query_fake_matches_testing_strategy() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // Original dogfooding finding: "testing sqlite fake embedder" returned 0 hits.
+    // "testing" and "fake" should now match via stemming ("testing"→"test",
+    // "fakes"→"fake"). "sqlite" and "embedder" don't appear in the pattern,
+    // but FTS5 OR-style matching should still surface the pattern from the
+    // two matching terms.
+    let results = search(&db, &embedder, &config, "testing fake");
+    assert_has_source(&results, "rust/testing-strategy", "testing fake");
+}
+
+#[test]
+fn dogfooding_verbose_query_matches_testing_strategy() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // The verbose query that originally worked (1.0 relevance).
+    // Confirm it still works as a regression baseline.
+    let results = search(
+        &db,
+        &embedder,
+        &config,
+        "testing strategy real dependencies fake externals",
+    );
+    assert_has_source(
+        &results,
+        "rust/testing-strategy",
+        "testing strategy real dependencies fake externals",
+    );
+}
+
+#[test]
+fn dogfooding_natural_query_unattended_agent() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // Original dogfooding finding: "unattended agent work" returned 0 hits.
+    // The pattern title and tags now contain these exact terms.
+    let results = search(&db, &embedder, &config, "unattended agent work");
+    assert_has_source(&results, "agents/unattended-work", "unattended agent work");
+}
+
+#[test]
+fn dogfooding_verbose_query_matches_unattended_pattern() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // The verbose query that originally worked (0.98 relevance).
+    // Confirm it works against the seeded pattern.
+    let results = search(&db, &embedder, &config, "agent unattended composite shell");
+    assert_has_source(
+        &results,
+        "agents/unattended-work",
+        "agent unattended composite shell",
+    );
 }
