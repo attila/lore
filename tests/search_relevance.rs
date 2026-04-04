@@ -404,3 +404,55 @@ fn hook_query_for_cargo_bash_finds_rust_patterns() {
         "hook query for cargo clippy should match rust patterns"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests: Porter stemming — morphological variant recall
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stemming_testing_matches_test() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // "testing" appears in the testing-strategy pattern body.
+    // Query with "test" should match via porter stemming (both stem to "test").
+    let results = search(&db, &embedder, &config, "test");
+    assert_has_source(&results, "rust/testing-strategy", "test");
+}
+
+#[test]
+fn stemming_test_matches_testing_reverse() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // The testing-strategy pattern contains "test" in the title.
+    // Query with "testing" should match via stemming.
+    let results = search(&db, &embedder, &config, "testing");
+    assert_has_source(&results, "rust/testing-strategy", "testing");
+}
+
+#[test]
+fn stemming_fakes_matches_fakes_in_body() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // The testing-strategy pattern body contains "fakes".
+    // Query with "fake" should match via porter stemming.
+    let results = search(&db, &embedder, &config, "fake");
+    assert_has_source(&results, "rust/testing-strategy", "fake");
+}
+
+#[test]
+fn stemming_structured_query_with_and() {
+    let (_tmp, config, db) = setup_test_env();
+    let embedder = FakeEmbedder::new();
+
+    // "rust AND testing" should still work with stemming — both operands
+    // are stemmed independently.
+    let results = search(&db, &embedder, &config, "rust AND testing");
+    assert!(
+        !results.is_empty(),
+        "structured AND query should work with stemming"
+    );
+    assert_has_source(&results, "rust/testing-strategy", "rust AND testing");
+}
