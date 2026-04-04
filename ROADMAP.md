@@ -43,9 +43,10 @@
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 - [x] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise. See
       `docs/plans/2026-04-03-001-fix-dogfooding-findings-plan.md`
-- [ ] FTS5 porter stemming — enable stemming tokenizer to improve recall for naturally-worded
-      queries without requiring exact vocabulary overlap in patterns. Addresses the search relevance
-      gaps found during dogfooding (e.g., "fake" not matching "fakes")
+- [x] FTS5 porter stemming — enable stemming tokenizer to improve recall for naturally-worded
+      queries without requiring exact vocabulary overlap in patterns. Auto-migrates existing
+      databases via transactional FTS table rebuild. See
+      `docs/plans/2026-04-04-001-feat-fts5-porter-stemming-plan.md`
 - [ ] Dogfooding deferred — search relevance regression tests, pattern strengthening, memory→lore
       migration evaluation. See `docs/plans/2026-04-03-002-fix-dogfooding-deferred-plan.md`
 
