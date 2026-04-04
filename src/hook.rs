@@ -197,47 +197,40 @@ fn handle_pre_tool_use(
     // Dedup: filter out already-injected chunk IDs for this session.
     // Only activate dedup when the dedup file exists (SessionStart ran).
     // Manual CLI calls and sessions without SessionStart skip dedup entirely.
+    // The read-filter-write sequence is held under a single file lock to
+    // prevent TOCTOU races between concurrent hook invocations.
     let dedup_path = session_dedup_path(input);
     let pre_dedup_count = results.len();
-    let (results, dedup_active) = if let Some(ref path) = dedup_path
+    let results = if let Some(ref path) = dedup_path
         && path.exists()
     {
-        let seen = read_dedup(path);
-        lore_debug!(
-            "dedup active: {} seen IDs in {}",
-            seen.len(),
-            path.display()
-        );
-        let filtered: Vec<SearchResult> = results
-            .into_iter()
-            .filter(|r| !seen.contains(&r.id))
-            .collect();
-        (filtered, true)
+        match dedup_filter_and_record(path, results) {
+            Ok(filtered) => {
+                lore_debug!(
+                    "dedup: {} before, {} after filtering ({})",
+                    pre_dedup_count,
+                    filtered.len(),
+                    path.display()
+                );
+                filtered
+            }
+            Err(e) => {
+                eprintln!("lore hook: dedup filter error: {e}");
+                lore_debug!("dedup filter error (continuing without dedup): {e}");
+                // Fall through without dedup on error — don't break the agent.
+                return Ok(None);
+            }
+        }
     } else {
         lore_debug!("dedup inactive (no session file)");
-        (results, false)
+        results
     };
-
-    lore_debug!(
-        "dedup: {} before, {} after filtering",
-        pre_dedup_count,
-        results.len()
-    );
 
     if results.is_empty() {
         return Ok(None);
     }
 
     let context = format_imperative(&results);
-
-    // Append newly injected chunk IDs to dedup file.
-    if dedup_active && let Some(ref path) = dedup_path {
-        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
-        if let Err(e) = write_dedup(path, &ids) {
-            eprintln!("lore hook: failed to update dedup file: {e}");
-            lore_debug!("dedup write error: {e}");
-        }
-    }
 
     let sources: HashSet<&str> = results.iter().map(|r| r.source_file.as_str()).collect();
     lore_debug!(
@@ -452,14 +445,23 @@ fn session_dedup_path(input: &HookInput) -> Option<PathBuf> {
 
 /// Return the dedup file path for a given session ID.
 ///
-/// Sanitizes the session ID for filename safety by replacing
-/// non-alphanumeric characters with `-`.
+/// Uses FNV-1a to hash the session ID into a deterministic 16-hex-char
+/// filename, avoiding collision from character-level sanitisation and
+/// preventing raw session IDs from leaking into `/tmp` filenames.
 pub fn dedup_file_path(session_id: &str) -> PathBuf {
-    let sanitized: String = session_id
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    std::env::temp_dir().join(format!("lore-session-{sanitized}"))
+    let hash = fnv1a_hash(session_id.as_bytes());
+    std::env::temp_dir().join(format!("lore-session-{hash:016x}"))
+}
+
+/// FNV-1a hash for short strings (session IDs, filenames).
+/// Deterministic within any single binary build.
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 /// Read chunk IDs from the dedup file. Returns an empty set on any error
@@ -489,10 +491,57 @@ pub fn write_dedup(path: &Path, ids: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create or truncate the dedup file (clear all tracked IDs).
+/// Create or truncate the dedup file under an exclusive advisory lock.
 pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
-    std::fs::write(path, "")?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let _guard = lock.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // File is already truncated by OpenOptions; lock ensures no concurrent
+    // reader sees a partial state.
     Ok(())
+}
+
+/// Read seen chunk IDs, filter results, and record newly seen IDs — all
+/// under a single exclusive file lock to prevent TOCTOU races between
+/// concurrent hook invocations.
+pub fn dedup_filter_and_record(
+    path: &Path,
+    results: Vec<SearchResult>,
+) -> anyhow::Result<Vec<SearchResult>> {
+    use std::io::Write as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let mut guard = lock.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Read seen chunk IDs.
+    let mut contents = String::new();
+    guard.read_to_string(&mut contents)?;
+    let seen: HashSet<String> = contents
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+
+    // Filter out already-injected chunks.
+    let filtered: Vec<SearchResult> = results
+        .into_iter()
+        .filter(|r| !seen.contains(&r.id))
+        .collect();
+
+    // Record newly seen chunk IDs while still holding the lock.
+    for r in &filtered {
+        writeln!(&mut *guard, "{}", r.id)?;
+    }
+
+    Ok(filtered)
 }
 
 // ---------------------------------------------------------------------------
@@ -527,8 +576,10 @@ pub fn extract_query(input: &HookInput) -> Option<String> {
         terms.extend(split_into_words(&text));
     }
 
-    // 3. Transcript tail (last user message)
+    // 3. Transcript tail (last user message).
+    // Validate that the transcript path is under $HOME before reading.
     if let Some(ref path) = input.transcript_path
+        && validate_transcript_path(Path::new(path)).is_some()
         && let Some(msg) = last_user_message(Path::new(path))
     {
         let truncated = truncate_str(&msg, 200);
@@ -649,9 +700,62 @@ fn split_into_words(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Read the transcript JSONL file in reverse to find the last user message.
+/// Validate that a transcript path is under `$HOME`.
+///
+/// Returns `Some(canonical_path)` if valid, `None` if the path is outside
+/// `$HOME`, doesn't exist, or `$HOME` is not set. Consistent with the
+/// existing fallthrough where `last_user_message` returns `None`.
+fn validate_transcript_path(path: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let home = PathBuf::from(home);
+    let canonical = path.canonicalize().ok()?;
+    if canonical.starts_with(&home) {
+        Some(canonical)
+    } else {
+        lore_debug!(
+            "transcript path outside $HOME, skipping: {}",
+            path.display()
+        );
+        None
+    }
+}
+
+/// Maximum bytes to read from the tail of a transcript file.
+const TRANSCRIPT_TAIL_BYTES: usize = 32_768;
+
+/// Read the last ~32KB of a transcript JSONL file in reverse to find the
+/// last user message. Bounds the read to prevent OOM on large transcripts.
 fn last_user_message(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let file_len = file.metadata().ok()?.len() as usize;
+
+    let buf = if file_len > TRANSCRIPT_TAIL_BYTES {
+        #[allow(clippy::cast_possible_wrap)]
+        file.seek(SeekFrom::End(-(TRANSCRIPT_TAIL_BYTES as i64)))
+            .ok()?;
+        let mut buf = Vec::with_capacity(TRANSCRIPT_TAIL_BYTES);
+        file.read_to_end(&mut buf).ok()?;
+        buf
+    } else {
+        let mut buf = Vec::with_capacity(file_len);
+        file.read_to_end(&mut buf).ok()?;
+        buf
+    };
+
+    let contents = String::from_utf8_lossy(&buf);
+
+    // If we seeked into the middle, discard the first partial JSONL line.
+    let contents = if file_len > TRANSCRIPT_TAIL_BYTES {
+        match contents.find('\n') {
+            Some(pos) => &contents[pos + 1..],
+            None => return None, // entire buffer is one partial line
+        }
+    } else {
+        &contents
+    };
 
     // Walk lines in reverse, find the last one with `"type":"user"`.
     for line in contents.lines().rev() {
@@ -1157,37 +1261,169 @@ mod tests {
         assert!(last_user_message(&path).is_none());
     }
 
-    // -- dedup_file_path ------------------------------------------------------
-
     #[test]
-    fn dedup_file_path_sanitizes_uuid() {
-        let path = dedup_file_path("60de87ba-e944-42c0-91f5-3cd3c38938de");
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(
-            filename,
-            "lore-session-60de87ba-e944-42c0-91f5-3cd3c38938de"
-        );
-        assert!(path.starts_with(std::env::temp_dir()));
+    fn last_user_message_bounded_read_small_file() {
+        // A file smaller than 32KB should be read in full.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"content":"first"}}
+{"type":"user","message":{"content":"second"}}
+"#,
+        )
+        .unwrap();
+
+        let msg = last_user_message(&path).unwrap();
+        assert_eq!(msg, "second");
     }
 
     #[test]
-    fn dedup_file_path_sanitizes_special_chars() {
-        let path = dedup_file_path("bad/session\\.id:with*special");
+    fn last_user_message_bounded_read_large_file() {
+        // A file larger than 32KB should only read the tail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.jsonl");
+
+        let mut content = String::new();
+        // Write enough filler lines to exceed 32KB.
+        for i in 0..500 {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                content,
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":\"filler line {i} {}\"}}}}",
+                "x".repeat(100)
+            );
+        }
+        // The last user message should be near the end.
+        content.push_str("{\"type\":\"user\",\"message\":{\"content\":\"the real query\"}}\n");
+        content.push_str("{\"type\":\"assistant\",\"message\":{\"content\":\"response\"}}\n");
+
+        assert!(content.len() > 32_768, "test file should exceed 32KB");
+        std::fs::write(&path, &content).unwrap();
+
+        let msg = last_user_message(&path).unwrap();
+        assert_eq!(msg, "the real query");
+    }
+
+    #[test]
+    fn last_user_message_discards_partial_first_line() {
+        // When seeking into the middle of a file, the first partial line
+        // should be discarded rather than causing a parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.jsonl");
+
+        let mut content = String::new();
+        // Write enough data to exceed 32KB.
+        for _ in 0..400 {
+            content.push_str(
+                "{\"type\":\"assistant\",\"message\":{\"content\":\"padding padding padding padding padding padding padding padding\"}}\n",
+            );
+        }
+        content.push_str("{\"type\":\"user\",\"message\":{\"content\":\"query after padding\"}}\n");
+
+        assert!(content.len() > 32_768);
+        std::fs::write(&path, &content).unwrap();
+
+        let msg = last_user_message(&path).unwrap();
+        assert_eq!(msg, "query after padding");
+    }
+
+    #[test]
+    fn last_user_message_no_user_messages_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-user.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+
+        assert!(last_user_message(&path).is_none());
+    }
+
+    // -- validate_transcript_path ---------------------------------------------
+
+    #[test]
+    fn validate_transcript_path_under_home() {
+        // A file under $HOME should pass validation.
+        let home = std::env::var("HOME").unwrap();
+        let dir = tempfile::tempdir_in(&home).unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        assert!(
+            validate_transcript_path(&path).is_some(),
+            "path under $HOME should be valid"
+        );
+    }
+
+    #[test]
+    fn validate_transcript_path_outside_home() {
+        // A file outside $HOME should fail validation.
+        // /tmp is typically NOT under $HOME.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evil.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let home = std::env::var("HOME").unwrap();
+        if !dir.path().starts_with(&home) {
+            assert!(
+                validate_transcript_path(&path).is_none(),
+                "path outside $HOME should be rejected"
+            );
+        }
+        // If tmp IS under $HOME (unusual), skip this assertion.
+    }
+
+    #[test]
+    fn validate_transcript_path_nonexistent() {
+        let path = PathBuf::from("/nonexistent/path/transcript.jsonl");
+        assert!(
+            validate_transcript_path(&path).is_none(),
+            "nonexistent path should return None"
+        );
+    }
+
+    // -- dedup_file_path ------------------------------------------------------
+
+    #[test]
+    fn dedup_file_path_returns_deterministic_hash() {
+        let path = dedup_file_path("60de87ba-e944-42c0-91f5-3cd3c38938de");
         let filename = path.file_name().unwrap().to_str().unwrap();
-        // All non-alphanumeric chars should be replaced with '-'.
-        assert!(
-            !filename.contains('/'),
-            "should not contain slashes: {filename}"
-        );
-        assert!(
-            !filename.contains('\\'),
-            "should not contain backslashes: {filename}"
-        );
-        assert!(
-            !filename.contains(':'),
-            "should not contain colons: {filename}"
-        );
         assert!(filename.starts_with("lore-session-"));
+        // 16 hex chars after the prefix.
+        let hash_part = filename.strip_prefix("lore-session-").unwrap();
+        assert_eq!(hash_part.len(), 16, "hash should be 16 hex chars");
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash should be hex: {hash_part}"
+        );
+        assert!(path.starts_with(std::env::temp_dir()));
+
+        // Same input always produces the same hash.
+        let path2 = dedup_file_path("60de87ba-e944-42c0-91f5-3cd3c38938de");
+        assert_eq!(path, path2, "same session ID must produce same path");
+    }
+
+    #[test]
+    fn dedup_file_path_similar_ids_produce_different_hashes() {
+        // These IDs would have collided under character-level sanitisation
+        // (both would become "abc-123") but should differ under hashing.
+        let path_a = dedup_file_path("abc:123");
+        let path_b = dedup_file_path("abc/123");
+        assert_ne!(path_a, path_b, "similar IDs must hash to different paths");
+    }
+
+    #[test]
+    fn dedup_file_path_empty_session_id() {
+        let path = dedup_file_path("");
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            filename.starts_with("lore-session-"),
+            "empty ID should still produce a valid filename"
+        );
+        let hash_part = filename.strip_prefix("lore-session-").unwrap();
+        assert_eq!(hash_part.len(), 16);
     }
 
     // -- read_dedup / write_dedup / reset_dedup --------------------------------
@@ -1256,5 +1492,84 @@ mod tests {
         reset_dedup(&path).unwrap();
         let ids = read_dedup(&path);
         assert!(ids.is_empty(), "reset should truncate existing content");
+    }
+
+    // -- dedup_filter_and_record -----------------------------------------------
+
+    fn make_search_result(id: &str) -> crate::database::SearchResult {
+        crate::database::SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: String::new(),
+            source_file: "test.md".to_string(),
+            heading_path: String::new(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn dedup_filter_and_record_filters_seen_and_records_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        // Seed the dedup file with one existing ID.
+        write_dedup(&path, &["c1"]).unwrap();
+
+        let results = vec![
+            make_search_result("c1"),
+            make_search_result("c2"),
+            make_search_result("c3"),
+        ];
+
+        let filtered = dedup_filter_and_record(&path, results).unwrap();
+        assert_eq!(filtered.len(), 2, "c1 should be filtered out");
+        assert!(filtered.iter().all(|r| r.id != "c1"));
+
+        // Verify that c2 and c3 were recorded.
+        let seen = read_dedup(&path);
+        assert!(seen.contains("c1"));
+        assert!(seen.contains("c2"));
+        assert!(seen.contains("c3"));
+    }
+
+    #[test]
+    fn dedup_filter_and_record_sequential_accumulates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        // Create the file.
+        reset_dedup(&path).unwrap();
+
+        // First invocation records c1.
+        let r1 = vec![make_search_result("c1")];
+        let filtered1 = dedup_filter_and_record(&path, r1).unwrap();
+        assert_eq!(filtered1.len(), 1);
+
+        // Second invocation should filter c1, keep c2.
+        let r2 = vec![make_search_result("c1"), make_search_result("c2")];
+        let filtered2 = dedup_filter_and_record(&path, r2).unwrap();
+        assert_eq!(filtered2.len(), 1);
+        assert_eq!(filtered2[0].id, "c2");
+
+        // Both should now be recorded.
+        let seen = read_dedup(&path);
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains("c1"));
+        assert!(seen.contains("c2"));
+    }
+
+    #[test]
+    fn reset_dedup_clears_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup");
+
+        write_dedup(&path, &["c1", "c2"]).unwrap();
+        reset_dedup(&path).unwrap();
+
+        // After reset, filter_and_record should see no prior IDs.
+        let results = vec![make_search_result("c1")];
+        let filtered = dedup_filter_and_record(&path, results).unwrap();
+        assert_eq!(filtered.len(), 1, "c1 should pass after reset");
     }
 }
