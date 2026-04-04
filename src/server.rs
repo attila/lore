@@ -313,6 +313,50 @@ fn handle_tool_call(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcRes
 }
 
 // ---------------------------------------------------------------------------
+// Input-length validation
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed values for MCP tool string inputs (in bytes).
+const MAX_QUERY_BYTES: usize = 1024;
+const MAX_TITLE_BYTES: usize = 512;
+const MAX_SOURCE_FILE_BYTES: usize = 512;
+const MAX_HEADING_BYTES: usize = 512;
+const MAX_BODY_BYTES: usize = 262_144; // 256 KB
+const MAX_TAGS_BYTES: usize = 8192; // 8 KB serialised JSON
+const MAX_TOP_K: u64 = 100;
+
+/// Return an error response if `value` exceeds `max_bytes`.
+fn check_limit(
+    req: &JsonRpcRequest,
+    value: &str,
+    field: &str,
+    max_bytes: usize,
+) -> Option<JsonRpcResponse> {
+    if value.len() > max_bytes {
+        Some(error_response(
+            req,
+            &format!("{field} exceeds maximum length of {max_bytes} bytes"),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Return an error response if the serialised `tags` array exceeds the limit.
+fn check_tags_limit(req: &JsonRpcRequest, args: &Value) -> Option<JsonRpcResponse> {
+    if let Some(tags_val) = args.get("tags") {
+        let serialised = serde_json::to_string(tags_val).unwrap_or_default();
+        if serialised.len() > MAX_TAGS_BYTES {
+            return Some(error_response(
+                req,
+                &format!("tags exceeds maximum serialised size of {MAX_TAGS_BYTES} bytes"),
+            ));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tool handlers
 // ---------------------------------------------------------------------------
 
@@ -323,11 +367,22 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         return text_response(req, "Please provide a search query.");
     }
 
+    if let Some(err) = check_limit(req, query, "query", MAX_QUERY_BYTES) {
+        return err;
+    }
+
+    let raw_top_k = args.get("top_k").and_then(Value::as_u64);
+    if let Some(k) = raw_top_k
+        && k > MAX_TOP_K
+    {
+        return error_response(
+            req,
+            &format!("top_k exceeds maximum allowed value of {MAX_TOP_K}"),
+        );
+    }
+
     #[allow(clippy::cast_possible_truncation)]
-    let top_k = args
-        .get("top_k")
-        .and_then(Value::as_u64)
-        .map_or(ctx.config.search.top_k, |k| k as usize);
+    let top_k = raw_top_k.map_or(ctx.config.search.top_k, |k| k as usize);
 
     eprintln!("[lore] Search: \"{query}\" (top_k={top_k})");
 
@@ -419,11 +474,23 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
     let Some(body) = args.get("body").and_then(Value::as_str) else {
         return error_response(req, "Missing required field: body");
     };
+
+    if let Some(err) = check_limit(req, title, "title", MAX_TITLE_BYTES) {
+        return err;
+    }
+    if let Some(err) = check_limit(req, body, "body", MAX_BODY_BYTES) {
+        return err;
+    }
+
     let tags: Vec<&str> = args
         .get("tags")
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+
+    if let Some(err) = check_tags_limit(req, args) {
+        return err;
+    }
 
     eprintln!("[lore] Add pattern: \"{title}\"");
 
@@ -458,11 +525,23 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     let Some(body) = args.get("body").and_then(Value::as_str) else {
         return error_response(req, "Missing required field: body");
     };
+
+    if let Some(err) = check_limit(req, source_file, "source_file", MAX_SOURCE_FILE_BYTES) {
+        return err;
+    }
+    if let Some(err) = check_limit(req, body, "body", MAX_BODY_BYTES) {
+        return err;
+    }
+
     let tags: Vec<&str> = args
         .get("tags")
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+
+    if let Some(err) = check_tags_limit(req, args) {
+        return err;
+    }
 
     eprintln!("[lore] Update pattern: \"{source_file}\"");
 
@@ -500,6 +579,16 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     let Some(body) = args.get("body").and_then(Value::as_str) else {
         return error_response(req, "Missing required field: body");
     };
+
+    if let Some(err) = check_limit(req, source_file, "source_file", MAX_SOURCE_FILE_BYTES) {
+        return err;
+    }
+    if let Some(err) = check_limit(req, heading, "heading", MAX_HEADING_BYTES) {
+        return err;
+    }
+    if let Some(err) = check_limit(req, body, "body", MAX_BODY_BYTES) {
+        return err;
+    }
 
     eprintln!("[lore] Append to: \"{source_file}\" -- {heading}");
 
@@ -1539,6 +1628,250 @@ mod tests {
         assert!(
             text.contains("Fallback Result"),
             "FTS fallback should bypass threshold, got: {text}"
+        );
+    }
+
+    // -- input length validation tests ----------------------------------------
+
+    #[test]
+    fn search_query_at_max_length_succeeds() {
+        let h = TestHarness::new();
+
+        // Insert a chunk so FTS has something to scan.
+        let chunk = crate::chunking::Chunk {
+            id: "lim1".into(),
+            title: "Limit Test".into(),
+            body: "Content for limit boundary testing".into(),
+            tags: String::new(),
+            source_file: "limit.md".into(),
+            heading_path: String::new(),
+        };
+        h.db.insert_chunk(&chunk, None).unwrap();
+
+        // Exactly 1024 bytes — should succeed.
+        let query = "a".repeat(1024);
+        let req_json = format!(
+            r#"{{"jsonrpc":"2.0","id":300,"method":"tools/call","params":{{"name":"search_patterns","arguments":{{"query":"{query}"}}}}}}"#
+        );
+        let resp = h.request_value(&req_json);
+        assert!(
+            resp["error"].is_null(),
+            "query at exactly 1024 bytes should succeed, got error: {:?}",
+            resp["error"]
+        );
+    }
+
+    #[test]
+    fn search_query_over_max_length_returns_error() {
+        let h = TestHarness::new();
+
+        // 1025 bytes — should be rejected.
+        let query = "a".repeat(1025);
+        let req_json = format!(
+            r#"{{"jsonrpc":"2.0","id":301,"method":"tools/call","params":{{"name":"search_patterns","arguments":{{"query":"{query}"}}}}}}"#
+        );
+        let resp = h.request_value(&req_json);
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("query") && msg.contains("1024"),
+            "error should mention field and limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_top_k_at_max_succeeds() {
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":302,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"test","top_k":100}
+                }
+            }"#,
+        );
+        assert!(
+            resp["error"].is_null(),
+            "top_k=100 should succeed, got error: {:?}",
+            resp["error"]
+        );
+    }
+
+    #[test]
+    fn search_top_k_over_max_returns_error() {
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":303,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"test","top_k":101}
+                }
+            }"#,
+        );
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("top_k") && msg.contains("100"),
+            "error should mention top_k limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_body_at_max_length_succeeds() {
+        let h = TestHarness::new();
+
+        // Exactly 256 KB body.
+        let body = "x".repeat(262_144);
+        let args = serde_json::json!({
+            "title": "Big Body Test",
+            "body": body
+        });
+        let req_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 304,
+            "method": "tools/call",
+            "params": { "name": "add_pattern", "arguments": args }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        assert!(
+            resp["error"].is_null(),
+            "body at exactly 256KB should succeed, got error: {:?}",
+            resp["error"]
+        );
+    }
+
+    #[test]
+    fn add_body_over_max_length_returns_error() {
+        let h = TestHarness::new();
+
+        // 256 KB + 1 byte.
+        let body = "x".repeat(262_145);
+        let args = serde_json::json!({
+            "title": "Too Big Body",
+            "body": body
+        });
+        let req_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 305,
+            "method": "tools/call",
+            "params": { "name": "add_pattern", "arguments": args }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("body") && msg.contains("262144"),
+            "error should mention body and limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_oversized_title_returns_error_no_disk_write() {
+        let h = TestHarness::new();
+
+        let title = "t".repeat(513);
+        let args = serde_json::json!({
+            "title": title,
+            "body": "Some body content for the pattern."
+        });
+        let req_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 306,
+            "method": "tools/call",
+            "params": { "name": "add_pattern", "arguments": args }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("title") && msg.contains("512"),
+            "error should mention title and limit, got: {msg}"
+        );
+
+        // Verify no file was written to knowledge dir.
+        let entries: Vec<_> = std::fs::read_dir(&h.config.knowledge_dir)
+            .unwrap()
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no file should be written for oversized title"
+        );
+    }
+
+    #[test]
+    fn update_oversized_source_file_returns_error() {
+        let h = TestHarness::new();
+
+        let source = "s".repeat(513);
+        let args = serde_json::json!({
+            "source_file": source,
+            "body": "New body."
+        });
+        let req_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 307,
+            "method": "tools/call",
+            "params": { "name": "update_pattern", "arguments": args }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("source_file") && msg.contains("512"),
+            "error should mention source_file and limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn append_oversized_heading_returns_error() {
+        let h = TestHarness::new();
+
+        let heading = "h".repeat(513);
+        let args = serde_json::json!({
+            "source_file": "some-file.md",
+            "heading": heading,
+            "body": "Appended content."
+        });
+        let req_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 308,
+            "method": "tools/call",
+            "params": { "name": "append_to_pattern", "arguments": args }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("heading") && msg.contains("512"),
+            "error should mention heading and limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_oversized_tags_returns_error() {
+        let h = TestHarness::new();
+
+        // Build a tags array whose serialised JSON exceeds 8 KB.
+        let big_tag = "t".repeat(4096);
+        let args = serde_json::json!({
+            "title": "Tags Test",
+            "body": "Body for tags test.",
+            "tags": [big_tag.clone(), big_tag]
+        });
+        let req_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 309,
+            "method": "tools/call",
+            "params": { "name": "add_pattern", "arguments": args }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("tags") && msg.contains("8192"),
+            "error should mention tags and limit, got: {msg}"
         );
     }
 }

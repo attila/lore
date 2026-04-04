@@ -1143,6 +1143,34 @@ mod tests {
         assert_eq!(patterns[0].tags, "rust, style");
     }
 
+    // -- sanitize_fts_query: expanded coverage ---------------------------
+
+    #[test]
+    fn sanitize_strips_backslash() {
+        assert_eq!(sanitize_fts_query("foo\\bar"), "foo bar");
+    }
+
+    #[test]
+    fn sanitize_combined_multi_operator_sequence() {
+        assert_eq!(sanitize_fts_query("foo/bar:baz\\qux"), "foo bar baz qux");
+    }
+
+    #[test]
+    fn sanitize_all_operators_returns_empty() {
+        assert_eq!(sanitize_fts_query("/:.\\*^-{}[]\"'"), "");
+    }
+
+    #[test]
+    fn sanitize_operators_mixed_with_terms_and_leading_minus() {
+        // "rust-lang/rust:main" should strip hyphens, slashes, and colons,
+        // and the leading minus on "lang" (after hyphen replacement) is a no-op
+        // since split_whitespace handles the space-separated tokens.
+        assert_eq!(
+            sanitize_fts_query("rust-lang/rust:main"),
+            "rust lang rust main"
+        );
+    }
+
     // -- ingest_metadata -----------------------------------------------
 
     #[test]
