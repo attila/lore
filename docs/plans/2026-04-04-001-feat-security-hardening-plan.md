@@ -120,7 +120,7 @@ access vectors that need closing before release.
 
 ## Implementation Units
 
-- [ ] **Unit 1: MCP input validation**
+- [x] **Unit 1: MCP input validation**
 
   **Goal:** Enforce length limits on all MCP tool string inputs and cap `top_k`.
 
@@ -164,7 +164,7 @@ access vectors that need closing before release.
   - All four handlers reject oversized inputs with descriptive `-32000` errors
   - Existing server tests still pass unchanged
 
-- [ ] **Unit 2: Dedup file hardening (hashing + locking)**
+- [x] **Unit 2: Dedup file hardening (hashing + locking)**
 
   **Goal:** Replace character-level session ID sanitisation with deterministic hashing, and wrap the
   read-filter-write sequence in an exclusive file lock.
@@ -226,7 +226,7 @@ access vectors that need closing before release.
     end-to-end)
   - `cargo deny check` passes with `fd-lock` added
 
-- [ ] **Unit 3: Transcript path validation and bounded read**
+- [x] **Unit 3: Transcript path validation and bounded read**
 
   **Goal:** Validate transcript paths are under `$HOME` and bound the file read to the last 32KB.
 
@@ -279,7 +279,7 @@ access vectors that need closing before release.
   - Existing hook tests pass (they use fixture transcript content)
   - New inline tests cover all validation and boundary cases
 
-- [ ] **Unit 4: FTS5 sanitisation test coverage**
+- [x] **Unit 4: FTS5 sanitisation test coverage**
 
   **Goal:** Close remaining gaps in FTS5 sanitisation test coverage.
 
@@ -314,7 +314,7 @@ access vectors that need closing before release.
   - Every operator character from the sanitisation match arm has at least one dedicated or combined
     test exercising it
 
-- [ ] **Unit 5: SECURITY.md**
+- [x] **Unit 5: SECURITY.md**
 
   **Goal:** Document the threat model, trust boundaries, and security reporting process.
 

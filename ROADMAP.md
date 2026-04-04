@@ -1,52 +1,8 @@
 # Roadmap
 
-## Completed
-
-- [x] Project infrastructure (CI, quality gates, formatting, lints)
-- [x] Port scaffold into working Rust binary (all modules compile, 96 tests)
-- [x] Progress bar during model pull
-- [x] Dev install via `just install`
-- [x] End-to-end lifecycle tests (ingest → search → add/update/append → verify)
-- [x] Branch push for agent submissions (per-submission branches via git plumbing)
-- [x] XDG config paths and MCP CLI output in `lore init`
-- [x] Integration tests for init output (requires Ollama)
-- [x] Ollama integration tests for semantic search quality
-- [x] CI action versions pinned to full commit SHAs
-- [x] MCP integration testing with Claude Code (tool discovery, invocation, edge cases)
-- [x] Ollama fallback warning and min_relevance threshold for search quality
-- [x] Search relevance boosting (FTS5 column weights + embedding enrichment)
-- [x] Score normalization (RRF scores mapped to 0–1 range)
-- [x] Agent integration — Claude Code plugin with deterministic pattern injection
-  - [x] Validation spike — confirmed `additionalContext` influences agent behavior
-  - [x] `lore hook` subcommand — unified hook handler for all lifecycle events
-  - [x] `lore list` subcommand + `--top-k` CLI flag + FTS5 query sanitization fix
-  - [x] Plugin assembly (`integrations/claude-code/`)
-  - [x] SessionStart priming, session dedup, PostCompact reset, error hook
-  - [x] Hook unit tests + search relevance regression tests (CI)
-  - [x] See `docs/plans/2026-04-01-005-feat-agent-integration-claude-code-plan.md`
-
 ## Up Next
 
-- [x] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
-      full re-embed. Use `git diff --name-status` against the last-ingested commit to detect
-      changes. Eliminates the Ollama round-trip penalty for unchanged files. See
-      `docs/plans/2026-04-02-001-feat-delta-ingest-plan.md`
-- [x] `LORE_DEBUG=1` verbose logging for hook pipeline troubleshooting — env var enables
-      `[lore debug]`-prefixed diagnostics to stderr covering query extraction, search results, dedup
-      filtering, threshold decisions, and error-swallowing paths. See
-      `docs/plans/2026-04-03-002-feat-debug-logging-json-output-plan.md`
-- [x] `--json` flag on `lore search` and `lore list` for structured machine-readable output — global
-      CLI flag outputs JSON arrays to stdout with full (untruncated) bodies and snake_case field
-      naming. See `docs/plans/2026-04-03-002-feat-debug-logging-json-output-plan.md`
-- [ ] Bounded transcript read — `last_user_message()` reads entire JSONL into memory; use
-      reverse-seek or tail-read to cap memory and latency for long sessions
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [x] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise. See
-      `docs/plans/2026-04-03-001-fix-dogfooding-findings-plan.md`
-- [x] FTS5 porter stemming — enable stemming tokenizer to improve recall for naturally-worded
-      queries without requiring exact vocabulary overlap in patterns. Auto-migrates existing
-      databases via transactional FTS table rebuild. See
-      `docs/plans/2026-04-04-001-feat-fts5-porter-stemming-plan.md`
 - [ ] Dogfooding deferred — search relevance regression tests, pattern strengthening, memory→lore
       migration evaluation. See `docs/plans/2026-04-03-002-fix-dogfooding-deferred-plan.md`
 
@@ -73,3 +29,41 @@
 - [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
+
+## Completed
+
+- [x] Project infrastructure (CI, quality gates, formatting, lints)
+- [x] Port scaffold into working Rust binary (all modules compile, 96 tests)
+- [x] Progress bar during model pull
+- [x] Dev install via `just install`
+- [x] End-to-end lifecycle tests (ingest → search → add/update/append → verify)
+- [x] Branch push for agent submissions (per-submission branches via git plumbing)
+- [x] XDG config paths and MCP CLI output in `lore init`
+- [x] Integration tests for init output (requires Ollama)
+- [x] Ollama integration tests for semantic search quality
+- [x] CI action versions pinned to full commit SHAs
+- [x] MCP integration testing with Claude Code (tool discovery, invocation, edge cases)
+- [x] Ollama fallback warning and min_relevance threshold for search quality
+- [x] Search relevance boosting (FTS5 column weights + embedding enrichment)
+- [x] Score normalization (RRF scores mapped to 0–1 range)
+- [x] Agent integration — Claude Code plugin with deterministic pattern injection
+  - [x] Validation spike — confirmed `additionalContext` influences agent behavior
+  - [x] `lore hook` subcommand — unified hook handler for all lifecycle events
+  - [x] `lore list` subcommand + `--top-k` CLI flag + FTS5 query sanitization fix
+  - [x] Plugin assembly (`integrations/claude-code/`)
+  - [x] SessionStart priming, session dedup, PostCompact reset, error hook
+  - [x] Hook unit tests + search relevance regression tests (CI)
+  - [x] See `docs/plans/2026-04-01-005-feat-agent-integration-claude-code-plan.md`
+- [x] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
+      full re-embed. Use `git diff --name-status` against the last-ingested commit to detect
+      changes. Eliminates the Ollama round-trip penalty for unchanged files. See
+      `docs/plans/2026-04-02-001-feat-delta-ingest-plan.md`
+- [x] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise. See
+      `docs/plans/2026-04-03-001-fix-dogfooding-findings-plan.md`
+- [x] `LORE_DEBUG=1` verbose logging and `--json` structured output. See
+      `docs/plans/2026-04-03-002-feat-debug-logging-json-output-plan.md`
+- [x] FTS5 porter stemming for improved search recall. See
+      `docs/plans/2026-04-04-001-feat-fts5-porter-stemming-plan.md`
+- [x] Security hardening — input limits, transcript path validation under `$HOME`, bounded tail-read
+      (32KB), dedup file locking (`fd-lock`) with FNV-1a hashing, `SECURITY.md`. See
+      `docs/plans/2026-04-04-001-feat-security-hardening-plan.md`
