@@ -204,7 +204,7 @@ fn handle_pre_tool_use(
     let results = if let Some(ref path) = dedup_path
         && path.exists()
     {
-        match dedup_filter_and_record(path, results) {
+        match dedup_filter_and_record(path, &results) {
             Ok(filtered) => {
                 lore_debug!(
                     "dedup: {} before, {} after filtering ({})",
@@ -217,8 +217,8 @@ fn handle_pre_tool_use(
             Err(e) => {
                 eprintln!("lore hook: dedup filter error: {e}");
                 lore_debug!("dedup filter error (continuing without dedup): {e}");
-                // Fall through without dedup on error — don't break the agent.
-                return Ok(None);
+                // Fall through with unfiltered results — dedup is non-critical.
+                results
             }
         }
     } else {
@@ -508,9 +508,12 @@ pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
 /// Read seen chunk IDs, filter results, and record newly seen IDs — all
 /// under a single exclusive file lock to prevent TOCTOU races between
 /// concurrent hook invocations.
+///
+/// Takes results by reference so the caller retains ownership and can fall
+/// back to the unfiltered set on error.
 pub fn dedup_filter_and_record(
     path: &Path,
-    results: Vec<SearchResult>,
+    results: &[SearchResult],
 ) -> anyhow::Result<Vec<SearchResult>> {
     use std::io::Write as _;
 
@@ -532,8 +535,9 @@ pub fn dedup_filter_and_record(
 
     // Filter out already-injected chunks.
     let filtered: Vec<SearchResult> = results
-        .into_iter()
+        .iter()
         .filter(|r| !seen.contains(&r.id))
+        .cloned()
         .collect();
 
     // Record newly seen chunk IDs while still holding the lock.
@@ -578,9 +582,11 @@ pub fn extract_query(input: &HookInput) -> Option<String> {
 
     // 3. Transcript tail (last user message).
     // Validate that the transcript path is under $HOME before reading.
+    // Use the canonical path returned from validation to prevent symlink
+    // TOCTOU between validation and file open.
     if let Some(ref path) = input.transcript_path
-        && validate_transcript_path(Path::new(path)).is_some()
-        && let Some(msg) = last_user_message(Path::new(path))
+        && let Some(canonical) = validate_transcript_path(Path::new(path))
+        && let Some(msg) = last_user_message(&canonical)
     {
         let truncated = truncate_str(&msg, 200);
         terms.extend(split_into_words(truncated));
@@ -1522,7 +1528,7 @@ mod tests {
             make_search_result("c3"),
         ];
 
-        let filtered = dedup_filter_and_record(&path, results).unwrap();
+        let filtered = dedup_filter_and_record(&path, &results).unwrap();
         assert_eq!(filtered.len(), 2, "c1 should be filtered out");
         assert!(filtered.iter().all(|r| r.id != "c1"));
 
@@ -1543,12 +1549,12 @@ mod tests {
 
         // First invocation records c1.
         let r1 = vec![make_search_result("c1")];
-        let filtered1 = dedup_filter_and_record(&path, r1).unwrap();
+        let filtered1 = dedup_filter_and_record(&path, &r1).unwrap();
         assert_eq!(filtered1.len(), 1);
 
         // Second invocation should filter c1, keep c2.
         let r2 = vec![make_search_result("c1"), make_search_result("c2")];
-        let filtered2 = dedup_filter_and_record(&path, r2).unwrap();
+        let filtered2 = dedup_filter_and_record(&path, &r2).unwrap();
         assert_eq!(filtered2.len(), 1);
         assert_eq!(filtered2[0].id, "c2");
 
@@ -1569,7 +1575,7 @@ mod tests {
 
         // After reset, filter_and_record should see no prior IDs.
         let results = vec![make_search_result("c1")];
-        let filtered = dedup_filter_and_record(&path, results).unwrap();
+        let filtered = dedup_filter_and_record(&path, &results).unwrap();
         assert_eq!(filtered.len(), 1, "c1 should pass after reset");
     }
 }
