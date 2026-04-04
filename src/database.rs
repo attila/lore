@@ -140,12 +140,18 @@ impl KnowledgeDB {
         Ok(())
     }
 
-    /// Delete every row from all three tables.
+    /// Drop and recreate all tables, ensuring schema changes (like tokenizer
+    /// updates) take effect.  Used by `lore ingest --force`.
     pub fn clear_all(&self) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
         tx.execute_batch(
-            "DELETE FROM chunks; DELETE FROM patterns_fts; DELETE FROM patterns_vec;",
+            "CREATE VIRTUAL TABLE patterns_fts USING fts5(
+                title, body, tags, source_file, chunk_id UNINDEXED,
+                tokenize = 'porter unicode61'
+            )",
         )?;
+        tx.execute_batch("DELETE FROM chunks; DELETE FROM patterns_vec;")?;
         tx.commit()?;
         Ok(())
     }
