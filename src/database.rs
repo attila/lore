@@ -103,12 +103,7 @@ impl KnowledgeDB {
         Ok(Self { conn, dimensions })
     }
 
-    /// Expected FTS5 tokenizer configuration.  When the stored metadata key
-    /// `fts_tokenizer` differs (or is absent), [`init`] migrates the FTS table.
-    const FTS_TOKENIZER: &str = "porter";
-
-    /// Create all tables if they don't already exist, and migrate the FTS5
-    /// tokenizer to porter stemming when needed.
+    /// Create all tables if they don't already exist.
     pub fn init(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts USING fts5(
@@ -142,42 +137,6 @@ impl KnowledgeDB {
             "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)",
         )?;
 
-        self.migrate_fts_tokenizer()?;
-
-        Ok(())
-    }
-
-    /// Migrate the FTS5 table to the expected tokenizer if needed.
-    ///
-    /// The migration is transactional: drop → recreate → repopulate → set
-    /// metadata all happen in one transaction.  If any step fails, the old FTS
-    /// table remains intact and searches continue with the previous tokenizer.
-    fn migrate_fts_tokenizer(&self) -> anyhow::Result<()> {
-        let current = self.get_metadata("fts_tokenizer")?;
-        if current.as_deref() == Some(Self::FTS_TOKENIZER) {
-            return Ok(());
-        }
-
-        let tx = self.conn.unchecked_transaction()?;
-
-        tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
-        tx.execute_batch(
-            "CREATE VIRTUAL TABLE patterns_fts USING fts5(
-                title, body, tags, source_file, chunk_id UNINDEXED,
-                tokenize = 'porter unicode61'
-            )",
-        )?;
-        tx.execute_batch(
-            "INSERT INTO patterns_fts (title, body, tags, source_file, chunk_id)
-             SELECT title, body, tags, source_file, id FROM chunks",
-        )?;
-
-        tx.execute(
-            "INSERT OR REPLACE INTO ingest_metadata (key, value) VALUES (?1, ?2)",
-            rusqlite::params!["fts_tokenizer", Self::FTS_TOKENIZER],
-        )?;
-
-        tx.commit()?;
         Ok(())
     }
 
@@ -1215,80 +1174,7 @@ mod tests {
         assert_eq!(db.get_metadata("key").unwrap(), Some(String::new()));
     }
 
-    // -- FTS5 porter migration ----------------------------------------------
-
-    #[test]
-    fn init_fresh_db_sets_fts_tokenizer_metadata() {
-        let db = open_memory_db(4);
-        db.init().unwrap();
-        assert_eq!(
-            db.get_metadata("fts_tokenizer").unwrap(),
-            Some("porter".to_string())
-        );
-    }
-
-    #[test]
-    fn init_idempotent_skips_migration_on_second_call() {
-        let db = open_memory_db(4);
-        db.init().unwrap();
-
-        let chunk = make_chunk("c1", "Test Title", "Test body content", "test.md");
-        db.insert_chunk(&chunk, Some(&[1.0, 0.0, 0.0, 0.0]))
-            .unwrap();
-
-        // Second init should not drop and recreate (data survives).
-        db.init().unwrap();
-
-        let results = db.search_fts("test", 10).unwrap();
-        assert!(!results.is_empty(), "data should survive idempotent init");
-    }
-
-    #[test]
-    fn migrate_fts_repopulates_from_chunks() {
-        let db = open_memory_db(4);
-        db.init().unwrap();
-
-        let chunk = make_chunk("c1", "Rust Fakes", "Use fakes for testing", "guide.md");
-        db.insert_chunk(&chunk, Some(&[1.0, 0.0, 0.0, 0.0]))
-            .unwrap();
-
-        // Simulate a pre-migration database by clearing the metadata key.
-        db.conn
-            .execute(
-                "DELETE FROM ingest_metadata WHERE key = 'fts_tokenizer'",
-                [],
-            )
-            .unwrap();
-
-        // Re-init triggers migration: drop + recreate + repopulate from chunks.
-        db.init().unwrap();
-
-        let results = db.search_fts("fakes", 10).unwrap();
-        assert!(!results.is_empty(), "FTS should be repopulated from chunks");
-        assert_eq!(results[0].id, "c1");
-    }
-
-    #[test]
-    fn migrate_fts_empty_chunks_succeeds() {
-        let db = open_memory_db(4);
-        db.init().unwrap();
-
-        // Clear the metadata to force migration with no chunks.
-        db.conn
-            .execute(
-                "DELETE FROM ingest_metadata WHERE key = 'fts_tokenizer'",
-                [],
-            )
-            .unwrap();
-
-        // Should not error even with zero rows to repopulate.
-        db.init().unwrap();
-
-        assert_eq!(
-            db.get_metadata("fts_tokenizer").unwrap(),
-            Some("porter".to_string())
-        );
-    }
+    // -- FTS5 porter stemming -------------------------------------------------
 
     #[test]
     fn porter_stemming_matches_morphological_variants() {
