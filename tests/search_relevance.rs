@@ -481,10 +481,9 @@ fn dogfooding_natural_query_fake_matches_testing_strategy() {
     let embedder = FakeEmbedder::new();
 
     // Original dogfooding finding: "testing sqlite fake embedder" returned 0 hits.
-    // "testing" and "fake" should now match via stemming ("testing"→"test",
-    // "fakes"→"fake"). "sqlite" and "embedder" don't appear in the pattern,
-    // but FTS5 OR-style matching should still surface the pattern from the
-    // two matching terms.
+    // We test the narrower "testing fake" (dropping "sqlite" and "embedder"
+    // which don't appear in the target pattern) to verify that stemming alone
+    // enables short, partial-match queries: "testing"→"test" and "fake"→"fakes".
     let results = search(&db, &embedder, &config, "testing fake");
     assert_has_source(&results, "rust/testing-strategy", "testing fake");
 }
