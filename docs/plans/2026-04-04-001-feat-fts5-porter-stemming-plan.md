@@ -1,7 +1,7 @@
 ---
 title: "feat: Enable FTS5 porter stemming for improved search recall"
 type: feat
-status: active
+status: completed
 date: 2026-04-04
 origin: docs/brainstorms/2026-04-04-fts5-porter-stemming-requirements.md
 ---
@@ -93,7 +93,7 @@ dogfooding — see origin document and `docs/plans/2026-04-03-002-fix-dogfooding
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add porter tokenizer and auto-migration**
+- [x] **Unit 1: Add porter tokenizer and auto-migration**
 
   **Goal:** Change the FTS5 table to use porter stemming and auto-migrate existing databases.
 
@@ -133,7 +133,7 @@ dogfooding — see origin document and `docs/plans/2026-04-03-002-fix-dogfooding
   - `init()` is idempotent — running it twice produces the same result
   - FTS table uses porter tokenizer (verified by stemming behavior in Unit 2 tests)
 
-- [ ] **Unit 2: Add stemming search relevance tests**
+- [x] **Unit 2: Add stemming search relevance tests**
 
   **Goal:** Verify that porter stemming improves recall for morphological variants and doesn't
   regress existing queries.
