@@ -56,10 +56,8 @@ fn init_default_paths_omits_config_from_output() {
         .assert()
         .success()
         .stderr(
-            predicate::str::contains("\"args\": [\"serve\"]")
-                .and(predicate::str::contains(
-                    "claude mcp add --scope user --transport stdio lore -- lore serve",
-                ))
+            predicate::str::contains("claude --plugin-dir")
+                .and(predicate::str::contains("integrations/claude-code/"))
                 .and(predicate::str::contains("--config").not()),
         );
 
@@ -102,7 +100,9 @@ fn init_custom_config_includes_config_in_output() {
         .assert()
         .success()
         .stderr(
-            predicate::str::contains("\"--config\"")
+            predicate::str::contains("claude --plugin-dir")
+                .and(predicate::str::contains("integrations/claude-code/"))
+                .and(predicate::str::contains("custom config"))
                 .and(predicate::str::contains("lore serve --config")),
         );
 
@@ -131,8 +131,10 @@ fn init_custom_database_does_not_appear_in_output() {
         .assert()
         .success()
         .stderr(
-            // Output should show simple serve args (no --config, no --database)
-            predicate::str::contains("\"args\": [\"serve\"]")
+            // Output should show plugin instructions (no --config, no --database)
+            predicate::str::contains("claude --plugin-dir")
+                .and(predicate::str::contains("integrations/claude-code/"))
+                .and(predicate::str::contains("--config").not())
                 .and(predicate::str::contains("--database").not()),
         );
 
