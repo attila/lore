@@ -3,11 +3,9 @@
 ## Up Next
 
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] Dogfooding deferred — search relevance regression tests, pattern strengthening, memory→lore
-      migration evaluation. See `docs/plans/2026-04-03-002-fix-dogfooding-deferred-plan.md`
-
-## Future
-
+- [ ] `.loreignore` — gitignore-style exclude file in pattern repos. Skip matching files during full
+      and delta ingest. If an already-indexed file is later ignored, remove its chunks on next
+      ingest. Prevents non-pattern files (README, LICENSE, .github/) from polluting the index
 - [ ] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
       commit, enabling a fast edit-ingest-search feedback loop for pattern authoring. Removes the
       current workaround of committing a WIP before testing discoverability. Update the vocabulary
@@ -15,6 +13,19 @@
 - [ ] Pattern QA skill — a skill that automates the vocabulary coverage checklist from the pattern
       authoring guide: ingest the pattern, search with candidate terms, report gaps. Best paired
       with single-file ingest to eliminate the commit-ingest dance
+- [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
+      content at SessionStart, not just titles. Covers process-level conventions that don't surface
+      through file-edit hooks
+- [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
+      JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
+      Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
+      inference side is non-trivial: each language has multiple tools (`bundle`/`gem`/`rake` → Ruby,
+      `javac`/`gradle`/`mvn` → Java, `dotnet` → C#, `swift build` → Swift, etc.). Consider
+      extracting both maps into a shared data structure to prevent drift between them
+- [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
+
+## Future
+
 - [ ] Evaluate transcript tail truncation limit — currently 200 bytes, which often cuts
       mid-sentence. Increasing to 400-500 bytes may improve search recall for longer user
       instructions without adding excessive noise. Use `LORE_DEBUG` traces to measure what gets
@@ -25,20 +36,10 @@
       reason, forcing Claude to retry with conventions visible. Requires solid deduplication to
       avoid infinite loops (see
       `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
-- [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
-      content at SessionStart, not just titles. Covers process-level conventions that don't surface
-      through file-edit hooks
-- [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
-      JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
-      Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
-      inference side is non-trivial: each language has multiple tools (`bundle`/`gem`/`rake` → Ruby,
-      `javac`/`gradle`/`mvn` → Java, `dotnet` → C#, `swift build` → Swift, etc.). Consider
-      extracting both maps into a shared data structure to prevent drift between them
 - [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
       `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
 - [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
-- [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
 
@@ -82,3 +83,6 @@
 - [x] Product documentation — pattern authoring guide, search mechanics reference, hook pipeline and
       plugin reference, configuration reference. See
       `docs/plans/2026-04-05-001-doc-product-documentation-plan.md`
+- [x] Dogfooding deferred — search relevance regression tests (PR #24), pattern strengthening
+      (`rust/tooling.md`, `workflows/git-branch-pr.md`), memory→lore migration (3 memories retired).
+      See `docs/plans/2026-04-03-002-fix-dogfooding-deferred-plan.md`
