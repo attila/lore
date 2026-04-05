@@ -3,9 +3,9 @@
 Your engineering wisdom, always in context.
 
 Lore is a local semantic search engine for your software patterns and conventions, exposed as an MCP
-tool for Claude Code (and any MCP-compatible client). Your knowledge lives as markdown files in a
-git repo. Lore indexes them with hybrid full-text and vector search, then serves results over MCP so
-your AI coding agent consults your patterns before writing code.
+tool for Claude Code. Your knowledge lives as markdown files in a git repository. Lore indexes them
+with hybrid full-text and vector search, then serves results over MCP so your AI coding agent
+consults your patterns before writing code.
 
 Single Rust binary. No external database. Only runtime dependency is [Ollama](https://ollama.com)
 for embeddings.
@@ -72,7 +72,7 @@ lore status
 ```
 
 The `init` command verifies Ollama is running, pulls the embedding model (`nomic-embed-text`,
-~270MB), creates `lore.toml` and `lore.db`, and runs the first ingestion.
+~270MB), creates `lore.toml` and the knowledge database, and runs the first ingestion.
 
 ### Use with Claude Code
 
@@ -117,7 +117,7 @@ The server exposes four tools:
 
 ## Knowledge Base Format
 
-Your knowledge base is a directory of markdown files in a git repo. Any structure works:
+Your knowledge base is a directory of markdown files in a git repository. Any structure works:
 
 ```
 my-patterns/
@@ -149,6 +149,15 @@ Always use Result<T, E> for fallible operations...
   queries return the right patterns first.
 - **FTS-only**: Set `hybrid = false` in `lore.toml` to skip Ollama at query time.
 
+## Documentation
+
+| Guide                                                                 | Description                                                  |
+| --------------------------------------------------------------------- | ------------------------------------------------------------ |
+| [Pattern Authoring Guide](docs/pattern-authoring-guide.md)            | How to write patterns that agents actually follow            |
+| [Search Mechanics Reference](docs/search-mechanics.md)                | Full search pipeline internals for debugging discoverability |
+| [Hook Pipeline and Plugin Reference](docs/hook-pipeline-reference.md) | Hook lifecycle, plugin setup, and injection tuning           |
+| [Configuration Reference](docs/configuration.md)                      | `lore.toml` options, environment variables, CLI flags        |
+
 ## Development
 
 ### Prerequisites
@@ -171,7 +180,7 @@ just ci       # run the full quality gate pipeline
 | `just fmt`       | Check formatting                           |
 | `just fmt-fix`   | Fix formatting                             |
 | `just clippy`    | Run clippy lints                           |
-| `just test`      | Run tests (96 tests, no Ollama needed)     |
+| `just test`      | Run tests (no Ollama needed)               |
 | `just deny`      | Run dependency audits                      |
 | `just doc`       | Build documentation                        |
 | `just changelog` | Regenerate CHANGELOG.md from git history   |
