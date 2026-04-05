@@ -8,11 +8,6 @@
 
 ## Future
 
-- [ ] Pattern authoring guide — product documentation on how to write effective lore patterns.
-      Covers descriptive vs. imperative content, incident context, tag strategy, chunking awareness,
-      query-friendly vocabulary, and anti-patterns. Based on dogfooding evidence, not speculation.
-      Iterated through real memory→lore migration cycles
-
 - [ ] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
       commit, enabling a fast edit-ingest-search feedback loop for pattern authoring. Removes the
       current workaround of committing a WIP before testing discoverability. Update the vocabulary
@@ -24,11 +19,11 @@
       mid-sentence. Increasing to 400-500 bytes may improve search recall for longer user
       instructions without adding excessive noise. Use `LORE_DEBUG` traces to measure what gets
       truncated in practice
-- [ ] Cycle-based dedup TTL — re-inject a pattern after N tool call cycles since last injection, so
-      long sessions don't bury early conventions deep in context
+- [ ] Cycle-based deduplication TTL — re-inject a pattern after N tool call cycles since last
+      injection, so long sessions don't bury early conventions deep in context
 - [ ] Deny-first-touch mode — block the first Edit/Write per domain with conventions as the deny
-      reason, forcing Claude to retry with conventions visible. Requires solid dedup to avoid
-      infinite loops (see
+      reason, forcing Claude to retry with conventions visible. Requires solid deduplication to
+      avoid infinite loops (see
       `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
 - [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
       content at SessionStart, not just titles. Covers process-level conventions that don't surface
@@ -68,7 +63,7 @@
   - [x] `lore hook` subcommand — unified hook handler for all lifecycle events
   - [x] `lore list` subcommand + `--top-k` CLI flag + FTS5 query sanitization fix
   - [x] Plugin assembly (`integrations/claude-code/`)
-  - [x] SessionStart priming, session dedup, PostCompact reset, error hook
+  - [x] SessionStart priming, session deduplication, PostCompact reset, error hook
   - [x] Hook unit tests + search relevance regression tests (CI)
   - [x] See `docs/plans/2026-04-01-005-feat-agent-integration-claude-code-plan.md`
 - [x] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
@@ -82,5 +77,8 @@
 - [x] FTS5 porter stemming for improved search recall. See
       `docs/plans/2026-04-04-001-feat-fts5-porter-stemming-plan.md`
 - [x] Security hardening — input limits, transcript path validation under `$HOME`, bounded tail-read
-      (32KB), dedup file locking (`fd-lock`) with FNV-1a hashing, `SECURITY.md`. See
+      (32KB), deduplication file locking (`fd-lock`) with FNV-1a hashing, `SECURITY.md`. See
       `docs/plans/2026-04-04-001-feat-security-hardening-plan.md`
+- [x] Product documentation — pattern authoring guide, search mechanics reference, hook pipeline and
+      plugin reference, configuration reference. See
+      `docs/plans/2026-04-05-001-doc-product-documentation-plan.md`

@@ -53,9 +53,10 @@ The primary threats are:
   long sessions. Partial UTF-8 sequences and partial JSONL lines at the buffer boundary are safely
   handled.
 
-- **Session dedup file integrity**: Session IDs are hashed (FNV-1a, 16 hex chars) for dedup
-  filenames, preventing collision from character-level sanitisation. Dedup file access uses advisory
-  file locking (`fd-lock`) across the full read-filter-write sequence to prevent TOCTOU races.
+- **Session deduplication file integrity**: Session IDs are hashed (FNV-1a, 16 hex chars) for
+  deduplication filenames, preventing collisions from character-level sanitisation. Deduplication
+  file access uses advisory file locking (`fd-lock`) across the full read-filter-write sequence to
+  prevent TOCTOU races.
 
 ### Code Safety
 
@@ -80,7 +81,7 @@ The primary threats are:
 
 If you discover a security vulnerability, please report it through
 [GitHub Security Advisories](../../security/advisories/new) or contact the maintainer directly. Do
-not open a public issue for security vulnerabilities.
+not report security vulnerabilities through public channels such as GitHub Discussions.
 
 Lore is not currently accepting external contributions (see [CONTRIBUTING.md](CONTRIBUTING.md)), but
 security reports are always welcome.
