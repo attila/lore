@@ -1,7 +1,7 @@
 ---
 title: "doc: Lore product documentation — authoring guide, search mechanics, agent integration, configuration"
 type: feat
-status: active
+status: completed
 date: 2026-04-05
 origin: docs/brainstorms/2026-04-04-pattern-authoring-guide-requirements.md
 ---
@@ -154,7 +154,7 @@ All four documents must meet this standard:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Pattern authoring guide**
+- [x] **Unit 1: Pattern authoring guide**
 
   **Goal:** Ship `docs/pattern-authoring-guide.md` — the primary guide for writing effective
   patterns.
@@ -195,7 +195,7 @@ All four documents must meet this standard:
   - The checklist covers: imperative voice, vocabulary coverage, stop word avoidance, incident
     context (when applicable), tag relevance
 
-- [ ] **Unit 2: Search mechanics reference**
+- [x] **Unit 2: Search mechanics reference**
 
   **Goal:** Ship `docs/search-mechanics.md` — detailed pipeline reference for power users debugging
   discoverability.
@@ -241,7 +241,7 @@ All four documents must meet this standard:
   - Pipeline description matches current code (verified against research output)
   - Worked examples are traceable through the actual code paths
 
-- [ ] **Unit 3: Agent integration guide**
+- [x] **Unit 3: Hook pipeline and plugin reference**
 
   **Goal:** Ship `docs/agent-integration.md` — how patterns reach the agent through the hook
   lifecycle.
@@ -290,7 +290,7 @@ All four documents must meet this standard:
   - The one-tool-call delay is documented accurately per the institutional learning
   - Plugin setup matches the actual `integrations/claude-code/` structure
 
-- [ ] **Unit 4: Configuration reference**
+- [x] **Unit 4: Configuration reference**
 
   **Goal:** Ship `docs/configuration.md` — lookup-oriented reference for all configuration options.
 
@@ -328,7 +328,7 @@ All four documents must meet this standard:
   - Every `lore.toml` field from Config struct is documented
   - XDG resolution matches `resolve_xdg_base()` behavior
 
-- [ ] **Unit 5: README updates**
+- [x] **Unit 5: README updates**
 
   **Goal:** Add a Documentation section to the README linking to the four new docs.
 
