@@ -13,6 +13,17 @@
       query-friendly vocabulary, and anti-patterns. Based on dogfooding evidence, not speculation.
       Iterated through real memory→lore migration cycles
 
+- [ ] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
+      commit, enabling a fast edit-ingest-search feedback loop for pattern authoring. Removes the
+      current workaround of committing a WIP before testing discoverability. Update the vocabulary
+      coverage technique section in `docs/pattern-authoring-guide.md` when shipped
+- [ ] Pattern QA skill — a skill that automates the vocabulary coverage checklist from the pattern
+      authoring guide: ingest the pattern, search with candidate terms, report gaps. Best paired
+      with single-file ingest to eliminate the commit-ingest dance
+- [ ] Evaluate transcript tail truncation limit — currently 200 bytes, which often cuts
+      mid-sentence. Increasing to 400-500 bytes may improve search recall for longer user
+      instructions without adding excessive noise. Use `LORE_DEBUG` traces to measure what gets
+      truncated in practice
 - [ ] Cycle-based dedup TTL — re-inject a pattern after N tool call cycles since last injection, so
       long sessions don't bury early conventions deep in context
 - [ ] Deny-first-touch mode — block the first Edit/Write per domain with conventions as the deny
@@ -22,6 +33,12 @@
 - [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
       content at SessionStart, not just titles. Covers process-level conventions that don't surface
       through file-edit hooks
+- [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
+      JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
+      Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
+      inference side is non-trivial: each language has multiple tools (`bundle`/`gem`/`rake` → Ruby,
+      `javac`/`gradle`/`mvn` → Java, `dotnet` → C#, `swift build` → Swift, etc.). Consider
+      extracting both maps into a shared data structure to prevent drift between them
 - [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
       `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)

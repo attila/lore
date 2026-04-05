@@ -149,6 +149,15 @@ Always use Result<T, E> for fallible operations...
   queries return the right patterns first.
 - **FTS-only**: Set `hybrid = false` in `lore.toml` to skip Ollama at query time.
 
+## Documentation
+
+| Guide                                                                 | Description                                                  |
+| --------------------------------------------------------------------- | ------------------------------------------------------------ |
+| [Pattern Authoring Guide](docs/pattern-authoring-guide.md)            | How to write patterns that agents actually follow            |
+| [Search Mechanics Reference](docs/search-mechanics.md)                | Full search pipeline internals for debugging discoverability |
+| [Hook Pipeline and Plugin Reference](docs/hook-pipeline-reference.md) | Hook lifecycle, plugin setup, and injection tuning           |
+| [Configuration Reference](docs/configuration.md)                      | `lore.toml` options, environment variables, CLI flags        |
+
 ## Development
 
 ### Prerequisites
