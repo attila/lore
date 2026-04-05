@@ -1,7 +1,7 @@
 ---
 title: "fix: Dogfooding findings — search relevance, pattern strengthening, memory migration"
 type: fix
-status: deferred
+status: completed
 date: 2026-04-03
 ---
 
@@ -117,9 +117,9 @@ still failed to prevent the exact mistake it documents. Two possible root causes
 ## Implementation Units
 
 - [x] **Unit 2: Add search relevance regression tests for query reformulation**
-- [ ] **Unit 4: Strengthen `rust/tooling.md` with behavioral mandates**
-- [ ] **Unit 5: Strengthen `workflows/git-branch-pr.md` with merge ownership context**
-- [ ] **Unit 6: Re-evaluate memory→lore substitution after strengthening**
+- [x] **Unit 4: Strengthen `rust/tooling.md` with behavioral mandates**
+- [x] **Unit 5: Strengthen `workflows/git-branch-pr.md` with merge ownership context**
+- [x] **Unit 6: Re-evaluate memory→lore substitution after strengthening**
 
 ## Sources & References
 
