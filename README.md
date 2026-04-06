@@ -96,13 +96,14 @@ patterns before edits and a `/search-lore` skill for on-demand queries.
 
 ## Commands
 
-| Command                   | Purpose                                                   |
-| ------------------------- | --------------------------------------------------------- |
-| `lore init --repo <path>` | First-time setup: provision Ollama, create config, ingest |
-| `lore ingest`             | Re-index the knowledge base after editing markdown files  |
-| `lore serve`              | Start the MCP server (stdio transport for Claude Code)    |
-| `lore search <query>`     | Search from the command line                              |
-| `lore status`             | Check health of all components                            |
+| Command                     | Purpose                                                   |
+| --------------------------- | --------------------------------------------------------- |
+| `lore init --repo <path>`   | First-time setup: provision Ollama, create config, ingest |
+| `lore ingest`               | Re-index the knowledge base after editing markdown files  |
+| `lore ingest --file <path>` | Index a single file without requiring a git commit        |
+| `lore serve`                | Start the MCP server (stdio transport for Claude Code)    |
+| `lore search <query>`       | Search from the command line                              |
+| `lore status`               | Check health of all components                            |
 
 ## MCP Tools
 

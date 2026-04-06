@@ -6,12 +6,19 @@ module: ingest
 problem_type: best_practice
 component: tooling
 severity: low
+status: superseded
+superseded_by: "lore ingest --file <path> (2026-04-06)"
 applies_when:
   - "Testing whether a new or modified pattern surfaces in search results"
   - "Running the vocabulary coverage technique from the pattern authoring guide"
   - "Debugging why a recently edited pattern does not appear in lore search"
 tags: [ingest, delta, git, commit, pattern-testing, workflow]
 ---
+
+> **Superseded (2026-04-06):** `lore ingest --file <path>` now indexes an uncommitted file directly
+> without touching delta-ingest state. The original friction described below no longer applies —
+> prefer `lore ingest --file` for the pattern authoring feedback loop. This document is kept for
+> historical context about why the flag exists.
 
 # Delta ingest requires committed changes for pattern testing
 
