@@ -148,6 +148,13 @@ fn cmd_init(
         anyhow::bail!("{} is not a directory", knowledge_dir.display());
     }
 
+    if !git::is_git_repo(&knowledge_dir) {
+        eprintln!("Note: {} is not a git repository.", knowledge_dir.display());
+        eprintln!("  Lore will work, but delta ingest, the inbox branch workflow, and version");
+        eprintln!("  history will be unavailable. Run `git init` in this directory to enable");
+        eprintln!("  them. See docs/configuration.md#git-integration for details.\n");
+    }
+
     let db_path = match database_override {
         Some(p) => std::path::absolute(p)?,
         None => default_database_path()?,

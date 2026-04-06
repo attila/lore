@@ -35,7 +35,7 @@ fn embed_text(chunk: &Chunk) -> String {
 // ---------------------------------------------------------------------------
 
 /// Key used to store the last successfully ingested commit SHA.
-const META_LAST_COMMIT: &str = "last_ingested_commit";
+pub(crate) const META_LAST_COMMIT: &str = "last_ingested_commit";
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -873,6 +873,8 @@ mod tests {
 
         assert_eq!(result.file_path, "my-pattern.md");
         assert!(result.chunks_indexed >= 1);
+        // Non-git directory: file is written and indexed, but not committed.
+        assert!(matches!(result.commit_status, CommitStatus::NotCommitted));
 
         let content = fs::read_to_string(dir.join("my-pattern.md")).unwrap();
         assert!(content.contains("tags: [design, rust]"));
@@ -922,6 +924,8 @@ mod tests {
         .unwrap();
 
         assert!(result.chunks_indexed >= 1);
+        // Non-git directory: file is written and indexed, but not committed.
+        assert!(matches!(result.commit_status, CommitStatus::NotCommitted));
 
         let content = fs::read_to_string(dir.join("doc.md")).unwrap();
         // Title should be preserved from the original file.
@@ -959,6 +963,8 @@ mod tests {
         .unwrap();
 
         assert!(result.chunks_indexed >= 1);
+        // Non-git directory: file is written and indexed, but not committed.
+        assert!(matches!(result.commit_status, CommitStatus::NotCommitted));
 
         let content = fs::read_to_string(dir.join("doc.md")).unwrap();
         assert!(content.contains("# Doc Title"));
@@ -1073,6 +1079,99 @@ mod tests {
         assert!(
             log.contains("lore: add pattern"),
             "commit message should start with 'lore:', got: {log}"
+        );
+    }
+
+    // -- inbox branch workflow against non-git directories ---------------
+    //
+    // The inbox branch workflow (Some(prefix)) calls git unconditionally to
+    // create and push per-submission branches. When the knowledge base is not
+    // a git repository, every variant must surface a hard error rather than
+    // silently writing the file or no-oping. These tests pin the documented
+    // contract from `docs/configuration.md` ("Omit the `[git]` section
+    // entirely when the knowledge base is not a git repository").
+
+    #[test]
+    fn add_pattern_with_inbox_prefix_fails_on_non_git_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Inbox Pattern",
+            "Body content long enough for chunking.",
+            &[],
+            Some("inbox/"),
+        );
+
+        assert!(
+            result.is_err(),
+            "expected failure when inbox prefix is set on a non-git dir"
+        );
+    }
+
+    #[test]
+    fn update_pattern_with_inbox_prefix_fails_on_non_git_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Pre-create a file so the slug-validation path is reached before the
+        // git operation; otherwise the test would also pass for the wrong
+        // reason (file-not-found).
+        fs::write(
+            dir.join("doc.md"),
+            "# Doc\n\nOriginal body that is long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "Replacement body that is long enough.",
+            &[],
+            Some("inbox/"),
+        );
+
+        assert!(
+            result.is_err(),
+            "expected failure when inbox prefix is set on a non-git dir"
+        );
+    }
+
+    #[test]
+    fn append_to_pattern_with_inbox_prefix_fails_on_non_git_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("doc.md"),
+            "# Doc\n\nOriginal body that is long enough.\n",
+        )
+        .unwrap();
+
+        let result = append_to_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "New Section",
+            "Appended body that is long enough.",
+            Some("inbox/"),
+        );
+
+        assert!(
+            result.is_err(),
+            "expected failure when inbox prefix is set on a non-git dir"
         );
     }
 

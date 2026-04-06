@@ -28,7 +28,7 @@ expression: resp
         "name": "search_patterns"
       },
       {
-        "description": "Create a new pattern in the knowledge base. Use only when the user explicitly asks to save, record, or document a pattern. Creates a markdown file, indexes it, and commits to git.",
+        "description": "Create a new pattern in the knowledge base. Use only when the user explicitly asks to save, record, or document a pattern. Creates a markdown file and indexes it; the change is committed to git when the knowledge base is a git repository, otherwise the file is written without a commit.",
         "inputSchema": {
           "properties": {
             "body": {
@@ -56,7 +56,7 @@ expression: resp
         "name": "add_pattern"
       },
       {
-        "description": "Replace the content of an existing pattern. Use only when the user explicitly asks to update or rewrite a pattern. Overwrites the file, re-indexes, and commits.",
+        "description": "Replace the content of an existing pattern. Use only when the user explicitly asks to update or rewrite a pattern. Overwrites the file and re-indexes; the change is committed to git when the knowledge base is a git repository, otherwise the file is written without a commit.",
         "inputSchema": {
           "properties": {
             "body": {
@@ -84,7 +84,7 @@ expression: resp
         "name": "update_pattern"
       },
       {
-        "description": "Add a new section to an existing pattern without replacing it. Use when the user wants to add examples, edge cases, or notes to an existing pattern. Appends a heading and body, re-indexes, and commits.",
+        "description": "Add a new section to an existing pattern without replacing it. Use when the user wants to add examples, edge cases, or notes to an existing pattern. Appends a heading and body and re-indexes; the change is committed to git when the knowledge base is a git repository, otherwise the file is written without a commit.",
         "inputSchema": {
           "properties": {
             "body": {
@@ -108,6 +108,15 @@ expression: resp
           "type": "object"
         },
         "name": "append_to_pattern"
+      },
+      {
+        "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), and whether the inbox branch workflow is configured. Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "lore_status"
       }
     ]
   }

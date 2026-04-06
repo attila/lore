@@ -260,6 +260,81 @@ fn hook_session_start_returns_meta_instruction() {
 }
 
 #[test]
+fn hook_session_start_advertises_git_advisory_for_non_git_dir() {
+    // setup_test_env creates a plain tempdir without `git init`, so the
+    // SessionStart context should warn the agent that git-dependent features
+    // are unavailable.
+    let (_tmp, config_path) = setup_test_env();
+
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "test-non-git-advisory"
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
+
+    assert!(
+        ctx.contains("not a git repository"),
+        "non-git knowledge base should advertise the git advisory: {ctx}"
+    );
+    assert!(
+        ctx.contains("delta ingest is unavailable"),
+        "advisory should mention delta ingest: {ctx}"
+    );
+    assert!(
+        ctx.contains("lore_status"),
+        "advisory should point at the lore_status tool: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_omits_git_advisory_for_git_dir() {
+    // When the knowledge base is a git repository, the SessionStart context
+    // should not contain the git advisory.
+    let (tmp, config_path) = setup_test_env();
+    let dir = tmp.path();
+
+    std::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(dir)
+        .status()
+        .unwrap();
+
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "test-git-advisory-absent"
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
+
+    assert!(
+        !ctx.contains("not a git repository"),
+        "git-initialised knowledge base should not show the advisory: {ctx}"
+    );
+    // The original meta-instruction and pattern list must still be present.
+    assert!(ctx.contains("Available patterns:"));
+}
+
+#[test]
 fn hook_post_compact_returns_session_context() {
     let (_tmp, config_path) = setup_test_env();
 

@@ -61,7 +61,7 @@ cargo build --release
 ### Initialize and Use
 
 ```sh
-# Point lore at a directory of markdown files (must be a git repo)
+# Point lore at a directory of markdown files (git repository recommended)
 lore init --repo ~/my-patterns
 
 # Test a search
@@ -106,18 +106,19 @@ patterns before edits and a `/search-lore` skill for on-demand queries.
 
 ## MCP Tools
 
-The server exposes four tools:
+The server exposes five tools:
 
-| Tool                | Purpose                                                 |
-| ------------------- | ------------------------------------------------------- |
-| `search_patterns`   | Semantic + keyword search across all patterns           |
-| `add_pattern`       | Create a new pattern file, index it, commit to git      |
-| `update_pattern`    | Replace an existing pattern's content, re-index, commit |
-| `append_to_pattern` | Add a section to an existing pattern, re-index, commit  |
+| Tool                | Purpose                                                                         |
+| ------------------- | ------------------------------------------------------------------------------- |
+| `search_patterns`   | Semantic + keyword search across all patterns                                   |
+| `add_pattern`       | Create a new pattern file, index it, and commit if the base is a git repository |
+| `update_pattern`    | Replace an existing pattern's content, re-index, and commit if git is in use    |
+| `append_to_pattern` | Add a section to an existing pattern, re-index, and commit if git is in use     |
+| `lore_status`       | Report knowledge base health: git status, indexed counts, last commit           |
 
 ## Knowledge Base Format
 
-Your knowledge base is a directory of markdown files in a git repository. Any structure works:
+Your knowledge base is a directory of markdown files. Any structure works:
 
 ```
 my-patterns/
@@ -128,6 +129,14 @@ my-patterns/
 ├── api-design.md
 └── code-style.md
 ```
+
+Only files with a `.md` or `.markdown` extension are ingested. Other files (`.txt`, `.mdx`, `.rst`,
+etc.) are silently skipped — they will not appear in search results.
+
+Git is recommended but not required. Lore works against a plain directory, but delta ingest, the
+inbox branch workflow, and version history are all unavailable without a git repository. See
+[Configuration Reference → Git Integration](docs/configuration.md#git-integration) for the full
+picture.
 
 Files are chunked by heading — each `## Section` becomes a separate searchable unit. YAML
 frontmatter tags are extracted and searchable:

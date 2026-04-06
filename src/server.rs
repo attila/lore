@@ -13,6 +13,7 @@ use std::io::{self, BufRead, Write};
 use crate::config::Config;
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
+use crate::git;
 use crate::ingest;
 use crate::ingest::CommitStatus;
 
@@ -201,8 +202,9 @@ fn tool_definitions() -> Value {
             "name": "add_pattern",
             "description":
                 "Create a new pattern in the knowledge base. Use only when the user explicitly \
-                 asks to save, record, or document a pattern. Creates a markdown file, indexes it, \
-                 and commits to git.",
+                 asks to save, record, or document a pattern. Creates a markdown file and indexes \
+                 it; the change is committed to git when the knowledge base is a git repository, \
+                 otherwise the file is written without a commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -227,7 +229,9 @@ fn tool_definitions() -> Value {
             "name": "update_pattern",
             "description":
                 "Replace the content of an existing pattern. Use only when the user explicitly \
-                 asks to update or rewrite a pattern. Overwrites the file, re-indexes, and commits.",
+                 asks to update or rewrite a pattern. Overwrites the file and re-indexes; the \
+                 change is committed to git when the knowledge base is a git repository, \
+                 otherwise the file is written without a commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -255,7 +259,8 @@ fn tool_definitions() -> Value {
             "description":
                 "Add a new section to an existing pattern without replacing it. Use when the user \
                  wants to add examples, edge cases, or notes to an existing pattern. Appends a \
-                 heading and body, re-indexes, and commits.",
+                 heading and body and re-indexes; the change is committed to git when the \
+                 knowledge base is a git repository, otherwise the file is written without a commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -274,6 +279,20 @@ fn tool_definitions() -> Value {
                     }
                 },
                 "required": ["source_file", "heading", "body"]
+            }
+        },
+        {
+            "name": "lore_status",
+            "description":
+                "Report knowledge base health: whether it is a git repository, the indexed \
+                 chunk and source counts, the last ingested commit (if any), and whether the \
+                 inbox branch workflow is configured. Use this before write operations to \
+                 verify the knowledge base is in the expected state, especially when the \
+                 agent needs to know whether changes will be committed to git.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         }
     ])
@@ -300,6 +319,7 @@ fn handle_tool_call(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcRes
         "add_pattern" => handle_add(req, ctx, &arguments),
         "update_pattern" => handle_update(req, ctx, &arguments),
         "append_to_pattern" => handle_append(req, ctx, &arguments),
+        "lore_status" => handle_lore_status(req, ctx),
         _ => JsonRpcResponse {
             jsonrpc: "2.0",
             id: req.id.clone(),
@@ -506,12 +526,19 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
-            text_response(
+            let metadata = json!({
+                "file_path": result.file_path,
+                "chunks_indexed": result.chunks_indexed,
+                "embedding_failures": result.embedding_failures,
+                "commit_status": commit_status_metadata(&result.commit_status),
+            });
+            text_response_with_metadata(
                 req,
                 &format!(
                     "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
                     title, result.file_path, result.chunks_indexed, cn
                 ),
+                &metadata,
             )
         }
         Err(e) => error_response(req, &format!("Failed to add pattern: {e}")),
@@ -557,12 +584,19 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
-            text_response(
+            let metadata = json!({
+                "file_path": result.file_path,
+                "chunks_indexed": result.chunks_indexed,
+                "embedding_failures": result.embedding_failures,
+                "commit_status": commit_status_metadata(&result.commit_status),
+            });
+            text_response_with_metadata(
                 req,
                 &format!(
                     "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
                     result.file_path, result.chunks_indexed, cn
                 ),
+                &metadata,
             )
         }
         Err(e) => error_response(req, &format!("Failed to update pattern: {e}")),
@@ -604,16 +638,78 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
-            text_response(
+            let metadata = json!({
+                "file_path": result.file_path,
+                "chunks_indexed": result.chunks_indexed,
+                "embedding_failures": result.embedding_failures,
+                "commit_status": commit_status_metadata(&result.commit_status),
+            });
+            text_response_with_metadata(
                 req,
                 &format!(
                     "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
                     heading, result.file_path, result.chunks_indexed, cn
                 ),
+                &metadata,
             )
         }
         Err(e) => error_response(req, &format!("Failed to append: {e}")),
     }
+}
+
+/// Report knowledge base health: git repository status, indexed counts, and
+/// inbox workflow configuration. Designed for agents that need to know whether
+/// pending writes will be committed before they call `add_pattern`,
+/// `update_pattern`, or `append_to_pattern`.
+fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcResponse {
+    let is_git_repo = git::is_git_repo(&ctx.config.knowledge_dir);
+    let last_commit = ctx
+        .db
+        .get_metadata(crate::ingest::META_LAST_COMMIT)
+        .ok()
+        .flatten();
+    let stats = ctx.db.stats().ok();
+    let chunks = stats.as_ref().map(|s| s.chunks);
+    let sources = stats.as_ref().map(|s| s.sources);
+    let inbox_workflow_configured = ctx.config.inbox_branch_prefix().is_some();
+    let delta_ingest_available = is_git_repo && last_commit.is_some();
+
+    let metadata = json!({
+        "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
+        "git_repository": is_git_repo,
+        "last_ingested_commit": last_commit,
+        "chunks_indexed": chunks,
+        "sources_indexed": sources,
+        "inbox_workflow_configured": inbox_workflow_configured,
+        "delta_ingest_available": delta_ingest_available,
+    });
+
+    let summary = format!(
+        "Knowledge base: {} — {} {} across {} {}. Git repository: {}. \
+         Delta ingest: {}. Inbox workflow: {}.",
+        ctx.config.knowledge_dir.display(),
+        chunks.map_or_else(|| "?".into(), |c| c.to_string()),
+        if chunks == Some(1) { "chunk" } else { "chunks" },
+        sources.map_or_else(|| "?".into(), |s| s.to_string()),
+        if sources == Some(1) {
+            "source"
+        } else {
+            "sources"
+        },
+        if is_git_repo { "yes" } else { "no" },
+        if delta_ingest_available {
+            "available"
+        } else {
+            "unavailable (full ingest only)"
+        },
+        if inbox_workflow_configured {
+            "configured"
+        } else {
+            "not configured"
+        },
+    );
+
+    text_response_with_metadata(req, &summary, &metadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +745,40 @@ fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
             "content": [{ "type": "text", "text": text }]
         })),
         error: None,
+    }
+}
+
+/// Build a tool response that carries both human-readable text and a structured
+/// metadata object alongside the standard `content` block. Agents that consume
+/// the MCP response programmatically can read fields from `metadata` directly
+/// rather than parsing the human prose.
+fn text_response_with_metadata(
+    req: &JsonRpcRequest,
+    text: &str,
+    metadata: &Value,
+) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id: req.id.clone(),
+        result: Some(json!({
+            "content": [{ "type": "text", "text": text }],
+            "metadata": metadata,
+        })),
+        error: None,
+    }
+}
+
+/// Render a `CommitStatus` as a structured JSON value for MCP response metadata.
+///
+/// The match is intentionally exhaustive (no wildcard arm) so adding a new
+/// `CommitStatus` variant fails to compile until this function is updated.
+/// MCP consumers branch on `commit_status.kind`, so a new variant must
+/// produce a documented JSON shape rather than silently mapping to "unknown".
+fn commit_status_metadata(status: &CommitStatus) -> Value {
+    match status {
+        CommitStatus::NotCommitted => json!({ "kind": "not_committed" }),
+        CommitStatus::Committed => json!({ "kind": "committed" }),
+        CommitStatus::Pushed { branch } => json!({ "kind": "pushed", "branch": branch }),
     }
 }
 
@@ -752,12 +882,12 @@ mod tests {
     // -- tools/list --------------------------------------------------------
 
     #[test]
-    fn tools_list_returns_all_four_tools() {
+    fn tools_list_returns_all_five_tools() {
         let h = TestHarness::new();
         let resp = h.request_value(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
 
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(
@@ -766,7 +896,8 @@ mod tests {
                 "search_patterns",
                 "add_pattern",
                 "update_pattern",
-                "append_to_pattern"
+                "append_to_pattern",
+                "lore_status"
             ]
         );
 
@@ -836,6 +967,155 @@ mod tests {
         assert!(
             text.contains("saved to"),
             "response should confirm save, got: {text}"
+        );
+    }
+
+    // -- lore_status -------------------------------------------------------
+
+    #[test]
+    fn lore_status_reports_non_git_state() {
+        // TestHarness uses a plain tempdir for knowledge_dir, so the status
+        // tool should report git_repository = false and delta_ingest_available
+        // = false.
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":50,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["git_repository"], false);
+        assert_eq!(metadata["delta_ingest_available"], false);
+        assert_eq!(metadata["inbox_workflow_configured"], false);
+        // No patterns ingested in this harness — chunks/sources should be 0.
+        assert_eq!(metadata["chunks_indexed"], 0);
+        assert_eq!(metadata["sources_indexed"], 0);
+        assert!(metadata["last_ingested_commit"].is_null());
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Git repository: no"),
+            "summary should reflect non-git state, got: {text}"
+        );
+        assert!(
+            text.contains("unavailable"),
+            "summary should mention delta ingest unavailability, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_git_state() {
+        // Initialise the harness's knowledge_dir as a git repository so the
+        // status tool reports git_repository = true. Without an ingested
+        // commit, delta_ingest_available remains false.
+        let h = TestHarness::new();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&h.config.knowledge_dir)
+            .status()
+            .unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":51,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["git_repository"], true);
+        // No ingest has been recorded, so delta is still unavailable.
+        assert_eq!(metadata["delta_ingest_available"], false);
+        assert!(metadata["last_ingested_commit"].is_null());
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Git repository: yes"),
+            "summary should reflect git state, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_delta_ingest_available_when_git_and_commit_present() {
+        // The only path that flips `delta_ingest_available` to true is
+        // `is_git_repo && last_commit.is_some()`. The previous two lore_status
+        // tests cover the false branches; this test pins the true branch by
+        // initialising a git repo AND seeding the META_LAST_COMMIT metadata
+        // directly. Setting metadata directly avoids the cost of running a
+        // full ingest, which would also require seeding markdown files.
+        let h = TestHarness::new();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&h.config.knowledge_dir)
+            .status()
+            .unwrap();
+        h.db.set_metadata(crate::ingest::META_LAST_COMMIT, "abc1234deadbeef")
+            .unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":52,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["git_repository"], true);
+        assert_eq!(metadata["delta_ingest_available"], true);
+        assert_eq!(metadata["last_ingested_commit"], "abc1234deadbeef");
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Delta ingest: available"),
+            "summary should reflect delta-available state, got: {text}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_response_metadata_pins_commit_status_for_non_git_dir() {
+        // The TestHarness uses a plain tempdir for knowledge_dir (no `git init`),
+        // so add_pattern should write the file and report commit_status = "not_committed"
+        // in the structured metadata block. Agents reading the metadata field can
+        // detect the degraded state without parsing the human-readable content text.
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":40,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Metadata Pinned Pattern",
+                        "body":"Body text that is long enough for chunking."
+                    }
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+
+        let metadata = &resp["result"]["metadata"];
+        assert!(
+            !metadata.is_null(),
+            "response should carry a metadata object, got: {resp:?}"
+        );
+        assert_eq!(
+            metadata["commit_status"]["kind"], "not_committed",
+            "non-git directory should report not_committed, got: {metadata:?}"
+        );
+        assert!(
+            metadata["chunks_indexed"].as_u64().unwrap() >= 1,
+            "metadata should report chunks_indexed >= 1"
+        );
+        assert!(
+            metadata["file_path"].is_string(),
+            "metadata should expose file_path"
         );
     }
 
@@ -1126,7 +1406,7 @@ mod tests {
             h.request_value(r#"{"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}"#);
         assert!(resp["error"].is_null());
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
 
         // -- add_pattern ------------------------------------------------------
         let resp = h.request_value(

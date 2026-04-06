@@ -39,11 +39,16 @@ inbox_branch_prefix = "inbox/"
 
 #### Top-Level Fields
 
-| Field           | Type   | Required | Default            | Description                                                                                                           |
-| --------------- | ------ | -------- | ------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `knowledge_dir` | path   | Yes      | Set by `lore init` | Directory containing your markdown pattern files. Must be a git repository.                                           |
-| `database`      | path   | Yes      | Set by `lore init` | Path to the SQLite database file. This is a derived artefact — safe to delete and rebuild with `lore ingest --force`. |
-| `bind`          | string | Yes      | `"localhost:3100"` | Bind address for future TCP transport (not yet implemented; MCP currently uses stdio).                                |
+| Field           | Type   | Required | Default            | Description                                                                                                                 |
+| --------------- | ------ | -------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge_dir` | path   | Yes      | Set by `lore init` | Directory containing your markdown pattern files. A git repository is recommended; see [Git Integration](#git-integration). |
+| `database`      | path   | Yes      | Set by `lore init` | Path to the SQLite database file. This is a derived artefact — safe to delete and rebuild with `lore ingest --force`.       |
+| `bind`          | string | Yes      | `"localhost:3100"` | Bind address for future TCP transport (not yet implemented; MCP currently uses stdio).                                      |
+
+Only files under `knowledge_dir` with a `.md` or `.markdown` extension are ingested. Other files
+(`.txt`, `.mdx`, `.rst`, etc.) are silently skipped — they will not appear in search results. This
+filter applies to both full and delta (git-based) ingest; for delta ingest, renaming a file across
+the extension boundary (e.g. `.md` → `.txt`) is treated as a deletion.
 
 #### `[ollama]` Section
 
@@ -76,7 +81,53 @@ via MCP tools.
 | --------------------- | ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `inbox_branch_prefix` | string | —       | Branch name prefix for per-submission branches created by `add_pattern`, `update_pattern`, and `append_to_pattern`. Each submission creates a branch like `inbox/pattern-title`. |
 
-When the `[git]` section is absent, MCP write operations commit directly to the current branch.
+When the `[git]` section is absent, MCP write operations commit directly to the current branch — or
+skip the commit entirely if the knowledge base is not a git repository. See
+[Git Integration](#git-integration) below for the full picture.
+
+## Git Integration
+
+Lore works with or without git, but several features depend on the knowledge base being a git
+repository. A git repository is strongly recommended, and is the assumed default throughout this
+documentation.
+
+### What works without git
+
+- `lore init` — initialises the configuration and runs a full ingest against a plain directory
+- `lore ingest` — runs a full re-index on every invocation and prints
+  `Not a git repository — running full ingest`
+- `lore search` — unaffected; searches the local database
+- MCP write tools (`add_pattern`, `update_pattern`, `append_to_pattern`) — files are written to disk
+  and indexed in SQLite, but are not committed. The returned `WriteResult` reflects this.
+
+### What degrades or breaks without git
+
+- **Delta ingest is unavailable.** Every `lore ingest` re-reads and re-embeds every markdown file in
+  the knowledge base. On a large corpus this is slower and multiplies the number of Ollama embedding
+  calls. Delta ingest uses `git diff` against the last successfully ingested commit SHA — without
+  git, there is no baseline to diff against. `lore ingest --force` is the equivalent rebuild path
+  inside a git repository when the database needs to be regenerated from scratch.
+- **Inbox branch workflow breaks.** Setting `[git] inbox_branch_prefix` in `lore.toml` will cause
+  `add_pattern`, `update_pattern`, and `append_to_pattern` to fail, because these commands call
+  `git` unconditionally to create and push per-submission branches. Omit the `[git]` section
+  entirely when the knowledge base is not a git repository.
+- **No version history.** Without commits there is no `git log`, no `git blame`, no way to roll back
+  a bad edit, and no way to review a diff of what changed. Patterns exist only as the current file
+  contents on disk.
+
+### Recommended setup
+
+Initialise the knowledge base directory as a git repository before running `lore init`:
+
+```sh
+cd ~/my-patterns
+git init
+lore init --repo ~/my-patterns
+```
+
+This enables delta ingest from the first run and preserves a full history of every pattern change. A
+remote is not required — lore's ingest and search features work entirely against the local
+repository. Add a remote later if you want the inbox branch workflow or off-machine backup.
 
 ## Environment Variables
 
@@ -136,7 +187,7 @@ These flags apply to all commands:
 
 | Command       | Flag                | Description                                                                                                                             |
 | ------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `lore init`   | `--repo <path>`     | Path to the knowledge base directory (must be a git repository).                                                                        |
+| `lore init`   | `--repo <path>`     | Path to the knowledge base directory. A git repository is recommended; see [Git Integration](#git-integration).                         |
 | `lore init`   | `--model <name>`    | Embedding model name (default: `nomic-embed-text`).                                                                                     |
 | `lore init`   | `--bind <addr>`     | Bind address (default: `localhost:3100`).                                                                                               |
 | `lore init`   | `--database <path>` | Database file path (overrides the XDG default).                                                                                         |
