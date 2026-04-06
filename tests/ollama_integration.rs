@@ -458,6 +458,164 @@ fn ollama_mcp_subprocess_roundtrip() {
     // guard drops here — kills the child process
 }
 
+/// Single-file ingest happy path with real embeddings.
+///
+/// Validates that `ingest::ingest_single_file` works end-to-end with the
+/// production `OllamaClient` (not `FakeEmbedder`): the file is upserted into
+/// the index, the chunks carry real (non-null) embeddings, vector search
+/// finds the file, and the walk-based `META_LAST_COMMIT` metadata is left
+/// untouched. This is the only test in the suite that exercises single-file
+/// ingest against real embeddings — every other single-file test uses
+/// `FakeEmbedder`. Without this, a regression in the embedding path
+/// specific to the single-file flow (timeouts, dimension mismatches, model
+/// swaps) would not be caught until production.
+#[test]
+#[ignore = "requires running Ollama instance"]
+fn ingest_single_file_happy_path_with_real_embeddings() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Note: deliberately NOT a git repo, so we also prove single-file
+    // ingest does not consult git state and works in non-git knowledge
+    // directories.
+    fs::write(
+        dir.join("retry-policies.md"),
+        "# Retry Policies\n\n\
+         Use exponential backoff with jitter for transient remote failures.\n\
+         Cap the maximum delay to bound user-visible latency.\n\
+         Distinguish retryable errors from permanent ones at the call site.\n",
+    )
+    .unwrap();
+
+    let embedder = ollama_client();
+    let db = open_db(dir, embedder.dimensions());
+
+    let result = ingest::ingest_single_file(
+        &db,
+        &embedder,
+        dir,
+        &dir.join("retry-policies.md"),
+        "heading",
+        false,
+        &|_| {},
+    );
+
+    assert!(
+        result.errors.is_empty(),
+        "single-file ingest with real Ollama errored: {:?}",
+        result.errors
+    );
+    assert_eq!(result.files_processed, 1);
+    assert!(
+        result.chunks_created >= 1,
+        "expected >=1 chunk, got {}",
+        result.chunks_created
+    );
+    assert!(matches!(
+        result.mode,
+        ingest::IngestMode::SingleFile { ref path } if path == "retry-policies.md"
+    ));
+
+    // Vector search must find the file using a semantically related query
+    // that does not share FTS tokens with the body. This proves the chunks
+    // carry real embeddings, not null ones.
+    let query = "handling temporary network glitches when calling APIs";
+    let query_emb = embedder.embed(query).unwrap();
+    let results = db.search_vector(&query_emb, 5).unwrap();
+    assert!(
+        in_top_n(&results, "retry-policies.md", 3),
+        "vector search for '{query}' should find retry-policies.md in top 3, got: {:?}",
+        results.iter().map(|r| &r.source_file).collect::<Vec<_>>()
+    );
+
+    // Critical orthogonality invariant: walk-based delta state is untouched.
+    // Single-file ingest must never write META_LAST_COMMIT.
+    assert_eq!(
+        db.get_metadata("last_ingested_commit").unwrap(),
+        None,
+        "single-file ingest must not write last_ingested_commit"
+    );
+}
+
+/// Single-file ingest happy path through the CLI binary.
+///
+/// Exercises the full dispatch chain that `tests/single_file_ingest.rs` and
+/// `tests/smoke.rs` cannot reach: clap → `cmd_ingest` → `Config::load` →
+/// `KnowledgeDB::open` → `WriteLock` acquire → `dispatch_ingest` →
+/// `std::path::absolute` → `ingest_single_file` → real embed → `on_progress`
+/// → `print_ingest_summary` success branch → exit 0. The library-level
+/// Ollama test above proves the embedding path works; this test proves the
+/// binary plumbing wires it together correctly.
+#[test]
+#[ignore = "requires running Ollama instance"]
+fn ingest_file_happy_path_via_binary() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("draft.md"),
+        "# Draft Pattern\n\n\
+         Distinctive vocabulary for the cli binary single file ingest test.\n\
+         The marker word is xyzzysinglefile so we can search for it later.\n",
+    )
+    .unwrap();
+
+    // Write a config pointing the database at the same tempdir.
+    let db_path = dir.join("knowledge.db");
+    let config_path = dir.join("lore.toml");
+    let config = Config::default_with(dir.to_path_buf(), db_path.clone(), OLLAMA_MODEL);
+    config.save(&config_path).unwrap();
+
+    // Pre-create the DB so the CLI does not have to do first-time setup.
+    {
+        let embedder = ollama_client();
+        let db = open_db(dir, embedder.dimensions());
+        // Drop closes the DB; the CLI will reopen it.
+        drop(db);
+    }
+
+    let bin = assert_cmd::cargo::cargo_bin("lore");
+    let output = Command::new(&bin)
+        .args(["ingest", "--config"])
+        .arg(&config_path)
+        .arg("--file")
+        .arg(dir.join("draft.md"))
+        .output()
+        .expect("failed to spawn lore ingest --file");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "lore ingest --file should exit 0, got {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    // Stderr carries the success summary in the documented format.
+    assert!(
+        stderr.contains("Done (single-file): draft.md"),
+        "stderr missing Done summary, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("chunks"),
+        "stderr missing chunk count, got: {stderr}"
+    );
+
+    // Reopen the DB and confirm the file is searchable by its distinctive
+    // marker. This proves the binary actually persisted real chunks, not
+    // just printed a success message.
+    let embedder = ollama_client();
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    let hits = db.search_fts("xyzzysinglefile", 10).unwrap();
+    assert!(
+        hits.iter().any(|h| h.source_file == "draft.md"),
+        "draft.md should be searchable after single-file ingest via the binary, got: {:?}",
+        hits.iter().map(|h| &h.source_file).collect::<Vec<_>>()
+    );
+}
+
 /// Ollama unreachable: operations return errors, not panics. (R8)
 #[test]
 #[ignore = "requires running Ollama instance"]
