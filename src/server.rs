@@ -510,12 +510,19 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
-            text_response(
+            let metadata = json!({
+                "file_path": result.file_path,
+                "chunks_indexed": result.chunks_indexed,
+                "embedding_failures": result.embedding_failures,
+                "commit_status": commit_status_metadata(&result.commit_status),
+            });
+            text_response_with_metadata(
                 req,
                 &format!(
                     "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
                     title, result.file_path, result.chunks_indexed, cn
                 ),
+                &metadata,
             )
         }
         Err(e) => error_response(req, &format!("Failed to add pattern: {e}")),
@@ -561,12 +568,19 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
-            text_response(
+            let metadata = json!({
+                "file_path": result.file_path,
+                "chunks_indexed": result.chunks_indexed,
+                "embedding_failures": result.embedding_failures,
+                "commit_status": commit_status_metadata(&result.commit_status),
+            });
+            text_response_with_metadata(
                 req,
                 &format!(
                     "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
                     result.file_path, result.chunks_indexed, cn
                 ),
+                &metadata,
             )
         }
         Err(e) => error_response(req, &format!("Failed to update pattern: {e}")),
@@ -608,12 +622,19 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
-            text_response(
+            let metadata = json!({
+                "file_path": result.file_path,
+                "chunks_indexed": result.chunks_indexed,
+                "embedding_failures": result.embedding_failures,
+                "commit_status": commit_status_metadata(&result.commit_status),
+            });
+            text_response_with_metadata(
                 req,
                 &format!(
                     "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
                     heading, result.file_path, result.chunks_indexed, cn
                 ),
+                &metadata,
             )
         }
         Err(e) => error_response(req, &format!("Failed to append: {e}")),
@@ -653,6 +674,35 @@ fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
             "content": [{ "type": "text", "text": text }]
         })),
         error: None,
+    }
+}
+
+/// Build a tool response that carries both human-readable text and a structured
+/// metadata object alongside the standard `content` block. Agents that consume
+/// the MCP response programmatically can read fields from `metadata` directly
+/// rather than parsing the human prose.
+fn text_response_with_metadata(
+    req: &JsonRpcRequest,
+    text: &str,
+    metadata: &Value,
+) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id: req.id.clone(),
+        result: Some(json!({
+            "content": [{ "type": "text", "text": text }],
+            "metadata": metadata,
+        })),
+        error: None,
+    }
+}
+
+/// Render a `CommitStatus` as a structured JSON value for MCP response metadata.
+fn commit_status_metadata(status: &CommitStatus) -> Value {
+    match status {
+        CommitStatus::NotCommitted => json!({ "kind": "not_committed" }),
+        CommitStatus::Committed => json!({ "kind": "committed" }),
+        CommitStatus::Pushed { branch } => json!({ "kind": "pushed", "branch": branch }),
     }
 }
 
@@ -840,6 +890,47 @@ mod tests {
         assert!(
             text.contains("saved to"),
             "response should confirm save, got: {text}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_response_metadata_pins_commit_status_for_non_git_dir() {
+        // The TestHarness uses a plain tempdir for knowledge_dir (no `git init`),
+        // so add_pattern should write the file and report commit_status = "not_committed"
+        // in the structured metadata block. Agents reading the metadata field can
+        // detect the degraded state without parsing the human-readable content text.
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":40,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Metadata Pinned Pattern",
+                        "body":"Body text that is long enough for chunking."
+                    }
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+
+        let metadata = &resp["result"]["metadata"];
+        assert!(
+            !metadata.is_null(),
+            "response should carry a metadata object, got: {resp:?}"
+        );
+        assert_eq!(
+            metadata["commit_status"]["kind"], "not_committed",
+            "non-git directory should report not_committed, got: {metadata:?}"
+        );
+        assert!(
+            metadata["chunks_indexed"].as_u64().unwrap() >= 1,
+            "metadata should report chunks_indexed >= 1"
+        );
+        assert!(
+            metadata["file_path"].is_string(),
+            "metadata should expose file_path"
         );
     }
 
