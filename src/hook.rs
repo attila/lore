@@ -105,10 +105,10 @@ pub fn handle_hook(
     );
 
     let result = match input.hook_event_name.as_str() {
-        "SessionStart" => handle_session_start(input, db),
+        "SessionStart" => handle_session_start(input, db, config),
         "PreToolUse" => handle_pre_tool_use(input, db, embedder, config),
         "PostToolUse" => handle_post_tool_use(input, db, embedder, config),
-        "PostCompact" => handle_post_compact(input, db),
+        "PostCompact" => handle_post_compact(input, db, config),
         _ => {
             lore_debug!("unknown event, producing no output");
             Ok(None)
@@ -129,7 +129,11 @@ pub fn handle_hook(
 // ---------------------------------------------------------------------------
 
 /// Handle `SessionStart`: create dedup file, return meta-instruction + pattern index.
-fn handle_session_start(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Option<HookOutput>> {
+fn handle_session_start(
+    input: &HookInput,
+    db: &KnowledgeDB,
+    config: &Config,
+) -> anyhow::Result<Option<HookOutput>> {
     let dedup_path = session_dedup_path(input);
     if let Some(ref path) = dedup_path
         && let Err(e) = reset_dedup(path)
@@ -138,7 +142,7 @@ fn handle_session_start(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<O
         lore_debug!("SessionStart dedup reset error: {e}");
     }
 
-    let context = format_session_context(db)?;
+    let context = format_session_context(db, &config.knowledge_dir)?;
     Ok(Some(HookOutput::SystemMessage {
         system_message: context,
     }))
@@ -248,7 +252,11 @@ fn handle_pre_tool_use(
 }
 
 /// Handle `PostCompact`: truncate dedup, re-emit `SessionStart` content.
-fn handle_post_compact(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Option<HookOutput>> {
+fn handle_post_compact(
+    input: &HookInput,
+    db: &KnowledgeDB,
+    config: &Config,
+) -> anyhow::Result<Option<HookOutput>> {
     let dedup_path = session_dedup_path(input);
     if let Some(ref path) = dedup_path
         && let Err(e) = reset_dedup(path)
@@ -257,7 +265,7 @@ fn handle_post_compact(input: &HookInput, db: &KnowledgeDB) -> anyhow::Result<Op
         lore_debug!("PostCompact dedup reset error: {e}");
     }
 
-    let context = format_session_context(db)?;
+    let context = format_session_context(db, &config.knowledge_dir)?;
     Ok(Some(HookOutput::SystemMessage {
         system_message: context,
     }))
@@ -409,7 +417,7 @@ pub fn search_with_threshold(
 
 /// Format the meta-instruction + compact pattern index returned at session
 /// start and after compaction.
-fn format_session_context(db: &KnowledgeDB) -> anyhow::Result<String> {
+fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Result<String> {
     let patterns = db.list_patterns()?;
 
     let mut out = String::from(
@@ -418,9 +426,21 @@ fn format_session_context(db: &KnowledgeDB) -> anyhow::Result<String> {
          additionalContext before your edits. Apply them as default \
          conventions — they take precedence over your training defaults but \
          yield to explicit project-level instructions (CLAUDE.md, AGENTS.md) \
-         when they conflict.\n\n\
-         Available patterns:\n",
+         when they conflict.\n",
     );
+
+    if !crate::git::is_git_repo(knowledge_dir) {
+        out.push_str(
+            "\nNote: this knowledge base is not a git repository. Pattern \
+             writes via add_pattern, update_pattern, and append_to_pattern \
+             will not be committed, delta ingest is unavailable, and there \
+             is no version history. Run `git init` in the knowledge base \
+             directory to enable these features. Use the lore_status tool \
+             to inspect this state at any time.\n",
+        );
+    }
+
+    out.push_str("\nAvailable patterns:\n");
 
     for p in &patterns {
         if p.tags.is_empty() {
