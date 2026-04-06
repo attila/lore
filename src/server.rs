@@ -201,8 +201,9 @@ fn tool_definitions() -> Value {
             "name": "add_pattern",
             "description":
                 "Create a new pattern in the knowledge base. Use only when the user explicitly \
-                 asks to save, record, or document a pattern. Creates a markdown file, indexes it, \
-                 and commits to git.",
+                 asks to save, record, or document a pattern. Creates a markdown file and indexes \
+                 it; the change is committed to git when the knowledge base is a git repository, \
+                 otherwise the file is written without a commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -227,7 +228,9 @@ fn tool_definitions() -> Value {
             "name": "update_pattern",
             "description":
                 "Replace the content of an existing pattern. Use only when the user explicitly \
-                 asks to update or rewrite a pattern. Overwrites the file, re-indexes, and commits.",
+                 asks to update or rewrite a pattern. Overwrites the file and re-indexes; the \
+                 change is committed to git when the knowledge base is a git repository, \
+                 otherwise the file is written without a commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -255,7 +258,8 @@ fn tool_definitions() -> Value {
             "description":
                 "Add a new section to an existing pattern without replacing it. Use when the user \
                  wants to add examples, edge cases, or notes to an existing pattern. Appends a \
-                 heading and body, re-indexes, and commits.",
+                 heading and body and re-indexes; the change is committed to git when the \
+                 knowledge base is a git repository, otherwise the file is written without a commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

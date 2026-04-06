@@ -125,6 +125,86 @@ fn init_help_shows_database_flag() {
 }
 
 #[test]
+fn init_against_plain_directory_emits_git_advisory() {
+    // The advisory is printed by `cmd_init` before Ollama provisioning, so we
+    // can capture it from stderr regardless of whether the rest of `lore init`
+    // succeeds (it will fail if Ollama is not running locally — that is fine).
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+
+    let config_path = tmp.path().join("lore.toml");
+    let db_path = tmp.path().join("knowledge.db");
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "init",
+            "--repo",
+            knowledge_dir.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "--database",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("is not a git repository"),
+        "expected git advisory on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("delta ingest"),
+        "expected advisory to mention delta ingest, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("docs/configuration.md#git-integration"),
+        "expected advisory to point at the documentation reference, got: {stderr}"
+    );
+}
+
+#[test]
+fn init_against_git_repo_does_not_emit_git_advisory() {
+    // When the target is a git repository, the advisory must not appear.
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+
+    // Initialise an empty git repository in the knowledge dir.
+    std::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(&knowledge_dir)
+        .status()
+        .unwrap();
+
+    let config_path = tmp.path().join("lore.toml");
+    let db_path = tmp.path().join("knowledge.db");
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "init",
+            "--repo",
+            knowledge_dir.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "--database",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("is not a git repository"),
+        "git advisory should not appear for a git repository, got: {stderr}"
+    );
+}
+
+#[test]
 fn status_without_config_shows_init_hint() {
     let tmp = tempfile::tempdir().unwrap();
     Command::cargo_bin("lore")

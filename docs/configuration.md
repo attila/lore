@@ -105,7 +105,8 @@ documentation.
 - **Delta ingest is unavailable.** Every `lore ingest` re-reads and re-embeds every markdown file in
   the knowledge base. On a large corpus this is slower and multiplies the number of Ollama embedding
   calls. Delta ingest uses `git diff` against the last successfully ingested commit SHA — without
-  git, there is no baseline to diff against.
+  git, there is no baseline to diff against. `lore ingest --force` is the equivalent rebuild path
+  inside a git repository when the database needs to be regenerated from scratch.
 - **Inbox branch workflow breaks.** Setting `[git] inbox_branch_prefix` in `lore.toml` will cause
   `add_pattern`, `update_pattern`, and `append_to_pattern` to fail, because these commands call
   `git` unconditionally to create and push per-submission branches. Omit the `[git]` section
