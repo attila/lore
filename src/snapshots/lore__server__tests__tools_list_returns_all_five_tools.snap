@@ -110,7 +110,7 @@ expression: resp
         "name": "append_to_pattern"
       },
       {
-        "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), and whether the inbox branch workflow is configured. Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git.",
+        "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), whether the inbox branch workflow is configured, and whether a .loreignore file is active (filtering files out of the index). Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git or whether files in a particular path are excluded from search.",
         "inputSchema": {
           "properties": {},
           "required": [],

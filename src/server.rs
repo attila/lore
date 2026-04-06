@@ -286,10 +286,12 @@ fn tool_definitions() -> Value {
             "name": "lore_status",
             "description":
                 "Report knowledge base health: whether it is a git repository, the indexed \
-                 chunk and source counts, the last ingested commit (if any), and whether the \
-                 inbox branch workflow is configured. Use this before write operations to \
-                 verify the knowledge base is in the expected state, especially when the \
-                 agent needs to know whether changes will be committed to git.",
+                 chunk and source counts, the last ingested commit (if any), whether the \
+                 inbox branch workflow is configured, and whether a .loreignore file is \
+                 active (filtering files out of the index). Use this before write operations \
+                 to verify the knowledge base is in the expected state, especially when the \
+                 agent needs to know whether changes will be committed to git or whether \
+                 files in a particular path are excluded from search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -701,6 +703,12 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
     let sources = stats.as_ref().map(|s| s.sources);
     let inbox_workflow_configured = ctx.config.inbox_branch_prefix().is_some();
     let delta_ingest_available = is_git_repo && last_commit.is_some();
+    // Reflect whether a .loreignore file is currently active so agents
+    // inspecting knowledge base health know that what they see in search is
+    // a filtered view of the underlying directory.
+    let loreignore_active = crate::loreignore::load(&ctx.config.knowledge_dir)
+        .matcher
+        .is_some();
 
     let metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
@@ -710,11 +718,12 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
         "sources_indexed": sources,
         "inbox_workflow_configured": inbox_workflow_configured,
         "delta_ingest_available": delta_ingest_available,
+        "loreignore_active": loreignore_active,
     });
 
     let summary = format!(
         "Knowledge base: {} — {} {} across {} {}. Git repository: {}. \
-         Delta ingest: {}. Inbox workflow: {}.",
+         Delta ingest: {}. Inbox workflow: {}. .loreignore: {}.",
         ctx.config.knowledge_dir.display(),
         chunks.map_or_else(|| "?".into(), |c| c.to_string()),
         if chunks == Some(1) { "chunk" } else { "chunks" },
@@ -734,6 +743,11 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
             "configured"
         } else {
             "not configured"
+        },
+        if loreignore_active {
+            "active"
+        } else {
+            "absent"
         },
     );
 
@@ -1022,6 +1036,8 @@ mod tests {
         assert_eq!(metadata["chunks_indexed"], 0);
         assert_eq!(metadata["sources_indexed"], 0);
         assert!(metadata["last_ingested_commit"].is_null());
+        // No .loreignore in the bare harness directory.
+        assert_eq!(metadata["loreignore_active"], false);
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1032,6 +1048,56 @@ mod tests {
             text.contains("unavailable"),
             "summary should mention delta ingest unavailability, got: {text}"
         );
+        assert!(
+            text.contains(".loreignore: absent"),
+            "summary should mention .loreignore absence, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_loreignore_active_when_present() {
+        // Drop a .loreignore into the harness's knowledge_dir and verify the
+        // status tool reflects it.
+        let h = TestHarness::new();
+        std::fs::write(h.config.knowledge_dir.join(".loreignore"), "README.md\n").unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":52,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["result"]["metadata"]["loreignore_active"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(".loreignore: active"),
+            "summary should mention .loreignore activation, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_loreignore_inactive_when_only_comments() {
+        // A comment-only .loreignore produces zero effective patterns and is
+        // not considered active. Pin this so the field reflects "would this
+        // file actually filter anything" rather than "does the file exist".
+        let h = TestHarness::new();
+        std::fs::write(
+            h.config.knowledge_dir.join(".loreignore"),
+            "# nothing excluded\n",
+        )
+        .unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":53,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["result"]["metadata"]["loreignore_active"], false);
     }
 
     #[test]
