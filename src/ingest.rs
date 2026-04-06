@@ -46,7 +46,7 @@ const META_LOREIGNORE_HASH: &str = "loreignore_hash";
 // Result types
 // ---------------------------------------------------------------------------
 
-/// Whether the ingest ran in full or delta mode.
+/// Whether the ingest ran in full, delta, or single-file mode.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IngestMode {
     /// Full re-index (cleared database and re-embedded everything).
@@ -55,6 +55,12 @@ pub enum IngestMode {
     Delta {
         /// Number of files that were unchanged and skipped.
         unchanged: usize,
+    },
+    /// Single-file upsert — exactly one file was re-indexed without walking
+    /// the repository or consulting git state.
+    SingleFile {
+        /// Knowledge-dir-relative path of the file that was indexed.
+        path: String,
     },
 }
 
@@ -673,6 +679,156 @@ pub fn full_ingest(
         on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
 
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Single-file ingest
+// ---------------------------------------------------------------------------
+
+/// Upsert a single markdown file into the index without walking the
+/// repository or consulting git state.
+///
+/// This is the fast edit-ingest-search feedback loop for pattern authoring:
+/// edit a file, run `lore ingest --file path/to/it.md`, and it is immediately
+/// searchable — no commit required. Intended as an alternative to the
+/// walk-based entry points [`ingest`] and [`full_ingest`], not a replacement.
+///
+/// The function:
+/// - canonicalises `file_path` and verifies it lies inside `knowledge_dir`;
+/// - rejects non-markdown extensions (`.md`, `.markdown`);
+/// - consults `.loreignore` and refuses to index excluded files unless
+///   `force_override_ignore` is `true`;
+/// - delegates the actual read → chunk → embed → insert sequence to the
+///   same internal helper used by walk-based ingest, so chunking and
+///   embedding behaviour match exactly;
+/// - does **not** touch the stored `last_ingested_commit` or `.loreignore`
+///   hash — this path is orthogonal to walk-based delta state and must not
+///   interfere with the next `lore ingest` picking up real git changes.
+///
+/// All error conditions are reported via `IngestResult::errors`; the function
+/// never panics and never returns early without populating the result.
+pub fn ingest_single_file(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    file_path: &Path,
+    strategy: &str,
+    force_override_ignore: bool,
+    on_progress: &dyn Fn(&str),
+) -> IngestResult {
+    // Seed the mode with the caller-supplied path so that early-return error
+    // branches (before rel_path is computed) still carry a meaningful path
+    // for downstream consumers that pattern-match on IngestMode::SingleFile.
+    let mut result = IngestResult {
+        mode: IngestMode::SingleFile {
+            path: file_path.to_string_lossy().into_owned(),
+        },
+        files_processed: 0,
+        chunks_created: 0,
+        reconciled_removed: 0,
+        reconciled_added: 0,
+        errors: Vec::new(),
+    };
+
+    // Canonicalise the file path. This also implicitly checks that it exists
+    // and is accessible. Include the current working directory in the error
+    // so agents hitting a relative-path mismatch can self-diagnose.
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            let cwd_hint = std::env::current_dir()
+                .map(|c| format!(" (cwd: {})", c.display()))
+                .unwrap_or_default();
+            result.errors.push(format!(
+                "Cannot access {}{cwd_hint}: {e}",
+                file_path.display()
+            ));
+            return result;
+        }
+    };
+
+    if !canonical.is_file() {
+        result
+            .errors
+            .push(format!("Not a regular file: {}", canonical.display()));
+        return result;
+    }
+
+    match canonical.extension().and_then(|s| s.to_str()) {
+        Some("md" | "markdown") => {}
+        other => {
+            let ext = other.unwrap_or("(none)");
+            result.errors.push(format!(
+                "Unsupported extension '{ext}' for {}: only .md and .markdown are indexed",
+                canonical.display()
+            ));
+            return result;
+        }
+    }
+
+    // Ensure the file lies inside the knowledge directory. Uses the same
+    // guard as add_pattern / update_pattern so path-traversal protection is
+    // uniform across write paths.
+    if let Err(e) = validate_within_dir(knowledge_dir, &canonical) {
+        result.errors.push(e.to_string());
+        return result;
+    }
+
+    // Derive the relative path the same way index_single_file does, against
+    // the canonicalised knowledge directory so strip_prefix succeeds.
+    let canonical_dir = match knowledge_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            result.errors.push(format!(
+                "Cannot access knowledge directory {}: {e}",
+                knowledge_dir.display()
+            ));
+            return result;
+        }
+    };
+    let rel_path = canonical
+        .strip_prefix(&canonical_dir)
+        .unwrap_or(&canonical)
+        .to_string_lossy()
+        .to_string();
+
+    // Respect .loreignore by default. The override flag exists for the
+    // author-iterating-on-a-draft case.
+    if !force_override_ignore {
+        let loaded = loreignore::load(&canonical_dir);
+        if let Some(matcher) = loaded.matcher.as_ref()
+            && loreignore::is_ignored(matcher, Path::new(&rel_path), false)
+        {
+            result.errors.push(format!(
+                "{rel_path} is excluded by .loreignore; pass --force to index anyway"
+            ));
+            return result;
+        }
+    }
+
+    lore_debug!("ingest_single_file: {rel_path} (override={force_override_ignore})");
+    on_progress(&format!("Single-file ingest: {rel_path}"));
+
+    match index_single_file(db, embedder, &canonical_dir, &canonical, strategy) {
+        Ok((chunks, embedding_failures)) => {
+            result.files_processed = 1;
+            result.chunks_created = chunks;
+            if embedding_failures > 0 {
+                result.errors.push(format!(
+                    "{embedding_failures} embedding failure(s) while indexing {rel_path}"
+                ));
+            }
+            on_progress(&format!("  {rel_path} → {chunks} chunks"));
+        }
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to index {rel_path}: {e}"));
+        }
+    }
+
+    result.mode = IngestMode::SingleFile { path: rel_path };
     result
 }
 
@@ -1349,6 +1505,275 @@ mod tests {
             "heading ({heading_count}) should produce more chunks than document ({doc_count})"
         );
         assert_eq!(doc_count, 1);
+    }
+
+    // -- ingest_single_file ------------------------------------------------
+
+    fn write_body(dir: &Path, name: &str, body: &str) {
+        let content = format!("# {name}\n\n{body} that is long enough for chunking.\n");
+        fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn ingest_single_file_indexes_uncommitted_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_body(dir, "draft.md", "Draft body text");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("draft.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.files_processed, 1);
+        assert!(result.chunks_created >= 1);
+        assert!(matches!(
+            result.mode,
+            IngestMode::SingleFile { ref path } if path == "draft.md"
+        ));
+        assert_eq!(db.source_files().unwrap(), vec!["draft.md".to_string()]);
+    }
+
+    #[test]
+    fn ingest_single_file_accepts_markdown_extension() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("alt.markdown"),
+            "# Alt\n\nBody text that is long enough for chunking.\n",
+        )
+        .unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("alt.markdown"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.files_processed, 1);
+    }
+
+    #[test]
+    fn ingest_single_file_replaces_existing_chunks() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_body(dir, "note.md", "Original body text");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("note.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+        let first_count = db.stats().unwrap().chunks;
+
+        // Rewrite file and re-ingest — chunk count should not double.
+        write_body(dir, "note.md", "Replacement body text");
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("note.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(result.errors.is_empty());
+        let second_count = db.stats().unwrap().chunks;
+        assert_eq!(
+            first_count, second_count,
+            "re-ingest must replace, not append"
+        );
+        assert_eq!(db.source_files().unwrap(), vec!["note.md".to_string()]);
+    }
+
+    #[test]
+    fn ingest_single_file_rejects_non_markdown_extension() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("notes.txt"), "not markdown").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("notes.txt"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(!result.errors.is_empty());
+        assert!(
+            result.errors[0].contains("Unsupported extension"),
+            "unexpected error: {}",
+            result.errors[0]
+        );
+        assert_eq!(result.files_processed, 0);
+        assert!(db.source_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_single_file_rejects_missing_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("nope.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].contains("Cannot access"));
+    }
+
+    #[test]
+    fn ingest_single_file_rejects_path_outside_knowledge_dir() {
+        let knowledge = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(
+            outside.path().join("escape.md"),
+            "# Escape\n\nBody that is long enough for chunking.\n",
+        )
+        .unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            knowledge.path(),
+            &outside.path().join("escape.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(!result.errors.is_empty());
+        assert!(
+            result.errors[0].contains("escapes the knowledge directory"),
+            "unexpected error: {}",
+            result.errors[0]
+        );
+        assert!(db.source_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_single_file_respects_loreignore() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_body(dir, "draft.md", "Draft body text");
+        fs::write(dir.join(".loreignore"), "draft.md\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("draft.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(!result.errors.is_empty());
+        assert!(
+            result.errors[0].contains(".loreignore"),
+            "unexpected error: {}",
+            result.errors[0]
+        );
+        assert!(db.source_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_single_file_force_overrides_loreignore() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_body(dir, "draft.md", "Draft body text");
+        fs::write(dir.join(".loreignore"), "draft.md\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("draft.md"),
+            "heading",
+            true,
+            &|_| {},
+        );
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.files_processed, 1);
+        assert_eq!(db.source_files().unwrap(), vec!["draft.md".to_string()]);
+    }
+
+    #[test]
+    fn ingest_single_file_does_not_touch_last_ingested_commit() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_body(dir, "note.md", "Body text");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Seed a fake commit SHA as if a previous walk-based ingest had run.
+        db.set_metadata(META_LAST_COMMIT, "deadbeef").unwrap();
+        db.set_metadata(META_LOREIGNORE_HASH, "cafef00d").unwrap();
+
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("note.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        assert_eq!(
+            db.get_metadata(META_LAST_COMMIT).unwrap(),
+            Some("deadbeef".to_string()),
+            "single-file ingest must not touch last_ingested_commit"
+        );
+        assert_eq!(
+            db.get_metadata(META_LOREIGNORE_HASH).unwrap(),
+            Some("cafef00d".to_string()),
+            "single-file ingest must not touch loreignore_hash"
+        );
     }
 
     // -- try_commit (git integration) --------------------------------------
