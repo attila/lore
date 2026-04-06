@@ -1082,6 +1082,99 @@ mod tests {
         );
     }
 
+    // -- inbox branch workflow against non-git directories ---------------
+    //
+    // The inbox branch workflow (Some(prefix)) calls git unconditionally to
+    // create and push per-submission branches. When the knowledge base is not
+    // a git repository, every variant must surface a hard error rather than
+    // silently writing the file or no-oping. These tests pin the documented
+    // contract from `docs/configuration.md` ("Omit the `[git]` section
+    // entirely when the knowledge base is not a git repository").
+
+    #[test]
+    fn add_pattern_with_inbox_prefix_fails_on_non_git_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Inbox Pattern",
+            "Body content long enough for chunking.",
+            &[],
+            Some("inbox/"),
+        );
+
+        assert!(
+            result.is_err(),
+            "expected failure when inbox prefix is set on a non-git dir"
+        );
+    }
+
+    #[test]
+    fn update_pattern_with_inbox_prefix_fails_on_non_git_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Pre-create a file so the slug-validation path is reached before the
+        // git operation; otherwise the test would also pass for the wrong
+        // reason (file-not-found).
+        fs::write(
+            dir.join("doc.md"),
+            "# Doc\n\nOriginal body that is long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "Replacement body that is long enough.",
+            &[],
+            Some("inbox/"),
+        );
+
+        assert!(
+            result.is_err(),
+            "expected failure when inbox prefix is set on a non-git dir"
+        );
+    }
+
+    #[test]
+    fn append_to_pattern_with_inbox_prefix_fails_on_non_git_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("doc.md"),
+            "# Doc\n\nOriginal body that is long enough.\n",
+        )
+        .unwrap();
+
+        let result = append_to_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "New Section",
+            "Appended body that is long enough.",
+            Some("inbox/"),
+        );
+
+        assert!(
+            result.is_err(),
+            "expected failure when inbox prefix is set on a non-git dir"
+        );
+    }
+
     // -- empty slug -------------------------------------------------------
 
     #[test]
