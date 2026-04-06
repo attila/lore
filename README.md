@@ -61,7 +61,7 @@ cargo build --release
 ### Initialize and Use
 
 ```sh
-# Point lore at a directory of markdown files (must be a git repo)
+# Point lore at a directory of markdown files (git repository recommended)
 lore init --repo ~/my-patterns
 
 # Test a search
@@ -117,7 +117,7 @@ The server exposes four tools:
 
 ## Knowledge Base Format
 
-Your knowledge base is a directory of markdown files in a git repository. Any structure works:
+Your knowledge base is a directory of markdown files. Any structure works:
 
 ```
 my-patterns/
@@ -128,6 +128,14 @@ my-patterns/
 ├── api-design.md
 └── code-style.md
 ```
+
+Only files with a `.md` or `.markdown` extension are ingested. Other files (`.txt`, `.mdx`, `.rst`,
+etc.) are silently skipped — they will not appear in search results.
+
+Git is recommended but not required. Lore works against a plain directory, but delta ingest, the
+inbox branch workflow, and version history are all unavailable without a git repository. See
+[Configuration Reference → Git Integration](docs/configuration.md#git-integration) for the full
+picture.
 
 Files are chunked by heading — each `## Section` becomes a separate searchable unit. YAML
 frontmatter tags are extracted and searchable:

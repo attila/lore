@@ -873,6 +873,8 @@ mod tests {
 
         assert_eq!(result.file_path, "my-pattern.md");
         assert!(result.chunks_indexed >= 1);
+        // Non-git directory: file is written and indexed, but not committed.
+        assert!(matches!(result.commit_status, CommitStatus::NotCommitted));
 
         let content = fs::read_to_string(dir.join("my-pattern.md")).unwrap();
         assert!(content.contains("tags: [design, rust]"));
@@ -922,6 +924,8 @@ mod tests {
         .unwrap();
 
         assert!(result.chunks_indexed >= 1);
+        // Non-git directory: file is written and indexed, but not committed.
+        assert!(matches!(result.commit_status, CommitStatus::NotCommitted));
 
         let content = fs::read_to_string(dir.join("doc.md")).unwrap();
         // Title should be preserved from the original file.
@@ -959,6 +963,8 @@ mod tests {
         .unwrap();
 
         assert!(result.chunks_indexed >= 1);
+        // Non-git directory: file is written and indexed, but not committed.
+        assert!(matches!(result.commit_status, CommitStatus::NotCommitted));
 
         let content = fs::read_to_string(dir.join("doc.md")).unwrap();
         assert!(content.contains("# Doc Title"));
