@@ -1,8 +1,10 @@
 ---
 title: "feat: Single-file ingest (`lore ingest --file`)"
 type: feat
-status: active
+status: completed
 date: 2026-04-06
+completed: 2026-04-06
+pr: attila/lore#31
 ---
 
 # feat: Single-file ingest (`lore ingest --file`)
@@ -158,7 +160,7 @@ None needed. Local patterns are established and recent.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `IngestMode::SingleFile` and `ingest_single_file` entry point**
+- [x] **Unit 1: Add `IngestMode::SingleFile` and `ingest_single_file` entry point**
 
 **Goal:** Introduce the public ingest entry point that indexes one file, with full validation and
 result reporting, and without touching any walk-based state.
@@ -238,7 +240,7 @@ result reporting, and without touching any walk-based state.
 
 ---
 
-- [ ] **Unit 2: Wire `--file` into the `Ingest` CLI subcommand**
+- [x] **Unit 2: Wire `--file` into the `Ingest` CLI subcommand**
 
 **Goal:** Expose single-file ingest on the CLI with proper flag wiring, mutual-exclusion validation,
 write-lock acquisition, and summary output to stderr.
@@ -310,7 +312,7 @@ write-lock acquisition, and summary output to stderr.
 
 ---
 
-- [ ] **Unit 3: Integration tests for single-file ingest**
+- [x] **Unit 3: Integration tests for single-file ingest**
 
 **Goal:** Provide end-to-end coverage that exercises the full single-file flow through
 `ingest::ingest_single_file` in a realistic tempdir, mirroring the style of `tests/loreignore.rs`.
@@ -365,7 +367,7 @@ write-lock acquisition, and summary output to stderr.
 
 ---
 
-- [ ] **Unit 4: Update pattern-authoring guide and close the learning**
+- [x] **Unit 4: Update pattern-authoring guide and close the learning**
 
 **Goal:** Rewrite the Vocabulary Coverage Technique to use `lore ingest --file`, and supersede the
 "delta ingest requires commit" learning.
@@ -451,6 +453,93 @@ write-lock acquisition, and summary output to stderr.
 - Mention in `README.md` CLI section if single-file is listed there (Unit 4).
 - Unblocks: **Pattern QA skill** (next Up Next item) — can now run the vocabulary coverage loop
   without commits.
+
+## Completion Notes (2026-04-06)
+
+Shipped as **attila/lore#31** in four commits. All four implementation units landed as planned; the
+deviations and additions below were driven by ce-review feedback and the user's request for
+robustness coverage ahead of the dogfooding cycle.
+
+### Resolved deferred questions
+
+- **`.loreignore` override flag.** Resolved as "reuse `--force`" per the plan's leaning. The
+  rationale (minimal flag surface, intuitive "do it anyway" semantics) survived ce-review, with
+  three reviewers nonetheless flagging the semantic overload as a P2 worth addressing later. The
+  cleaner split into `--force` + `--override-ignore` is captured as a follow-up todo
+  (`docs/todos/ingest-force-flag-semantic-overload.md`) rather than landed in this PR.
+
+### What ce-review changed before merge
+
+ce-review surfaced findings that were applied in the same PR as `safe_auto` fixes:
+
+- **Empty-path "Done" line on error returns.** Three reviewers (correctness, adversarial,
+  maintainability) independently flagged that `IngestMode::SingleFile.path` was initialised with
+  `String::new()` and only overwritten on the success path, producing a contradictory
+  `Done (single-file): → 0 chunks` line on every early-return error. Fixed by seeding the path
+  upfront from `file_path.to_string_lossy()` and gating the "Done" summary on `errors.is_empty()`.
+  Pinned by a regression test (`done_line_is_suppressed_when_single_file_ingest_fails`).
+- **Composition cascade — adversarial review finding.** A specific user scenario the plan did not
+  cover: `git rm`ing a file, recreating it in the working tree, single-file-ingesting it, then
+  running `lore ingest`. The walk-based delta pass sees the file as `Deleted` in
+  `git diff --name-status` against the prior `last_ingested_commit` and silently wipes the chunks
+  single-file just upserted. Neither component is buggy in isolation; the failure lives in their
+  interaction. Captured as an "Interaction hazard" block in `docs/pattern-authoring-guide.md` with
+  the safe workflow prescription, and pinned by a hazard-test
+  (`subsequent_delta_ingest_wipes_single_file_upsert_of_git_deleted_file`) so any future refactor
+  that changes delta-wipe behaviour notices.
+- **CWD context on `Cannot access` errors** — added a `(cwd: <path>)` hint so an agent passing a
+  relative path from an unrelated working directory can self-diagnose.
+- **Duplicate "Single-file ingest:" banner** — was being emitted twice (once by `dispatch_ingest`,
+  once by the `on_progress` callback inside `ingest_single_file`). Removed the dispatch-side one.
+- **`after_help` block on the `Ingest` subcommand** — added EXAMPLES (all four invocation shapes),
+  EXIT CODES, and NOTES so `lore ingest --help` self-documents the matrix.
+
+### Test additions beyond the plan
+
+Plan Unit 3 specified library-level integration tests in `tests/single_file_ingest.rs`. Three
+additional layers landed during execution:
+
+- **CLI binary error-path tests** in `tests/smoke.rs` (4 tests). Exercise the `lore ingest --file`
+  binary directly via `assert_cmd::cargo_bin` for the exit-1 paths (extension rejection, path
+  outside `knowledge_dir`, missing file with CWD hint, `--help` content). Added in response to the
+  testing reviewer flagging that the entire dispatch chain had no end-to-end test.
+- **Symlink-escape regression test** (`#[cfg(unix)]`) — pins the property that symlinks inside
+  `knowledge_dir` whose canonical target lies outside are rejected by `validate_within_dir`. Plan
+  did not list this scenario; testing reviewer flagged the gap.
+- **Directory-path rejection test** — plan listed it in the test scenarios for Unit 1 but the
+  implementation did not include it. Added during ce-review.
+- **Real-Ollama integration tests** in `tests/ollama_integration.rs` (2 tests, `#[ignore]`-gated):
+  one library-level (`ingest_single_file_happy_path_with_real_embeddings`) proving the embedding
+  path works against production `nomic-embed-text`, and one binary-level
+  (`ingest_file_happy_path_via_binary`) proving the full clap → cmd_ingest → write-lock → dispatch →
+  embed → summary → exit-0 chain wires correctly. Both verified locally against a running Ollama
+  before push. Added at the user's request to maximise confidence ahead of the dogfooding cycle that
+  this feature enables.
+
+### Final test totals at merge
+
+| Layer                                       | Test count                    |
+| ------------------------------------------- | ----------------------------- |
+| Library unit (`src/ingest.rs::tests`)       | 9 single-file tests added     |
+| Library integration (FakeEmbedder)          | 12 in `single_file_ingest.rs` |
+| CLI binary (assert_cmd, default suite)      | 4 in `smoke.rs`               |
+| Library + binary (real Ollama, `#[ignore]`) | 2 in `ollama_integration.rs`  |
+
+Default `just ci` is Ollama-free and runs in seconds; the real-Ollama tests opt in via
+`cargo test -- --ignored`. All gates green (clippy, dprint, cargo-deny, cargo-doc).
+
+### Residual follow-ups (captured as todos)
+
+Six deferred items from ce-review live under `docs/todos/`:
+
+- `ingest-force-flag-semantic-overload.md` (P2)
+- `ingest-json-output-and-error-codes.md` (P2)
+- `mcp-reindex-file-tool.md` (P2)
+- `single-file-ingest-embedding-failure-rollback.md` (P2)
+- `tests-common-helpers-extraction.md` (P3)
+- `validate-within-dir-double-canonicalisation.md` (P3)
+
+None block the merge or the dogfooding cycle.
 
 ## Sources & References
 
