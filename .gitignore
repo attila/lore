@@ -3,6 +3,9 @@
 *.pdb
 tmp
 
+# Compound engineering local artefacts (not source)
+.context/
+
 .DS_Store
 
 .env

@@ -16,6 +16,7 @@ use crate::embeddings::Embedder;
 use crate::git;
 use crate::ingest;
 use crate::ingest::CommitStatus;
+use crate::lockfile::{WriteLock, lock_path_for};
 
 // ---------------------------------------------------------------------------
 // Context
@@ -514,6 +515,15 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
 
     eprintln!("[lore] Add pattern: \"{title}\"");
 
+    let mut write_lock = match WriteLock::open(&lock_path_for(&ctx.config.database)) {
+        Ok(l) => l,
+        Err(e) => return error_response(req, &format!("Failed to open write lock: {e}")),
+    };
+    let _guard = match write_lock.acquire() {
+        Ok(g) => g,
+        Err(e) => return error_response(req, &format!("Failed to acquire write lock: {e}")),
+    };
+
     match ingest::add_pattern(
         ctx.db,
         ctx.embedder,
@@ -572,6 +582,15 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Update pattern: \"{source_file}\"");
 
+    let mut write_lock = match WriteLock::open(&lock_path_for(&ctx.config.database)) {
+        Ok(l) => l,
+        Err(e) => return error_response(req, &format!("Failed to open write lock: {e}")),
+    };
+    let _guard = match write_lock.acquire() {
+        Ok(g) => g,
+        Err(e) => return error_response(req, &format!("Failed to acquire write lock: {e}")),
+    };
+
     match ingest::update_pattern(
         ctx.db,
         ctx.embedder,
@@ -625,6 +644,15 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     }
 
     eprintln!("[lore] Append to: \"{source_file}\" -- {heading}");
+
+    let mut write_lock = match WriteLock::open(&lock_path_for(&ctx.config.database)) {
+        Ok(l) => l,
+        Err(e) => return error_response(req, &format!("Failed to open write lock: {e}")),
+    };
+    let _guard = match write_lock.acquire() {
+        Ok(g) => g,
+        Err(e) => return error_response(req, &format!("Failed to acquire write lock: {e}")),
+    };
 
     match ingest::append_to_pattern(
         ctx.db,
@@ -797,7 +825,7 @@ fn error_response(req: &JsonRpcRequest, message: &str) -> JsonRpcResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     use tempfile::tempdir;
@@ -823,7 +851,7 @@ mod tests {
             db.init().unwrap();
             let config = Config::default_with(
                 tmp.path().to_path_buf(),
-                PathBuf::from(":memory:"),
+                tmp.path().join("lore-test.db"),
                 "test-model",
             );
             Self {
@@ -1236,7 +1264,7 @@ mod tests {
         db.init().unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
         // Disable hybrid search.
@@ -1587,8 +1615,11 @@ mod tests {
         let embedder = FakeEmbedder::with_dimensions(4);
         let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
         db.init().unwrap();
+        // Database is in-memory but the write-lock file lands beside the
+        // configured database path. Point it inside the tempdir so the lock
+        // is cleaned up automatically when the test exits.
         let mut config =
-            Config::default_with(dir.to_path_buf(), PathBuf::from(":memory:"), "test-model");
+            Config::default_with(dir.to_path_buf(), dir.join("lore-test.db"), "test-model");
         config.git = Some(crate::config::GitConfig {
             inbox_branch_prefix: "inbox/".to_string(),
         });
@@ -1648,7 +1679,7 @@ mod tests {
         db.init().unwrap();
         let config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
 
@@ -1813,7 +1844,7 @@ mod tests {
         db.init().unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
         config.search.hybrid = false;
@@ -1864,7 +1895,7 @@ mod tests {
         db.init().unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
         config.search.min_relevance = 0.6;

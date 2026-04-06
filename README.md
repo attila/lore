@@ -139,7 +139,12 @@ inbox branch workflow, and version history are all unavailable without a git rep
 picture.
 
 Files are chunked by heading — each `## Section` becomes a separate searchable unit. YAML
-frontmatter tags are extracted and searchable:
+frontmatter tags are extracted and searchable.
+
+To exclude non-pattern files such as `README.md`, `CONTRIBUTING.md`, or a `drafts/` directory from
+indexing, place a `.loreignore` file at the repository root. The syntax matches `.gitignore` and
+supports negation patterns. See the [Configuration Reference](docs/configuration.md#loreignore) for
+details.
 
 ```markdown
 ---

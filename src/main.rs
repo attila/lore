@@ -9,6 +9,7 @@ use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient};
 use lore::hook;
+use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
 use lore::{git, ingest, provision, server};
 
@@ -207,6 +208,9 @@ fn cmd_init(
 
     eprintln!("Search mode: hybrid (FTS5 + vector)\n");
 
+    let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
+    let _lock_guard = write_lock.acquire()?;
+
     let ingest_result = ingest::full_ingest(
         &db,
         &ollama,
@@ -266,6 +270,9 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
         eprintln!("{msg}");
     };
 
+    let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
+    let _lock_guard = write_lock.acquire()?;
+
     let result = if force {
         eprintln!("Full ingest (--force)...\n");
         ingest::full_ingest(
@@ -302,13 +309,27 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
         }
         ingest::IngestMode::Delta { unchanged } => {
             lore_debug!("ingest delta: unchanged={unchanged}");
-            if result.files_processed == 0 {
-                eprintln!("\nAlready up to date.");
-            } else {
-                eprintln!(
-                    "\nDone (delta): {} files changed, {} unchanged",
-                    result.files_processed, unchanged
-                );
+            let removed = result.reconciled_removed;
+            let added = result.reconciled_added;
+            let processed = result.files_processed;
+            let reconcile_summary = match (removed, added) {
+                (0, 0) => String::new(),
+                (r, 0) => format!("{r} reconciled (removed)"),
+                (0, a) => format!("{a} reconciled (re-indexed)"),
+                (r, a) => format!("{r} reconciled (removed), {a} reconciled (re-indexed)"),
+            };
+
+            match (processed, reconcile_summary.is_empty()) {
+                (0, true) => eprintln!("\nAlready up to date."),
+                (0, false) => {
+                    eprintln!("\nDone (delta): {reconcile_summary}, no other changes");
+                }
+                (changed, true) => {
+                    eprintln!("\nDone (delta): {changed} files changed, {unchanged} unchanged");
+                }
+                (changed, false) => eprintln!(
+                    "\nDone (delta): {changed} files changed, {reconcile_summary}, {unchanged} unchanged"
+                ),
             }
         }
     }

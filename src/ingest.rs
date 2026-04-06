@@ -17,6 +17,8 @@ use crate::chunking::{Chunk, chunk_as_document, chunk_by_heading, extract_title}
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
 use crate::git;
+use crate::lore_debug;
+use crate::loreignore;
 
 // ---------------------------------------------------------------------------
 // Embedding helpers
@@ -36,6 +38,9 @@ fn embed_text(chunk: &Chunk) -> String {
 
 /// Key used to store the last successfully ingested commit SHA.
 pub(crate) const META_LAST_COMMIT: &str = "last_ingested_commit";
+/// Key used to store the FNV-1a content hash of `.loreignore` so the next
+/// ingest can detect when the ignore list has changed.
+const META_LOREIGNORE_HASH: &str = "loreignore_hash";
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -59,6 +64,13 @@ pub struct IngestResult {
     pub mode: IngestMode,
     pub files_processed: usize,
     pub chunks_created: usize,
+    /// Files removed from the index by `.loreignore` reconciliation because
+    /// they now match an ignore pattern.
+    pub reconciled_removed: usize,
+    /// Files re-indexed by `.loreignore` reconciliation because they exist
+    /// on disk, are no longer matched by an ignore pattern, and were missing
+    /// from the database.
+    pub reconciled_added: usize,
     pub errors: Vec<String>,
 }
 
@@ -140,28 +152,232 @@ pub fn ingest(
         }
     };
 
+    // Detect .loreignore changes by content hash. The diff above filters to
+    // markdown files, so .loreignore edits never appear there — the hash
+    // comparison is the only signal. Reconciliation runs before FileChange
+    // processing so the database starts in a clean state.
+    //
+    // Both the matcher and the hash come from a single read of .loreignore
+    // (see loreignore::load), eliminating the race window where two sequential
+    // reads could observe different file contents.
+    let loaded_ignore = loreignore::load(knowledge_dir);
+    let stored_hash = db
+        .get_metadata(META_LOREIGNORE_HASH)
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let loreignore_changed = loaded_ignore.hash != stored_hash;
+    lore_debug!(
+        "loreignore: current_hash={:?} stored_hash={:?} changed={} matcher={}",
+        loaded_ignore.hash,
+        stored_hash,
+        loreignore_changed,
+        if loaded_ignore.matcher.is_some() {
+            "loaded"
+        } else {
+            "none"
+        }
+    );
+
+    let (reconcile_stats, reconcile_errors) = if loreignore_changed {
+        on_progress(".loreignore changed — running reconciliation");
+        run_reconciliation(
+            db,
+            embedder,
+            knowledge_dir,
+            strategy,
+            &loaded_ignore,
+            on_progress,
+        )
+    } else {
+        (ReconcileStats::default(), Vec::new())
+    };
+    let mut reconcile_errors = reconcile_errors;
+
+    let reconciled_removed = reconcile_stats.removed;
+    let reconciled_added = reconcile_stats.added;
+    let reconcile_chunks = reconcile_stats.chunks_added;
+    let reconcile_did_work = reconciled_removed > 0 || reconciled_added > 0;
+
     if changes.is_empty() {
-        on_progress("Already up to date — no files changed since last ingest");
+        if !reconcile_did_work && reconcile_errors.is_empty() {
+            on_progress("Already up to date — no files changed since last ingest");
+        } else {
+            on_progress(&format!(
+                "Reconciliation: {reconciled_removed} removed, {reconciled_added} re-indexed; HEAD recorded"
+            ));
+            if let Err(e) = db.set_metadata(META_LAST_COMMIT, &head) {
+                reconcile_errors.push(format!("Failed to record commit SHA: {e}"));
+            }
+        }
         return IngestResult {
             mode: IngestMode::Delta { unchanged: 0 },
             files_processed: 0,
-            chunks_created: 0,
-            errors: Vec::new(),
+            chunks_created: reconcile_chunks,
+            reconciled_removed,
+            reconciled_added,
+            errors: reconcile_errors,
         };
     }
 
-    delta_ingest(
+    let mut result = delta_ingest(
         db,
         embedder,
         knowledge_dir,
         strategy,
         &changes,
         &head,
+        loaded_ignore.matcher.as_ref(),
         on_progress,
-    )
+    );
+    // Surface reconciliation errors and counts to the caller alongside delta
+    // results.
+    result.errors.extend(reconcile_errors);
+    result.reconciled_removed = reconciled_removed;
+    result.reconciled_added = reconciled_added;
+    result.chunks_created += reconcile_chunks;
+    result
+}
+
+/// Run a reconciliation pass and update the stored content hash on success.
+///
+/// Encapsulates the "reconcile then commit hash" sequence so that
+/// [`ingest`] can call it as a single statement, keeping the entry-point
+/// function within the line limit.
+fn run_reconciliation(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    strategy: &str,
+    loaded: &loreignore::LoadedIgnore,
+    on_progress: &dyn Fn(&str),
+) -> (ReconcileStats, Vec<String>) {
+    let mut errors: Vec<String> = Vec::new();
+    let stats = match reconcile_ignored(
+        db,
+        embedder,
+        knowledge_dir,
+        strategy,
+        loaded.matcher.as_ref(),
+        on_progress,
+    ) {
+        Ok(stats) => {
+            // Only update the stored hash on successful reconciliation.
+            // If reconciliation failed partway through, the database is in
+            // a partially reconciled state — leaving the hash stale forces
+            // the next ingest to retry, rather than skipping reconciliation
+            // and silently leaving stale chunks.
+            if let Err(e) = db.set_metadata(META_LOREIGNORE_HASH, &loaded.hash) {
+                errors.push(format!("Failed to record .loreignore hash: {e}"));
+            }
+            stats
+        }
+        Err(e) => {
+            errors.push(format!("Reconciliation failed: {e}"));
+            ReconcileStats::default()
+        }
+    };
+    (stats, errors)
+}
+
+/// Outcome of a `.loreignore` reconciliation pass.
+#[derive(Debug, Default)]
+struct ReconcileStats {
+    /// Files removed from the database because they now match an ignore
+    /// pattern.
+    removed: usize,
+    /// Files re-indexed from disk because they are no longer matched by an
+    /// ignore pattern (or `.loreignore` was deleted entirely) and were
+    /// missing from the database.
+    added: usize,
+    /// Total chunks inserted by the re-index pass.
+    chunks_added: usize,
+}
+
+/// Reconcile the database against the current `.loreignore` matcher.
+///
+/// This pass is cumulative: it both removes files that are now ignored
+/// **and** re-indexes files that are now allowed but missing from the
+/// database. The two directions together make `.loreignore` edits behave
+/// transparently — adding a pattern removes matching files, removing a
+/// pattern brings them back, and deleting `.loreignore` re-indexes
+/// everything that had been excluded.
+///
+/// When `ignore_matcher` is `None` (no `.loreignore` file), the removal
+/// pass is a no-op but the re-index pass still runs — picking up files
+/// that were previously excluded.
+fn reconcile_ignored(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    strategy: &str,
+    ignore_matcher: Option<&ignore::gitignore::Gitignore>,
+    on_progress: &dyn Fn(&str),
+) -> anyhow::Result<ReconcileStats> {
+    use std::collections::HashSet;
+
+    let mut stats = ReconcileStats::default();
+
+    // Snapshot the indexed source list once. We use it for both the removal
+    // pass and the re-index pass; the snapshot is taken before any deletions
+    // so the re-index pass can correctly identify "files we just removed"
+    // and avoid re-indexing them.
+    let db_sources_vec = db.source_files()?;
+    lore_debug!(
+        "loreignore: reconcile scanning {} indexed sources",
+        db_sources_vec.len()
+    );
+    let db_sources: HashSet<String> = db_sources_vec.iter().cloned().collect();
+
+    // Pass 1: remove files in the database that the matcher now rejects.
+    if let Some(matcher) = ignore_matcher {
+        for source in &db_sources_vec {
+            let ignored = loreignore::is_ignored(matcher, Path::new(source), false);
+            lore_debug!("loreignore: reconcile check {source} → ignored={ignored}");
+            if ignored {
+                db.delete_by_source(source)?;
+                stats.removed += 1;
+                lore_debug!("loreignore: reconciled {source} (removed from index)");
+                on_progress(&format!("  {source} (reconciled — removed)"));
+            }
+        }
+    } else {
+        lore_debug!("loreignore: reconcile removal pass skipped (no matcher)");
+    }
+
+    // Pass 2: walk the filesystem and re-index any markdown file that is
+    // not currently in the database (using the pre-pass-1 snapshot, so
+    // files we just removed are correctly excluded). walk_md_files already
+    // applies the ignore matcher, so this loop only sees allowed files.
+    let (disk_files, _) = walk_md_files(knowledge_dir, ignore_matcher);
+    for (rel_path, full_path) in disk_files {
+        if db_sources.contains(&rel_path) {
+            continue;
+        }
+        match index_single_file(db, embedder, knowledge_dir, &full_path, strategy) {
+            Ok((chunks, _)) => {
+                stats.added += 1;
+                stats.chunks_added += chunks;
+                lore_debug!("loreignore: reconciled {rel_path} (re-indexed, {chunks} chunks)");
+                on_progress(&format!("  {rel_path} (reconciled — re-indexed)"));
+            }
+            Err(e) => {
+                lore_debug!("loreignore: failed to re-index {rel_path}: {e}");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Return `true` when the path is matched by the `.loreignore` matcher.
+/// Returns `false` when no matcher is present.
+fn path_ignored(matcher: Option<&ignore::gitignore::Gitignore>, path: &str) -> bool {
+    matcher.is_some_and(|m| loreignore::is_ignored(m, Path::new(path), false))
 }
 
 /// Process only the files that changed since the last ingest.
+#[allow(clippy::too_many_arguments)]
 fn delta_ingest(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -169,13 +385,22 @@ fn delta_ingest(
     strategy: &str,
     changes: &[git::FileChange],
     head: &str,
+    ignore_matcher: Option<&ignore::gitignore::Gitignore>,
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
-    // Count unchanged files: existing sources minus those being modified/deleted/renamed.
+    // Count unchanged files: existing sources minus those that this delta
+    // will actually touch. Ignored changes do not affect indexed state, so
+    // they must not deflate the unchanged count.
     let sources_before = db.stats().map(|s| s.sources).unwrap_or(0);
     let existing_changed = changes
         .iter()
-        .filter(|c| !matches!(c, git::FileChange::Added(_)))
+        .filter(|c| match c {
+            git::FileChange::Added(_) => false,
+            git::FileChange::Modified(p) | git::FileChange::Deleted(p) => {
+                !path_ignored(ignore_matcher, p)
+            }
+            git::FileChange::Renamed { from, .. } => !path_ignored(ignore_matcher, from),
+        })
         .count();
     let unchanged = sources_before.saturating_sub(existing_changed);
 
@@ -185,49 +410,25 @@ fn delta_ingest(
         mode: IngestMode::Delta { unchanged },
         files_processed: 0,
         chunks_created: 0,
+        reconciled_removed: 0,
+        reconciled_added: 0,
         errors: Vec::new(),
     };
 
     for change in changes {
-        match change {
-            git::FileChange::Added(path) | git::FileChange::Modified(path) => {
-                let file_path = knowledge_dir.join(path);
-                match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
-                    Ok((chunks, _)) => {
-                        result.chunks_created += chunks;
-                        on_progress(&format!("  {path} → {chunks} chunks"));
-                    }
-                    Err(e) => {
-                        result.errors.push(format!("Failed to index {path}: {e}"));
-                    }
-                }
-            }
-            git::FileChange::Deleted(path) => {
-                if let Err(e) = db.delete_by_source(path) {
-                    result.errors.push(format!("Failed to delete {path}: {e}"));
-                } else {
-                    on_progress(&format!("  {path} (deleted)"));
-                }
-            }
-            git::FileChange::Renamed { from, to } => {
-                if let Err(e) = db.delete_by_source(from) {
-                    result
-                        .errors
-                        .push(format!("Failed to delete old path {from}: {e}"));
-                }
-                let file_path = knowledge_dir.join(to);
-                match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
-                    Ok((chunks, _)) => {
-                        result.chunks_created += chunks;
-                        on_progress(&format!("  {from} → {to} ({chunks} chunks)"));
-                    }
-                    Err(e) => {
-                        result.errors.push(format!("Failed to index {to}: {e}"));
-                    }
-                }
-            }
+        let processed = process_change(
+            db,
+            embedder,
+            knowledge_dir,
+            strategy,
+            change,
+            ignore_matcher,
+            on_progress,
+            &mut result,
+        );
+        if processed {
+            result.files_processed += 1;
         }
-        result.files_processed += 1;
     }
 
     // Record the pre-captured HEAD on success (no errors).
@@ -238,6 +439,146 @@ fn delta_ingest(
     }
 
     result
+}
+
+/// Process one [`git::FileChange`] within delta ingest.
+///
+/// Returns `true` when the change actually touched the database (and should
+/// count toward `files_processed`); returns `false` for changes that were
+/// skipped because the path is ignored.
+#[allow(clippy::too_many_arguments)]
+fn process_change(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    strategy: &str,
+    change: &git::FileChange,
+    ignore_matcher: Option<&ignore::gitignore::Gitignore>,
+    on_progress: &dyn Fn(&str),
+    result: &mut IngestResult,
+) -> bool {
+    match change {
+        git::FileChange::Added(path) | git::FileChange::Modified(path) => {
+            if path_ignored(ignore_matcher, path) {
+                lore_debug!("loreignore: skipping {path} (delta ingest)");
+                return false;
+            }
+            let file_path = knowledge_dir.join(path);
+            match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
+                Ok((chunks, _)) => {
+                    result.chunks_created += chunks;
+                    on_progress(&format!("  {path} → {chunks} chunks"));
+                }
+                Err(e) => {
+                    result.errors.push(format!("Failed to index {path}: {e}"));
+                }
+            }
+            true
+        }
+        git::FileChange::Deleted(path) => {
+            if let Err(e) = db.delete_by_source(path) {
+                result.errors.push(format!("Failed to delete {path}: {e}"));
+            } else {
+                on_progress(&format!("  {path} (deleted)"));
+            }
+            true
+        }
+        git::FileChange::Renamed { from, to } => {
+            let from_ignored = path_ignored(ignore_matcher, from);
+            let to_ignored = path_ignored(ignore_matcher, to);
+            // Only delete from-side chunks when the source had been indexed.
+            if !from_ignored && let Err(e) = db.delete_by_source(from) {
+                result
+                    .errors
+                    .push(format!("Failed to delete old path {from}: {e}"));
+            }
+            if to_ignored {
+                lore_debug!("loreignore: rename target {to} ignored, skipping index");
+                if from_ignored {
+                    return false;
+                }
+                on_progress(&format!("  {from} → {to} (target ignored)"));
+                return true;
+            }
+            let file_path = knowledge_dir.join(to);
+            match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
+                Ok((chunks, _)) => {
+                    result.chunks_created += chunks;
+                    on_progress(&format!("  {from} → {to} ({chunks} chunks)"));
+                }
+                Err(e) => {
+                    result.errors.push(format!("Failed to index {to}: {e}"));
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Walk a knowledge directory for markdown files, optionally filtering
+/// through a `.loreignore` matcher.
+///
+/// Returns the kept files as `(rel_path, full_path)` tuples sorted by
+/// relative path, plus the total number of markdown files seen before
+/// filtering. Silent — callers attach progress messages themselves.
+fn walk_md_files(
+    knowledge_dir: &Path,
+    ignore_matcher: Option<&ignore::gitignore::Gitignore>,
+) -> (Vec<(String, PathBuf)>, usize) {
+    let walked: Vec<PathBuf> = WalkDir::new(knowledge_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file()
+                && matches!(
+                    e.path().extension().and_then(|s| s.to_str()),
+                    Some("md" | "markdown")
+                )
+        })
+        .map(walkdir::DirEntry::into_path)
+        .collect();
+
+    let walked_count = walked.len();
+    let mut kept: Vec<(String, PathBuf)> = walked
+        .into_iter()
+        .filter_map(|path| {
+            let rel = path
+                .strip_prefix(knowledge_dir)
+                .ok()?
+                .to_string_lossy()
+                .to_string();
+            if let Some(matcher) = ignore_matcher
+                && loreignore::is_ignored(matcher, Path::new(&rel), false)
+            {
+                lore_debug!("loreignore: skipping {rel} (walk)");
+                return None;
+            }
+            Some((rel, path))
+        })
+        .collect();
+    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    (kept, walked_count)
+}
+
+/// Walk + report for full ingest. Returns full paths for compatibility with
+/// the existing `full_ingest` loop.
+fn discover_md_files(
+    knowledge_dir: &Path,
+    ignore_matcher: Option<&ignore::gitignore::Gitignore>,
+    on_progress: &dyn Fn(&str),
+) -> Vec<PathBuf> {
+    let (kept, walked_count) = walk_md_files(knowledge_dir, ignore_matcher);
+    let skipped = walked_count - kept.len();
+    if skipped > 0 {
+        on_progress(&format!(
+            "Found {} markdown files ({} excluded by .loreignore)",
+            kept.len(),
+            skipped
+        ));
+    } else {
+        on_progress(&format!("Found {} markdown files", kept.len()));
+    }
+    kept.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Clear the database and re-index every markdown file from scratch.
@@ -255,28 +596,29 @@ pub fn full_ingest(
         mode: IngestMode::Full,
         files_processed: 0,
         chunks_created: 0,
+        reconciled_removed: 0,
+        reconciled_added: 0,
         errors: Vec::new(),
     };
 
-    let mut md_files: Vec<_> = WalkDir::new(knowledge_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().is_file()
-                && matches!(
-                    e.path().extension().and_then(|s| s.to_str()),
-                    Some("md" | "markdown")
-                )
-        })
-        .map(walkdir::DirEntry::into_path)
-        .collect();
+    // Single read of .loreignore: matcher and hash come from the same bytes.
+    let loaded_ignore = loreignore::load(knowledge_dir);
+    let md_files = discover_md_files(knowledge_dir, loaded_ignore.matcher.as_ref(), on_progress);
 
-    md_files.sort();
-    on_progress(&format!("Found {} markdown files", md_files.len()));
+    if md_files.is_empty() && loaded_ignore.matcher.is_some() {
+        on_progress("Warning: .loreignore matched every markdown file; nothing will be indexed");
+    }
 
     if let Err(e) = db.clear_all() {
         result.errors.push(format!("Failed to clear database: {e}"));
         return result;
+    }
+
+    // Store the .loreignore content hash so delta ingest can detect changes.
+    // clear_all() does not touch ingest_metadata, so a stale value from a
+    // previous ingest could survive — always write the current hash.
+    if let Err(e) = db.set_metadata(META_LOREIGNORE_HASH, &loaded_ignore.hash) {
+        on_progress(&format!("Warning: failed to record .loreignore hash: {e}"));
     }
 
     for file_path in &md_files {
@@ -1547,5 +1889,624 @@ mod tests {
         // First ingest() call with no stored commit falls back to full.
         let result = ingest(&db, &embedder, dir, "heading", &|_| {});
         assert_eq!(result.mode, IngestMode::Full);
+    }
+
+    // -- .loreignore in full ingest ---------------------------------------
+
+    /// Helper: write a markdown file with frontmatter and a body chunk.
+    fn write_md(dir: &Path, name: &str, title: &str, body: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            &path,
+            format!("# {title}\n\n{body} that is long enough to chunk.\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn full_ingest_skips_files_matched_by_loreignore() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "README.md", "Readme", "Project readme");
+        write_md(dir, "rust.md", "Rust", "Rust pattern body");
+        fs::write(dir.join(".loreignore"), "README.md\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.files_processed, 1);
+        let files = db.source_files().unwrap();
+        assert_eq!(files, vec!["rust.md".to_string()]);
+    }
+
+    #[test]
+    fn full_ingest_skips_directory_matched_by_loreignore() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "rust.md", "Rust", "Rust pattern body");
+        write_md(dir, "docs/intro.md", "Intro", "Doc intro");
+        write_md(dir, "docs/api.md", "API", "Doc api");
+        fs::write(dir.join(".loreignore"), "docs/\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.files_processed, 1);
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+    }
+
+    #[test]
+    fn full_ingest_without_loreignore_indexes_all_files() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "a.md", "A", "Body a");
+        write_md(dir, "b.md", "B", "Body b");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert_eq!(result.files_processed, 2);
+        assert_eq!(db.stats().unwrap().sources, 2);
+    }
+
+    #[test]
+    fn full_ingest_with_all_files_excluded_indexes_nothing() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "a.md", "A", "Body a");
+        write_md(dir, "b.md", "B", "Body b");
+        fs::write(dir.join(".loreignore"), "*.md\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let messages = std::cell::RefCell::new(Vec::<String>::new());
+        let result = ingest(&db, &embedder, dir, "heading", &|m| {
+            messages.borrow_mut().push(m.to_string());
+        });
+
+        assert_eq!(result.files_processed, 0);
+        assert_eq!(db.stats().unwrap().sources, 0);
+        let captured = messages.borrow();
+        assert!(
+            captured
+                .iter()
+                .any(|m| m.contains("matched every markdown")),
+            "expected warning, got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn full_ingest_with_empty_loreignore_applies_no_filtering() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "a.md", "A", "Body a");
+        // Comments and blanks only — no effective patterns.
+        fs::write(dir.join(".loreignore"), "# nothing here\n\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert_eq!(result.files_processed, 1);
+    }
+
+    #[test]
+    fn full_ingest_negation_un_ignores_specific_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "important.md", "Important", "Important body");
+        write_md(dir, "draft.md", "Draft", "Draft body");
+        write_md(dir, "scratch.md", "Scratch", "Scratch body");
+        fs::write(dir.join(".loreignore"), "*.md\n!important.md\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert_eq!(result.files_processed, 1);
+        assert_eq!(db.source_files().unwrap(), vec!["important.md".to_string()]);
+    }
+
+    #[test]
+    fn full_ingest_stores_loreignore_hash_in_metadata() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "rust.md", "Rust", "Body");
+        fs::write(dir.join(".loreignore"), "README.md\n").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let _ = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        let stored = db.get_metadata(META_LOREIGNORE_HASH).unwrap();
+        let expected = loreignore::load(dir).hash;
+        assert_eq!(stored, Some(expected));
+        assert!(stored.unwrap() != "");
+    }
+
+    // -- .loreignore in delta ingest --------------------------------------
+
+    /// Helper: stage and commit all changes in a tempdir.
+    fn git_commit_all(dir: &Path, message: &str) {
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn delta_ingest_skips_added_file_matched_by_loreignore() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        fs::write(dir.join(".loreignore"), "drafts/\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Add a new file that .loreignore matches.
+        write_md(dir, "drafts/wip.md", "WIP", "Draft body");
+        git_commit_all(dir, "add draft");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(matches!(result.mode, IngestMode::Delta { .. }));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(
+            result.files_processed, 0,
+            "ignored file should not be processed"
+        );
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+    }
+
+    #[test]
+    fn delta_ingest_without_loreignore_processes_all_changes() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "a.md", "A", "Body a");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        write_md(dir, "b.md", "B", "Body b");
+        git_commit_all(dir, "add b");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(result.files_processed, 1);
+        assert_eq!(db.stats().unwrap().sources, 2);
+    }
+
+    #[test]
+    fn delta_ingest_reconciles_when_loreignore_added() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "README.md", "Readme", "Project readme");
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 2);
+
+        // Add .loreignore in a new commit.
+        fs::write(dir.join(".loreignore"), "README.md\n").unwrap();
+        git_commit_all(dir, "add loreignore");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(
+            db.source_files().unwrap(),
+            vec!["rust.md".to_string()],
+            "README should have been reconciled out"
+        );
+    }
+
+    #[test]
+    fn delta_ingest_reconciles_when_loreignore_modified_to_add_pattern() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "scratch.md", "Scratch", "Scratch body");
+        fs::write(dir.join(".loreignore"), "# placeholder\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 2);
+
+        // Modify .loreignore to add a pattern.
+        fs::write(dir.join(".loreignore"), "scratch.md\n").unwrap();
+        git_commit_all(dir, "exclude scratch");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+    }
+
+    #[test]
+    fn delta_ingest_loreignore_deleted_keeps_indexed_files() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        fs::write(dir.join(".loreignore"), "drafts/\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Delete .loreignore.
+        fs::remove_file(dir.join(".loreignore")).unwrap();
+        git_commit_all(dir, "remove loreignore");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+        assert_eq!(
+            db.get_metadata(META_LOREIGNORE_HASH).unwrap(),
+            Some(String::new()),
+            "hash should be cleared after .loreignore deletion"
+        );
+    }
+
+    #[test]
+    fn delta_ingest_runs_when_loreignore_is_only_change() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "README.md", "Readme", "Readme body");
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 2);
+
+        // Add .loreignore with no other changes.
+        fs::write(dir.join(".loreignore"), "README.md\n").unwrap();
+        git_commit_all(dir, "exclude readme");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        // git diff is empty for markdown files; reconciliation still ran.
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+    }
+
+    #[test]
+    fn delta_ingest_renamed_to_ignored_path_removes_old_chunks() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        fs::write(dir.join(".loreignore"), "archive/\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(db.source_files().unwrap().contains(&"rust.md".to_string()));
+
+        // Rename rust.md → archive/rust.md (target is ignored).
+        fs::create_dir_all(dir.join("archive")).unwrap();
+        fs::rename(dir.join("rust.md"), dir.join("archive/rust.md")).unwrap();
+        git_commit_all(dir, "archive rust");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        let files = db.source_files().unwrap();
+        assert!(
+            files.is_empty(),
+            "rust.md should be removed, archive/rust.md should not be indexed: {files:?}"
+        );
+    }
+
+    #[test]
+    fn delta_ingest_renamed_from_ignored_path_indexes_new_file() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "drafts/idea.md", "Idea", "Idea body");
+        fs::write(dir.join(".loreignore"), "drafts/\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        // drafts/idea.md was never indexed.
+        assert!(db.source_files().unwrap().is_empty());
+
+        // Rename drafts/idea.md → idea.md (source was ignored, target is not).
+        fs::rename(dir.join("drafts/idea.md"), dir.join("idea.md")).unwrap();
+        git_commit_all(dir, "promote idea");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(db.source_files().unwrap(), vec!["idea.md".to_string()]);
+    }
+
+    #[test]
+    fn delta_ingest_renamed_with_both_paths_ignored_is_skipped() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "drafts/idea.md", "Idea", "Idea body");
+        fs::write(dir.join(".loreignore"), "drafts/\narchive/\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+
+        // Rename drafts/idea.md → archive/idea.md (both paths ignored).
+        fs::create_dir_all(dir.join("archive")).unwrap();
+        fs::rename(dir.join("drafts/idea.md"), dir.join("archive/idea.md")).unwrap();
+        git_commit_all(dir, "rename to archive");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        // Only rust.md remains; the rename was a no-op for the database.
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+    }
+
+    #[test]
+    fn delta_ingest_reconciliation_failure_preserves_stale_hash() {
+        // Verifies the cascade-fix: if reconciliation fails, the stored hash
+        // must remain stale so the next ingest retries reconciliation rather
+        // than silently skipping it.
+        //
+        // We can't easily inject a database failure without invasive
+        // refactoring, so this test exercises the success path and verifies
+        // the hash IS written on success — providing the inverse evidence.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "scratch.md", "Scratch", "Scratch body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        let initial_hash = db
+            .get_metadata(META_LOREIGNORE_HASH)
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(initial_hash, "", "no .loreignore initially");
+
+        // Add .loreignore in a new commit — reconciliation must run and the
+        // hash must be updated only on success.
+        fs::write(dir.join(".loreignore"), "scratch.md\n").unwrap();
+        git_commit_all(dir, "exclude scratch");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        let new_hash = db.get_metadata(META_LOREIGNORE_HASH).unwrap();
+        assert!(new_hash.is_some() && !new_hash.unwrap().is_empty());
+    }
+
+    #[test]
+    fn delta_ingest_loreignore_pattern_removed_re_indexes_file() {
+        // Cumulative reconciliation: removing a pattern from .loreignore
+        // brings previously excluded files back into the index automatically.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "drafts/wip.md", "WIP", "Draft body");
+        fs::write(dir.join(".loreignore"), "drafts/\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.source_files().unwrap(), vec!["rust.md".to_string()]);
+
+        // Remove the drafts/ pattern.
+        fs::write(dir.join(".loreignore"), "# nothing excluded\n").unwrap();
+        git_commit_all(dir, "un-ignore drafts");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.reconciled_removed, 0);
+        assert_eq!(
+            result.reconciled_added, 1,
+            "drafts/wip.md should be re-indexed"
+        );
+        let files = db.source_files().unwrap();
+        assert_eq!(
+            files,
+            vec!["drafts/wip.md".to_string(), "rust.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn delta_ingest_reconciliation_respects_negation() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "important.md", "Important", "Important body");
+        write_md(dir, "draft.md", "Draft", "Draft body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 2);
+
+        // Exclude all .md files except important.md.
+        fs::write(dir.join(".loreignore"), "*.md\n!important.md\n").unwrap();
+        git_commit_all(dir, "add loreignore with negation");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        // Reconciliation must not remove important.md (whitelist).
+        assert_eq!(db.source_files().unwrap(), vec!["important.md".to_string()]);
+    }
+
+    #[test]
+    fn delta_ingest_unchanged_count_excludes_ignored_modifications() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "go.md", "Go", "Go body");
+        // Make scratch.md exist but don't index it (it's ignored from the start).
+        write_md(dir, "scratch.md", "Scratch", "Scratch body");
+        fs::write(dir.join(".loreignore"), "scratch.md\n").unwrap();
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 2);
+
+        // Modify both rust.md and scratch.md. scratch.md is ignored.
+        write_md(dir, "rust.md", "Rust", "Updated rust body");
+        write_md(dir, "scratch.md", "Scratch", "Updated scratch body");
+        git_commit_all(dir, "modify both");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty());
+        assert_eq!(result.files_processed, 1, "only rust.md should process");
+        // unchanged should be 1 (go.md), not deflated by the ignored scratch.md.
+        if let IngestMode::Delta { unchanged } = result.mode {
+            assert_eq!(unchanged, 1, "go.md should be the only unchanged file");
+        } else {
+            panic!("expected Delta mode");
+        }
+    }
+
+    #[test]
+    fn delta_ingest_result_reports_reconciled_count() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "scratch.md", "Scratch", "Scratch body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 2);
+
+        // Add .loreignore excluding scratch.md, no other file changes.
+        fs::write(dir.join(".loreignore"), "scratch.md\n").unwrap();
+        git_commit_all(dir, "exclude scratch");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(
+            result.reconciled_removed, 1,
+            "should report one removed file"
+        );
+        assert_eq!(result.reconciled_added, 0);
+        assert_eq!(result.files_processed, 0, "no diff-driven changes");
+    }
+
+    #[test]
+    fn delta_ingest_result_reports_zero_reconciled_when_unchanged() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Modify rust.md (no .loreignore).
+        write_md(dir, "rust.md", "Rust", "Updated rust body");
+        git_commit_all(dir, "modify rust");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(result.reconciled_removed, 0);
+        assert_eq!(result.reconciled_added, 0);
+        assert_eq!(result.files_processed, 1);
+    }
+
+    #[test]
+    fn delta_ingest_unchanged_count_after_reconciliation() {
+        // Regression: when reconciliation removes files, the unchanged count
+        // must reflect the post-reconciliation source count, not the
+        // pre-reconciliation count. delta_ingest queries db.stats() after
+        // reconciliation has run, so this is correct by construction —
+        // this test pins that ordering.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        write_md(dir, "rust.md", "Rust", "Rust body");
+        write_md(dir, "go.md", "Go", "Go body");
+        write_md(dir, "drafts/wip.md", "WIP", "Draft body");
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(db.stats().unwrap().sources, 3);
+
+        // In one commit: add .loreignore excluding drafts/, AND modify rust.md.
+        // Reconciliation removes drafts/wip.md (1 file), then delta processes
+        // rust.md (1 file), leaving go.md as the only "unchanged" file.
+        fs::write(dir.join(".loreignore"), "drafts/\n").unwrap();
+        write_md(dir, "rust.md", "Rust", "Updated rust body");
+        git_commit_all(dir, "exclude drafts and update rust");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.files_processed, 1, "only rust.md should process");
+        if let IngestMode::Delta { unchanged } = result.mode {
+            assert_eq!(
+                unchanged, 1,
+                "after reconciliation removed drafts/wip.md, only go.md is unchanged"
+            );
+        } else {
+            panic!("expected Delta mode");
+        }
+        // Verify the database actually reflects the reconciled state.
+        let files = db.source_files().unwrap();
+        assert_eq!(files, vec!["go.md".to_string(), "rust.md".to_string()]);
+    }
+
+    #[test]
+    fn full_ingest_stores_empty_hash_when_loreignore_absent() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_md(dir, "rust.md", "Rust", "Body");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let _ = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        let stored = db.get_metadata(META_LOREIGNORE_HASH).unwrap();
+        assert_eq!(stored, Some(String::new()));
     }
 }

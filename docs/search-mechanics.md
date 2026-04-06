@@ -193,6 +193,19 @@ threshold is applied only when:
 When FTS5 is the sole search method (hybrid disabled or Ollama unreachable), no threshold is applied
 because FTS5 BM25 scores use a different scale and are not directly comparable.
 
+## Ingest-Time Filtering with `.loreignore`
+
+Search only sees what ingest indexed. A `.loreignore` file at the repository root excludes matching
+markdown files from the index entirely — they never reach the FTS5 or vector tables, so they cannot
+appear in results regardless of how the query is constructed.
+
+Filtering applies during both full ingest and delta ingest. When `.loreignore` changes, delta ingest
+detects the change via a content hash stored in `ingest_metadata` and runs a cumulative
+reconciliation pass: previously indexed files that now match an exclusion are removed, and files
+that are no longer excluded are re-indexed from disk automatically.
+
+For the full syntax and behaviour, see the [Configuration Reference](configuration.md#loreignore).
+
 ## Sibling Chunk Expansion
 
 After the top results are selected, lore fetches all chunks from each matched source file. If a

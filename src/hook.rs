@@ -474,19 +474,8 @@ fn session_dedup_path(input: &HookInput) -> Option<PathBuf> {
 /// filename, avoiding collision from character-level sanitisation and
 /// preventing raw session IDs from leaking into `/tmp` filenames.
 pub fn dedup_file_path(session_id: &str) -> PathBuf {
-    let hash = fnv1a_hash(session_id.as_bytes());
+    let hash = crate::hash::fnv1a(session_id.as_bytes());
     std::env::temp_dir().join(format!("lore-session-{hash:016x}"))
-}
-
-/// FNV-1a hash for short strings (session IDs, filenames).
-/// Deterministic within any single binary build.
-fn fnv1a_hash(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
 }
 
 /// Read chunk IDs from the dedup file. Returns an empty set on any error

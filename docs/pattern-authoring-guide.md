@@ -234,6 +234,49 @@ one coherent domain in enough depth to be useful as a group — typically three 
 - A good test: if the agent is editing a Rust file and one section matches, would the other sections
   in this file also be useful? If not, they belong in a separate file
 
+### Excluding non-pattern files with `.loreignore`
+
+A pattern repository often contains markdown files that are not patterns: a README, a CONTRIBUTING
+guide, a LICENSE, or documentation about the patterns themselves. If these files end up in the
+index, they pollute search results — an agent looking for a pattern about error handling does not
+want a chunk from your README about how to clone the repository.
+
+Place a `.loreignore` file at the root of your pattern repository to exclude them. The syntax is the
+same as `.gitignore`:
+
+```text
+# Repository documentation
+README.md
+CONTRIBUTING.md
+LICENSE
+
+# Tooling and CI
+.github/
+ci/
+
+# Drafts you do not want indexed yet
+drafts/
+**/*.draft.md
+
+# Negation: explicitly include a file matched by an earlier pattern
+!drafts/important.md
+```
+
+Lore reads `.loreignore` from the repository root only — nested files in subdirectories are not
+supported. Patterns support bare filenames, trailing-slash directories, wildcards, recursive globs
+(`**/*.draft.md`), anchoring (a leading slash anchors a pattern to the repository root), and
+negation (`!`).
+
+When you add or modify `.loreignore`, run `lore ingest` afterwards. The next ingest detects the
+change and reconciles the database in both directions: files that newly match an exclusion are
+removed, and files that are no longer excluded are re-indexed automatically. The same applies when
+you delete `.loreignore` entirely — every file that had been excluded comes back into the index on
+the next `lore ingest`.
+
+> **Why is `.loreignore` opt-in?** Without a `.loreignore` file, every markdown file in the
+> repository is indexed, exactly as before. The feature is purely additive — you only encounter it
+> when you choose to.
+
 ## Anti-Patterns
 
 ### The Reference Document
