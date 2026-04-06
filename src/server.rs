@@ -769,6 +769,11 @@ fn text_response_with_metadata(
 }
 
 /// Render a `CommitStatus` as a structured JSON value for MCP response metadata.
+///
+/// The match is intentionally exhaustive (no wildcard arm) so adding a new
+/// `CommitStatus` variant fails to compile until this function is updated.
+/// MCP consumers branch on `commit_status.kind`, so a new variant must
+/// produce a documented JSON shape rather than silently mapping to "unknown".
 fn commit_status_metadata(status: &CommitStatus) -> Value {
     match status {
         CommitStatus::NotCommitted => json!({ "kind": "not_committed" }),
@@ -1032,6 +1037,44 @@ mod tests {
         assert!(
             text.contains("Git repository: yes"),
             "summary should reflect git state, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_delta_ingest_available_when_git_and_commit_present() {
+        // The only path that flips `delta_ingest_available` to true is
+        // `is_git_repo && last_commit.is_some()`. The previous two lore_status
+        // tests cover the false branches; this test pins the true branch by
+        // initialising a git repo AND seeding the META_LAST_COMMIT metadata
+        // directly. Setting metadata directly avoids the cost of running a
+        // full ingest, which would also require seeding markdown files.
+        let h = TestHarness::new();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&h.config.knowledge_dir)
+            .status()
+            .unwrap();
+        h.db.set_metadata(crate::ingest::META_LAST_COMMIT, "abc1234deadbeef")
+            .unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":52,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["git_repository"], true);
+        assert_eq!(metadata["delta_ingest_available"], true);
+        assert_eq!(metadata["last_ingested_commit"], "abc1234deadbeef");
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Delta ingest: available"),
+            "summary should reflect delta-available state, got: {text}"
         );
     }
 

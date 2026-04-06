@@ -417,6 +417,11 @@ pub fn search_with_threshold(
 
 /// Format the meta-instruction + compact pattern index returned at session
 /// start and after compaction.
+///
+/// Invokes `git rev-parse` against `knowledge_dir` (via [`crate::git::is_git_repo`])
+/// to decide whether to inject the git advisory paragraph. `SessionStart` and
+/// `PostCompact` are infrequent events, so the per-call subprocess cost is
+/// acceptable.
 fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Result<String> {
     let patterns = db.list_patterns()?;
 

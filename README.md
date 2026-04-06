@@ -108,13 +108,13 @@ patterns before edits and a `/search-lore` skill for on-demand queries.
 
 The server exposes five tools:
 
-| Tool                | Purpose                                                                      |
-| ------------------- | ---------------------------------------------------------------------------- |
-| `search_patterns`   | Semantic + keyword search across all patterns                                |
-| `add_pattern`       | Create a new pattern file, index it, and commit if the base is a git repo    |
-| `update_pattern`    | Replace an existing pattern's content, re-index, and commit if git is in use |
-| `append_to_pattern` | Add a section to an existing pattern, re-index, and commit if git is in use  |
-| `lore_status`       | Report knowledge base health: git status, indexed counts, last commit        |
+| Tool                | Purpose                                                                         |
+| ------------------- | ------------------------------------------------------------------------------- |
+| `search_patterns`   | Semantic + keyword search across all patterns                                   |
+| `add_pattern`       | Create a new pattern file, index it, and commit if the base is a git repository |
+| `update_pattern`    | Replace an existing pattern's content, re-index, and commit if git is in use    |
+| `append_to_pattern` | Add a section to an existing pattern, re-index, and commit if git is in use     |
+| `lore_status`       | Report knowledge base health: git status, indexed counts, last commit           |
 
 ## Knowledge Base Format
 
