@@ -108,6 +108,15 @@ expression: resp
           "type": "object"
         },
         "name": "append_to_pattern"
+      },
+      {
+        "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), and whether the inbox branch workflow is configured. Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "lore_status"
       }
     ]
   }

@@ -35,7 +35,7 @@ fn embed_text(chunk: &Chunk) -> String {
 // ---------------------------------------------------------------------------
 
 /// Key used to store the last successfully ingested commit SHA.
-const META_LAST_COMMIT: &str = "last_ingested_commit";
+pub(crate) const META_LAST_COMMIT: &str = "last_ingested_commit";
 
 // ---------------------------------------------------------------------------
 // Result types
