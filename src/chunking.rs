@@ -367,7 +367,43 @@ Body text that is definitely long enough.
         let chunks = chunk_by_heading(md, "plain.md");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].source_file, "plain.md");
-        // No headings means heading_path is empty and id ends with ":root".
+    }
+
+    #[test]
+    fn yaml_formatting_pattern_produces_chunks() {
+        // Reproduces the exact content of lore-patterns/yaml/formatting.md
+        // to verify the file produces at least one indexable chunk.
+        let content = "---\n\
+            tags: [yaml, yml, formatting, quotes]\n\
+            ---\n\
+            \n\
+            # YAML Formatting\n\
+            \n\
+            ## Never quote strings unless required by the parser\n\
+            \n\
+            Do not quote string values in YAML files unless the value requires quotes for\n\
+            correct YAML parsing (e.g., contains special characters, starts with `*`, `&`,\n\
+            `!`, etc.).\n\
+            \n\
+            **Why:** Unnecessary quoting adds visual noise and is not idiomatic YAML.\n";
+        let chunks = chunk_by_heading(content, "yaml/formatting.md");
+        assert!(!chunks.is_empty(), "expected at least one chunk");
+        for chunk in &chunks {
+            assert_eq!(chunk.source_file, "yaml/formatting.md");
+            eprintln!(
+                "chunk id={} title={:?} body_len={}",
+                chunk.id,
+                chunk.title,
+                chunk.body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn no_headings_root_chunk_has_empty_heading_path() {
+        let md = "This file has no headings but has enough body text to make a chunk.\n";
+        let chunks = chunk_by_heading(md, "plain.md");
+        assert_eq!(chunks.len(), 1);
         assert!(chunks[0].heading_path.is_empty());
         assert_eq!(chunks[0].id, "plain.md:root");
     }

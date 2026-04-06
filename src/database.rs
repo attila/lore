@@ -414,6 +414,19 @@ impl KnowledgeDB {
         })
     }
 
+    /// Return every distinct `source_file` currently indexed.
+    ///
+    /// Used by the `.loreignore` reconciliation pass to find files that need
+    /// to be removed when ignore patterns change. Results are sorted
+    /// alphabetically. Uses the `idx_chunks_source_file` index for efficiency.
+    pub fn source_files(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT source_file FROM chunks ORDER BY source_file")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Read a metadata value by key.
     pub fn get_metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut stmt = self
@@ -758,6 +771,61 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 3);
         assert_eq!(stats.sources, 2);
+    }
+
+    // -- source_files -----------------------------------------------------
+
+    #[test]
+    fn source_files_returns_distinct_paths_in_sorted_order() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        db.insert_chunk(
+            &make_chunk("c1", "T1", "Body one content", "rust/b.md"),
+            None,
+        )
+        .unwrap();
+        db.insert_chunk(
+            &make_chunk("c2", "T2", "Body two content", "rust/a.md"),
+            None,
+        )
+        .unwrap();
+        db.insert_chunk(
+            &make_chunk("c3", "T3", "Body three content", "rust/a.md"),
+            None,
+        )
+        .unwrap();
+
+        let files = db.source_files().unwrap();
+        assert_eq!(
+            files,
+            vec!["rust/a.md".to_string(), "rust/b.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn source_files_returns_empty_vec_for_empty_database() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let files = db.source_files().unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn source_files_excludes_files_after_delete_by_source() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        db.insert_chunk(&make_chunk("c1", "T1", "Body one content", "a.md"), None)
+            .unwrap();
+        db.insert_chunk(&make_chunk("c2", "T2", "Body two content", "b.md"), None)
+            .unwrap();
+
+        db.delete_by_source("a.md").unwrap();
+
+        let files = db.source_files().unwrap();
+        assert_eq!(files, vec!["b.md".to_string()]);
     }
 
     // -- RRF unit test ----------------------------------------------------

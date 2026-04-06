@@ -129,6 +129,55 @@ This enables delta ingest from the first run and preserves a full history of eve
 remote is not required — lore's ingest and search features work entirely against the local
 repository. Add a remote later if you want the inbox branch workflow or off-machine backup.
 
+## `.loreignore`
+
+A `.loreignore` file at the root of your `knowledge_dir` specifies markdown files that should be
+excluded from indexing. The syntax is identical to `.gitignore`:
+
+```text
+README.md
+CONTRIBUTING.md
+LICENSE
+.github/
+drafts/
+**/*.draft.md
+!drafts/important.md
+```
+
+### Supported pattern syntax
+
+| Pattern         | Matches                                                              |
+| --------------- | -------------------------------------------------------------------- |
+| `README.md`     | A bare filename in any directory                                     |
+| `docs/`         | A directory and everything inside it (trailing slash is significant) |
+| `*.txt`         | All `.txt` files                                                     |
+| `**/*.draft.md` | Recursive glob — matches in any subdirectory                         |
+| `/top.md`       | Anchored — only matches at the repository root                       |
+| `# comment`     | Comment line, ignored                                                |
+| `!important.md` | Negation — un-ignores a file matched by an earlier pattern           |
+
+Patterns without a slash match in any subdirectory; patterns with a slash are anchored to the
+repository root.
+
+### Behaviour
+
+- **Opt-in:** Without a `.loreignore` file, every markdown file in the repository is indexed.
+- **Root only:** Lore reads `.loreignore` from `knowledge_dir` only. Nested files in subdirectories
+  are not supported.
+- **Cumulative reconciliation:** When `.loreignore` changes, the next ingest detects the change via
+  a content hash and reconciles the database in both directions. Files that now match an exclusion
+  are removed; files that are no longer excluded are re-indexed automatically. Deleting
+  `.loreignore` re-indexes every file that had been excluded.
+- **Bounded read:** `.loreignore` is limited to 64 KiB. Files exceeding this limit are rejected with
+  a warning to stderr, and no filtering is applied.
+- **Malformed patterns:** Invalid glob syntax in a single line emits a warning to stderr; other
+  valid patterns continue to apply.
+
+### Debug output
+
+Set `LORE_DEBUG=1` to see which files are skipped, which patterns matched them, and the per-source
+checks performed during reconciliation. Both removals and re-indexes are logged.
+
 ## Environment Variables
 
 | Variable          | Purpose                                   | Values                          | Notes                                                                                                                          |

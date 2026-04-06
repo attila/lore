@@ -16,6 +16,7 @@ use crate::embeddings::Embedder;
 use crate::git;
 use crate::ingest;
 use crate::ingest::CommitStatus;
+use crate::lockfile::{WriteLock, lock_path_for};
 
 // ---------------------------------------------------------------------------
 // Context
@@ -285,10 +286,12 @@ fn tool_definitions() -> Value {
             "name": "lore_status",
             "description":
                 "Report knowledge base health: whether it is a git repository, the indexed \
-                 chunk and source counts, the last ingested commit (if any), and whether the \
-                 inbox branch workflow is configured. Use this before write operations to \
-                 verify the knowledge base is in the expected state, especially when the \
-                 agent needs to know whether changes will be committed to git.",
+                 chunk and source counts, the last ingested commit (if any), whether the \
+                 inbox branch workflow is configured, and whether a .loreignore file is \
+                 active (filtering files out of the index). Use this before write operations \
+                 to verify the knowledge base is in the expected state, especially when the \
+                 agent needs to know whether changes will be committed to git or whether \
+                 files in a particular path are excluded from search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -514,6 +517,15 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
 
     eprintln!("[lore] Add pattern: \"{title}\"");
 
+    let mut write_lock = match WriteLock::open(&lock_path_for(&ctx.config.database)) {
+        Ok(l) => l,
+        Err(e) => return error_response(req, &format!("Failed to open write lock: {e}")),
+    };
+    let _guard = match write_lock.acquire() {
+        Ok(g) => g,
+        Err(e) => return error_response(req, &format!("Failed to acquire write lock: {e}")),
+    };
+
     match ingest::add_pattern(
         ctx.db,
         ctx.embedder,
@@ -572,6 +584,15 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Update pattern: \"{source_file}\"");
 
+    let mut write_lock = match WriteLock::open(&lock_path_for(&ctx.config.database)) {
+        Ok(l) => l,
+        Err(e) => return error_response(req, &format!("Failed to open write lock: {e}")),
+    };
+    let _guard = match write_lock.acquire() {
+        Ok(g) => g,
+        Err(e) => return error_response(req, &format!("Failed to acquire write lock: {e}")),
+    };
+
     match ingest::update_pattern(
         ctx.db,
         ctx.embedder,
@@ -626,6 +647,15 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Append to: \"{source_file}\" -- {heading}");
 
+    let mut write_lock = match WriteLock::open(&lock_path_for(&ctx.config.database)) {
+        Ok(l) => l,
+        Err(e) => return error_response(req, &format!("Failed to open write lock: {e}")),
+    };
+    let _guard = match write_lock.acquire() {
+        Ok(g) => g,
+        Err(e) => return error_response(req, &format!("Failed to acquire write lock: {e}")),
+    };
+
     match ingest::append_to_pattern(
         ctx.db,
         ctx.embedder,
@@ -673,6 +703,12 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
     let sources = stats.as_ref().map(|s| s.sources);
     let inbox_workflow_configured = ctx.config.inbox_branch_prefix().is_some();
     let delta_ingest_available = is_git_repo && last_commit.is_some();
+    // Reflect whether a .loreignore file is currently active so agents
+    // inspecting knowledge base health know that what they see in search is
+    // a filtered view of the underlying directory.
+    let loreignore_active = crate::loreignore::load(&ctx.config.knowledge_dir)
+        .matcher
+        .is_some();
 
     let metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
@@ -682,11 +718,12 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
         "sources_indexed": sources,
         "inbox_workflow_configured": inbox_workflow_configured,
         "delta_ingest_available": delta_ingest_available,
+        "loreignore_active": loreignore_active,
     });
 
     let summary = format!(
         "Knowledge base: {} — {} {} across {} {}. Git repository: {}. \
-         Delta ingest: {}. Inbox workflow: {}.",
+         Delta ingest: {}. Inbox workflow: {}. .loreignore: {}.",
         ctx.config.knowledge_dir.display(),
         chunks.map_or_else(|| "?".into(), |c| c.to_string()),
         if chunks == Some(1) { "chunk" } else { "chunks" },
@@ -706,6 +743,11 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
             "configured"
         } else {
             "not configured"
+        },
+        if loreignore_active {
+            "active"
+        } else {
+            "absent"
         },
     );
 
@@ -797,7 +839,7 @@ fn error_response(req: &JsonRpcRequest, message: &str) -> JsonRpcResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     use tempfile::tempdir;
@@ -823,7 +865,7 @@ mod tests {
             db.init().unwrap();
             let config = Config::default_with(
                 tmp.path().to_path_buf(),
-                PathBuf::from(":memory:"),
+                tmp.path().join("lore-test.db"),
                 "test-model",
             );
             Self {
@@ -994,6 +1036,8 @@ mod tests {
         assert_eq!(metadata["chunks_indexed"], 0);
         assert_eq!(metadata["sources_indexed"], 0);
         assert!(metadata["last_ingested_commit"].is_null());
+        // No .loreignore in the bare harness directory.
+        assert_eq!(metadata["loreignore_active"], false);
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1004,6 +1048,56 @@ mod tests {
             text.contains("unavailable"),
             "summary should mention delta ingest unavailability, got: {text}"
         );
+        assert!(
+            text.contains(".loreignore: absent"),
+            "summary should mention .loreignore absence, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_loreignore_active_when_present() {
+        // Drop a .loreignore into the harness's knowledge_dir and verify the
+        // status tool reflects it.
+        let h = TestHarness::new();
+        std::fs::write(h.config.knowledge_dir.join(".loreignore"), "README.md\n").unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":52,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["result"]["metadata"]["loreignore_active"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(".loreignore: active"),
+            "summary should mention .loreignore activation, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_loreignore_inactive_when_only_comments() {
+        // A comment-only .loreignore produces zero effective patterns and is
+        // not considered active. Pin this so the field reflects "would this
+        // file actually filter anything" rather than "does the file exist".
+        let h = TestHarness::new();
+        std::fs::write(
+            h.config.knowledge_dir.join(".loreignore"),
+            "# nothing excluded\n",
+        )
+        .unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":53,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["result"]["metadata"]["loreignore_active"], false);
     }
 
     #[test]
@@ -1236,7 +1330,7 @@ mod tests {
         db.init().unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
         // Disable hybrid search.
@@ -1587,8 +1681,11 @@ mod tests {
         let embedder = FakeEmbedder::with_dimensions(4);
         let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
         db.init().unwrap();
+        // Database is in-memory but the write-lock file lands beside the
+        // configured database path. Point it inside the tempdir so the lock
+        // is cleaned up automatically when the test exits.
         let mut config =
-            Config::default_with(dir.to_path_buf(), PathBuf::from(":memory:"), "test-model");
+            Config::default_with(dir.to_path_buf(), dir.join("lore-test.db"), "test-model");
         config.git = Some(crate::config::GitConfig {
             inbox_branch_prefix: "inbox/".to_string(),
         });
@@ -1648,7 +1745,7 @@ mod tests {
         db.init().unwrap();
         let config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
 
@@ -1813,7 +1910,7 @@ mod tests {
         db.init().unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
         config.search.hybrid = false;
@@ -1864,7 +1961,7 @@ mod tests {
         db.init().unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
-            PathBuf::from(":memory:"),
+            tmp.path().join("lore-test.db"),
             "test-model",
         );
         config.search.min_relevance = 0.6;

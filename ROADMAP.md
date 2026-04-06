@@ -3,9 +3,6 @@
 ## Up Next
 
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] `.loreignore` — gitignore-style exclude file in pattern repos. Skip matching files during full
-      and delta ingest. If an already-indexed file is later ignored, remove its chunks on next
-      ingest. Prevents non-pattern files (README, LICENSE, .github/) from polluting the index
 - [ ] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
       commit, enabling a fast edit-ingest-search feedback loop for pattern authoring. Removes the
       current workaround of committing a WIP before testing discoverability. Update the vocabulary
@@ -15,7 +12,14 @@
       with single-file ingest to eliminate the commit-ingest dance
 - [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
       content at SessionStart, not just titles. Covers process-level conventions that don't surface
-      through file-edit hooks
+      through file-edit hooks. **Motivating example (2026-04-06):** during the `.loreignore` work an
+      agent ran a plain `git push`, hit `main`-protection rejection, and only then realised the
+      `workflows/git-branch-pr.md` "Pushing" section already prescribed `git push origin HEAD`. The
+      pattern was discoverable (relevance 1.0), the hook injected it on the first git command of the
+      session, and session deduplication then correctly suppressed it on every subsequent git call —
+      including the failing push. Tagging git workflow conventions as `universal` would keep them
+      visible at every SessionStart, bypassing dedup for meta-rules that need continuous
+      reinforcement
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -86,3 +90,7 @@
 - [x] Dogfooding deferred — search relevance regression tests (PR #24), pattern strengthening
       (`rust/tooling.md`, `workflows/git-branch-pr.md`), memory→lore migration (3 memories retired).
       See `docs/plans/2026-04-03-002-fix-dogfooding-deferred-plan.md`
+- [x] `.loreignore` — gitignore-style exclude file in pattern repositories. Filters files during
+      full and delta ingest, with reconciliation when the file changes. Supports negation patterns,
+      directory globs, and recursive globs via the `ignore` crate. See
+      `docs/plans/2026-04-06-001-feat-loreignore-plan.md`
