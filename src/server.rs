@@ -484,36 +484,7 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 format!("{summary}\n\n{formatted}")
             };
 
-            // Build the structured metadata block consumed by the
-            // coverage-check skill (and any future MCP client) so callers
-            // can read per-row rank/source/score and the top-level mode
-            // field directly instead of parsing the prose body. The
-            // `mode` field is the load-bearing signal that distinguishes
-            // hybrid (Ollama embedder + FTS) from `fts_fallback`
-            // (embedder unreachable, lexical-only). See
-            // `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
-            // for the full contract.
-            let result_rows: Vec<Value> = results
-                .iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    json!({
-                        "rank": i + 1,
-                        "title": r.title,
-                        "source_file": r.source_file,
-                        "score": r.score,
-                    })
-                })
-                .collect();
-            let metadata = json!({
-                "query": query,
-                "top_k": top_k,
-                "result_count": results.len(),
-                "mode": if embed_failed { "fts_fallback" } else { "hybrid" },
-                "embed_failed": embed_failed,
-                "results": result_rows,
-            });
-
+            let metadata = build_search_metadata(query, top_k, embed_failed, &results);
             text_response_with_metadata(req, &response, &metadata)
         }
         Err(e) => error_response(req, &format!("Search failed: {e}")),
@@ -809,6 +780,49 @@ fn commit_note(status: &CommitStatus) -> String {
     }
 }
 
+/// Build the structured metadata block consumed by `search_patterns` MCP
+/// callers (specifically the `coverage-check` Claude Code skill at
+/// `integrations/claude-code/skills/coverage-check/SKILL.md`).
+///
+/// The `mode` field is the load-bearing signal that distinguishes hybrid
+/// (Ollama embedder + FTS) from `fts_fallback` (embedder unreachable,
+/// lexical-only). Without it, MCP clients cannot detect the silent FTS-only
+/// fallback that `handle_search` performs when the embedder errors — the
+/// prose response returns successfully with a "Note: Ollama unreachable"
+/// prefix, but lexical and hybrid ranks are not comparable, so any
+/// downstream coverage computation against `fts_fallback` results would be
+/// meaningless.
+///
+/// See `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+/// (Unit 2, "Approach" and "Test scenarios") for the full contract.
+fn build_search_metadata(
+    query: &str,
+    top_k: usize,
+    embed_failed: bool,
+    results: &[crate::database::SearchResult],
+) -> Value {
+    let result_rows: Vec<Value> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            json!({
+                "rank": i + 1,
+                "title": r.title,
+                "source_file": r.source_file,
+                "score": r.score,
+            })
+        })
+        .collect();
+    json!({
+        "query": query,
+        "top_k": top_k,
+        "result_count": results.len(),
+        "mode": if embed_failed { "fts_fallback" } else { "hybrid" },
+        "embed_failed": embed_failed,
+        "results": result_rows,
+    })
+}
+
 fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0",
@@ -1049,10 +1063,11 @@ mod tests {
     }
 
     /// Pin the `search_patterns` metadata block contract: hybrid mode, results
-    /// present, per-row rank/source/score, top-level query/top_k/result_count/
-    /// embed_failed/mode fields. The skill that consumes this metadata depends
-    /// on these field names — changing the shape requires updating the skill
-    /// prompt at `integrations/claude-code/skills/coverage-check/SKILL.md`.
+    /// present, per-row `rank`/`source_file`/`score`, top-level `query`/`top_k`/
+    /// `result_count`/`embed_failed`/`mode` fields. The skill that consumes
+    /// this metadata depends on these field names — changing the shape
+    /// requires updating the skill prompt at
+    /// `integrations/claude-code/skills/coverage-check/SKILL.md`.
     #[test]
     fn search_patterns_response_metadata_pins_hybrid_shape() {
         let h = TestHarness::new();
@@ -1113,8 +1128,9 @@ mod tests {
         );
     }
 
-    /// Empty result set: results array is empty, result_count is 0, mode is
-    /// still hybrid (the embedder did not fail; there were just no matches).
+    /// Empty result set: `results` array is empty, `result_count` is 0,
+    /// `mode` is still `hybrid` (the embedder did not fail; there were just
+    /// no matches).
     #[test]
     fn search_patterns_response_metadata_empty_results() {
         let h = TestHarness::new();
@@ -1141,8 +1157,8 @@ mod tests {
     /// Multiple chunks for the same source file produce multiple result rows
     /// with the same `source_file` and ascending rank values. The skill
     /// computes "rank of the pattern" as the minimum rank across matching
-    /// rows; this test pins the per-row source_file field so that computation
-    /// is well-defined.
+    /// rows; this test pins the per-row `source_file` field so that
+    /// computation is well-defined.
     ///
     /// `min_relevance` is set to 0.0 in this harness to bypass the
     /// production-default 0.6 threshold, which filters `FakeEmbedder`'s

@@ -175,10 +175,10 @@ fn split_frontmatter(contents: &str) -> (String, String) {
 
 fn frontmatter_field<'a>(frontmatter: &'a str, key: &str) -> Option<&'a str> {
     for line in frontmatter.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim() == key {
-                return Some(v.trim());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim() == key
+        {
+            return Some(v.trim());
         }
     }
     None
