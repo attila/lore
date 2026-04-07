@@ -53,8 +53,12 @@ is exhaustive — no requirement is silently dropped.
   timeout) — **Unit 2** (Rust change makes the parallel-results path machine-readable) and **Unit
   3** (skill prompt invokes in parallel and waits).
 - **R6** (four-state coverage report: surfaced/not_present/errored/ degraded; refuse coverage ratio
-  if any query is degraded) — **Unit 2** (Rust change adds `mode: "hybrid" | "fts_fallback"` field)
-  and **Unit 3** (skill prompt renders the four states and applies the refusal rule).
+  if any query is degraded) — **Unit 2** (Rust change adds three-value
+  `mode: "hybrid" |
+  "fts_fallback" | "fts_only"` enum so MCP clients can distinguish full hybrid
+  search from embedder-fallback and from configured FTS-only deployments) and **Unit 3** (skill
+  prompt renders the four states and applies the refusal rule, with cascade detection at step 6
+  catching `fts_only` and `fts_fallback` early).
 - **R7** (concrete edit suggestions per gap) — **Unit 3** (skill prompt generates and applies
   suggestions).
 - **R8** (auto-iteration with stability OR ceiling=3 termination, Bash-`diff`-driven mechanical
@@ -227,14 +231,25 @@ call sites are the canonical reference) and the institutional learnings cover ev
   put per-result fields in a `results: [...]` array. Mirror the field-naming conventions already in
   the file.
 - **Search metadata fields:**
-  - Top level: `mode` (`"hybrid" | "fts_fallback"`), `query`, `top_k`, `result_count`,
-    `embed_failed` (boolean — already an internal flag at `src/server.rs:412`).
+  - Top level: `mode` (three-value enum, see below), `query`, `top_k`, `result_count`.
   - Per result row in `results`: `rank` (1-indexed integer matching the existing `[N]` prose
     prefix), `title`, `source_file`, `score`. Other fields (`tags`, `body_excerpt`) are nice-to-have
     but not required by the skill.
-  - The `mode` field is the load-bearing one — without it the skill cannot detect Ollama-down silent
-    FTS fallback. Use the existing `embed_failed` boolean as the source of truth and translate to
-    the string enum.
+  - The `mode` field is the load-bearing one. It distinguishes three orthogonal cases that the prose
+    response body cannot expose:
+    - `"hybrid"`: full hybrid search (Ollama embedder + FTS combined via reciprocal-rank fusion).
+      Scores are comparable across queries; aggregate coverage metrics are valid.
+    - `"fts_fallback"`: hybrid was attempted but the embedder was unreachable; silently fell back to
+      FTS-only for this query. Scores use BM25 rank, not comparable to `"hybrid"`.
+    - `"fts_only"`: deployment is configured for FTS-only via `config.search.hybrid = false`. The
+      embedder was never attempted. Scores use BM25 rank, not comparable to `"hybrid"`.
+  - The mode value is derived from `(config.search.hybrid, embed_failed)` via a Rust enum
+    `SearchMode` whose `as_str` match is intentionally exhaustive (no wildcard arm) so adding a new
+    variant fails to compile until the JSON serialisation is updated.
+  - **`embed_failed` is NOT exposed.** The previous design exposed `embed_failed: bool` alongside
+    `mode`, but it was strictly derivable (`true` iff `mode == "fts_fallback"`) and the redundancy
+    created a maintenance hazard for clients that branched on either field. Clients read `mode`
+    exclusively.
 - **No new metadata helper.** The metadata block is built inline in `handle_search` using
   `serde_json::json!`, matching the convention of the four existing call sites. A
   `search_results_metadata()` helper would be premature abstraction for one call site.
@@ -409,7 +424,6 @@ After Unit 2, the same prose body remains in `content[0].text`, plus a new `meta
       "top_k": 5,
       "result_count": 3,
       "mode": "hybrid",
-      "embed_failed": false,
       "results": [
         {
           "rank": 1,
@@ -429,9 +443,19 @@ After Unit 2, the same prose body remains in `content[0].text`, plus a new `meta
 }
 ```
 
-When the embedder is unreachable, `mode` becomes `"fts_fallback"` and `embed_failed` becomes `true`.
-The skill detects this and surfaces the query as `degraded` rather than computing coverage against
-incomparable ranks.
+The `mode` field is a three-value enum:
+
+- `"hybrid"`: full Ollama-embedder + FTS search via reciprocal-rank fusion. Comparable across
+  queries.
+- `"fts_fallback"`: hybrid was attempted but the embedder was unreachable for this query; silently
+  fell back to FTS-only. Not comparable to `"hybrid"`.
+- `"fts_only"`: deployment is configured for FTS-only via `config.search.hybrid = false`. The
+  embedder was never attempted. Not comparable to `"hybrid"`.
+
+The skill detects `"fts_fallback"` and `"fts_only"` at step 6 (cascade detection runs one extra
+search call before the parallel batch and aborts the iteration on either non-hybrid value with a
+clear next-action message). Step 9's coverage-ratio refusal is the fallback for the rare case where
+the embedder fails partway through the parallel batch after passing cascade detection.
 
 ### Skill iteration loop (Unit 3)
 
@@ -595,12 +619,21 @@ before modifying `handle_search`, mirroring the
 
 **Approach:**
 
-- Build the metadata `serde_json::Value` inline in `handle_search` using the `json!` macro. Match
-  the convention of the four existing call sites (`handle_add`, `handle_update`, `handle_append`,
-  `handle_lore_status`).
-- Top-level fields: `mode` (`"hybrid"` or `"fts_fallback"`), `query`, `top_k`, `result_count`,
-  `embed_failed`. The `mode` value derives from the existing internal `embed_failed` boolean —
-  `true` → `"fts_fallback"`, `false` → `"hybrid"`.
+- Build the metadata `serde_json::Value` in a `build_search_metadata` helper near the existing
+  response helpers in `src/server.rs`. The plan originally called for an inline `json!` block in
+  `handle_search` mirroring the four existing call sites, but the per-row `results` array pushed
+  `handle_search` over the project's `clippy::too_many_lines = 100` limit, so the metadata
+  construction was extracted into the helper. The helper is testable in isolation if a future test
+  wants to assert on the metadata shape without going through the full handler.
+- Introduce a `SearchMode` Rust enum with three variants — `Hybrid`, `FtsFallback`, `FtsOnly` — that
+  maps from `(config.search.hybrid, embed_failed)` to a stable string via an exhaustive `as_str`
+  match (no wildcard arm). This mirrors the discipline in `commit_status_metadata`: adding a new
+  variant fails to compile until the JSON serialisation is updated. The three values distinguish
+  full hybrid search, embedder-down fallback, and configured FTS-only deployments — all three need
+  different client behaviour because their rank semantics are not comparable.
+- Top-level metadata fields: `mode` (the three-value enum, serialised as a string), `query`,
+  `top_k`, `result_count`. `embed_failed` is **NOT** exposed — it was strictly derivable from `mode`
+  and the redundancy created a maintenance hazard.
 - Per-result fields in a `results: [...]` array: `rank` (1-indexed integer matching the prose `[N]`
   prefix), `title`, `source_file`, `score`. Map from the existing `SearchResult` rows the function
   already iterates over for prose rendering.
@@ -608,13 +641,12 @@ before modifying `handle_search`, mirroring the
   `text_response_with_metadata(req, &response, &metadata)`. The prose `response` body is
   **unchanged** — this is purely additive, so existing consumers reading `content[0].text` continue
   to work.
-- Do not introduce a `search_results_metadata()` helper. One inline call site does not justify
-  abstraction; mirror the inline `json!` pattern of the existing call sites.
 - **File-scoped restriction:** Unit 2 does NOT modify the `tools_list` handler, the
   `search_patterns` tool registration, or the JSON-Schema declaration of the tool's input/output.
-  Only the request-handler (`handle_search`) response-building code changes. This is a stricter
-  invariant than "the snapshot test still passes" — it bounds the blast radius of Unit 2 to one
-  function and one helper call.
+  Only the request-handler (`handle_search`) response-building code and the new
+  `SearchMode`/`build_search_metadata` helpers change. This is a stricter invariant than "the
+  snapshot test still passes" — it bounds the blast radius of Unit 2 to one function and one helper
+  module.
 
 **Patterns to follow:**
 
@@ -628,27 +660,37 @@ before modifying `handle_search`, mirroring the
 **Test scenarios:**
 
 - **Happy path — hybrid mode, results present.** Insert a chunk for `rust/cargo-deny.md`, send a
-  `search_patterns` request for `"cargo
-  deny check"`, assert: `error.is_null()`,
-  `metadata.mode == "hybrid"`, `metadata.embed_failed == false`,
+  `search_patterns` request for `"cargo deny check"`, assert: `error.is_null()`,
+  `metadata.mode == "hybrid"`, `metadata.embed_failed.is_null()` (the field was removed),
   `metadata.query == "cargo deny check"`, `metadata.top_k == 5`, `metadata.result_count >= 1`,
   `metadata.results[0].rank == 1`, `metadata.results[0].source_file == "rust/cargo-deny.md"`,
   `metadata.results[0].score > 0`. Also assert the prose `content[0].text` still contains
   `[1] ... (source: rust/cargo-deny.md)` — confirms additive non-breaking change.
 - **Happy path — empty result set.** Insert no chunks, send a `search_patterns` request, assert:
   `metadata.results` is an empty array, `metadata.result_count == 0`, `metadata.mode == "hybrid"`,
-  `metadata.embed_failed == false`. Prose body is "No results."
+  `metadata.embed_failed.is_null()`. Prose body is "No results."
 - **Edge case — multiple chunks for same source file.** Insert two chunks for `rust/cargo-deny.md`
   (different headings), assert `metadata.results` contains two rows both with
   `source_file == "rust/cargo-deny.md"`, with `rank` values 1 and 2. This is the case where the
   skill computes "rank of the pattern = minimum rank across rows whose source_file matches".
-- **Error path — embedder failure triggers `fts_fallback` mode.** Use a `FakeEmbedder` configured to
-  return an error, send a `search_patterns` request, assert: `metadata.mode == "fts_fallback"`,
-  `metadata.embed_failed == true`. Prose body still contains the existing `Note: Ollama unreachable`
-  prefix (per `src/server.rs:418-422`). The skill (Unit 3) consumes `metadata.mode` rather than
-  string-matching the prose note.
+- **Error path — embedder failure triggers `fts_fallback` mode.** Use a `FailingEmbedder`, send a
+  `search_patterns` request, assert: `metadata.mode == "fts_fallback"`,
+  `metadata.embed_failed.is_null()`. Prose body still contains the existing
+  `Note: Ollama unreachable` prefix (per `src/server.rs:418-422`). The skill (Unit 3) consumes
+  `metadata.mode` rather than string-matching the prose note.
+- **Configuration path — FTS-only deployment reports `fts_only` mode.** Build a test harness with
+  `config.search.hybrid = false`, insert a chunk without an embedding, send a `search_patterns`
+  request, assert: `metadata.mode == "fts_only"` (distinct from `"hybrid"` and `"fts_fallback"`),
+  `metadata.embed_failed.is_null()`, `metadata.result_count >= 1`,
+  `metadata.results[0].source_file == "rust/cargo-deny.md"`. Pins the contract that `"fts_only"` is
+  its own mode value, not aliased to `"hybrid"` (which the original derivation via `embed_failed`
+  alone would have silently produced).
 - **Edge case — `top_k` parameter respected.** Send a `search_patterns` request with `top_k: 3`,
   assert `metadata.top_k == 3` and `metadata.results.len() <= 3`.
+- **Error path — JSON-RPC error response carries no metadata block.** Send a request with
+  `top_k > MAX_TOP_K`, assert `resp["error"].is_null() == false` and the response either has no
+  `result` or no `metadata` block. Pins the asymmetry the skill consumer relies on (read
+  `resp["error"]` first; only read `result.metadata` on the success path).
 - **Integration — `tools_list_returns_all_five_tools` snapshot still passes unchanged.** Sanity
   check on the file-scoped restriction. The existing test at `src/server.rs:927` should pass without
   modification.

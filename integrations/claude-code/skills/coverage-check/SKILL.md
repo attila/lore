@@ -160,12 +160,44 @@ Run `lore ingest --file <target>` via Bash, **without** `--force` initially. Cap
   - On `N` (or empty): exit cleanly with "Coverage check skipped: file is `.loreignore`-excluded and
     the author declined to bypass."
 
-## 6. Cascade detection (do not skip)
+## 6. Cascade detection and search-mode pre-flight (do not skip)
 
 Before the main parallel search batch, issue **one extra** `search_patterns` call with a query
 constructed from a distinctive token in the pattern body — the agent picks a unique-looking word
-from the body that satisfies the FTS5 rubric (≥3 alphabetic characters, not a stop-word). Verify the
-target's `source_file` appears in `metadata.results`. If it does not, halt the iteration with:
+from the body that satisfies the FTS5 rubric (≥3 alphabetic characters, not a stop-word). This
+single call serves two purposes that both produce loud aborts on failure.
+
+**(a) Search-mode pre-flight.** Read `result.metadata.mode`. The lore MCP server reports one of
+three values:
+
+- **`"hybrid"`** — full hybrid search (Ollama embedder + FTS combined via reciprocal-rank fusion).
+  Proceed to (b) below.
+- **`"fts_only"`** — the lore deployment is configured for FTS-only search via
+  `config.search.hybrid = false` in the lore configuration file. The embedder was never attempted.
+  Halt the iteration immediately with:
+
+  > Coverage check halted: lore is configured for FTS-only search (`config.search.hybrid = false` in
+  > `~/.config/lore/lore.toml`). The coverage-check skill requires hybrid mode (Ollama embedder +
+  > FTS combined via reciprocal-rank fusion) because FTS-only ranks (BM25) are not comparable to
+  > hybrid ranks across queries — the per-query coverage scoring would be meaningless. Set
+  > `hybrid = true` in `~/.config/lore/lore.toml` and retry.
+- **`"fts_fallback"`** — the lore deployment is configured for hybrid mode but the embedder (Ollama)
+  was unreachable for this query, so the search fell back to FTS-only. The parallel query batch in
+  step 7 would also fall back, producing a fully-degraded report. Halt the iteration immediately
+  with:
+
+  > Coverage check halted: the lore embedder (Ollama) is unreachable. The cascade-detection query
+  > fell back to FTS-only, and the parallel coverage queries that follow would do the same —
+  > producing a report whose ranks are not comparable across queries. Restart Ollama and retry the
+  > skill.
+
+These two early aborts catch deployment-misconfiguration and embedder-unavailability **once** at
+step 6 instead of repeating the diagnosis 5-12 times in step 7's parallel batch and then refusing
+the coverage ratio at step 9. Step 9's refusal logic remains as a fallback for the edge case where
+the embedder fails _partway through_ the parallel batch (after passing cascade detection).
+
+**(b) Cascade detection.** With `mode == "hybrid"` confirmed, verify the target's `source_file`
+appears in `result.metadata.results`. If it does not, halt the iteration with:
 
 > Coverage check halted: index state changed unexpectedly between ingest and search. Check for
 > parallel `lore ingest` processes (file watcher, pre-commit hook, second Claude Code session). The
@@ -173,9 +205,10 @@ target's `source_file` appears in `metadata.results`. If it does not, halt the i
 > `docs/solutions/best-practices/composition-cascades-new-write-paths-can-be-silently-undone-2026-04-06.md`
 > may have fired. Stop the parallel writer and re-invoke the skill.
 
-This single extra MCP call converts a silent failure into a loud abort. Do not skip it; the cost is
-one query per iteration and the benefit is a clear next-action message instead of a misleading
-coverage report.
+This single extra MCP call converts three silent failures (deployment misconfiguration, embedder
+unavailability, composition cascade) into three distinct loud aborts. Do not skip it; the cost is
+one query per iteration and the benefit is a clear next-action message in each case instead of a
+misleading coverage report.
 
 ## 7. Parallel search (R5)
 
@@ -195,8 +228,14 @@ For each query response, classify the target pattern into exactly one of four st
 - **errored: `<reason>`** — the JSON-RPC `error` field on the response is non-null. Read the error
   message and surface it.
 - **degraded: fts_fallback** — the response succeeded but `result.metadata.mode == "fts_fallback"`.
-  The embedder was unreachable; hybrid-mode rank is not comparable to FTS-only rank, so coverage
-  cannot be computed.
+  The embedder was unreachable for this individual query, falling back to FTS-only mid-batch. This
+  state is **rare in practice** because step 6's pre-flight already aborted the iteration if the
+  cascade-detection query reported `fts_fallback`. It can still happen if the embedder fails partway
+  through the parallel batch (e.g. Ollama hits a request budget mid-batch). When it does,
+  hybrid-mode rank is not comparable to FTS-only rank, so coverage cannot be computed for this
+  query. Note: `result.metadata.mode == "fts_only"` is **structurally impossible** at this step
+  because step 6 catches the FTS-only deployment and aborts the iteration before the parallel batch
+  ever runs.
 - **surfaced (rank: N)** — the target's canonical `source_file` (relative to `knowledge_dir`)
   appears in any row of `result.metadata.results`. Compute N as the **minimum** rank across all
   matching rows (a single source file may produce multiple chunk rows; the lowest rank wins).

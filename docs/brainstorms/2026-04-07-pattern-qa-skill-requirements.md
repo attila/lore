@@ -60,7 +60,7 @@ eventual quality gate is not.
         │
         ▼
   Coverage report (rendered to chat AND appended as JSONL line):
-    surfaced (rank) + not present + errored + degraded (fts_fallback)
+    surfaced (rank) + not present + errored + degraded (fts_fallback or fts_only)
         │
         ▼
   Suggest concrete edits to close gaps
@@ -127,9 +127,13 @@ eventual quality gate is not.
 
   `search_patterns` returns its result rows as a structured metadata block (added in this same pull
   request — see Dependencies and Key Decisions) containing per-row `rank`, `source_file`, `score`,
-  and a top-level `mode` field that distinguishes `hybrid` (Ollama embedder plus FTS) from
-  `fts_fallback` (Ollama unreachable, lexical-only). The skill consumes the metadata block directly
-  rather than parsing the human-readable prose body of the response.
+  and a top-level three-value `mode` field: `hybrid` (Ollama embedder plus FTS via reciprocal-rank
+  fusion), `fts_fallback` (Ollama unreachable in a hybrid-configured deployment, silently fell back
+  to FTS-only for this query), or `fts_only` (deployment is configured for FTS-only via
+  `config.search.hybrid = false`, embedder never attempted). The skill consumes the metadata block
+  directly rather than parsing the human-readable prose body of the response. Both `fts_fallback`
+  and `fts_only` use BM25 ranks that are not comparable to hybrid RRF scores, so the skill must
+  refuse to compute aggregate coverage metrics in either state.
 - R6. The skill produces a coverage report listing each query and one of **four** states for the
   target pattern:
   - **surfaced (rank N):** the target's `source_file` appears in a result row at rank N within the
@@ -139,10 +143,14 @@ eventual quality gate is not.
   - **errored: <reason>:** the MCP tool returned a JSON-RPC error for this query (transport failure,
     malformed input, internal panic). Distinct from "timed out", which is not a v1 state because v1
     commits no per-query timeout.
-  - **degraded: fts_fallback:** the MCP tool succeeded but returned `mode: fts_fallback` because the
-    embedder was unreachable. Hybrid- mode rank is not comparable to FTS-only rank, so the skill
-    refuses to compute coverage for queries in this state and surfaces them separately. The author
-    should retry once Ollama is back.
+  - **degraded:** the MCP tool succeeded but returned `mode: fts_fallback` (embedder unreachable in
+    a hybrid-configured deployment) or `mode: fts_only` (deployment configured for FTS-only).
+    Hybrid-mode rank is not comparable to FTS-only rank, so the skill refuses to compute coverage
+    for queries in this state and surfaces them separately. For `fts_fallback` the author should
+    retry once Ollama is back; for `fts_only` the author should reconfigure lore with
+    `hybrid = true`. In practice the skill catches both cases at step 6's cascade-detection
+    pre-flight before the parallel batch ever runs, so this state in step 8 is reserved for the edge
+    case where the embedder fails partway through the parallel batch.
 
   Per-query errors and degradation do not abort the report. The overall coverage ratio is computed
   against successfully-executed hybrid-mode queries only; the counts of errored and degraded queries
@@ -334,7 +342,7 @@ eventual quality gate is not.
         status: 'surfaced' | 'not_present' | 'errored' | 'degraded',
         rank: int | null,
         error: string | null,
-        mode: 'hybrid' | 'fts_fallback' | null
+        mode: 'hybrid' | 'fts_fallback' | 'fts_only' | null
       }
     ],
     coverage_ratio: float,    // computed against hybrid-mode only

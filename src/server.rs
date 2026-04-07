@@ -484,7 +484,8 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 format!("{summary}\n\n{formatted}")
             };
 
-            let metadata = build_search_metadata(query, top_k, embed_failed, &results);
+            let mode = SearchMode::from_search_state(ctx.config.search.hybrid, embed_failed);
+            let metadata = build_search_metadata(query, top_k, mode, &results);
             text_response_with_metadata(req, &response, &metadata)
         }
         Err(e) => error_response(req, &format!("Search failed: {e}")),
@@ -780,25 +781,87 @@ fn commit_note(status: &CommitStatus) -> String {
     }
 }
 
+/// The search mode used to produce a `search_patterns` response.
+///
+/// The mode distinguishes three orthogonal cases that the prose response
+/// body cannot expose:
+///
+/// - `Hybrid`: full hybrid search with embedder + FTS combined via
+///   reciprocal-rank fusion. Scores are comparable across queries.
+/// - `FtsFallback`: hybrid was attempted but the embedder was unreachable;
+///   silently fell back to FTS-only for this query. Scores use BM25
+///   rank, not comparable to `Hybrid`.
+/// - `FtsOnly`: deployment is configured for FTS-only via
+///   `config.search.hybrid = false`. The embedder was never attempted.
+///   Scores use BM25 rank, not comparable to `Hybrid`.
+///
+/// MCP clients (specifically the `coverage-check` Claude Code skill)
+/// consume the `mode` field to decide whether aggregate coverage metrics
+/// are meaningful. Only `Hybrid` is comparable; both `FtsFallback` and
+/// `FtsOnly` must trigger client-side refusal of cross-query
+/// aggregation.
+///
+/// The `as_str` match is intentionally exhaustive (no wildcard arm) so
+/// adding a new variant fails to compile until the JSON serialisation is
+/// updated. This mirrors the discipline in `commit_status_metadata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Hybrid,
+    FtsFallback,
+    FtsOnly,
+}
+
+impl SearchMode {
+    /// Derive the search mode from `config.search.hybrid` and the
+    /// runtime `embed_failed` flag observed by `handle_search`. The two
+    /// inputs are orthogonal: `hybrid_enabled` is a configuration choice
+    /// (FTS-only is a deliberate deployment decision); `embed_failed`
+    /// reflects whether the embedder was reachable for this specific
+    /// request.
+    fn from_search_state(hybrid_enabled: bool, embed_failed: bool) -> Self {
+        if !hybrid_enabled {
+            // Configured FTS-only — `handle_search` never attempts the
+            // embedder, so `embed_failed` is necessarily false. The
+            // debug_assert documents the invariant; in release builds the
+            // outer `if` already routes correctly.
+            debug_assert!(
+                !embed_failed,
+                "embed_failed must be false when hybrid is disabled — the embedder is never attempted in the FTS-only code path"
+            );
+            Self::FtsOnly
+        } else if embed_failed {
+            Self::FtsFallback
+        } else {
+            Self::Hybrid
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::FtsFallback => "fts_fallback",
+            Self::FtsOnly => "fts_only",
+        }
+    }
+}
+
 /// Build the structured metadata block consumed by `search_patterns` MCP
 /// callers (specifically the `coverage-check` Claude Code skill at
 /// `integrations/claude-code/skills/coverage-check/SKILL.md`).
 ///
-/// The `mode` field is the load-bearing signal that distinguishes hybrid
-/// (Ollama embedder + FTS) from `fts_fallback` (embedder unreachable,
-/// lexical-only). Without it, MCP clients cannot detect the silent FTS-only
-/// fallback that `handle_search` performs when the embedder errors — the
-/// prose response returns successfully with a "Note: Ollama unreachable"
-/// prefix, but lexical and hybrid ranks are not comparable, so any
-/// downstream coverage computation against `fts_fallback` results would be
-/// meaningless.
+/// The `mode` field is the load-bearing signal — see `SearchMode` above
+/// for the three values and their meaning. The previous version of this
+/// helper exposed a separate `embed_failed` boolean alongside `mode`;
+/// that field has been removed because it was strictly derivable from
+/// `mode` (true iff `mode == "fts_fallback"`) and the redundancy created
+/// a maintenance hazard for clients that branched on either field.
 ///
 /// See `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
 /// (Unit 2, "Approach" and "Test scenarios") for the full contract.
 fn build_search_metadata(
     query: &str,
     top_k: usize,
-    embed_failed: bool,
+    mode: SearchMode,
     results: &[crate::database::SearchResult],
 ) -> Value {
     let result_rows: Vec<Value> = results
@@ -817,8 +880,7 @@ fn build_search_metadata(
         "query": query,
         "top_k": top_k,
         "result_count": results.len(),
-        "mode": if embed_failed { "fts_fallback" } else { "hybrid" },
-        "embed_failed": embed_failed,
+        "mode": mode.as_str(),
         "results": result_rows,
     })
 }
@@ -1063,11 +1125,16 @@ mod tests {
     }
 
     /// Pin the `search_patterns` metadata block contract: hybrid mode, results
-    /// present, per-row `rank`/`source_file`/`score`, top-level `query`/`top_k`/
-    /// `result_count`/`embed_failed`/`mode` fields. The skill that consumes
+    /// present, per-row `rank`/`source_file`/`score`, top-level
+    /// `query`/`top_k`/`result_count`/`mode` fields. The skill that consumes
     /// this metadata depends on these field names — changing the shape
     /// requires updating the skill prompt at
     /// `integrations/claude-code/skills/coverage-check/SKILL.md`.
+    ///
+    /// `embed_failed` was previously exposed as a separate boolean alongside
+    /// `mode` but has been removed. It was strictly derivable from `mode`
+    /// (`true` iff `mode == "fts_fallback"`) and the redundancy created a
+    /// maintenance hazard once the third mode value (`fts_only`) landed.
     #[test]
     fn search_patterns_response_metadata_pins_hybrid_shape() {
         let h = TestHarness::new();
@@ -1098,7 +1165,11 @@ mod tests {
 
         // Top-level fields the skill consumes.
         assert_eq!(metadata["mode"], "hybrid");
-        assert_eq!(metadata["embed_failed"], false);
+        assert!(
+            metadata["embed_failed"].is_null(),
+            "embed_failed was removed from metadata in favour of the three-value `mode` enum; \
+             clients must read `mode` exclusively"
+        );
         assert_eq!(metadata["query"], "cargo deny check");
         assert_eq!(metadata["top_k"], 5);
         assert!(
@@ -1148,7 +1219,7 @@ mod tests {
         assert!(resp["error"].is_null());
         let metadata = &resp["result"]["metadata"];
         assert_eq!(metadata["mode"], "hybrid");
-        assert_eq!(metadata["embed_failed"], false);
+        assert!(metadata["embed_failed"].is_null());
         assert_eq!(metadata["result_count"], 0);
         let results = metadata["results"].as_array().unwrap();
         assert!(results.is_empty(), "results should be empty for no matches");
@@ -1239,11 +1310,15 @@ mod tests {
         }
     }
 
-    /// Embedder failure (Ollama unreachable) flips `mode` to `"fts_fallback"`
-    /// and `embed_failed` to `true`. The prose body still contains the
-    /// existing "Note: Ollama unreachable" prefix so prose-consuming clients
-    /// keep working, but the metadata is the load-bearing signal that lets
-    /// the coverage-check skill detect the silent FTS-only fallback.
+    /// Embedder failure (Ollama unreachable) flips `mode` to `"fts_fallback"`.
+    /// The prose body still contains the existing "Note: Ollama unreachable"
+    /// prefix so prose-consuming clients keep working, but the metadata is
+    /// the load-bearing signal that lets the coverage-check skill detect the
+    /// silent FTS-only fallback. `fts_fallback` is distinct from `fts_only`:
+    /// the former means "the embedder was attempted and failed", the latter
+    /// means "the embedder was never attempted because the deployment is
+    /// configured for FTS-only" (see
+    /// `search_patterns_response_metadata_fts_only_when_hybrid_disabled`).
     #[test]
     fn search_patterns_response_metadata_fts_fallback_on_embedder_failure() {
         let (db, embedder, config, _tmp) = failing_embedder_harness();
@@ -1278,13 +1353,90 @@ mod tests {
         assert!(resp["error"].is_null());
         let metadata = &resp["result"]["metadata"];
         assert_eq!(metadata["mode"], "fts_fallback");
-        assert_eq!(metadata["embed_failed"], true);
+        assert!(
+            metadata["embed_failed"].is_null(),
+            "embed_failed was removed; use `mode == \"fts_fallback\"` instead"
+        );
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("Note: Ollama unreachable"),
             "prose body should still contain the Ollama-unreachable note, got: {text}"
         );
+    }
+
+    /// FTS-only configured search (`config.search.hybrid = false`) flips
+    /// `mode` to `"fts_only"`, distinct from both `"hybrid"` (full
+    /// embedder + FTS) and `"fts_fallback"` (embedder unreachable in a
+    /// hybrid-configured deployment).
+    ///
+    /// This test pins the contract that `fts_only` is its own mode value,
+    /// not aliased to `hybrid` or `fts_fallback`. The coverage-check skill
+    /// reads `mode` to decide whether aggregate coverage metrics are
+    /// meaningful — only `hybrid` is comparable across queries; both
+    /// `fts_only` and `fts_fallback` use BM25 ranks that are incomparable
+    /// to RRF scores, so the skill must refuse to compute a coverage ratio
+    /// when it sees either value.
+    ///
+    /// Without this test, the previous bug — where `mode` was derived
+    /// solely from `embed_failed` and silently reported `"hybrid"` for
+    /// `config.search.hybrid = false` deployments — would not be caught
+    /// by the existing test suite.
+    #[test]
+    fn search_patterns_response_metadata_fts_only_when_hybrid_disabled() {
+        let tmp = tempdir().unwrap();
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "test-model",
+        );
+        config.search.hybrid = false;
+
+        // Insert without an embedding — FTS-only path does not consult the
+        // vector index, so the chunk only needs to be in the FTS5 table.
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":17,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(
+            metadata["mode"], "fts_only",
+            "FTS-only configured search must report mode='fts_only' (distinct from \
+             'hybrid' and 'fts_fallback'); the previous derivation from embed_failed \
+             alone silently reported 'hybrid' here"
+        );
+        assert!(metadata["embed_failed"].is_null());
+        // Sanity check: the FTS-only path actually returned the chunk via
+        // lexical match.
+        assert!(
+            metadata["result_count"].as_u64().unwrap() >= 1,
+            "expected the FTS-only path to find the chunk via lexical match, got: {metadata}"
+        );
+        let results = metadata["results"].as_array().unwrap();
+        assert_eq!(results[0]["source_file"], "rust/cargo-deny.md");
     }
 
     /// `top_k` parameter is reflected in the metadata block, and the results
