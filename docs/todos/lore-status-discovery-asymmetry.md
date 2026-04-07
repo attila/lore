@@ -7,7 +7,7 @@ created: 2026-04-06
 source: ce-review (feat/git-optional-knowledge-base second pass)
 files:
   - src/hook.rs:format_session_context
-  - integrations/claude-code/skills/search-lore/SKILL.md
+  - integrations/claude-code/skills/search/SKILL.md
 related_pr: feat/git-optional-knowledge-base
 ---
 
@@ -47,10 +47,9 @@ Pick one of:
    (git status, indexed counts, last ingested commit) before write operations.
    ```
 
-2. **Add `lore_status` to the search-lore skill description** at
-   `integrations/claude-code/skills/search-lore/SKILL.md` so agents using the skill see it. This
-   couples the skill to the new tool but avoids polluting every SessionStart context with extra
-   tokens.
+2. **Add `lore_status` to the search skill description** at
+   `integrations/claude-code/skills/search/SKILL.md` so agents using the skill see it. This couples
+   the skill to the new tool but avoids polluting every SessionStart context with extra tokens.
 
 3. **Both.** Modest token cost, maximum discoverability.
 

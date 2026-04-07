@@ -77,7 +77,7 @@ integrations/claude-code/
     hooks.json           # auto-loaded
   mcp.json               # <-- HERE, at plugin root
   skills/
-    search-lore/
+    search/
       SKILL.md
 ```
 
@@ -89,7 +89,7 @@ frontmatter to make it user-invocable only:
 
 ```yaml
 ---
-name: search-lore
+name: search
 description: Search the lore knowledge base...
 disable-model-invocation: true
 user-invocable: true

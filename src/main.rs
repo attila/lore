@@ -258,7 +258,7 @@ fn cmd_init(
     eprintln!("\nTo use with Claude Code, install the lore plugin:\n");
     eprintln!("  claude --plugin-dir <lore-repo>/integrations/claude-code/\n");
     eprintln!("Replace <lore-repo> with the path to your lore source checkout.");
-    eprintln!("This includes the MCP server, lifecycle hooks, and the /search-lore skill.");
+    eprintln!("This includes the MCP server, lifecycle hooks, and the /search skill.");
 
     if user_provided_config {
         eprintln!();

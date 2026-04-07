@@ -130,7 +130,7 @@ integrations/claude-code/
 │   └── hooks.json           # Hook definitions for all four lifecycle events
 ├── mcp.json                 # MCP server configuration (stdio transport)
 └── skills/
-    └── search-lore/
+    └── search/
         └── SKILL.md         # Manual search skill (user-invocable)
 ```
 
@@ -203,9 +203,9 @@ server processes.
 
 ### Skills
 
-The `search-lore` skill provides a user-invocable search command (`/search-lore`) for manual pattern
-lookups. It is configured with `disable-model-invocation: true` because hooks already handle
-automatic injection — the skill exists for explicit, user-initiated searches only.
+The `search` skill provides a user-invocable search command (`/search`) for manual pattern lookups.
+It is configured with `disable-model-invocation: true` because hooks already handle automatic
+injection — the skill exists for explicit, user-initiated searches only.
 
 ## Query Extraction from the Agent's Perspective
 
