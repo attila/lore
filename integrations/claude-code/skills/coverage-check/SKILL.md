@@ -59,6 +59,15 @@ This is a fast-path heuristic, not a guarantee. The authoritative containment ch
 `validate_within_dir` inside `lore ingest --file`'s Rust code (see step 6). Pre-flight exists to
 fail fast on the obvious cases before any embedder work.
 
+> **Why the `include_metadata: true` parameter?** Claude Code's MCP client strips the
+> `result.metadata` sibling from tool responses before surfacing them to the agent — only the
+> `content[]` array reaches the model. Lore's MCP tools therefore carry structured metadata in a
+> fenced `lore-metadata` code block embedded in `content[0].text` rather than as a sibling field on
+> `result`. The fenced block is opt-in because it bloats the response for callers that only need the
+> prose body. See
+> `docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md` for the
+> design.
+
 Steps:
 
 1. Detect the platform once with `uname -s`. On Linux, use `readlink -f` for canonical path
@@ -66,16 +75,26 @@ Steps:
    `python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"` as a portable fallback
    because GNU `readlink -f` is not present on those systems by default. Always quote the path
    argument when invoking either form.
-2. Call the `lore_status` MCP tool with no arguments. Read `result.metadata.knowledge_dir` (a
-   string, the configured knowledge directory). This value may be either an absolute path or a path
-   relative to lore's configuration file location; the canonicalisation step below resolves both
-   cases.
-3. Resolve `$ARGUMENTS` against the configured `knowledge_dir`, NOT against the agent session's
+2. Call the `lore_status` MCP tool with `{"include_metadata": true}`. The `include_metadata`
+   parameter is **required** — without it, the server returns only the prose summary, and the
+   structured `knowledge_dir` field the skill needs for deterministic path resolution is
+   inaccessible from inside Claude Code's MCP client (see the background note below).
+3. Extract the structured metadata from the tool response. The response's `content[0].text` ends
+   with a fenced `lore-metadata` code block containing JSON. The opening marker is a blank line
+   followed by a triple-backtick fence with language tag `lore-metadata`; the closing marker is a
+   triple-backtick fence on its own line. Find the last opening marker in the response text, advance
+   past it, read forward until the next closing marker, and parse the intervening text as JSON. The
+   parsed object exposes the configured `knowledge_dir` at the top level along with
+   `git_repository`, `chunks_indexed`, `loreignore_active`, and other status fields. Read
+   `knowledge_dir` (a string, the configured knowledge directory). This value may be either an
+   absolute path or a path relative to lore's configuration file location; the canonicalisation step
+   below resolves both cases.
+4. Resolve `$ARGUMENTS` against the configured `knowledge_dir`, NOT against the agent session's
    current working directory. The recipe must be deterministic so the skill's pre-flight error
    messages name the same path that R4's authoritative `validate_within_dir` check will see.
 
    1. Canonicalise the configured `knowledge_dir` (call it `KD`).
-      - If `metadata.knowledge_dir` is absolute (starts with `/`), pass it through the
+      - If the extracted `knowledge_dir` is absolute (starts with `/`), pass it through the
         canonicalisation command directly.
       - If it is relative, **halt** with: "Coverage check halted: lore_status returned a relative
         `knowledge_dir` (`<value>`), but R1a cannot determine the correct anchor to resolve it
@@ -89,10 +108,10 @@ Steps:
       `T="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' -- "$KD/$ARGUMENTS")"`.
       This guarantees the target resolves against the pattern repository, not the agent's current
       working directory — the agent may be invoked from any folder.
-4. Check that the canonical target path `T` starts with the canonical `knowledge_dir` `KD` followed
+5. Check that the canonical target path `T` starts with the canonical `knowledge_dir` `KD` followed
    by `/` (string-prefix check, with the trailing `/` so that `KD = /foo` does not match
    `T = /foobar/x.md`).
-5. If the check fails, halt with:
+6. If the check fails, halt with:
 
    > Coverage check requires the target file to live inside the configured `knowledge_dir`.
    >
@@ -164,11 +183,28 @@ Run `lore ingest --file <target>` via Bash, **without** `--force` initially. Cap
 
 Before the main parallel search batch, issue **one extra** `search_patterns` call with a query
 constructed from a distinctive token in the pattern body — the agent picks a unique-looking word
-from the body that satisfies the FTS5 rubric (≥3 alphabetic characters, not a stop-word). This
-single call serves two purposes that both produce loud aborts on failure.
+from the body that satisfies the FTS5 rubric (≥3 alphabetic characters, not a stop-word). **The call
+must pass `include_metadata: true`** in the arguments so the response carries the fenced
+`lore-metadata` block the skill reads below.
 
-**(a) Search-mode pre-flight.** Read `result.metadata.mode`. The lore MCP server reports one of
-three values:
+```json
+{
+  "name": "search_patterns",
+  "arguments": {
+    "query": "<distinctive token from body>",
+    "top_k": 5,
+    "include_metadata": true
+  }
+}
+```
+
+This single call serves two purposes that both produce loud aborts on failure.
+
+**(a) Search-mode pre-flight.** Extract the fenced `lore-metadata` JSON from the response's
+`content[0].text` using the same extraction recipe described in step 2 (locate the last opening
+triple-backtick fence with language tag `lore-metadata`, advance past it, read until the next
+closing triple-backtick fence, parse as JSON). Read the `mode` field from the parsed object. The
+lore MCP server reports one of three values:
 
 - **`"hybrid"`** — full hybrid search (Ollama embedder + FTS combined via reciprocal-rank fusion).
   Proceed to (b) below.
@@ -176,11 +212,12 @@ three values:
   `config.search.hybrid = false` in the lore configuration file. The embedder was never attempted.
   Halt the iteration immediately with:
 
-  > Coverage check halted: lore is configured for FTS-only search (`config.search.hybrid = false` in
-  > `~/.config/lore/lore.toml`). The coverage-check skill requires hybrid mode (Ollama embedder +
-  > FTS combined via reciprocal-rank fusion) because FTS-only ranks (BM25) are not comparable to
-  > hybrid ranks across queries — the per-query coverage scoring would be meaningless. Set
-  > `hybrid = true` in `~/.config/lore/lore.toml` and retry.
+  > Coverage check halted: lore is configured for FTS-only search
+  > (`config.search.hybrid =
+  > false` in `~/.config/lore/lore.toml`). The coverage-check skill
+  > requires hybrid mode (Ollama embedder + FTS combined via reciprocal-rank fusion) because
+  > FTS-only ranks (BM25) are not comparable to hybrid ranks across queries — the per-query coverage
+  > scoring would be meaningless. Set `hybrid = true` in `~/.config/lore/lore.toml` and retry.
 - **`"fts_fallback"`** — the lore deployment is configured for hybrid mode but the embedder (Ollama)
   was unreachable for this query, so the search fell back to FTS-only. The parallel query batch in
   step 7 would also fall back, producing a fully-degraded report. Halt the iteration immediately
@@ -196,8 +233,9 @@ step 6 instead of repeating the diagnosis 5-12 times in step 7's parallel batch 
 the coverage ratio at step 9. Step 9's refusal logic remains as a fallback for the edge case where
 the embedder fails _partway through_ the parallel batch (after passing cascade detection).
 
-**(b) Cascade detection.** With `mode == "hybrid"` confirmed, verify the target's `source_file`
-appears in `result.metadata.results`. If it does not, halt the iteration with:
+**(b) Cascade detection.** With `mode == "hybrid"` confirmed, read the `results` array from the same
+parsed metadata object and verify that at least one row's `source_file` matches the canonical target
+path (relative to `knowledge_dir`). If none does, halt the iteration with:
 
 > Coverage check halted: index state changed unexpectedly between ingest and search. Check for
 > parallel `lore ingest` processes (file watcher, pre-commit hook, second Claude Code session). The
@@ -212,9 +250,21 @@ misleading coverage report.
 
 ## 7. Parallel search (R5)
 
-Issue all candidate queries from step 4 through the `search_patterns` MCP tool with `top_k = 5`.
-Issue them in parallel (multiple tool calls per assistant turn) so the wall-clock cost approaches
-the latency of one query rather than N sequential queries.
+Issue all candidate queries from step 4 through the `search_patterns` MCP tool with `top_k = 5` and
+**`include_metadata: true`** on every call. Issue them in parallel (multiple tool calls per
+assistant turn) so the wall-clock cost approaches the latency of one query rather than N sequential
+queries.
+
+```json
+{
+  "name": "search_patterns",
+  "arguments": {
+    "query": "<candidate query from step 4>",
+    "top_k": 5,
+    "include_metadata": true
+  }
+}
+```
 
 **Wait for all parallel calls to settle** before scoring per-query state in step 8. v1 commits no
 per-query timeout — one slow Ollama query holds up the report. There is no Bash fallback: if
@@ -223,22 +273,26 @@ unavailable. Restart the Claude Code session."
 
 ## 8. Score per-query state (R6)
 
-For each query response, classify the target pattern into exactly one of four states:
+For each query response, extract the fenced `lore-metadata` JSON from `content[0].text` using the
+same extraction recipe described in step 2 and applied in step 6. Then classify the target pattern
+into exactly one of four states:
 
 - **errored: `<reason>`** — the JSON-RPC `error` field on the response is non-null. Read the error
-  message and surface it.
-- **degraded: fts_fallback** — the response succeeded but `result.metadata.mode == "fts_fallback"`.
-  The embedder was unreachable for this individual query, falling back to FTS-only mid-batch. This
-  state is **rare in practice** because step 6's pre-flight already aborted the iteration if the
-  cascade-detection query reported `fts_fallback`. It can still happen if the embedder fails partway
-  through the parallel batch (e.g. Ollama hits a request budget mid-batch). When it does,
-  hybrid-mode rank is not comparable to FTS-only rank, so coverage cannot be computed for this
-  query. Note: `result.metadata.mode == "fts_only"` is **structurally impossible** at this step
-  because step 6 catches the FTS-only deployment and aborts the iteration before the parallel batch
-  ever runs.
+  message and surface it. When the error field is set, there is no `content` array and no fenced
+  block to parse; branch on `resp["error"].is_null()` first.
+- **degraded: fts_fallback** — the response succeeded but the extracted metadata's `mode` field is
+  `"fts_fallback"`. The embedder was unreachable for this individual query, falling back to FTS-only
+  mid-batch. This state is **rare in practice** because step 6's pre-flight already aborted the
+  iteration if the cascade-detection query reported `fts_fallback`. It can still happen if the
+  embedder fails partway through the parallel batch (e.g. Ollama hits a request budget mid-batch).
+  When it does, hybrid-mode rank is not comparable to FTS-only rank, so coverage cannot be computed
+  for this query. Note: `mode == "fts_only"` is **structurally impossible** at this step because
+  step 6 catches the FTS-only deployment and aborts the iteration before the parallel batch ever
+  runs.
 - **surfaced (rank: N)** — the target's canonical `source_file` (relative to `knowledge_dir`)
-  appears in any row of `result.metadata.results`. Compute N as the **minimum** rank across all
-  matching rows (a single source file may produce multiple chunk rows; the lowest rank wins).
+  appears in any row of the extracted metadata's `results` array. Compute N as the **minimum**
+  `rank` value across all matching rows (a single source file may produce multiple chunk rows; the
+  lowest rank wins).
 - **not_present** — no row's `source_file` matches the target.
 
 ## 9. Coverage ratio refusal on degraded queries
