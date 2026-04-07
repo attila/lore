@@ -71,18 +71,24 @@ Steps:
    relative to lore's configuration file location; the canonicalisation step below resolves both
    cases.
 3. Resolve `$ARGUMENTS` against the configured `knowledge_dir`, NOT against the agent session's
-   current working directory. Concretely:
-   1. Canonicalise the configured `knowledge_dir` first (call it `KD`). If it is already absolute,
-      this is a no-op containment-wise; if it is relative, the canonicalisation resolves it from
-      whichever directory the canonicalisation command was invoked in — so the skill must `cd` into
-      a known anchor first or pass an absolute base. The simplest reliable recipe is to ask the
-      agent to interpret a relative `knowledge_dir` from `$HOME` (or the lore configuration file's
-      directory if known) before canonicalising.
+   current working directory. The recipe must be deterministic so the skill's pre-flight error
+   messages name the same path that R4's authoritative `validate_within_dir` check will see.
+
+   1. Canonicalise the configured `knowledge_dir` (call it `KD`).
+      - If `metadata.knowledge_dir` is absolute (starts with `/`), pass it through the
+        canonicalisation command directly.
+      - If it is relative, **halt** with: "Coverage check halted: lore_status returned a relative
+        `knowledge_dir` (`<value>`), but R1a cannot determine the correct anchor to resolve it
+        against. Reconfigure lore to use an absolute `knowledge_dir` in `~/.config/lore/lore.toml`
+        and retry." A relative `knowledge_dir` is rare and deterministically refusing it is safer
+        than guessing an anchor that may differ from what `lore ingest --file` will use at R4 time.
    2. If `$ARGUMENTS` is absolute, canonicalise it directly (call it `T`).
-   3. If `$ARGUMENTS` is relative, treat it as relative to `KD` (the canonicalised `knowledge_dir`),
-      join them, then canonicalise. This guarantees the target resolves against the pattern
-      repository, not the agent's current working directory — the agent may be invoked from any
-      folder.
+   3. If `$ARGUMENTS` is relative, join it onto `KD` (the canonicalised, absolute `knowledge_dir`)
+      with a path separator, then canonicalise the joined path. Concretely on Linux:
+      `T="$(readlink -f -- "$KD/$ARGUMENTS")"`. On macOS/BSD:
+      `T="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' -- "$KD/$ARGUMENTS")"`.
+      This guarantees the target resolves against the pattern repository, not the agent's current
+      working directory — the agent may be invoked from any folder.
 4. Check that the canonical target path `T` starts with the canonical `knowledge_dir` `KD` followed
    by `/` (string-prefix check, with the trailing `/` so that `KD = /foo` does not match
    `T = /foobar/x.md`).
@@ -137,10 +143,16 @@ Run `lore ingest --file <target>` via Bash, **without** `--force` initially. Cap
   whether the target's `source_file` appears in `metadata.results`. If it does not, the file is
   `.loreignore`-excluded.
 
-  Prompt the author:
+  Prompt the author with explicit consequences (do not abbreviate this prompt — the author needs to
+  understand what `--force` actually does before saying yes):
 
-  > `<target>` is excluded by `.loreignore`. Run with `--force` to bypass the exclusion for this
-  > coverage check? (y/N)
+  > `<target>` is excluded by `.loreignore`. Forcing the ingest will write the file's chunks into
+  > the local search index, where they will surface in any subsequent `search_patterns` call from
+  > this skill, the `search` skill, or the PreToolUse hooks until the next walk-based `lore ingest`
+  > re-applies `.loreignore` (which deletes the chunks again). If this draft contains secrets,
+  > internal hostnames, customer names, or other content you parked in `.loreignore` for a reason,
+  > decline now and remove the file from `.loreignore` first if you still want to coverage-check it.
+  > Continue with `--force`? (y/N)
 
   - On `y`: re-run `lore ingest --file --force <target>`. If the second run still produces zero
     chunks (verified by the same detection check), halt with "Coverage check halted: file remains
@@ -282,6 +294,15 @@ After every iteration, append one JSON line to `$log_file` recording:
 Skip the entire log step if `LORE_NO_QA_LOG=1` is set in the environment. The log is opt-out, never
 read by this skill, and exists solely so that future improvements have real session data to ground
 their design choices in.
+
+**Secret-content warning.** The log captures brainstormed queries derived from the pattern body and
+per-row search results that include source paths and titles. Pattern bodies that contain secrets
+(example API keys, internal hostnames, customer names, incident response detail) will land in the
+JSONL log via the brainstormed queries and the surfaced excerpts, where they persist indefinitely
+under `~/.cache/lore/qa-sessions/`. The log is owner-readable only thanks to `umask 077`, but it
+survives across sessions, is captured by any home-directory backup tool, and may sync to cloud
+storage on setups that back up `~/.cache`. Set `LORE_NO_QA_LOG=1` in the environment before
+coverage-checking patterns that contain sensitive content.
 
 This skill is **POSIX-only**. Native Windows is out of scope.
 
