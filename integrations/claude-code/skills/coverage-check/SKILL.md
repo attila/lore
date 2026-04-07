@@ -243,16 +243,24 @@ Write the sorted surfaced-query list (one query per line, no markdown formatting
 to:
 
 ```
-${XDG_CACHE_HOME:-$HOME/.cache}/lore/coverage-check/<session>-iter-<N>.txt
+${XDG_RUNTIME_DIR:-/tmp/lore-$(id -u)}/lore/coverage-check/<session>-iter-<N>.txt
 ```
 
 Where `<session>` is the same session identifier used for the JSONL log path in step 12 (see below)
 and `<N>` is the current iteration number (1-indexed).
 
-Set `umask 077` once at the start of the skill (immediately before the first `mkdir -p` in step 12)
-so every file the skill creates under `~/.cache/lore/` is owner-readable only. Pattern bodies,
-brainstormed queries, and coverage outcomes can include sensitive content; on multi-user systems the
-default umask may otherwise leave them group- or world-readable.
+The runtime directory is **deliberately ephemeral**: `XDG_RUNTIME_DIR` is wiped on logout/reboot on
+systemd systems, and the `/tmp/lore-$(id -u)` fallback is wiped at next boot on most distros. The
+skill writes its iteration state and the JSONL session log under the same root so neither artefact
+persists across reboots — pattern body content, brainstormed queries, and accepted edits never end
+up in long-lived storage like `~/.cache` where backup tools or cloud sync would pick them up.
+Same-session inspection still works: the files are readable for the lifetime of the session, just
+not beyond.
+
+Set `umask 077` at the start of the skill (immediately before the first `mkdir -p` in step 12) so
+every file the skill creates is owner-readable only. The `/tmp/lore-$(id -u)` fallback is in a
+shared world-readable parent (`/tmp`), so the umask plus an explicit `chmod 700` on the directory
+itself (in the step 12 recipe) is what actually keeps other users on the same machine out.
 
 Create the parent directory with `mkdir -p` if it does not exist. If the `mkdir` fails (EACCES on
 read-only NFS, tmpfs out of space), abort the iteration with "Coverage check halted: cannot write
@@ -261,19 +269,20 @@ iteration state to `<path>`."
 ## 12. Append the JSONL session log (R10)
 
 Pin the cache path with this exact shell recipe (the agent runs it once at session start, before
-step 5). The `umask 077` at the top is load-bearing — it ensures every file the skill creates under
-`~/.cache/lore/` is owner-readable only, so brainstormed queries, pattern excerpts, and coverage
-outcomes do not leak to other users on shared systems:
+step 5). The `umask 077` at the top and the `chmod 700` on the runtime root are load-bearing — they
+ensure every file and directory the skill creates is owner-readable only, even when the fallback
+`/tmp/lore-$(id -u)` lands inside a world-readable `/tmp`:
 
 ```sh
 umask 077
-cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/lore/qa-sessions"
-mkdir -p "$cache_root" || { echo "ERROR: cannot create $cache_root" >&2; exit 1; }
+runtime_root="${XDG_RUNTIME_DIR:-/tmp/lore-$(id -u)}/lore/qa-sessions"
+mkdir -p "$runtime_root" || { echo "ERROR: cannot create $runtime_root" >&2; exit 1; }
+chmod 700 "$(dirname "$runtime_root")" "$runtime_root"
 # Linux:
 session_id="$(date -u +%Y%m%dT%H%M%S%N)-$$"
 # macOS/BSD fallback (no %N support in BSD date):
 # session_id="$(python3 -c 'import time, os; print(f"{int(time.time_ns())}-{os.getpid()}")')"
-log_file="$cache_root/$session_id.jsonl"
+log_file="$runtime_root/$session_id.jsonl"
 ```
 
 Use `uname -s` to pick the platform-appropriate `session_id` command. The PID suffix prevents
@@ -291,20 +300,20 @@ After every iteration, append one JSON line to `$log_file` recording:
 - `iteration`: 1-indexed iteration counter
 - `coverage_ratio`: float, or `null` if step 9 fired
 
-Skip the entire log step if `LORE_NO_QA_LOG=1` is set in the environment. The log is opt-out, never
-read by this skill, and exists solely so that future improvements have real session data to ground
-their design choices in.
+Skip the entire log step if `LORE_NO_QA_LOG=1` is set in the environment. The log is opt-out for
+authors who want zero trace even within the session, but the default behaviour is already secure by
+construction — the log lives in an ephemeral runtime directory that does not survive reboot and is
+not picked up by backup or cloud sync tools. There is no need to set `LORE_NO_QA_LOG=1` to protect
+against persistent leakage of pattern body content; that risk is structurally eliminated by the
+runtime-directory location.
 
-**Secret-content warning.** The log captures brainstormed queries derived from the pattern body and
-per-row search results that include source paths and titles. Pattern bodies that contain secrets
-(example API keys, internal hostnames, customer names, incident response detail) will land in the
-JSONL log via the brainstormed queries and the surfaced excerpts, where they persist indefinitely
-under `~/.cache/lore/qa-sessions/`. The log is owner-readable only thanks to `umask 077`, but it
-survives across sessions, is captured by any home-directory backup tool, and may sync to cloud
-storage on setups that back up `~/.cache`. Set `LORE_NO_QA_LOG=1` in the environment before
-coverage-checking patterns that contain sensitive content.
+The log is never read by this skill. It exists for same-session debugging (the author can `cat` the
+file mid-session to inspect what the skill recorded) and as a short-lived breadcrumb. Future
+improvements that need a persistent corpus of session data must collect it through their own
+explicit opt-in mechanism, not by reading this log.
 
-This skill is **POSIX-only**. Native Windows is out of scope.
+This skill is **POSIX-only**. Native Windows is out of scope. WSL is supported through the
+`/tmp/lore-$(id -u)` fallback because `XDG_RUNTIME_DIR` is not reliably set in WSL environments.
 
 ## 13. Suggest concrete edits to close gaps (R7)
 
@@ -341,8 +350,9 @@ After re-rendering and persisting the new sorted list at step 11 in the second a
 iterations, **immediately** run:
 
 ```sh
-diff "${XDG_CACHE_HOME:-$HOME/.cache}/lore/coverage-check/<session>-iter-<N-1>.txt" \
-     "${XDG_CACHE_HOME:-$HOME/.cache}/lore/coverage-check/<session>-iter-<N>.txt"
+runtime_root="${XDG_RUNTIME_DIR:-/tmp/lore-$(id -u)}/lore/coverage-check"
+diff "$runtime_root/<session>-iter-<N-1>.txt" \
+     "$runtime_root/<session>-iter-<N>.txt"
 ```
 
 The `diff` exit code is the loop signal:
@@ -369,5 +379,7 @@ After the loop terminates (converged, ceiling, skip, or any halt condition):
    > those chunks are now stale.
 
 2. Clean up the per-iteration temp files:
-   `rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/lore/coverage-check/<session>-iter-"*.txt` The JSONL log
-   file is **not** cleaned up — it is the audit trail and persists across sessions.
+   `rm -f "${XDG_RUNTIME_DIR:-/tmp/lore-$(id -u)}/lore/coverage-check/<session>-iter-"*.txt`. The
+   JSONL log file is **not** explicitly cleaned up by this skill — it lives in the same ephemeral
+   runtime root and is wiped automatically at next reboot or logout (depending on the platform), so
+   no audit-trail accumulation problem exists.
