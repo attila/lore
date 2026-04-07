@@ -484,7 +484,37 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 format!("{summary}\n\n{formatted}")
             };
 
-            text_response(req, &response)
+            // Build the structured metadata block consumed by the
+            // coverage-check skill (and any future MCP client) so callers
+            // can read per-row rank/source/score and the top-level mode
+            // field directly instead of parsing the prose body. The
+            // `mode` field is the load-bearing signal that distinguishes
+            // hybrid (Ollama embedder + FTS) from `fts_fallback`
+            // (embedder unreachable, lexical-only). See
+            // `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+            // for the full contract.
+            let result_rows: Vec<Value> = results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    json!({
+                        "rank": i + 1,
+                        "title": r.title,
+                        "source_file": r.source_file,
+                        "score": r.score,
+                    })
+                })
+                .collect();
+            let metadata = json!({
+                "query": query,
+                "top_k": top_k,
+                "result_count": results.len(),
+                "mode": if embed_failed { "fts_fallback" } else { "hybrid" },
+                "embed_failed": embed_failed,
+                "results": result_rows,
+            });
+
+            text_response_with_metadata(req, &response, &metadata)
         }
         Err(e) => error_response(req, &format!("Search failed: {e}")),
     }
@@ -979,6 +1009,305 @@ mod tests {
         assert!(
             text.contains("Error Handling"),
             "search result should contain the title, got: {text}"
+        );
+    }
+
+    /// Build a `TestHarness` whose embedder always fails. Used to pin the
+    /// `mode: "fts_fallback"` branch on the search response metadata.
+    fn failing_embedder_harness() -> (
+        KnowledgeDB,
+        crate::embeddings::FailingEmbedder,
+        Config,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempdir().unwrap();
+        let embedder = crate::embeddings::FailingEmbedder::new(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "test-model",
+        );
+        (db, embedder, config, tmp)
+    }
+
+    fn dispatch_value(
+        db: &KnowledgeDB,
+        embedder: &dyn Embedder,
+        config: &Config,
+        json: &str,
+    ) -> Value {
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        let ctx = ServerContext {
+            db,
+            embedder,
+            config,
+        };
+        let resp = handle_request(&req, &ctx).expect("expected a response");
+        serde_json::to_value(&resp).unwrap()
+    }
+
+    /// Pin the `search_patterns` metadata block contract: hybrid mode, results
+    /// present, per-row rank/source/score, top-level query/top_k/result_count/
+    /// embed_failed/mode fields. The skill that consumes this metadata depends
+    /// on these field names — changing the shape requires updating the skill
+    /// prompt at `integrations/claude-code/skills/coverage-check/SKILL.md`.
+    #[test]
+    fn search_patterns_response_metadata_pins_hybrid_shape() {
+        let h = TestHarness::new();
+
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":10,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check","top_k":5}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+
+        // Top-level fields the skill consumes.
+        assert_eq!(metadata["mode"], "hybrid");
+        assert_eq!(metadata["embed_failed"], false);
+        assert_eq!(metadata["query"], "cargo deny check");
+        assert_eq!(metadata["top_k"], 5);
+        assert!(
+            metadata["result_count"].as_u64().unwrap() >= 1,
+            "expected at least one hit, got result_count = {}",
+            metadata["result_count"]
+        );
+
+        // Per-row fields the skill consumes.
+        let results = metadata["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "results array should not be empty");
+        let first = &results[0];
+        assert_eq!(first["rank"], 1);
+        assert_eq!(first["source_file"], "rust/cargo-deny.md");
+        assert_eq!(first["title"], "Cargo Deny");
+        assert!(
+            first["score"].as_f64().unwrap() > 0.0,
+            "expected a positive score, got: {}",
+            first["score"]
+        );
+
+        // Prose body remains unchanged — additive metadata change.
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("[1] Cargo Deny (source: rust/cargo-deny.md)"),
+            "prose body should still contain the rendered result row, got: {text}"
+        );
+    }
+
+    /// Empty result set: results array is empty, result_count is 0, mode is
+    /// still hybrid (the embedder did not fail; there were just no matches).
+    #[test]
+    fn search_patterns_response_metadata_empty_results() {
+        let h = TestHarness::new();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":11,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"nothing matches this"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["mode"], "hybrid");
+        assert_eq!(metadata["embed_failed"], false);
+        assert_eq!(metadata["result_count"], 0);
+        let results = metadata["results"].as_array().unwrap();
+        assert!(results.is_empty(), "results should be empty for no matches");
+    }
+
+    /// Multiple chunks for the same source file produce multiple result rows
+    /// with the same `source_file` and ascending rank values. The skill
+    /// computes "rank of the pattern" as the minimum rank across matching
+    /// rows; this test pins the per-row source_file field so that computation
+    /// is well-defined.
+    ///
+    /// `min_relevance` is set to 0.0 in this harness to bypass the
+    /// production-default 0.6 threshold, which filters `FakeEmbedder`'s
+    /// hash-based scores aggressively. The threshold is exercised in
+    /// production by real embeddings; here we are pinning the metadata
+    /// shape, not the threshold behaviour.
+    #[test]
+    fn search_patterns_response_metadata_multiple_chunks_same_source() {
+        let tmp = tempdir().unwrap();
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "test-model",
+        );
+        config.search.min_relevance = 0.0;
+
+        for (i, body) in [
+            "Run cargo deny check on every release",
+            "Cargo deny validates licenses and advisories",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let chunk = crate::chunking::Chunk {
+                id: format!("c{i}"),
+                title: format!("Cargo Deny Section {i}"),
+                body: (*body).to_string(),
+                tags: "rust".into(),
+                source_file: "rust/cargo-deny.md".into(),
+                heading_path: format!("section-{i}"),
+            };
+            let emb = embedder.embed(&chunk.body).unwrap();
+            db.insert_chunk(&chunk, Some(&emb)).unwrap();
+        }
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":12,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny licenses"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        let results = metadata["results"].as_array().unwrap();
+        assert!(
+            results.len() >= 2,
+            "expected at least two result rows from two chunks, got {}",
+            results.len()
+        );
+        let matching: Vec<_> = results
+            .iter()
+            .filter(|r| r["source_file"] == "rust/cargo-deny.md")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            results.len(),
+            "all rows should share source_file"
+        );
+        // Ranks should be monotonically increasing 1-indexed integers.
+        for (i, row) in results.iter().enumerate() {
+            assert_eq!(
+                row["rank"],
+                i + 1,
+                "row {i} should have rank {} (1-indexed), got {}",
+                i + 1,
+                row["rank"]
+            );
+        }
+    }
+
+    /// Embedder failure (Ollama unreachable) flips `mode` to `"fts_fallback"`
+    /// and `embed_failed` to `true`. The prose body still contains the
+    /// existing "Note: Ollama unreachable" prefix so prose-consuming clients
+    /// keep working, but the metadata is the load-bearing signal that lets
+    /// the coverage-check skill detect the silent FTS-only fallback.
+    #[test]
+    fn search_patterns_response_metadata_fts_fallback_on_embedder_failure() {
+        let (db, embedder, config, _tmp) = failing_embedder_harness();
+
+        // Insert a chunk under the failing-embedder harness's db. We can't
+        // call `embedder.embed()` for the insert (it would fail), so insert
+        // with no embedding — FTS-only path will still find it via lexical
+        // match.
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":13,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check"}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["mode"], "fts_fallback");
+        assert_eq!(metadata["embed_failed"], true);
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Note: Ollama unreachable"),
+            "prose body should still contain the Ollama-unreachable note, got: {text}"
+        );
+    }
+
+    /// `top_k` parameter is reflected in the metadata block, and the results
+    /// array honours the cap.
+    #[test]
+    fn search_patterns_response_metadata_top_k_respected() {
+        let h = TestHarness::new();
+
+        for i in 0..6 {
+            let chunk = crate::chunking::Chunk {
+                id: format!("c{i}"),
+                title: format!("Pattern {i}"),
+                body: format!("cargo deny content number {i}"),
+                tags: "rust".into(),
+                source_file: format!("rust/pattern-{i}.md"),
+                heading_path: String::new(),
+            };
+            let emb = h.embedder.embed(&chunk.body).unwrap();
+            h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+        }
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":14,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny content","top_k":3}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = &resp["result"]["metadata"];
+        assert_eq!(metadata["top_k"], 3);
+        let results = metadata["results"].as_array().unwrap();
+        assert!(
+            results.len() <= 3,
+            "results array length must respect top_k=3, got {}",
+            results.len()
         );
     }
 
