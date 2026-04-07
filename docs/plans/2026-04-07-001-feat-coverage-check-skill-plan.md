@@ -1040,6 +1040,111 @@ These are not v1 work, but the plan acknowledges them so they are not forgotten.
   token. If `lore_status` adds a per-source-file chunk count later, the skill prompt becomes
   cleaner.
 
+## Design pivot: layer 2 finding
+
+**Added 2026-04-07 during real-run testing on a separate machine.** The original design relied on
+reading `result.metadata` directly from the `search_patterns` and `lore_status` MCP responses. This
+was correct at the wire-format layer — `lore serve` emitted the sibling correctly and the unit tests
+verified it. It was **wrong** for the primary consumer.
+
+### What we found
+
+Claude Code's MCP client strips the `metadata` sibling from `result` before forwarding tool
+responses to the agent. Only the `content[]` array reaches the model. Every lore MCP tool that used
+`text_response_with_metadata` (`search_patterns`, `lore_status`, `add_pattern`, `update_pattern`,
+`append_to_pattern`) was silently broken for Claude Code agents. The coverage-check skill's step 2
+(R1a pre-flight reading `metadata.knowledge_dir` from `lore_status`), step 6 (cascade detection +
+search-mode pre-flight reading `metadata.mode`), step 7 (parallel search batch), and step 8
+(per-query state classification reading `metadata.results[].rank/source_file`) all depended on a
+channel that did not reach the agent.
+
+The finding was reproduced in two ways:
+
+1. Calling `search_patterns` and `lore_status` directly from inside my own Claude Code session and
+   observing that the tool output contained only the prose body — no `metadata` sibling reached the
+   agent.
+2. Piping a `tools/call` request to `lore serve` over stdio with
+   `printf '...' | lore serve 2>/dev/null | jq '.result | keys'` and observing
+   `["content", "metadata"]` — confirming the wire format was correct and the stripping happened on
+   the client side, not in the lore binary.
+
+A follow-on exploratory test emitted two text blocks in `content[]` to check whether Claude Code
+forwards multi-block arrays. It does — but it concatenates the blocks into a single flat string with
+no delimiter, gluing the second block's text directly onto the end of the first block's body. This
+confirmed that `content[]` reaches the agent but needs an explicit in-text delimiter to be
+parseable.
+
+### What we pivoted to
+
+Structured metadata now travels inside `content[0].text` as a fenced code block with the distinctive
+language tag `lore-metadata`. The fenced block is opt-in via a new `include_metadata: bool`
+parameter on every lore MCP tool schema. Default callers (the `search` skill, hook-injected queries,
+general-purpose `search_patterns` calls from agents that only want the prose) pay no token cost for
+the embedded JSON. Opt-in callers (specifically the coverage-check skill) pass
+`include_metadata: true` on every call.
+
+The `result.metadata` sibling is dropped entirely from lore's MCP response shape. It was unreachable
+from the primary consumer and kept only as redundant noise; removing it simplifies the wire format
+and eliminates the dual-channel maintenance hazard.
+
+The skill's four metadata-consuming steps (2, 6, 7, 8) now extract the fenced block from
+`content[0].text` using a deterministic recipe: locate the last opening triple-backtick fence with
+language tag `lore-metadata`, advance past it, read forward until the next closing triple-backtick
+fence, and parse the intervening text as JSON. The extractor is safe because `serde_json::to_string`
+escapes newlines, so the first newline-then-fence after the opening marker is unambiguously the
+closing fence — never a false match inside a JSON string value.
+
+### What carried over unchanged
+
+- The three-value `SearchMode` enum (`Hybrid` / `FtsFallback` / `FtsOnly`). The metadata payload
+  shape is identical; only the transport channel changed.
+- The canonical JSON shape (queries, per-row rank/source_file/score, top-level
+  mode/result_count/query/top_k). Same field names, same structure, extracted from a different place
+  in the response.
+- The exhaustive-match discipline for enum serialisation. `SearchMode::as_str` and
+  `commit_status_metadata` still have no wildcard arms; adding a variant fails to compile until the
+  serialiser is updated.
+- The skill's logic for pre-flight containment, cascade detection, degraded-mode refusal, iteration
+  loop with Bash `diff` stability check, and ephemeral JSONL log. Only the metadata extraction
+  channel changed.
+
+### Institutional learning
+
+The superseded learning at
+`docs/solutions/best-practices/mcp-tool-conditional-outcomes-as-metadata-2026-04-06.md` was marked
+with `status: superseded` and a prominent banner pointing at the new learning. The new learning at
+`docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md` documents the
+production pattern (opt-in parameter, fenced block, extractor recipe, test discipline) and explains
+why the sibling channel fails for Claude Code. The three principles from the superseded learning
+that remain correct — state both branches of conditional behaviour in the tool description, use a
+tagged-union discriminator, pin the contract with tests — are preserved and repeated in the new
+learning.
+
+### Tests added / rewritten
+
+- **Rewrote 10 existing metadata tests** (5 `search_patterns`, 1 `add_pattern`, 4 `lore_status`) to
+  pass `include_metadata: true` and assert on the fenced block via a new
+  `extract_lore_metadata_fence` test helper. Tests now use the project's AAA structure with
+  `// Arrange`, `// Act`, `// Assert` comment labels.
+- **Added 3 new "default path omits fence" tests** pinning the opt-in contract:
+  `search_patterns_omits_metadata_fence_by_default`, `lore_status_omits_metadata_fence_by_default`,
+  and `add_pattern_omits_metadata_fence_by_default`. These verify that callers who do not pass the
+  parameter get a clean prose-only response and that `extract_lore_metadata_fence` returns `None`.
+- **Updated `search_patterns_response_metadata_absent_on_error`** to assert that error responses
+  have `result` null, not just that they lack a `metadata` sibling. Passes `include_metadata: true`
+  to verify the opt-in setting does not leak metadata into error responses.
+- **Regenerated the `tools_list_returns_all_five_tools` insta snapshot** to reflect the new
+  `include_metadata` property in every tool's `inputSchema`.
+
+### What remains untested
+
+End-to-end skill behaviour from inside a Claude Code session. The cargo structural test
+(`tests/coverage_check_skill_parses.rs`) verifies the skill file's frontmatter and tool-name
+references but does not exercise the fenced-block extraction logic or the iteration loop. A future
+improvement could spin up a headless Claude API session and pipe the skill prompt through it — but
+that harness is non-trivial and outside v1 scope. For now, the three must-run smoke tests in the PR
+description remain the behavioural verification gate.
+
 ## Documentation / Operational Notes
 
 - **PR description test plan must include the `/exit` + relaunch step** between `just install` and

@@ -6,6 +6,8 @@ module: mcp-server
 problem_type: best_practice
 component: tooling
 severity: medium
+status: superseded
+superseded_by: docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md
 applies_when:
   - Designing a new MCP tool with conditional behaviour (e.g. a tool that commits to git only when the knowledge base is a git repository)
   - Adding a fallback or degraded path to an existing MCP tool
@@ -19,6 +21,30 @@ tags:
   - response-shape
   - observability
 ---
+
+> **Superseded 2026-04-07.** The core principles in this learning — state both branches of
+> conditional behaviour in the tool description, surface structured outcomes as machine-readable
+> data, pin the contract with tests — are still correct. **But the transport channel described below
+> (a `metadata` sibling on `result`) does not work inside Claude Code.** Claude Code's MCP client
+> forwards only the `content[]` array to the agent; the `metadata` sibling is stripped before the
+> agent sees it. Real-run testing of the coverage-check skill surfaced this during PR #32 (see
+> [`docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`](../../plans/2026-04-07-001-feat-coverage-check-skill-plan.md)
+> § 'Design pivot: layer 2 finding'). The wire format described in this learning is correct — unit
+> tests that dispatch directly through `handle_request` still read `resp["result"]["metadata"]`
+> successfully, and external MCP clients that surface the sibling work fine. But the primary target
+> (Claude Code agents) cannot read it.
+>
+> **For new MCP tools, use the fenced content block pattern instead.** See the superseding learning
+> at
+> [`mcp-metadata-via-fenced-content-block-2026-04-07.md`](mcp-metadata-via-fenced-content-block-2026-04-07.md)
+> for the production pattern: embed the metadata as a JSON payload inside a fenced code block
+> (language tag `lore-metadata`) at the end of `content[0].text`, gated behind an
+> `include_metadata: bool` tool parameter so default callers do not pay the token cost.
+>
+> This document is retained as historical context for the reasoning behind the original
+> `text_response_with_metadata` helper (now removed) and for the parts that remain correct (the
+> three-surface consistency principle, the tagged-union discriminator pattern, the exhaustive-match
+> discipline for enum serialisation).
 
 # Expose MCP tool conditional outcomes as structured metadata
 

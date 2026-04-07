@@ -457,3 +457,25 @@ _(none)_
 → `/ce:plan` for structured implementation planning. The naming- convention rename, the structured
 metadata addition to `handle_search`, and the new skill all ship in the same pull request, so there
 is no precursor work blocking planning.
+
+## Implementation note (2026-04-07)
+
+The structured metadata channel described in this brainstorm as "the skill reads `result.metadata`
+directly instead of parsing the prose body" turned out to be unreachable from inside Claude Code —
+the MCP client strips the `metadata` sibling from `result` before forwarding tool responses to the
+agent. Real-run testing during PR #32 surfaced this, and the implementation pivoted mid-PR to a
+different transport channel: a fenced `lore-metadata` code block embedded in `content[0].text`,
+gated behind an opt-in `include_metadata: bool` tool parameter.
+
+The pivot preserves every other design decision in this brainstorm — the three-value `mode` enum,
+the canonical JSON shape, the opt-in principle, the four-state per-query classification, the
+fail-fast cascade detection, the degraded-mode refusal rule, the iteration-loop stability check via
+Bash diff, and the ephemeral JSONL session log. Only the transport channel for the structured
+metadata changed. The agent still reads the same field names from the same JSON shape; it just
+extracts them from a fenced block in the prose body instead of a sibling field on `result`.
+
+See the plan's "Design pivot: layer 2 finding" section
+(`docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`) for the detailed diagnostic
+walk-through and the new learning at
+`docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md` for the
+production pattern that future MCP tool designs should follow.
