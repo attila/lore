@@ -54,10 +54,36 @@ enum Commands {
     },
 
     /// Re-index the knowledge base from markdown files
+    #[command(after_help = "EXAMPLES:
+  lore ingest                          Delta ingest (only changed files since the last commit)
+  lore ingest --force                  Full re-index of the whole knowledge base
+  lore ingest --file patterns/foo.md   Index one file without a git commit
+  lore ingest --file patterns/foo.md --force
+                                       Index one file, overriding .loreignore
+
+EXIT CODES:
+  0  Success. Delta and full ingest may list per-file errors on stderr and still exit 0.
+  1  Single-file ingest failed (atomic), or an unrecoverable error (config, database,
+     embedding service). Relative paths are resolved against the current working directory,
+     not the knowledge directory.
+
+NOTES:
+  - `--file` takes one path per invocation; globs are not expanded.
+  - Single-file ingest does not update delta-ingest state, so a subsequent
+    `lore ingest` still sees real git changes.")]
     Ingest {
-        /// Force a full re-index instead of delta
+        /// Force a full re-index instead of delta. When combined with
+        /// `--file`, overrides `.loreignore` for that single file.
         #[arg(long)]
         force: bool,
+
+        /// Index a single markdown file without requiring a git commit.
+        /// Respects `.loreignore` unless `--force` is also passed. Does not
+        /// touch delta-ingest state, so the next `lore ingest` still sees
+        /// real git changes. Relative paths are resolved against the current
+        /// working directory, not the knowledge directory.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
     },
 
     /// Start the MCP server (stdio transport for Claude Code)
@@ -116,7 +142,7 @@ fn main() {
             &model,
             &bind,
         ),
-        Commands::Ingest { force } => cmd_ingest(&config_path, force),
+        Commands::Ingest { force, file } => cmd_ingest(&config_path, force, file.as_deref()),
         Commands::Serve => cmd_serve(&config_path),
         Commands::Search { query, top_k } => {
             cmd_search(&config_path, &query.join(" "), top_k, json)
@@ -253,12 +279,18 @@ fn cmd_init(
     Ok(())
 }
 
-fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
+fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
+    let mode_label = match (file.is_some(), force) {
+        (true, true) => "single-file (force override .loreignore)",
+        (true, false) => "single-file",
+        (false, true) => "full",
+        (false, false) => "delta",
+    };
     lore_debug!(
         "ingest: dir={} mode={} strategy={}",
         config.knowledge_dir.display(),
-        if force { "full" } else { "delta" },
+        mode_label,
         config.chunking.strategy,
     );
 
@@ -273,25 +305,7 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
     let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
     let _lock_guard = write_lock.acquire()?;
 
-    let result = if force {
-        eprintln!("Full ingest (--force)...\n");
-        ingest::full_ingest(
-            &db,
-            &ollama,
-            &config.knowledge_dir,
-            &config.chunking.strategy,
-            on_progress,
-        )
-    } else {
-        eprintln!("Ingesting knowledge base...\n");
-        ingest::ingest(
-            &db,
-            &ollama,
-            &config.knowledge_dir,
-            &config.chunking.strategy,
-            on_progress,
-        )
-    };
+    let result = dispatch_ingest(&db, &ollama, &config, force, file, on_progress)?;
 
     lore_debug!(
         "ingest: processed={} chunks_created={} errors={}",
@@ -300,12 +314,97 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
         result.errors.len(),
     );
 
+    print_ingest_summary(&result);
+
+    if !result.errors.is_empty() {
+        eprintln!("Errors: {}", result.errors.len());
+        for err in &result.errors {
+            eprintln!("  ✗ {err}");
+        }
+        // Single-file ingest is atomic: any error means the one requested
+        // file did not land, so propagate as a non-zero exit. Delta and
+        // full ingests may collect per-file errors while still making
+        // progress on the rest, so their behaviour is unchanged.
+        if matches!(result.mode, ingest::IngestMode::SingleFile { .. }) {
+            anyhow::bail!("single-file ingest failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Route the ingest request to the right library entry point based on the
+/// flags passed to `cmd_ingest`.
+fn dispatch_ingest(
+    db: &KnowledgeDB,
+    ollama: &OllamaClient,
+    config: &Config,
+    force: bool,
+    file: Option<&Path>,
+    on_progress: &dyn Fn(&str),
+) -> anyhow::Result<ingest::IngestResult> {
+    if let Some(path) = file {
+        // Resolve relative paths against the current working directory so
+        // `lore ingest --file ./patterns/foo.md` works from anywhere.
+        // ingest_single_file canonicalises again internally, enforces the
+        // knowledge-directory containment check, and emits its own
+        // "Single-file ingest: {rel_path}" progress line via on_progress —
+        // so no banner is needed here.
+        let resolved = std::path::absolute(path)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve path {}: {e}", path.display()))?;
+        return Ok(ingest::ingest_single_file(
+            db,
+            ollama,
+            &config.knowledge_dir,
+            &resolved,
+            &config.chunking.strategy,
+            force,
+            on_progress,
+        ));
+    }
+
+    if force {
+        eprintln!("Full ingest (--force)...\n");
+        Ok(ingest::full_ingest(
+            db,
+            ollama,
+            &config.knowledge_dir,
+            &config.chunking.strategy,
+            on_progress,
+        ))
+    } else {
+        eprintln!("Ingesting knowledge base...\n");
+        Ok(ingest::ingest(
+            db,
+            ollama,
+            &config.knowledge_dir,
+            &config.chunking.strategy,
+            on_progress,
+        ))
+    }
+}
+
+/// Print the one-line summary for a completed ingest, shaped by mode.
+fn print_ingest_summary(result: &ingest::IngestResult) {
     match &result.mode {
         ingest::IngestMode::Full => {
             eprintln!(
                 "\nDone (full): {} files → {} chunks",
                 result.files_processed, result.chunks_created
             );
+        }
+        ingest::IngestMode::SingleFile { path } => {
+            // Skip the "Done" line when the single-file ingest failed —
+            // otherwise stderr reads `Done (single-file): … → 0 chunks`
+            // immediately followed by the error list, which is contradictory.
+            // The error loop below still prints the details, and cmd_ingest
+            // bails with exit 1, so silence here is not silent.
+            if result.errors.is_empty() {
+                eprintln!(
+                    "\nDone (single-file): {path} → {chunks} chunks",
+                    chunks = result.chunks_created
+                );
+            }
         }
         ingest::IngestMode::Delta { unchanged } => {
             lore_debug!("ingest delta: unchanged={unchanged}");
@@ -333,15 +432,6 @@ fn cmd_ingest(config_path: &Path, force: bool) -> anyhow::Result<()> {
             }
         }
     }
-
-    if !result.errors.is_empty() {
-        eprintln!("Errors: {}", result.errors.len());
-        for err in &result.errors {
-            eprintln!("  ✗ {err}");
-        }
-    }
-
-    Ok(())
 }
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {

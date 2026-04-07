@@ -159,19 +159,18 @@ to "create," so a pattern that says "creating" will not match a query containing
 
 ## Vocabulary Coverage Technique
 
-Before finalising a pattern, audit its term coverage. Delta ingest only detects committed changes,
-so you need to commit the pattern before searching for it:
+Before finalising a pattern, audit its term coverage. Use `lore ingest --file` to index the draft
+without committing it — the full edit → ingest → search loop runs against your working tree, no WIP
+commit required:
 
 1. List the verbs and nouns an agent would use when the pattern should surface. For a pattern about
    pull request workflows, this might include: create, edit, update, merge, push, branch, PR, pull
    request, draft, review.
 
-2. Commit the pattern and run an ingest so the search engine can find it:
+2. Index the draft file directly:
 
    ```sh
-   git add patterns/my-new-pattern.md
-   git commit -m "wip: draft pattern for review"
-   lore ingest
+   lore ingest --file patterns/my-new-pattern.md
    ```
 
 3. Search for your pattern using the terms from step 1:
@@ -181,11 +180,25 @@ so you need to commit the pattern before searching for it:
    lore search "merge branch workflow" --top-k 3
    ```
 
-4. If your pattern does not appear in the results, add the missing terms to the body or tags, amend
-   the commit, and run `lore ingest` again.
+4. If your pattern does not appear in the results, add the missing terms to the body or tags and
+   re-run `lore ingest --file patterns/my-new-pattern.md`. Repeat until every query from step 1
+   surfaces the pattern.
 
 5. Remember that stop words and short terms are invisible. If a key concept such as "CI" is too
    short, include a longer form such as "continuous integration" or "quality gate pipeline."
+
+Single-file ingest does not touch delta-ingest state, so the next `lore ingest` (against the whole
+repository) still sees real git changes. It also respects `.loreignore` by default; pass `--force`
+alongside `--file` to index a file that is otherwise excluded.
+
+**Interaction hazard — `lore ingest` can wipe chunks you just upserted.** Single-file ingest is
+orthogonal to git state, but walk-based delta ingest is not. If you single-file-ingest a file that
+was deleted in git history between the last walk-based ingest and `HEAD`, the next `lore ingest`
+will observe the deletion in `git diff` and remove the chunks you just added. Concrete example: you
+`git rm draft.md` and commit, then recreate `draft.md` in the working tree and run
+`lore ingest --file draft.md`. The single-file ingest lands. Running `lore ingest` afterwards will
+silently undo it. The safe workflow is to finish iterating with `lore ingest --file`, commit the
+file to git, and only then run `lore ingest`.
 
 ## Tag Strategy
 

@@ -3,13 +3,10 @@
 ## Up Next
 
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
-      commit, enabling a fast edit-ingest-search feedback loop for pattern authoring. Removes the
-      current workaround of committing a WIP before testing discoverability. Update the vocabulary
-      coverage technique section in `docs/pattern-authoring-guide.md` when shipped
 - [ ] Pattern QA skill — a skill that automates the vocabulary coverage checklist from the pattern
-      authoring guide: ingest the pattern, search with candidate terms, report gaps. Best paired
-      with single-file ingest to eliminate the commit-ingest dance
+      authoring guide: ingest the pattern, search with candidate terms, report gaps. Now that
+      single-file ingest has landed, the commit-ingest dance is gone and this skill can run the loop
+      directly against working-tree edits
 - [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
       content at SessionStart, not just titles. Covers process-level conventions that don't surface
       through file-edit hooks. **Motivating example (2026-04-06):** during the `.loreignore` work an
@@ -94,3 +91,7 @@
       full and delta ingest, with reconciliation when the file changes. Supports negation patterns,
       directory globs, and recursive globs via the `ignore` crate. See
       `docs/plans/2026-04-06-001-feat-loreignore-plan.md`
+- [x] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
+      commit, enabling the fast edit-ingest-search feedback loop for pattern authoring. Orthogonal
+      to delta state, respects `.loreignore` with a `--force` override. See
+      `docs/plans/2026-04-06-002-feat-single-file-ingest-plan.md`

@@ -549,6 +549,104 @@ fn list_json_outputs_valid_array() {
     assert!(first.get("tags").is_some());
 }
 
+// -- lore ingest --file ------------------------------------------------------
+//
+// These tests exercise the CLI binary end-to-end for error paths that do not
+// require a running Ollama embedder (all fail before any embed call). The
+// happy path is covered by tests/single_file_ingest.rs at the library level
+// with FakeEmbedder.
+
+fn setup_empty_knowledge(dir: &Path) -> std::path::PathBuf {
+    let knowledge_dir = dir.join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+    let db_path = dir.join("knowledge.db");
+    let config = Config::default_with(knowledge_dir, db_path, "nomic-embed-text");
+    let config_path = dir.join("lore.toml");
+    config.save(&config_path).unwrap();
+    config_path
+}
+
+#[test]
+fn ingest_file_rejects_unsupported_extension_with_exit_code_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_empty_knowledge(tmp.path());
+    let txt = tmp.path().join("knowledge").join("notes.txt");
+    std::fs::write(&txt, "not markdown").unwrap();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "ingest",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--file",
+            txt.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Unsupported extension"))
+        .stderr(predicate::str::contains("single-file ingest failed"));
+}
+
+#[test]
+fn ingest_file_rejects_path_outside_knowledge_dir_with_exit_code_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_empty_knowledge(tmp.path());
+    // File is a sibling of knowledge_dir, not inside it.
+    let outside = tmp.path().join("outside.md");
+    std::fs::write(
+        &outside,
+        "# Outside\n\nBody that is long enough for chunking.\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "ingest",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--file",
+            outside.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("escapes the knowledge directory"));
+}
+
+#[test]
+fn ingest_file_rejects_missing_file_with_cwd_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_empty_knowledge(tmp.path());
+    let missing = tmp.path().join("knowledge").join("does-not-exist.md");
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "ingest",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--file",
+            missing.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Cannot access"))
+        .stderr(predicate::str::contains("cwd:"));
+}
+
+#[test]
+fn ingest_help_shows_file_flag_and_exit_codes() {
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["ingest", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--file"))
+        .stdout(predicate::str::contains("EXIT CODES"))
+        .stdout(predicate::str::contains("EXAMPLES"));
+}
+
 #[test]
 fn list_json_empty_database() {
     let tmp = tempfile::tempdir().unwrap();
