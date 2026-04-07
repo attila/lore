@@ -11,6 +11,11 @@ expression: resp
         "description": "Search the knowledge base for software patterns, conventions, and preferences. Use this before implementing new code to check for established patterns. Returns ranked results with source provenance.",
         "inputSchema": {
           "properties": {
+            "include_metadata": {
+              "default": false,
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with per-row rank/source_file/score and a top-level mode field ('hybrid' | 'fts_fallback' | 'fts_only'). Defaults to false. Opt-in because the fenced block bloats the response and most callers only need the human-readable prose.",
+              "type": "boolean"
+            },
             "query": {
               "description": "Natural language search query",
               "type": "string"
@@ -34,6 +39,11 @@ expression: resp
             "body": {
               "description": "Pattern content in markdown",
               "type": "string"
+            },
+            "include_metadata": {
+              "default": false,
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the written file path, chunk count, and commit status. Defaults to false.",
+              "type": "boolean"
             },
             "tags": {
               "description": "Optional tags for categorisation",
@@ -62,6 +72,11 @@ expression: resp
             "body": {
               "description": "New pattern content in markdown (replaces existing body)",
               "type": "string"
+            },
+            "include_metadata": {
+              "default": false,
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the updated file path, chunk count, and commit status. Defaults to false.",
+              "type": "boolean"
             },
             "source_file": {
               "description": "Relative path of the file to update (from search results)",
@@ -95,6 +110,11 @@ expression: resp
               "description": "Heading for the new section",
               "type": "string"
             },
+            "include_metadata": {
+              "default": false,
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the updated file path, chunk count, and commit status. Defaults to false.",
+              "type": "boolean"
+            },
             "source_file": {
               "description": "Relative path of the file to append to (from search results)",
               "type": "string"
@@ -112,7 +132,13 @@ expression: resp
       {
         "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), whether the inbox branch workflow is configured, and whether a .loreignore file is active (filtering files out of the index). Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git or whether files in a particular path are excluded from search.",
         "inputSchema": {
-          "properties": {},
+          "properties": {
+            "include_metadata": {
+              "default": false,
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, git_repository, last_ingested_commit, chunks_indexed, sources_indexed, inbox_workflow_configured, delta_ingest_available, and loreignore_active fields. Defaults to false.",
+              "type": "boolean"
+            }
+          },
           "required": [],
           "type": "object"
         },
