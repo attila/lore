@@ -12,8 +12,17 @@ Technique from `docs/pattern-authoring-guide.md`. Brainstorm 5-12 queries an age
 type, ingest the working-tree file, search for each query in parallel, score per-query coverage,
 suggest concrete edits to close gaps, and iterate until convergence.
 
-Invoke as `/lore:coverage-check <pattern-file-path>` with a path relative to the pattern repository
-root. The path argument is `$ARGUMENTS`.
+Invoke as `/lore:coverage-check <pattern-file-path>` with a path relative to the configured
+`knowledge_dir` (the pattern repository root that lore is configured to index — see step 2 for how
+the skill resolves this from the `lore_status` MCP tool). The path argument is `$ARGUMENTS`.
+
+**Quoting discipline (do not skip):** every Bash invocation in this skill that interpolates
+`$ARGUMENTS`, the canonical target path, or any agent-derived value MUST quote the value with double
+quotes. The existing `search` skill demonstrates the convention: `lore search "$ARGUMENTS"`
+(quoted). The same applies here. A target path like `foo'; rm -rf ~ #.md` must be passed to Bash as
+`lore ingest --file "foo'; rm -rf ~ #.md"` so the shell treats it as a single argument, not a
+command sequence. The skill steps below show the quoted form explicitly; do not strip the quotes
+when expanding the templates.
 
 ## Purpose and limit (read this first)
 
@@ -35,7 +44,7 @@ prior commit. The skill includes an active detection step (see step 7) that will
 if it notices the chunks it just ingested have disappeared, but the safest workflow is to not run
 plain `lore ingest` at all while this skill is iterating.
 
-## 1. Pre-flight: lore binary on PATH (R1b)
+## 1. Pre-flight: `lore` binary on PATH (R1b)
 
 Run `command -v lore` via Bash. If it exits non-zero, halt with:
 
@@ -44,7 +53,7 @@ Run `command -v lore` via Bash. If it exits non-zero, halt with:
 
 Do not proceed to step 2.
 
-## 2. Pre-flight: knowledge_dir containment (R1, R1a)
+## 2. Pre-flight: `knowledge_dir` containment (R1, R1a)
 
 This is a fast-path heuristic, not a guarantee. The authoritative containment check is
 `validate_within_dir` inside `lore ingest --file`'s Rust code (see step 6). Pre-flight exists to
@@ -54,23 +63,39 @@ Steps:
 
 1. Detect the platform once with `uname -s`. On Linux, use `readlink -f` for canonical path
    resolution. On Darwin (macOS) or BSD, use
-   `python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))'` as a portable fallback
-   because GNU `readlink -f` is not present on those systems by default.
+   `python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"` as a portable fallback
+   because GNU `readlink -f` is not present on those systems by default. Always quote the path
+   argument when invoking either form.
 2. Call the `lore_status` MCP tool with no arguments. Read `result.metadata.knowledge_dir` (a
-   string, the configured knowledge directory).
-3. Canonicalise the configured `knowledge_dir` and the target file path (`$ARGUMENTS`) using the
-   platform-appropriate command from step 1.
-4. Check that the canonical target path starts with the canonical `knowledge_dir` followed by `/`
-   (string-prefix check).
+   string, the configured knowledge directory). This value may be either an absolute path or a path
+   relative to lore's configuration file location; the canonicalisation step below resolves both
+   cases.
+3. Resolve `$ARGUMENTS` against the configured `knowledge_dir`, NOT against the agent session's
+   current working directory. Concretely:
+   1. Canonicalise the configured `knowledge_dir` first (call it `KD`). If it is already absolute,
+      this is a no-op containment-wise; if it is relative, the canonicalisation resolves it from
+      whichever directory the canonicalisation command was invoked in — so the skill must `cd` into
+      a known anchor first or pass an absolute base. The simplest reliable recipe is to ask the
+      agent to interpret a relative `knowledge_dir` from `$HOME` (or the lore configuration file's
+      directory if known) before canonicalising.
+   2. If `$ARGUMENTS` is absolute, canonicalise it directly (call it `T`).
+   3. If `$ARGUMENTS` is relative, treat it as relative to `KD` (the canonicalised `knowledge_dir`),
+      join them, then canonicalise. This guarantees the target resolves against the pattern
+      repository, not the agent's current working directory — the agent may be invoked from any
+      folder.
+4. Check that the canonical target path `T` starts with the canonical `knowledge_dir` `KD` followed
+   by `/` (string-prefix check, with the trailing `/` so that `KD = /foo` does not match
+   `T = /foobar/x.md`).
 5. If the check fails, halt with:
 
    > Coverage check requires the target file to live inside the configured `knowledge_dir`.
    >
-   > Configured knowledge_dir: `<canonical-knowledge_dir>` Target file (canonical):
+   > Configured `knowledge_dir`: `<canonical-knowledge_dir>` Target file (canonical):
    > `<canonical-target>`
    >
-   > Move the file inside the knowledge_dir, change the lore config to point at the target's parent
-   > directory, or invoke the skill from a session whose lore config covers the file.
+   > Move the file inside the `knowledge_dir`, change the lore configuration to point at the
+   > target's parent directory, or invoke the skill from a session whose lore configuration covers
+   > the file.
 
    Do not proceed.
 
@@ -212,6 +237,11 @@ ${XDG_CACHE_HOME:-$HOME/.cache}/lore/coverage-check/<session>-iter-<N>.txt
 Where `<session>` is the same session identifier used for the JSONL log path in step 12 (see below)
 and `<N>` is the current iteration number (1-indexed).
 
+Set `umask 077` once at the start of the skill (immediately before the first `mkdir -p` in step 12)
+so every file the skill creates under `~/.cache/lore/` is owner-readable only. Pattern bodies,
+brainstormed queries, and coverage outcomes can include sensitive content; on multi-user systems the
+default umask may otherwise leave them group- or world-readable.
+
 Create the parent directory with `mkdir -p` if it does not exist. If the `mkdir` fails (EACCES on
 read-only NFS, tmpfs out of space), abort the iteration with "Coverage check halted: cannot write
 iteration state to `<path>`."
@@ -219,9 +249,12 @@ iteration state to `<path>`."
 ## 12. Append the JSONL session log (R10)
 
 Pin the cache path with this exact shell recipe (the agent runs it once at session start, before
-step 5):
+step 5). The `umask 077` at the top is load-bearing — it ensures every file the skill creates under
+`~/.cache/lore/` is owner-readable only, so brainstormed queries, pattern excerpts, and coverage
+outcomes do not leak to other users on shared systems:
 
 ```sh
+umask 077
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/lore/qa-sessions"
 mkdir -p "$cache_root" || { echo "ERROR: cannot create $cache_root" >&2; exit 1; }
 # Linux:

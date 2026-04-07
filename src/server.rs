@@ -1327,6 +1327,47 @@ mod tests {
         );
     }
 
+    /// Pin the JSON-RPC error response shape for `search_patterns` so the
+    /// `coverage-check` skill's step 8 (`errored` per-query state) is grounded
+    /// in a tested contract. When `handle_search` rejects a request (e.g.
+    /// `top_k` over `MAX_TOP_K`), the response must have `error` non-null and
+    /// **must not** carry a `metadata` block — the skill's step 8 reads
+    /// `resp["error"].is_null()` first before touching `result.metadata`, so
+    /// the absence of metadata on the error path is the contract that
+    /// prevents the skill from attempting to read fields off a missing
+    /// object.
+    #[test]
+    fn search_patterns_response_metadata_absent_on_error() {
+        let h = TestHarness::new();
+
+        let oversized = MAX_TOP_K + 1;
+        let body = format!(
+            r#"{{
+                "jsonrpc":"2.0","id":15,"method":"tools/call",
+                "params":{{
+                    "name":"search_patterns",
+                    "arguments":{{"query":"anything","top_k":{oversized}}}
+                }}
+            }}"#
+        );
+        let resp = h.request_value(&body);
+
+        // The error path must surface a JSON-RPC error and must not pretend
+        // to have metadata. The skill consumer (coverage-check, step 8)
+        // depends on this asymmetry: error response → "errored" per-query
+        // state, success response → read `result.metadata`.
+        assert!(
+            !resp["error"].is_null(),
+            "error response should populate the JSON-RPC error field, got: {resp}"
+        );
+        assert!(
+            resp["result"].is_null() || resp["result"]["metadata"].is_null(),
+            "error response must not carry a metadata block (skill consumers \
+             read resp[\"error\"] first), got result: {}",
+            resp["result"]
+        );
+    }
+
     // -- add_pattern -------------------------------------------------------
 
     #[test]
