@@ -76,7 +76,8 @@ The `init` command verifies Ollama is running, pulls the embedding model (`nomic
 
 ### Use with Claude Code
 
-Install the lore plugin to get the MCP server, lifecycle hooks, and the `/search-lore` skill:
+Install the lore plugin to get the MCP server, lifecycle hooks, and the `/search` and
+`/coverage-check` skills:
 
 ```sh
 claude --plugin-dir /path/to/lore/integrations/claude-code/
@@ -92,7 +93,9 @@ claude mcp add --scope user --transport stdio lore -- \
 ```
 
 The manual approach gives only the MCP server. The plugin also includes hooks that inject relevant
-patterns before edits and a `/search-lore` skill for on-demand queries.
+patterns before edits, a `/search` skill for on-demand queries, and a `/coverage-check` skill that
+audits a draft pattern's vocabulary coverage by simulating the PreToolUse hook's own query
+extraction against synthetic tool calls.
 
 ## Commands
 
@@ -103,6 +106,7 @@ patterns before edits and a `/search-lore` skill for on-demand queries.
 | `lore ingest --file <path>` | Index a single file without requiring a git commit        |
 | `lore serve`                | Start the MCP server (stdio transport for Claude Code)    |
 | `lore search <query>`       | Search from the command line                              |
+| `lore extract-queries`      | Simulate the hook's FTS5 query extraction for a tool call |
 | `lore status`               | Check health of all components                            |
 
 ## MCP Tools

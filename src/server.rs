@@ -194,6 +194,17 @@ fn tool_definitions() -> Value {
                     "top_k": {
                         "type": "number",
                         "description": "Number of results to return (default: from config)"
+                    },
+                    "include_metadata": {
+                        "type": "boolean",
+                        "description":
+                            "When true, appends a `lore-metadata` fenced code block to the \
+                             end of the response containing machine-readable JSON with per-row \
+                             rank/source_file/score and a top-level mode field \
+                             ('hybrid' | 'fts_fallback' | 'fts_only'). Defaults to false. \
+                             Opt-in because the fenced block bloats the response and most \
+                             callers only need the human-readable prose.",
+                        "default": false
                     }
                 },
                 "required": ["query"]
@@ -221,6 +232,14 @@ fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional tags for categorisation"
+                    },
+                    "include_metadata": {
+                        "type": "boolean",
+                        "description":
+                            "When true, appends a `lore-metadata` fenced code block to the \
+                             end of the response containing machine-readable JSON with the \
+                             written file path, chunk count, and commit status. Defaults to false.",
+                        "default": false
                     }
                 },
                 "required": ["title", "body"]
@@ -250,6 +269,14 @@ fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional updated tags"
+                    },
+                    "include_metadata": {
+                        "type": "boolean",
+                        "description":
+                            "When true, appends a `lore-metadata` fenced code block to the \
+                             end of the response containing machine-readable JSON with the \
+                             updated file path, chunk count, and commit status. Defaults to false.",
+                        "default": false
                     }
                 },
                 "required": ["source_file", "body"]
@@ -277,6 +304,14 @@ fn tool_definitions() -> Value {
                     "body": {
                         "type": "string",
                         "description": "Content to append under the heading"
+                    },
+                    "include_metadata": {
+                        "type": "boolean",
+                        "description":
+                            "When true, appends a `lore-metadata` fenced code block to the \
+                             end of the response containing machine-readable JSON with the \
+                             updated file path, chunk count, and commit status. Defaults to false.",
+                        "default": false
                     }
                 },
                 "required": ["source_file", "heading", "body"]
@@ -294,7 +329,19 @@ fn tool_definitions() -> Value {
                  files in a particular path are excluded from search.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "include_metadata": {
+                        "type": "boolean",
+                        "description":
+                            "When true, appends a `lore-metadata` fenced code block to the \
+                             end of the response containing machine-readable JSON with \
+                             knowledge_dir, git_repository, last_ingested_commit, \
+                             chunks_indexed, sources_indexed, inbox_workflow_configured, \
+                             delta_ingest_available, and loreignore_active fields. \
+                             Defaults to false.",
+                        "default": false
+                    }
+                },
                 "required": []
             }
         }
@@ -322,7 +369,7 @@ fn handle_tool_call(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcRes
         "add_pattern" => handle_add(req, ctx, &arguments),
         "update_pattern" => handle_update(req, ctx, &arguments),
         "append_to_pattern" => handle_append(req, ctx, &arguments),
-        "lore_status" => handle_lore_status(req, ctx),
+        "lore_status" => handle_lore_status(req, ctx, &arguments),
         _ => JsonRpcResponse {
             jsonrpc: "2.0",
             id: req.id.clone(),
@@ -385,6 +432,7 @@ fn check_tags_limit(req: &JsonRpcRequest, args: &Value) -> Option<JsonRpcRespons
 
 fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
     let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+    let include_metadata = include_metadata_arg(args);
 
     if query.is_empty() {
         return text_response(req, "Please provide a search query.");
@@ -484,13 +532,18 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 format!("{summary}\n\n{formatted}")
             };
 
-            text_response(req, &response)
+            let mode = SearchMode::from_search_state(ctx.config.search.hybrid, embed_failed);
+            let metadata = build_search_metadata(query, top_k, mode, &results);
+            let response_with_fence =
+                maybe_append_lore_metadata_fence(response, &metadata, include_metadata);
+            text_response(req, &response_with_fence)
         }
         Err(e) => error_response(req, &format!("Search failed: {e}")),
     }
 }
 
 fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
+    let include_metadata = include_metadata_arg(args);
     let Some(title) = args.get("title").and_then(Value::as_str) else {
         return error_response(req, "Missing required field: title");
     };
@@ -544,20 +597,20 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
             });
-            text_response_with_metadata(
-                req,
-                &format!(
-                    "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
-                    title, result.file_path, result.chunks_indexed, cn
-                ),
-                &metadata,
-            )
+            let prose = format!(
+                "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
+                title, result.file_path, result.chunks_indexed, cn
+            );
+            let prose_with_fence =
+                maybe_append_lore_metadata_fence(prose, &metadata, include_metadata);
+            text_response(req, &prose_with_fence)
         }
         Err(e) => error_response(req, &format!("Failed to add pattern: {e}")),
     }
 }
 
 fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
+    let include_metadata = include_metadata_arg(args);
     let Some(source_file) = args.get("source_file").and_then(Value::as_str) else {
         return error_response(req, "Missing required field: source_file");
     };
@@ -611,20 +664,20 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
             });
-            text_response_with_metadata(
-                req,
-                &format!(
-                    "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
-                    result.file_path, result.chunks_indexed, cn
-                ),
-                &metadata,
-            )
+            let prose = format!(
+                "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
+                result.file_path, result.chunks_indexed, cn
+            );
+            let prose_with_fence =
+                maybe_append_lore_metadata_fence(prose, &metadata, include_metadata);
+            text_response(req, &prose_with_fence)
         }
         Err(e) => error_response(req, &format!("Failed to update pattern: {e}")),
     }
 }
 
 fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
+    let include_metadata = include_metadata_arg(args);
     let Some(source_file) = args.get("source_file").and_then(Value::as_str) else {
         return error_response(req, "Missing required field: source_file");
     };
@@ -674,14 +727,13 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
             });
-            text_response_with_metadata(
-                req,
-                &format!(
-                    "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
-                    heading, result.file_path, result.chunks_indexed, cn
-                ),
-                &metadata,
-            )
+            let prose = format!(
+                "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
+                heading, result.file_path, result.chunks_indexed, cn
+            );
+            let prose_with_fence =
+                maybe_append_lore_metadata_fence(prose, &metadata, include_metadata);
+            text_response(req, &prose_with_fence)
         }
         Err(e) => error_response(req, &format!("Failed to append: {e}")),
     }
@@ -691,7 +743,12 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 /// inbox workflow configuration. Designed for agents that need to know whether
 /// pending writes will be committed before they call `add_pattern`,
 /// `update_pattern`, or `append_to_pattern`.
-fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcResponse {
+fn handle_lore_status(
+    req: &JsonRpcRequest,
+    ctx: &ServerContext<'_>,
+    args: &Value,
+) -> JsonRpcResponse {
+    let include_metadata = include_metadata_arg(args);
     let is_git_repo = git::is_git_repo(&ctx.config.knowledge_dir);
     let last_commit = ctx
         .db
@@ -751,7 +808,8 @@ fn handle_lore_status(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcR
         },
     );
 
-    text_response_with_metadata(req, &summary, &metadata)
+    let summary_with_fence = maybe_append_lore_metadata_fence(summary, &metadata, include_metadata);
+    text_response(req, &summary_with_fence)
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +837,110 @@ fn commit_note(status: &CommitStatus) -> String {
     }
 }
 
+/// The search mode used to produce a `search_patterns` response.
+///
+/// The mode distinguishes three orthogonal cases that the prose response
+/// body cannot expose:
+///
+/// - `Hybrid`: full hybrid search with embedder + FTS combined via
+///   reciprocal-rank fusion. Scores are comparable across queries.
+/// - `FtsFallback`: hybrid was attempted but the embedder was unreachable;
+///   silently fell back to FTS-only for this query. Scores use BM25
+///   rank, not comparable to `Hybrid`.
+/// - `FtsOnly`: deployment is configured for FTS-only via
+///   `config.search.hybrid = false`. The embedder was never attempted.
+///   Scores use BM25 rank, not comparable to `Hybrid`.
+///
+/// MCP clients (specifically the `coverage-check` Claude Code skill)
+/// consume the `mode` field to decide whether aggregate coverage metrics
+/// are meaningful. Only `Hybrid` is comparable; both `FtsFallback` and
+/// `FtsOnly` must trigger client-side refusal of cross-query
+/// aggregation.
+///
+/// The `as_str` match is intentionally exhaustive (no wildcard arm) so
+/// adding a new variant fails to compile until the JSON serialisation is
+/// updated. This mirrors the discipline in `commit_status_metadata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Hybrid,
+    FtsFallback,
+    FtsOnly,
+}
+
+impl SearchMode {
+    /// Derive the search mode from `config.search.hybrid` and the
+    /// runtime `embed_failed` flag observed by `handle_search`. The two
+    /// inputs are orthogonal: `hybrid_enabled` is a configuration choice
+    /// (FTS-only is a deliberate deployment decision); `embed_failed`
+    /// reflects whether the embedder was reachable for this specific
+    /// request.
+    fn from_search_state(hybrid_enabled: bool, embed_failed: bool) -> Self {
+        if !hybrid_enabled {
+            // Configured FTS-only — `handle_search` never attempts the
+            // embedder, so `embed_failed` is necessarily false. The
+            // debug_assert documents the invariant; in release builds the
+            // outer `if` already routes correctly.
+            debug_assert!(
+                !embed_failed,
+                "embed_failed must be false when hybrid is disabled — the embedder is never attempted in the FTS-only code path"
+            );
+            Self::FtsOnly
+        } else if embed_failed {
+            Self::FtsFallback
+        } else {
+            Self::Hybrid
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::FtsFallback => "fts_fallback",
+            Self::FtsOnly => "fts_only",
+        }
+    }
+}
+
+/// Build the structured metadata block consumed by `search_patterns` MCP
+/// callers (specifically the `coverage-check` Claude Code skill at
+/// `integrations/claude-code/skills/coverage-check/SKILL.md`).
+///
+/// The `mode` field is the load-bearing signal — see `SearchMode` above
+/// for the three values and their meaning. The previous version of this
+/// helper exposed a separate `embed_failed` boolean alongside `mode`;
+/// that field has been removed because it was strictly derivable from
+/// `mode` (true iff `mode == "fts_fallback"`) and the redundancy created
+/// a maintenance hazard for clients that branched on either field.
+///
+/// See `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+/// (Unit 2, "Approach" and "Test scenarios") for the full contract.
+fn build_search_metadata(
+    query: &str,
+    top_k: usize,
+    mode: SearchMode,
+    results: &[crate::database::SearchResult],
+) -> Value {
+    let result_rows: Vec<Value> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            json!({
+                "rank": i + 1,
+                "title": r.title,
+                "source_file": r.source_file,
+                "score": r.score,
+            })
+        })
+        .collect();
+    json!({
+        "query": query,
+        "top_k": top_k,
+        "result_count": results.len(),
+        "mode": mode.as_str(),
+        "results": result_rows,
+    })
+}
+
 fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0",
@@ -790,24 +952,55 @@ fn text_response(req: &JsonRpcRequest, text: &str) -> JsonRpcResponse {
     }
 }
 
-/// Build a tool response that carries both human-readable text and a structured
-/// metadata object alongside the standard `content` block. Agents that consume
-/// the MCP response programmatically can read fields from `metadata` directly
-/// rather than parsing the human prose.
-fn text_response_with_metadata(
-    req: &JsonRpcRequest,
-    text: &str,
+/// The fence language tag for the machine-readable metadata block embedded
+/// in tool response prose. Chosen to be unique enough that collision with
+/// legitimate pattern-body content is near-zero.
+const LORE_METADATA_FENCE_TAG: &str = "lore-metadata";
+
+/// Conditionally append a fenced `lore-metadata` block to a tool response's
+/// prose body, returning the (possibly extended) prose.
+///
+/// Background: Claude Code's MCP client strips the `result.metadata` sibling
+/// from tool responses before surfacing them to the agent — only the content
+/// array reaches the model. This helper embeds the structured metadata in the
+/// prose body instead, where the agent can read it via `content[0].text` (the
+/// standard MCP surface every compliant client forwards).
+///
+/// The fenced block is opt-in via the `include_metadata` tool parameter so
+/// default callers (e.g. the `search` skill, hook-injected prose queries) do
+/// not pay the token cost of the embedded JSON. Opt-in callers (e.g. the
+/// `coverage-check` skill) pass `include_metadata: true` on every call.
+///
+/// `serde_json::to_string` escapes newlines and control characters, so the
+/// serialised JSON contains no real newline characters. This guarantees the
+/// closing fence marker (`\n` + triple backtick) after the JSON payload is
+/// unambiguous — the client-side extractor can safely look for `\n` + triple
+/// backtick as the end-of-fence delimiter without risk of false matches
+/// inside the JSON string.
+///
+/// See `docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md`
+/// for the design rationale and `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+/// § 'Design pivot: layer 2 finding' for the history.
+fn maybe_append_lore_metadata_fence(
+    prose: String,
     metadata: &Value,
-) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0",
-        id: req.id.clone(),
-        result: Some(json!({
-            "content": [{ "type": "text", "text": text }],
-            "metadata": metadata,
-        })),
-        error: None,
+    include_metadata: bool,
+) -> String {
+    if !include_metadata {
+        return prose;
     }
+    let json = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string());
+    format!("{prose}\n\n```{LORE_METADATA_FENCE_TAG}\n{json}\n```")
+}
+
+/// Read the `include_metadata` boolean from a tool-call `arguments` object,
+/// defaulting to `false` when the key is absent or not a boolean. Matches the
+/// schema declared in `tool_definitions()` for every tool that supports the
+/// opt-in fenced-metadata channel.
+fn include_metadata_arg(args: &Value) -> bool {
+    args.get("include_metadata")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Render a `CommitStatus` as a structured JSON value for MCP response metadata.
@@ -897,6 +1090,39 @@ mod tests {
         }
     }
 
+    /// Extract the JSON payload from a `lore-metadata` fenced code block
+    /// embedded at the end of a tool response's prose body. Returns `None`
+    /// if no fence is present (e.g. the caller did not pass
+    /// `include_metadata: true`).
+    ///
+    /// The extractor mirrors the skill-side parsing logic: locate the last
+    /// occurrence of the opening fence marker, advance past it, then find
+    /// the next newline-triple-backtick closing marker. Because
+    /// `serde_json::to_string` escapes newlines as `\n`, the serialised
+    /// metadata payload contains no real newline characters, so the first
+    /// newline followed by triple-backtick after the opening fence is
+    /// guaranteed to be our closing marker (not a false match inside the
+    /// JSON).
+    fn extract_lore_metadata_fence(text: &str) -> Option<Value> {
+        let opening = format!("\n\n```{LORE_METADATA_FENCE_TAG}\n");
+        let start = text.rfind(&opening)?;
+        let after_opening = &text[start + opening.len()..];
+        let end = after_opening.find("\n```")?;
+        let json_str = &after_opening[..end];
+        serde_json::from_str(json_str).ok()
+    }
+
+    /// Pull the metadata fence from a successful tool response. Fails loudly
+    /// if the fence is absent — tests that use this helper are pinning the
+    /// `include_metadata: true` contract.
+    fn metadata_from_response(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("response should have a content[0].text field");
+        extract_lore_metadata_fence(text)
+            .expect("expected a `lore-metadata` fence in the response prose")
+    }
+
     // -- initialize --------------------------------------------------------
 
     #[test]
@@ -982,6 +1208,483 @@ mod tests {
         );
     }
 
+    /// Build a `TestHarness` whose embedder always fails. Used to pin the
+    /// `mode: "fts_fallback"` branch on the search response metadata.
+    fn failing_embedder_harness() -> (
+        KnowledgeDB,
+        crate::embeddings::FailingEmbedder,
+        Config,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempdir().unwrap();
+        let embedder = crate::embeddings::FailingEmbedder::new(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "test-model",
+        );
+        (db, embedder, config, tmp)
+    }
+
+    fn dispatch_value(
+        db: &KnowledgeDB,
+        embedder: &dyn Embedder,
+        config: &Config,
+        json: &str,
+    ) -> Value {
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        let ctx = ServerContext {
+            db,
+            embedder,
+            config,
+        };
+        let resp = handle_request(&req, &ctx).expect("expected a response");
+        serde_json::to_value(&resp).unwrap()
+    }
+
+    /// Pin the `search_patterns` metadata block contract when the caller
+    /// opts in via `include_metadata: true`: hybrid mode, results present,
+    /// per-row `rank`/`source_file`/`score`, top-level
+    /// `query`/`top_k`/`result_count`/`mode` fields, carried via a
+    /// `lore-metadata` fenced code block at the end of the prose body.
+    /// The skill that consumes this metadata depends on these field names —
+    /// changing the shape requires updating the skill prompt at
+    /// `integrations/claude-code/skills/coverage-check/SKILL.md`.
+    ///
+    /// Channel history: the metadata was previously carried in a sibling
+    /// field on `result` (`result.metadata`) alongside `result.content`.
+    /// That channel was structurally stripped by Claude Code's MCP client
+    /// before reaching the agent, so the design pivoted to embedding the
+    /// JSON in a fenced code block inside `content[0].text` — the standard
+    /// MCP surface every compliant client forwards. See
+    /// `docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md`
+    /// for the finding and the production pattern.
+    #[test]
+    fn search_patterns_response_metadata_pins_hybrid_shape() {
+        // Arrange
+        let h = TestHarness::new();
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":10,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check","top_k":5,"include_metadata":true}
+                }
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+
+        // Top-level fields the skill consumes.
+        assert_eq!(metadata["mode"], "hybrid");
+        assert_eq!(metadata["query"], "cargo deny check");
+        assert_eq!(metadata["top_k"], 5);
+        assert!(
+            metadata["result_count"].as_u64().unwrap() >= 1,
+            "expected at least one hit, got result_count = {}",
+            metadata["result_count"]
+        );
+
+        // Per-row fields the skill consumes.
+        let results = metadata["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "results array should not be empty");
+        let first = &results[0];
+        assert_eq!(first["rank"], 1);
+        assert_eq!(first["source_file"], "rust/cargo-deny.md");
+        assert_eq!(first["title"], "Cargo Deny");
+        assert!(
+            first["score"].as_f64().unwrap() > 0.0,
+            "expected a positive score, got: {}",
+            first["score"]
+        );
+
+        // Prose body still contains the rendered result row — the fenced
+        // block is appended at the end, not interleaved with the prose.
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("[1] Cargo Deny (source: rust/cargo-deny.md)"),
+            "prose body should still contain the rendered result row, got: {text}"
+        );
+    }
+
+    /// When the caller does NOT pass `include_metadata: true`, the response
+    /// must not contain a `lore-metadata` fence. Pins the opt-in contract.
+    #[test]
+    fn search_patterns_omits_metadata_fence_by_default() {
+        // Arrange
+        let h = TestHarness::new();
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":20,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check"}
+                }
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("```lore-metadata"),
+            "default search_patterns response must not contain a lore-metadata \
+             fence (the fence is opt-in via include_metadata: true), got: {text}"
+        );
+        assert!(
+            extract_lore_metadata_fence(text).is_none(),
+            "extract_lore_metadata_fence should return None for a response \
+             without the fence, got Some(..)"
+        );
+    }
+
+    /// Empty result set: `results` array is empty, `result_count` is 0,
+    /// `mode` is still `hybrid` (the embedder did not fail; there were just
+    /// no matches).
+    #[test]
+    fn search_patterns_response_metadata_empty_results() {
+        let h = TestHarness::new();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":11,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"nothing matches this","include_metadata":true}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "hybrid");
+        assert_eq!(metadata["result_count"], 0);
+        let results = metadata["results"].as_array().unwrap();
+        assert!(results.is_empty(), "results should be empty for no matches");
+    }
+
+    /// Multiple chunks for the same source file produce multiple result rows
+    /// with the same `source_file` and ascending rank values. The skill
+    /// computes "rank of the pattern" as the minimum rank across matching
+    /// rows; this test pins the per-row `source_file` field so that
+    /// computation is well-defined.
+    ///
+    /// `min_relevance` is set to 0.0 in this harness to bypass the
+    /// production-default 0.6 threshold, which filters `FakeEmbedder`'s
+    /// hash-based scores aggressively. The threshold is exercised in
+    /// production by real embeddings; here we are pinning the metadata
+    /// shape, not the threshold behaviour.
+    #[test]
+    fn search_patterns_response_metadata_multiple_chunks_same_source() {
+        let tmp = tempdir().unwrap();
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "test-model",
+        );
+        config.search.min_relevance = 0.0;
+
+        for (i, body) in [
+            "Run cargo deny check on every release",
+            "Cargo deny validates licenses and advisories",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let chunk = crate::chunking::Chunk {
+                id: format!("c{i}"),
+                title: format!("Cargo Deny Section {i}"),
+                body: (*body).to_string(),
+                tags: "rust".into(),
+                source_file: "rust/cargo-deny.md".into(),
+                heading_path: format!("section-{i}"),
+            };
+            let emb = embedder.embed(&chunk.body).unwrap();
+            db.insert_chunk(&chunk, Some(&emb)).unwrap();
+        }
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":12,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny licenses","include_metadata":true}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        let results = metadata["results"].as_array().unwrap();
+        assert!(
+            results.len() >= 2,
+            "expected at least two result rows from two chunks, got {}",
+            results.len()
+        );
+        let matching: Vec<_> = results
+            .iter()
+            .filter(|r| r["source_file"] == "rust/cargo-deny.md")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            results.len(),
+            "all rows should share source_file"
+        );
+        // Ranks should be monotonically increasing 1-indexed integers.
+        for (i, row) in results.iter().enumerate() {
+            assert_eq!(
+                row["rank"],
+                i + 1,
+                "row {i} should have rank {} (1-indexed), got {}",
+                i + 1,
+                row["rank"]
+            );
+        }
+    }
+
+    /// Embedder failure (Ollama unreachable) flips `mode` to `"fts_fallback"`.
+    /// The prose body still contains the existing "Note: Ollama unreachable"
+    /// prefix so prose-consuming clients keep working, but the metadata is
+    /// the load-bearing signal that lets the coverage-check skill detect the
+    /// silent FTS-only fallback. `fts_fallback` is distinct from `fts_only`:
+    /// the former means "the embedder was attempted and failed", the latter
+    /// means "the embedder was never attempted because the deployment is
+    /// configured for FTS-only" (see
+    /// `search_patterns_response_metadata_fts_only_when_hybrid_disabled`).
+    #[test]
+    fn search_patterns_response_metadata_fts_fallback_on_embedder_failure() {
+        let (db, embedder, config, _tmp) = failing_embedder_harness();
+
+        // Insert a chunk under the failing-embedder harness's db. We can't
+        // call `embedder.embed()` for the insert (it would fail), so insert
+        // with no embedding — FTS-only path will still find it via lexical
+        // match.
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":13,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check","include_metadata":true}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "fts_fallback");
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Note: Ollama unreachable"),
+            "prose body should still contain the Ollama-unreachable note, got: {text}"
+        );
+    }
+
+    /// FTS-only configured search (`config.search.hybrid = false`) flips
+    /// `mode` to `"fts_only"`, distinct from both `"hybrid"` (full
+    /// embedder + FTS) and `"fts_fallback"` (embedder unreachable in a
+    /// hybrid-configured deployment).
+    ///
+    /// This test pins the contract that `fts_only` is its own mode value,
+    /// not aliased to `hybrid` or `fts_fallback`. The coverage-check skill
+    /// reads `mode` to decide whether aggregate coverage metrics are
+    /// meaningful — only `hybrid` is comparable across queries; both
+    /// `fts_only` and `fts_fallback` use BM25 ranks that are incomparable
+    /// to RRF scores, so the skill must refuse to compute a coverage ratio
+    /// when it sees either value.
+    ///
+    /// Without this test, the previous bug — where `mode` was derived
+    /// solely from `embed_failed` and silently reported `"hybrid"` for
+    /// `config.search.hybrid = false` deployments — would not be caught
+    /// by the existing test suite.
+    #[test]
+    fn search_patterns_response_metadata_fts_only_when_hybrid_disabled() {
+        let tmp = tempdir().unwrap();
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        db.init().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "test-model",
+        );
+        config.search.hybrid = false;
+
+        // Insert without an embedding — FTS-only path does not consult the
+        // vector index, so the chunk only needs to be in the FTS5 table.
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":17,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check","include_metadata":true}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(
+            metadata["mode"], "fts_only",
+            "FTS-only configured search must report mode='fts_only' (distinct from \
+             'hybrid' and 'fts_fallback'); the previous derivation from embed_failed \
+             alone silently reported 'hybrid' here"
+        );
+        // Sanity check: the FTS-only path actually returned the chunk via
+        // lexical match.
+        assert!(
+            metadata["result_count"].as_u64().unwrap() >= 1,
+            "expected the FTS-only path to find the chunk via lexical match, got: {metadata}"
+        );
+        let results = metadata["results"].as_array().unwrap();
+        assert_eq!(results[0]["source_file"], "rust/cargo-deny.md");
+    }
+
+    /// `top_k` parameter is reflected in the metadata block, and the results
+    /// array honours the cap.
+    #[test]
+    fn search_patterns_response_metadata_top_k_respected() {
+        let h = TestHarness::new();
+
+        for i in 0..6 {
+            let chunk = crate::chunking::Chunk {
+                id: format!("c{i}"),
+                title: format!("Pattern {i}"),
+                body: format!("cargo deny content number {i}"),
+                tags: "rust".into(),
+                source_file: format!("rust/pattern-{i}.md"),
+                heading_path: String::new(),
+            };
+            let emb = h.embedder.embed(&chunk.body).unwrap();
+            h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+        }
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":14,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny content","top_k":3,"include_metadata":true}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["top_k"], 3);
+        let results = metadata["results"].as_array().unwrap();
+        assert!(
+            results.len() <= 3,
+            "results array length must respect top_k=3, got {}",
+            results.len()
+        );
+    }
+
+    /// Pin the JSON-RPC error response shape for `search_patterns` so the
+    /// `coverage-check` skill's step 8 (`errored` per-query state) is grounded
+    /// in a tested contract. When `handle_search` rejects a request (e.g.
+    /// `top_k` over `MAX_TOP_K`), the response must have `error` non-null and
+    /// **must not** carry a `content` array with a fenced metadata block.
+    /// The skill's step 8 reads `resp["error"].is_null()` first before
+    /// touching `content[0].text`, so the absence of a success-path response
+    /// on the error path is the contract that prevents the skill from
+    /// attempting to extract fields from a missing object.
+    ///
+    /// This test passes `include_metadata: true` to verify that even when
+    /// the caller opts in to the fenced-metadata channel, error responses
+    /// still short-circuit past the append step and return via
+    /// `error_response` with no `result` field populated.
+    #[test]
+    fn search_patterns_response_metadata_absent_on_error() {
+        // Arrange
+        let h = TestHarness::new();
+        let oversized = MAX_TOP_K + 1;
+        let body = format!(
+            r#"{{
+                "jsonrpc":"2.0","id":15,"method":"tools/call",
+                "params":{{
+                    "name":"search_patterns",
+                    "arguments":{{"query":"anything","top_k":{oversized},"include_metadata":true}}
+                }}
+            }}"#
+        );
+
+        // Act
+        let resp = h.request_value(&body);
+
+        // Assert
+        assert!(
+            !resp["error"].is_null(),
+            "error response should populate the JSON-RPC error field, got: {resp}"
+        );
+        assert!(
+            resp["result"].is_null(),
+            "error response must not carry a `result` field (skill consumers \
+             read resp[\"error\"] first), got result: {}",
+            resp["result"]
+        );
+    }
+
     // -- add_pattern -------------------------------------------------------
 
     #[test]
@@ -1016,19 +1719,23 @@ mod tests {
 
     #[test]
     fn lore_status_reports_non_git_state() {
+        // Arrange
         // TestHarness uses a plain tempdir for knowledge_dir, so the status
         // tool should report git_repository = false and delta_ingest_available
         // = false.
         let h = TestHarness::new();
+
+        // Act
         let resp = h.request_value(
             r#"{
                 "jsonrpc":"2.0","id":50,"method":"tools/call",
-                "params":{"name":"lore_status","arguments":{}}
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
             }"#,
         );
 
+        // Assert
         assert!(resp["error"].is_null());
-        let metadata = &resp["result"]["metadata"];
+        let metadata = metadata_from_response(&resp);
         assert_eq!(metadata["git_repository"], false);
         assert_eq!(metadata["delta_ingest_available"], false);
         assert_eq!(metadata["inbox_workflow_configured"], false);
@@ -1054,22 +1761,59 @@ mod tests {
         );
     }
 
+    /// When the caller does NOT pass `include_metadata: true`, `lore_status`
+    /// must return the prose summary with no `lore-metadata` fence. Pins
+    /// the opt-in contract: default callers pay no token cost for the
+    /// embedded JSON block.
+    #[test]
+    fn lore_status_omits_metadata_fence_by_default() {
+        // Arrange
+        let h = TestHarness::new();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":55,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{}}
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("```lore-metadata"),
+            "default lore_status response must not contain a lore-metadata fence, got: {text}"
+        );
+        assert!(extract_lore_metadata_fence(text).is_none());
+        // Prose summary is still present — the opt-out path does not
+        // suppress the human-readable response.
+        assert!(
+            text.contains("Knowledge base:"),
+            "prose summary should still be present, got: {text}"
+        );
+    }
+
     #[test]
     fn lore_status_reports_loreignore_active_when_present() {
+        // Arrange
         // Drop a .loreignore into the harness's knowledge_dir and verify the
         // status tool reflects it.
         let h = TestHarness::new();
         std::fs::write(h.config.knowledge_dir.join(".loreignore"), "README.md\n").unwrap();
 
+        // Act
         let resp = h.request_value(
             r#"{
                 "jsonrpc":"2.0","id":52,"method":"tools/call",
-                "params":{"name":"lore_status","arguments":{}}
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
             }"#,
         );
 
+        // Assert
         assert!(resp["error"].is_null());
-        assert_eq!(resp["result"]["metadata"]["loreignore_active"], true);
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["loreignore_active"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains(".loreignore: active"),
@@ -1079,6 +1823,7 @@ mod tests {
 
     #[test]
     fn lore_status_reports_loreignore_inactive_when_only_comments() {
+        // Arrange
         // A comment-only .loreignore produces zero effective patterns and is
         // not considered active. Pin this so the field reflects "would this
         // file actually filter anything" rather than "does the file exist".
@@ -1089,19 +1834,23 @@ mod tests {
         )
         .unwrap();
 
+        // Act
         let resp = h.request_value(
             r#"{
                 "jsonrpc":"2.0","id":53,"method":"tools/call",
-                "params":{"name":"lore_status","arguments":{}}
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
             }"#,
         );
 
+        // Assert
         assert!(resp["error"].is_null());
-        assert_eq!(resp["result"]["metadata"]["loreignore_active"], false);
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["loreignore_active"], false);
     }
 
     #[test]
     fn lore_status_reports_git_state() {
+        // Arrange
         // Initialise the harness's knowledge_dir as a git repository so the
         // status tool reports git_repository = true. Without an ingested
         // commit, delta_ingest_available remains false.
@@ -1113,15 +1862,17 @@ mod tests {
             .status()
             .unwrap();
 
+        // Act
         let resp = h.request_value(
             r#"{
                 "jsonrpc":"2.0","id":51,"method":"tools/call",
-                "params":{"name":"lore_status","arguments":{}}
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
             }"#,
         );
 
+        // Assert
         assert!(resp["error"].is_null());
-        let metadata = &resp["result"]["metadata"];
+        let metadata = metadata_from_response(&resp);
         assert_eq!(metadata["git_repository"], true);
         // No ingest has been recorded, so delta is still unavailable.
         assert_eq!(metadata["delta_ingest_available"], false);
@@ -1136,6 +1887,7 @@ mod tests {
 
     #[test]
     fn lore_status_reports_delta_ingest_available_when_git_and_commit_present() {
+        // Arrange
         // The only path that flips `delta_ingest_available` to true is
         // `is_git_repo && last_commit.is_some()`. The previous two lore_status
         // tests cover the false branches; this test pins the true branch by
@@ -1152,15 +1904,17 @@ mod tests {
         h.db.set_metadata(crate::ingest::META_LAST_COMMIT, "abc1234deadbeef")
             .unwrap();
 
+        // Act
         let resp = h.request_value(
             r#"{
-                "jsonrpc":"2.0","id":52,"method":"tools/call",
-                "params":{"name":"lore_status","arguments":{}}
+                "jsonrpc":"2.0","id":54,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
             }"#,
         );
 
+        // Assert
         assert!(resp["error"].is_null());
-        let metadata = &resp["result"]["metadata"];
+        let metadata = metadata_from_response(&resp);
         assert_eq!(metadata["git_repository"], true);
         assert_eq!(metadata["delta_ingest_available"], true);
         assert_eq!(metadata["last_ingested_commit"], "abc1234deadbeef");
@@ -1174,11 +1928,14 @@ mod tests {
 
     #[test]
     fn add_pattern_response_metadata_pins_commit_status_for_non_git_dir() {
+        // Arrange
         // The TestHarness uses a plain tempdir for knowledge_dir (no `git init`),
         // so add_pattern should write the file and report commit_status = "not_committed"
-        // in the structured metadata block. Agents reading the metadata field can
-        // detect the degraded state without parsing the human-readable content text.
+        // in the fenced metadata block. Agents reading the fence can detect the
+        // degraded state without parsing the human-readable prose summary.
         let h = TestHarness::new();
+
+        // Act
         let resp = h.request_value(
             r#"{
                 "jsonrpc":"2.0","id":40,"method":"tools/call",
@@ -1186,19 +1943,16 @@ mod tests {
                     "name":"add_pattern",
                     "arguments":{
                         "title":"Metadata Pinned Pattern",
-                        "body":"Body text that is long enough for chunking."
+                        "body":"Body text that is long enough for chunking.",
+                        "include_metadata":true
                     }
                 }
             }"#,
         );
 
+        // Assert
         assert!(resp["error"].is_null());
-
-        let metadata = &resp["result"]["metadata"];
-        assert!(
-            !metadata.is_null(),
-            "response should carry a metadata object, got: {resp:?}"
-        );
+        let metadata = metadata_from_response(&resp);
         assert_eq!(
             metadata["commit_status"]["kind"], "not_committed",
             "non-git directory should report not_committed, got: {metadata:?}"
@@ -1211,6 +1965,38 @@ mod tests {
             metadata["file_path"].is_string(),
             "metadata should expose file_path"
         );
+    }
+
+    /// When the caller does NOT pass `include_metadata: true`, the write
+    /// tool responses must not contain a `lore-metadata` fence. Pins the
+    /// opt-in contract for the write tools (`add_pattern` in particular).
+    #[test]
+    fn add_pattern_omits_metadata_fence_by_default() {
+        // Arrange
+        let h = TestHarness::new();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":41,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Plain Pattern",
+                        "body":"Body text for default path."
+                    }
+                }
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("```lore-metadata"),
+            "default add_pattern response must not contain a lore-metadata fence, got: {text}"
+        );
+        assert!(extract_lore_metadata_fence(text).is_none());
     }
 
     // -- unknown method ----------------------------------------------------

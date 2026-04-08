@@ -179,7 +179,7 @@ origin: `docs/brainstorms/2026-04-01-agent-integration-claude-code-requirements.
 │  │ PostCompact    │ lore hook                        │  │
 │  └────────────────┴──────────────────────────────────┘  │
 │                                                          │
-│  skills/search-lore/SKILL.md                            │
+│  skills/search/SKILL.md                                 │
 │  ┌──────────────────────────────────────────────────┐   │
 │  │ Auto-invocable + user-invocable                  │   │
 │  │ Calls search_patterns MCP tool                    │   │
@@ -458,7 +458,7 @@ everything together.
 
 - Create: `integrations/claude-code/.claude-plugin/plugin.json`
 - Create: `integrations/claude-code/hooks/hooks.json`
-- Create: `integrations/claude-code/skills/search-lore/SKILL.md`
+- Create: `integrations/claude-code/skills/search/SKILL.md`
 
 **Approach:**
 
@@ -470,7 +470,7 @@ everything together.
   - PostCompact → `lore hook` (no matcher)
 - `SKILL.md`: auto-invocable + user-invocable skill with description targeting domain entry, new
   file creation, unfamiliar territory. Instructs Claude to call `search_patterns` MCP tool and treat
-  results as constraints. Name: `search-lore`, invocable as `/lore:search-lore`.
+  results as constraints. Name: `search`, invocable as `/lore:search`.
 - Note: the skill's `search_patterns` MCP tool call requires the lore MCP server to be separately
   configured (via `claude mcp add` or user settings). The plugin does not bundle MCP server config
   because lore's MCP server is already configured during `lore init`. Document this prerequisite.

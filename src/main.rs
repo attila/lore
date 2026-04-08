@@ -102,6 +102,24 @@ NOTES:
     /// Process a Claude Code lifecycle hook (reads JSON from stdin)
     Hook,
 
+    /// Simulate hook query extraction for a synthetic tool call.
+    ///
+    /// Reads a JSON object with `tool_name` and `tool_input` from stdin and
+    /// prints the FTS5 query the hook would derive for it (or nothing if no
+    /// meaningful terms survive). Used by the coverage-check skill to
+    /// materialize production-realistic queries from inferred tool calls.
+    #[command(after_help = "EXAMPLES:
+  echo '{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"src/lib.rs\"}}' \\
+    | lore extract-queries
+
+  echo '{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cargo deny check\"}}' \\
+    | lore extract-queries
+
+EXIT CODES:
+  0  Success. Stdout carries the query, or is empty when no terms survived.
+  1  Malformed JSON on stdin.")]
+    ExtractQueries,
+
     /// List all patterns in the knowledge base
     List,
 
@@ -148,6 +166,7 @@ fn main() {
             cmd_search(&config_path, &query.join(" "), top_k, json)
         }
         Commands::Hook => cmd_hook(&config_path),
+        Commands::ExtractQueries => cmd_extract_queries(),
         Commands::List => cmd_list(&config_path, json),
         Commands::Status => cmd_status(&config_path),
     };
@@ -258,7 +277,7 @@ fn cmd_init(
     eprintln!("\nTo use with Claude Code, install the lore plugin:\n");
     eprintln!("  claude --plugin-dir <lore-repo>/integrations/claude-code/\n");
     eprintln!("Replace <lore-repo> with the path to your lore source checkout.");
-    eprintln!("This includes the MCP server, lifecycle hooks, and the /search-lore skill.");
+    eprintln!("This includes the MCP server, lifecycle hooks, and the /search skill.");
 
     if user_provided_config {
         eprintln!();
@@ -546,6 +565,45 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
         println!("{json}");
     }
 
+    Ok(())
+}
+
+/// Simulate the hook's FTS5 query extraction for a synthetic tool call.
+///
+/// Reads a thin JSON envelope (`tool_name` + `tool_input`) from stdin, wraps
+/// it into a `PreToolUse` `HookInput`, and runs the same `extract_query`
+/// logic the hook uses. Prints the resulting query to stdout (no trailing
+/// output when extraction yields nothing).
+fn cmd_extract_queries() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        tool_name: Option<String>,
+        tool_input: Option<serde_json::Value>,
+    }
+
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("failed to read stdin: {e}"))?;
+
+    let envelope: Envelope =
+        serde_json::from_str(&buf).map_err(|e| anyhow::anyhow!("invalid JSON on stdin: {e}"))?;
+
+    let input = hook::HookInput {
+        hook_event_name: "PreToolUse".to_string(),
+        session_id: None,
+        tool_name: envelope.tool_name,
+        tool_input: envelope.tool_input,
+        agent_type: None,
+        transcript_path: None,
+        tool_response: None,
+    };
+
+    if let Some(query) = hook::extract_query(&input) {
+        println!("{query}");
+    }
     Ok(())
 }
 
