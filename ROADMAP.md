@@ -3,10 +3,6 @@
 ## Up Next
 
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] Pattern QA skill — a skill that automates the vocabulary coverage checklist from the pattern
-      authoring guide: ingest the pattern, search with candidate terms, report gaps. Now that
-      single-file ingest has landed, the commit-ingest dance is gone and this skill can run the loop
-      directly against working-tree edits
 - [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
       content at SessionStart, not just titles. Covers process-level conventions that don't surface
       through file-edit hooks. **Motivating example (2026-04-06):** during the `.loreignore` work an
@@ -95,3 +91,9 @@
       commit, enabling the fast edit-ingest-search feedback loop for pattern authoring. Orthogonal
       to delta state, respects `.loreignore` with a `--force` override. See
       `docs/plans/2026-04-06-002-feat-single-file-ingest-plan.md`
+- [x] Coverage-check skill (`/coverage-check`) — automates the Vocabulary Coverage Technique from
+      the pattern authoring guide by simulating the PreToolUse hook's own query extraction on
+      synthetic tool calls (via `lore extract-queries`), ingesting the draft, searching in parallel,
+      and iterating on edit suggestions until the surfaced-query set stabilises. Ships alongside the
+      fenced `lore-metadata` content-block pivot for MCP tool responses. See
+      `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
