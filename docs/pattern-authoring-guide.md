@@ -200,6 +200,16 @@ will observe the deletion in `git diff` and remove the chunks you just added. Co
 silently undo it. The safe workflow is to finish iterating with `lore ingest --file`, commit the
 file to git, and only then run `lore ingest`.
 
+**Automating this loop with the `/coverage-check` skill.** If you are authoring patterns inside a
+Claude Code session with the lore plugin installed, the `/coverage-check <pattern-file-path>` skill
+automates the entire loop above: it derives the candidate query set by simulating the PreToolUse
+hook's own query extraction on synthetic tool calls (via the `lore extract-queries` subcommand),
+ingests the draft via `lore ingest --file`, searches in parallel, scores per-query coverage,
+suggests concrete edits to close gaps, and iterates until the surfaced-query set stabilises. Because
+the queries are hook output rather than author paraphrase, the report approximates production
+discoverability more closely than the manual loop. See
+`integrations/claude-code/skills/coverage-check/SKILL.md` for the full contract.
+
 ## Tag Strategy
 
 Tags appear in YAML frontmatter and are indexed as a separate FTS5 column with five times the weight

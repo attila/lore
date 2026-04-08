@@ -130,8 +130,10 @@ integrations/claude-code/
 │   └── hooks.json           # Hook definitions for all four lifecycle events
 ├── mcp.json                 # MCP server configuration (stdio transport)
 └── skills/
-    └── search/
-        └── SKILL.md         # Manual search skill (user-invocable)
+    ├── search/
+    │   └── SKILL.md         # Manual search skill (user-invocable)
+    └── coverage-check/
+        └── SKILL.md         # Pattern vocabulary coverage audit (user-invocable)
 ```
 
 ### Plugin Manifest
@@ -203,9 +205,20 @@ server processes.
 
 ### Skills
 
+Both skills are configured with `disable-model-invocation: true` because hooks already handle
+automatic injection — skills exist for explicit, user-initiated work only.
+
 The `search` skill provides a user-invocable search command (`/search`) for manual pattern lookups.
-It is configured with `disable-model-invocation: true` because hooks already handle automatic
-injection — the skill exists for explicit, user-initiated searches only.
+
+The `coverage-check` skill (`/coverage-check <pattern-file-path>`) audits a draft pattern's
+vocabulary coverage by automating the manual Vocabulary Coverage Technique from
+`docs/pattern-authoring-guide.md`. It infers 3-6 synthetic tool calls an agent would plausibly issue
+when the pattern applies, pipes each call through the `lore extract-queries` subcommand to
+materialise the exact FTS5 query the PreToolUse hook would inject, runs those queries through
+`search_patterns` in parallel, and iterates on edit suggestions until the surfaced query set is
+stable. The subcommand `lore extract-queries` is a thin wrapper around the same `extract_query`
+logic the hook uses, so the candidate queries are byte-for-byte identical to what the runtime hook
+would synthesise for the same tool calls.
 
 ## Query Extraction from the Agent's Perspective
 
