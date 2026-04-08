@@ -1145,6 +1145,88 @@ improvement could spin up a headless Claude API session and pipe the skill promp
 that harness is non-trivial and outside v1 scope. For now, the three must-run smoke tests in the PR
 description remain the behavioural verification gate.
 
+## Design pivot: query source — from LLM brainstorm to hook simulation
+
+**Added 2026-04-08 after end-to-end skill testing.** The second and more consequential mid-PR pivot.
+v1's original step 4 asked the LLM to brainstorm 5-12 candidate queries from the pattern body.
+Real-run testing exposed the obvious flaw: the same agent that reads the pattern body also writes
+the queries, so the queries paraphrase the body nearly losslessly, coverage is trivially high, and
+the report tells the author nothing about production discoverability. The brainstorm rubric (3-5
+tokens, no stop-words, no command-name-only queries) was an attempt to patch this by forbidding the
+known failure modes, but forbidding the failure modes is exactly wrong — those failure modes are the
+signal the skill should be measuring.
+
+### What we pivoted to
+
+A new `lore extract-queries` CLI subcommand that wraps the existing
+`hook::extract_query(&HookInput) -> Option<String>` logic. It reads a thin JSON envelope
+(`{tool_name, tool_input}`) from stdin, wraps it into a `PreToolUse` `HookInput`, and prints the
+resulting FTS5 query to stdout (or nothing if no terms survive cleaning). Empty output is the
+diagnostic signal — it means the PreToolUse hook would inject nothing for that tool call, which is a
+real production-discoverability finding.
+
+The skill's step 4 now produces queries in three layered sources:
+
+1. **`qa_simulations` frontmatter override (opt-in).** An optional frontmatter list of
+   `{tool_name, tool_input}` objects. If present, the skill uses them verbatim and skips inference.
+   This is the escape hatch for patterns whose discoverability depends on unusual tool calls
+   automatic inference cannot guess.
+2. **Automatic inference (default).** The skill inspects the pattern's tags, headings, concrete
+   filenames, and fenced code block contents to construct 3-6 synthetic tool calls, guided by
+   tag-to-tool-call lookup tables embedded in the skill prompt (rust/cargo, typescript/pnpm,
+   python/uv, ruby/rails, ci/github-actions, sqlite, git, yaml, testing). Concrete filenames named
+   in the pattern body (`deny.toml`, `justfile`) take precedence over inferred ones.
+3. **Author confirmation** before any extraction runs. The skill renders the inferred tool-call list
+   to chat and asks the author to confirm, edit, or replace. This keeps the author in the loop
+   without reintroducing paraphrase bias — the author is correcting tool calls, not writing queries.
+
+For each confirmed tool call, the skill pipes the JSON envelope through `lore extract-queries` and
+collects the stdout line as one candidate query. The candidate set is the union of non-empty
+results.
+
+### What this buys
+
+- **Query strings are hook output, not author paraphrase.** They are byte-for-byte what the
+  PreToolUse hook would inject when an agent issues the same tool calls at runtime. Paraphrase bias
+  is reduced from "the agent reworded the pattern body" to "the agent picked which tool calls to
+  simulate" — still a source of bias, but a much smaller one, and one the author can audit at
+  confirmation time.
+- **Empty queries become diagnostics.** A tool call that produces empty stdout (e.g. `Bash just ci`
+  — `just` is a stop-word, `ci` is shorter than three characters) is a real finding: the hook would
+  inject nothing for that call, so the pattern's discoverability via that route is structurally
+  zero. The skill records the fact and continues; it no longer forbids the failure modes it should
+  be measuring.
+- **Zero-candidate degenerate case halts loudly.** If every inferred tool call produces empty
+  output, the skill halts with a clear next-action message telling the author to reword tags and
+  headings or add a `qa_simulations` override.
+
+### What carried over unchanged
+
+- The iteration loop (ingest → search → score → suggest → iterate) and its Bash `diff` stability
+  comparison.
+- The three pre-flight aborts at step 6 (cascade detection, `fts_fallback`, `fts_only`).
+- The ephemeral JSONL log under `${XDG_RUNTIME_DIR:-/tmp/lore-$(id -u)}/lore/qa-sessions/`.
+- The fenced `lore-metadata` block extraction recipe from the layer-2 pivot.
+- The three-value `SearchMode` enum and exhaustive-match discipline.
+
+### Tests added
+
+- **`tests/extract_queries.rs`** — five integration tests covering the happy path (`Edit src/lib.rs`
+  emits a `rust` anchor, `Bash cargo deny check` emits a rust anchor with enrichment,
+  `Edit app/page.tsx` emits a `typescript` anchor), the degenerate case (`Bash just
+  ci` emits
+  empty stdout), and the malformed-input failure path (invalid JSON exits non-zero with a stderr
+  message containing "invalid JSON").
+
+### What remains manual
+
+- The tool-call inference step itself. The tag-to-tool-call lookup tables embedded in the skill
+  prompt are heuristics, not data; the LLM still chooses among them. A follow-up could replace the
+  heuristics with a deterministic Rust pass that walks the pattern's frontmatter and body, but v1
+  keeps inference inside the skill prompt to avoid blocking on another Rust subcommand.
+- The paraphrase bias in the inference step. The author-confirmation checkpoint is the mitigation;
+  the agent shows its work before any extraction runs.
+
 ## Documentation / Operational Notes
 
 - **PR description test plan must include the `/exit` + relaunch step** between `just install` and

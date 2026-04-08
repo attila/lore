@@ -479,3 +479,31 @@ See the plan's "Design pivot: layer 2 finding" section
 walk-through and the new learning at
 `docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md` for the
 production pattern that future MCP tool designs should follow.
+
+## Implementation note (2026-04-08) — query source pivot
+
+This brainstorm framed R3 as "the agent brainstorms 5-12 candidate queries from the pattern body
+against an FTS5 rubric". End-to-end testing of the first implementation exposed a deeper flaw: the
+same agent that reads the pattern body also writes the queries, so the queries paraphrase the body
+nearly losslessly and coverage is trivially high. The FTS5 rubric attempted to mitigate this by
+forbidding the known hook failure modes (command-name-only queries, sub-three-character tokens,
+stop-words) — but forbidding the failure modes is precisely wrong because those are exactly what the
+skill should be measuring.
+
+The implementation pivoted mid-pull-request to a hook-simulation approach:
+
+- A new `lore extract-queries` Rust subcommand wraps `hook::extract_query(&HookInput)` and reads a
+  thin `{tool_name, tool_input}` JSON envelope from stdin. It prints the FTS5 query the PreToolUse
+  hook would inject for that tool call (or nothing if no terms survive cleaning).
+- The skill's step 4 infers 3-6 synthetic tool calls from the pattern's tags, headings, concrete
+  filenames, and fenced code blocks, presents them to the author for confirmation, and pipes each
+  confirmed call through `lore extract-queries` to materialise the candidate query set.
+- An optional `qa_simulations` frontmatter field is the author override: if present, the skill uses
+  the listed tool calls verbatim instead of inferring.
+- Empty stdout from `lore extract-queries` is now a diagnostic signal, not a forbidden state. It
+  means the hook would inject nothing for that tool call, which is a real production-discoverability
+  finding.
+
+Paraphrase bias is reduced from "the agent reworded the pattern body" to "the agent picked which
+tool calls to simulate" — still a source of bias, but one the author can audit at the confirmation
+checkpoint. See the plan's "Design pivot: query source" section for the full walk-through.
