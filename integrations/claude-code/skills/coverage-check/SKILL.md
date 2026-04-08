@@ -26,6 +26,39 @@ quotes. The existing `search` skill demonstrates the convention: `lore search "$
 command sequence. The skill steps below show the quoted form explicitly; do not strip the quotes
 when expanding the templates.
 
+## Author prompt format (do not skip)
+
+Every time this skill asks the author for a decision, the prompt MUST use the following lettered
+format so the author can reply with a single letter unambiguously. Render the `Options:` menu as a
+**fenced code block** (not a blockquote or plain paragraph) so line breaks between lettered options
+are preserved verbatim across every markdown renderer:
+
+```
+Options:
+A: <imperative verb phrase>
+B: <imperative verb phrase>
+C: <imperative verb phrase>
+```
+
+Rules:
+
+- Render the choice block as a fenced code block starting with a single `Options:` label on its own
+  line.
+- Use consecutive uppercase letters starting from `A`. No numbered lists, no `y/N`, no free-form
+  prose choices.
+- Each option is a single line and an imperative verb phrase — "Accept all edits", not "You can
+  accept all edits if you want".
+- If an option needs a payload from the author (a list of numbers, a corrected tool-call list),
+  accept it on the **same reply** when the author prefixes the payload with the letter — e.g.
+  `B: 1, 3, 4`. If the letter arrives without the payload, the skill prompts once more for the
+  payload. Never guess a default.
+- Do not add a footer explaining how to reply. The format is self-evident.
+- The numbered lists that feed into a letter choice (e.g. "1. Edit Cargo.toml" in step 4, or the
+  numbered edit suggestions in step 14) are rendered **above** the `Options:` block, not mixed into
+  it. The numbered list is the menu; the lettered block is the decision.
+
+This convention is the house style for all prompts in this skill and applies at steps 4, 5, and 14.
+
 ## Purpose and limit (read this first)
 
 This skill catches **vocabulary gaps** between a pattern's wording and the queries the lore
@@ -185,16 +218,24 @@ exact command.
 
 ### Confirmation
 
-Render the constructed tool-call list to chat as a numbered list and ask the author to confirm,
-edit, or replace it before running extraction:
+Render the constructed tool-call list as a numbered list, then present the author with the lettered
+options menu following the house style defined in the "Author prompt format" section above. Example:
 
 > I'll simulate these tool calls to derive candidate queries:
 >
 > 1. `Edit Cargo.toml`
 > 2. `Edit deny.toml`
 > 3. `Bash cargo deny check`
->
-> Confirm, edit, or replace before I run extraction. (y / edited list / skip)
+
+```
+Options:
+A: Run extraction with this list
+B: Provide a different list (reply with the corrected tool calls)
+C: Skip coverage check
+```
+
+On `A`, proceed to extraction. On `B` with a list attached, use it verbatim. On `B` without a list,
+prompt once more for the list. On `C`, exit cleanly.
 
 ### Extraction via `lore extract-queries`
 
@@ -253,13 +294,17 @@ Run `lore ingest --file <target>` via Bash, **without** `--force` initially. Cap
   > re-applies `.loreignore` (which deletes the chunks again). If this draft contains secrets,
   > internal hostnames, customer names, or other content you parked in `.loreignore` for a reason,
   > decline now and remove the file from `.loreignore` first if you still want to coverage-check it.
-  > Continue with `--force`? (y/N)
 
-  - On `y`: re-run `lore ingest --file --force <target>`. If the second run still produces zero
-    chunks (verified by the same detection check), halt with "Coverage check halted: file remains
-    unindexed after `--force`. Investigate the ingest pipeline."
-  - On `N` (or empty): exit cleanly with "Coverage check skipped: file is `.loreignore`-excluded and
-    the author declined to bypass."
+  ```
+  Options:
+  A: Continue with --force (ingest the excluded file)
+  B: Skip coverage check
+  ```
+
+  On `A`: re-run `lore ingest --file --force <target>`. If the second run still produces zero chunks
+  (verified by the same detection check), halt with "Coverage check halted: file remains unindexed
+  after `--force`. Investigate the ingest pipeline." On `B`: exit cleanly with "Coverage check
+  skipped: file is `.loreignore`-excluded and the author declined to bypass."
 
 ## 6. Cascade detection and search-mode pre-flight (do not skip)
 
@@ -506,12 +551,23 @@ Each suggestion must reference the specific missing term and where the edit shou
 
 ## 14. Author decision and iteration loop (R8)
 
-Ask the author: **accept all / accept some / skip**.
+Render the suggested edits as a numbered list (1, 2, 3, …), then present the author with the
+lettered options menu following the house style defined in the "Author prompt format" section:
 
-- **Accept all:** apply every suggested edit via the file-editing tool, then increment the iteration
+```
+Options:
+A: Accept all suggested edits
+B: Accept some edits (reply with the numbers, e.g. "B: 1, 3, 4")
+C: Skip (no edits applied, exit cleanly)
+```
+
+- **`A`:** apply every suggested edit via the file-editing tool, then increment the iteration
   counter.
-- **Accept some:** apply only the edits the author selected, then increment the iteration counter.
-- **Skip:** exit cleanly with "no edits applied".
+- **`B` with a number list attached:** apply only the numbered edits the author selected, then
+  increment the iteration counter.
+- **`B` without a number list:** prompt once more, quoting the same numbered edit list and asking
+  for the selection as `B: <numbers>`. Do not guess a default.
+- **`C`:** exit cleanly with "no edits applied".
 
 If any edits were applied:
 

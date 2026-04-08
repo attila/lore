@@ -15,3 +15,32 @@ or, when unambiguous, `/search`. New skills follow the same shape — pick a fun
 
 This convention is documented here so future skill authors do not reach for the redundant `lore-`
 prefix.
+
+## Author prompt format (house style)
+
+Skills that prompt the author for a decision MUST use a lettered option block so replies are
+single-letter and unambiguous. The canonical format:
+
+```
+Options:
+
+A: <imperative verb phrase>
+B: <imperative verb phrase>
+C: <imperative verb phrase>
+```
+
+Rules:
+
+- Start the block with a single `Options:` label on its own line.
+- Use consecutive uppercase letters from `A`. No numbered lists, no `y/N`, no free-form prose
+  choices.
+- Each option is a single imperative verb phrase.
+- If an option needs a payload (list of numbers, a corrected list), accept it on the same reply when
+  the author prefixes the payload with the letter, e.g. `B: 1, 3, 4`. If the letter arrives without
+  the payload, prompt once more; never guess a default.
+- No footer explaining how to reply — the format is self-evident.
+- Any numbered list that feeds into a letter choice (menus, edit suggestions, tool-call lists) is
+  rendered **above** the `Options:` block, not mixed into it. The numbered list is the menu; the
+  lettered block is the decision.
+
+See `skills/coverage-check/SKILL.md` for worked examples at steps 4, 5, and 14.
