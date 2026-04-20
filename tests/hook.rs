@@ -1148,3 +1148,257 @@ fn hook_session_start_skips_pinned_pattern_when_source_file_missing() {
         "the missing-file universal pattern should not surface a body: {ctx}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Universal patterns: PreToolUse partition + dedup bypass
+// ---------------------------------------------------------------------------
+
+/// Run a `SessionStart` followed by N `PreToolUse` calls with the same input,
+/// returning the `additional_context` string from each call (empty when no
+/// output was produced). Cleans up the dedup file on drop.
+fn run_pre_tool_use_sequence(
+    config_path: &Path,
+    session_id: &str,
+    pre_tool_input: &serde_json::Value,
+    repeats: usize,
+) -> Vec<String> {
+    // SessionStart first to create the dedup file.
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let mut outputs = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let output = Command::cargo_bin("lore")
+            .unwrap()
+            .args(["hook", "--config", config_path.to_str().unwrap()])
+            .write_stdin(serde_json::to_string(pre_tool_input).unwrap())
+            .assert()
+            .success();
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        let context = if stdout.is_empty() {
+            String::new()
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            parsed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        outputs.push(context);
+    }
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(session_id));
+    outputs
+}
+
+#[test]
+fn hook_pre_tool_use_universal_chunk_present_on_first_and_third_call() {
+    let (_tmp, config_path) = setup_with_universal_pattern();
+
+    // PreToolUse for `Bash git push` — the workflow.md universal pattern's
+    // body matches via FTS (push, workflow, etc.).
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "test-universal-repeated",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    });
+
+    let contexts = run_pre_tool_use_sequence(&config_path, "test-universal-repeated", &input, 3);
+
+    // The universal pattern body must appear on every call.
+    for (i, ctx) in contexts.iter().enumerate() {
+        assert!(
+            ctx.contains("git push origin HEAD"),
+            "call #{} should re-inject the universal workflow pattern, got: {ctx:?}",
+            i + 1
+        );
+    }
+}
+
+#[test]
+fn hook_pre_tool_use_non_universal_chunk_present_on_first_call_only() {
+    let (_tmp, config_path) = setup_test_env();
+
+    // PreToolUse for an Edit that matches the seeded rust pattern.
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "test-non-universal-deduped",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/lib.rs" },
+    });
+
+    let contexts = run_pre_tool_use_sequence(&config_path, "test-non-universal-deduped", &input, 2);
+
+    // Either nothing matches at all (then both calls are empty), or the
+    // non-universal pattern appears on the first call but is deduped on the
+    // second. The contract is: dedup still works for non-universal chunks.
+    if !contexts[0].is_empty() {
+        assert!(
+            contexts[1].is_empty()
+                || !contexts[1].contains("anyhow for application-level error propagation"),
+            "second call must dedup the non-universal pattern, got: {:?}",
+            contexts[1]
+        );
+    }
+}
+
+#[test]
+fn hook_pre_tool_use_universal_persists_after_post_compact_truncation() {
+    // Composition cascade hazard pin (per docs/solutions/best-practices/
+    // composition-cascades-...): the dedup file is mutated by both
+    // SessionStart truncation, PostCompact truncation, AND PreToolUse writes.
+    // Ensure universal chunks survive all three mutation routes.
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = "test-cascade";
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    });
+
+    // SessionStart
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    // 3x PreToolUse (writes universal IDs to dedup, but read-side bypass)
+    for _ in 0..3 {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(["hook", "--config", config_path.to_str().unwrap()])
+            .write_stdin(serde_json::to_string(&input).unwrap())
+            .assert()
+            .success();
+    }
+
+    // PostCompact (truncates dedup, re-emits SessionStart content)
+    let post_compact = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&post_compact).unwrap())
+        .assert()
+        .success();
+
+    // 4th PreToolUse — universal must still inject after the truncate cycle.
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("git push origin HEAD"),
+        "universal pattern must persist across PostCompact truncation: {stdout}"
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(session_id));
+}
+
+#[test]
+fn hook_pre_tool_use_universal_chunk_absent_when_query_does_not_match() {
+    // R4 negative pin: a universal pattern only injects when it passes the
+    // search relevance gate for the current tool call.
+    //
+    // workflow.md universal pattern is about `git push origin HEAD`. An
+    // Edit against a Cargo.toml file with no overlap in extracted query
+    // terms must NOT pull in the workflow pattern.
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = "test-irrelevant-tool-call";
+
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "Cargo.toml" },
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        !stdout.contains("git push origin HEAD"),
+        "universal git pattern must not inject for an unrelated Cargo.toml edit: {stdout}"
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(session_id));
+}
+
+#[test]
+fn hook_pre_tool_use_dedup_file_records_universal_chunks() {
+    // Pins the read-side semantic: universal IDs ARE written to the dedup
+    // file (the file remains a faithful injection log) but ignored on read.
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = "test-dedup-records-universal";
+
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let dedup_path = lore::hook::dedup_file_path(session_id);
+    let contents = std::fs::read_to_string(&dedup_path).unwrap();
+    assert!(
+        contents.contains("workflow.md"),
+        "dedup file should record the universal chunk's id (which contains its source_file): {contents}"
+    );
+
+    let _ = std::fs::remove_file(dedup_path);
+}

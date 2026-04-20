@@ -167,19 +167,101 @@ fn handle_pre_tool_use(
 
     lore_debug!("extracted query: {query}");
 
-    let results = search_with_threshold(db, embedder, config, &query)?;
+    let partitioned = search_with_threshold(db, embedder, config, &query)?;
 
-    if results.is_empty() {
+    if partitioned.is_empty() {
         lore_debug!("search returned no results");
         return Ok(None);
     }
 
-    // Expand: fetch all sibling chunks from matched source files.
-    // If Error Handling matched, also inject Functions, Naming, etc. from the
-    // same document.
+    // Expand each slice independently to its sibling chunks. is_universal
+    // is a file-level frontmatter tag, so universal seeds expand only to
+    // universal siblings and non-universal seeds only to non-universal —
+    // no cross-contamination at the chunk level.
+    let universal = expand_to_siblings(db, &partitioned.universal);
+    let ranked = expand_to_siblings(db, &partitioned.ranked);
+    lore_debug!(
+        "expand: {} universal + {} ranked after sibling expansion",
+        universal.len(),
+        ranked.len(),
+    );
+
+    // Combine universal first, then ranked, and route the full set through
+    // dedup. dedup_filter_and_record bypasses the `seen.contains` check
+    // for universal chunks (read-side filter) and still appends every
+    // surfaced chunk to the dedup file (write side). The dedup file
+    // therefore remains a faithful "what was injected this session" log
+    // — defensive consistency per the session-dedup-lifecycle learning.
+    let mut combined = universal;
+    let universal_count = combined.len();
+    combined.extend(ranked);
+
+    let dedup_path = session_dedup_path(input);
+    let combined = if let Some(ref path) = dedup_path
+        && path.exists()
+    {
+        let pre_count = combined.len();
+        match dedup_filter_and_record(path, &combined) {
+            Ok(filtered) => {
+                let kept_universal = filtered.iter().filter(|r| r.is_universal).count();
+                lore_debug!(
+                    "dedup: {} before -> {} after ({} universal kept by read-bypass) ({})",
+                    pre_count,
+                    filtered.len(),
+                    kept_universal,
+                    path.display()
+                );
+                filtered
+            }
+            Err(e) => {
+                eprintln!("lore hook: dedup filter error: {e}");
+                lore_debug!("dedup filter error (continuing without dedup): {e}");
+                combined
+            }
+        }
+    } else {
+        lore_debug!("dedup inactive (no session file)");
+        combined
+    };
+
+    if combined.is_empty() {
+        lore_debug!("nothing to inject after partition + dedup");
+        return Ok(None);
+    }
+
+    let kept_universal = combined.iter().filter(|r| r.is_universal).count();
+    let kept_ranked = combined.len() - kept_universal;
+    let sources: HashSet<&str> = combined.iter().map(|r| r.source_file.as_str()).collect();
+    lore_debug!(
+        "injecting {} chunks ({} universal + {} ranked, {} initially universal) from {} sources",
+        combined.len(),
+        kept_universal,
+        kept_ranked,
+        universal_count,
+        sources.len()
+    );
+
+    let context = format_imperative(&combined);
+
+    Ok(Some(HookOutput::HookSpecific {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            additional_context: context,
+        },
+    }))
+}
+
+/// Expand a result slice to include all sibling chunks from the matched
+/// source files (e.g. if Error Handling matched, also inject Functions and
+/// Naming from the same document). Falls back to the original slice when
+/// the database query fails.
+fn expand_to_siblings(db: &KnowledgeDB, seeds: &[SearchResult]) -> Vec<SearchResult> {
+    if seeds.is_empty() {
+        return Vec::new();
+    }
     let source_files: Vec<&str> = {
         let mut seen = HashSet::new();
-        results
+        seeds
             .iter()
             .filter_map(|r| {
                 if seen.insert(r.source_file.as_str()) {
@@ -190,65 +272,8 @@ fn handle_pre_tool_use(
             })
             .collect()
     };
-
-    lore_debug!("expanding {} source files", source_files.len());
-    let results = db.chunks_by_sources(&source_files).unwrap_or(results);
-
-    if results.is_empty() {
-        return Ok(None);
-    }
-
-    // Dedup: filter out already-injected chunk IDs for this session.
-    // Only activate dedup when the dedup file exists (SessionStart ran).
-    // Manual CLI calls and sessions without SessionStart skip dedup entirely.
-    // The read-filter-write sequence is held under a single file lock to
-    // prevent TOCTOU races between concurrent hook invocations.
-    let dedup_path = session_dedup_path(input);
-    let pre_dedup_count = results.len();
-    let results = if let Some(ref path) = dedup_path
-        && path.exists()
-    {
-        match dedup_filter_and_record(path, &results) {
-            Ok(filtered) => {
-                lore_debug!(
-                    "dedup: {} before, {} after filtering ({})",
-                    pre_dedup_count,
-                    filtered.len(),
-                    path.display()
-                );
-                filtered
-            }
-            Err(e) => {
-                eprintln!("lore hook: dedup filter error: {e}");
-                lore_debug!("dedup filter error (continuing without dedup): {e}");
-                // Fall through with unfiltered results — dedup is non-critical.
-                results
-            }
-        }
-    } else {
-        lore_debug!("dedup inactive (no session file)");
-        results
-    };
-
-    if results.is_empty() {
-        return Ok(None);
-    }
-
-    let context = format_imperative(&results);
-
-    let sources: HashSet<&str> = results.iter().map(|r| r.source_file.as_str()).collect();
-    lore_debug!(
-        "injecting {} chunks from {} sources",
-        results.len(),
-        sources.len()
-    );
-
-    Ok(Some(HookOutput::HookSpecific {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            additional_context: context,
-        },
-    }))
+    db.chunks_by_sources(&source_files)
+        .unwrap_or_else(|_| seeds.to_vec())
 }
 
 /// Handle `PostCompact`: truncate dedup, re-emit `SessionStart` content.
@@ -324,7 +349,7 @@ fn handle_post_tool_use(
 
     let query = cleaned.join(" OR ");
     lore_debug!("PostToolUse: error query: {query}");
-    let results = search_with_threshold(db, embedder, config, &query)?;
+    let results = search_with_threshold(db, embedder, config, &query)?.flatten();
 
     if results.is_empty() {
         lore_debug!("PostToolUse: no results for error query");
@@ -344,16 +369,61 @@ fn handle_post_tool_use(
     }))
 }
 
-/// Shared search pipeline: embed, hybrid search, threshold filter.
+/// Search results split by injection policy.
 ///
-/// Extracted so that `cmd_search` and the hook handler both call the same
-/// function, avoiding drift between the two code paths.
+/// `universal` carries chunks from `is_universal = 1` patterns above
+/// `min_relevance` with no `top_k` cap — they are additive, re-injected on
+/// every relevant `PreToolUse` call.
+///
+/// `ranked` carries non-universal chunks above `min_relevance`, capped at
+/// `config.search.top_k`. They flow through the existing dedup pipeline.
+#[derive(Debug, Default, Clone)]
+pub struct PartitionedResults {
+    pub universal: Vec<SearchResult>,
+    pub ranked: Vec<SearchResult>,
+}
+
+impl PartitionedResults {
+    /// Flatten into a single list with universal results first, then ranked.
+    /// Used by `cmd_search` and the `PostToolUse` handler where the consumer
+    /// does not need to know which chunks bypassed dedup.
+    #[must_use]
+    pub fn flatten(self) -> Vec<SearchResult> {
+        let Self {
+            mut universal,
+            mut ranked,
+        } = self;
+        universal.append(&mut ranked);
+        universal
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.universal.is_empty() && self.ranked.is_empty()
+    }
+}
+
+/// Multiplier applied to `top_k` when querying the database for the raw
+/// result set. Picked generously so a knowledge base with universal chunks
+/// scattered across the ranking still returns them — the additive R5
+/// promise can only deliver universal chunks the search actually sees.
+const SEARCH_OVERFETCH_MULTIPLIER: usize = 10;
+
+/// Shared search pipeline: embed, hybrid search, threshold filter, partition.
+///
+/// Returns universal chunks (uncapped) and ranked non-universal chunks (capped
+/// at `config.search.top_k`) as separate slices. Callers that don't care
+/// about the split can call `.flatten()`.
+///
+/// Extracted so that `cmd_search`, the `PreToolUse` handler, and the
+/// `PostToolUse` handler all call the same function, avoiding drift between
+/// the code paths.
 pub fn search_with_threshold(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     config: &Config,
     query: &str,
-) -> anyhow::Result<Vec<SearchResult>> {
+) -> anyhow::Result<PartitionedResults> {
     lore_debug!(
         "search: query={query:?} hybrid={} top_k={} min_relevance={:.4}",
         config.search.hybrid,
@@ -380,7 +450,14 @@ pub fn search_with_threshold(
         None
     };
 
-    let results = db.search_hybrid(query, query_embedding.as_deref(), config.search.top_k)?;
+    // Over-fetch so universal chunks scattered in the ranking still surface.
+    // Total cost is bounded — the multiplier ensures we don't over-fetch
+    // pathologically when top_k is already large.
+    let overfetch_limit = config
+        .search
+        .top_k
+        .saturating_mul(SEARCH_OVERFETCH_MULTIPLIER);
+    let results = db.search_hybrid(query, query_embedding.as_deref(), overfetch_limit)?;
     lore_debug!("search: {} raw results", results.len());
 
     let apply_threshold =
@@ -408,7 +485,18 @@ pub fn search_with_threshold(
         results
     };
 
-    Ok(results)
+    let (universal, mut ranked): (Vec<_>, Vec<_>) =
+        results.into_iter().partition(|r| r.is_universal);
+    ranked.truncate(config.search.top_k);
+
+    lore_debug!(
+        "search: partitioned {} universal + {} ranked (top_k={})",
+        universal.len(),
+        ranked.len(),
+        config.search.top_k,
+    );
+
+    Ok(PartitionedResults { universal, ranked })
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +673,13 @@ pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
 ///
 /// Takes results by reference so the caller retains ownership and can fall
 /// back to the unfiltered set on error.
+///
+/// Universal-tagged chunks bypass the read-side `seen.contains` check so
+/// they re-inject on every relevant tool call regardless of dedup state.
+/// They are still recorded on the write side — the dedup file remains a
+/// faithful "what was injected this session" log, and the read-side
+/// exemption is the defensive choice per
+/// `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`.
 fn dedup_filter_and_record(
     path: &Path,
     results: &[SearchResult],
@@ -607,14 +702,17 @@ fn dedup_filter_and_record(
         .map(String::from)
         .collect();
 
-    // Filter out already-injected chunks.
+    // Filter out already-injected chunks. Universal chunks bypass the
+    // `seen.contains` check entirely.
     let filtered: Vec<SearchResult> = results
         .iter()
-        .filter(|r| !seen.contains(&r.id))
+        .filter(|r| r.is_universal || !seen.contains(&r.id))
         .cloned()
         .collect();
 
-    // Record newly seen chunk IDs while still holding the lock.
+    // Record newly seen chunk IDs while still holding the lock. Universal
+    // chunks are recorded too — the dedup file is the canonical injection
+    // log and must reflect every chunk we surfaced this session.
     for r in &filtered {
         writeln!(&mut *guard, "{}", r.id)?;
     }
