@@ -952,3 +952,199 @@ fn hook_pretooluse_all_results_deduped_no_output() {
     let dedup_path = lore::hook::dedup_file_path(&session_id);
     let _ = std::fs::remove_file(dedup_path);
 }
+
+// ---------------------------------------------------------------------------
+// Universal patterns: SessionStart pinned-conventions section
+// ---------------------------------------------------------------------------
+
+/// Set up a knowledge directory containing one universal pattern alongside the
+/// usual seeded patterns. Returns the temp dir handle and config path.
+fn setup_with_universal_pattern() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("workflow.md"),
+        "---\ntags: [universal, conventions]\n---\n\n\
+         # Workflow Conventions\n\n\
+         Always push with `git push origin HEAD`, never plain `git push`.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+    (tmp, config_path)
+}
+
+fn invoke_session_start(config_path: &Path, session_id: &str) -> String {
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    parsed["systemMessage"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn hook_session_start_omits_pinned_section_when_no_universal_patterns() {
+    let (_tmp, config_path) = setup_test_env();
+    let ctx = invoke_session_start(&config_path, "test-no-universal");
+    assert!(
+        !ctx.contains("## Pinned conventions"),
+        "section header should be omitted when no patterns are universal: {ctx}"
+    );
+    assert!(
+        ctx.contains("Available patterns:"),
+        "index should still be present: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_emits_pinned_section_with_body_above_index_when_universal_present() {
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let ctx = invoke_session_start(&config_path, "test-pinned-present");
+
+    let pinned_idx = ctx
+        .find("## Pinned conventions")
+        .expect("pinned conventions section should be present");
+    let index_idx = ctx
+        .find("Available patterns:")
+        .expect("available patterns index should be present");
+
+    assert!(
+        pinned_idx < index_idx,
+        "pinned conventions section should appear above the available-patterns index"
+    );
+    assert!(
+        ctx.contains("Always push with `git push origin HEAD`"),
+        "pinned section should contain the body of the universal pattern: {ctx}"
+    );
+    assert!(
+        ctx.contains("### Workflow Conventions"),
+        "pinned section should label each pattern with its title: {ctx}"
+    );
+}
+
+#[test]
+fn hook_post_compact_re_emits_pinned_section() {
+    let (_tmp, config_path) = setup_with_universal_pattern();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": "test-post-compact-pinned",
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
+
+    assert!(
+        ctx.contains("## Pinned conventions"),
+        "PostCompact should re-emit the pinned section: {ctx}"
+    );
+    assert!(
+        ctx.contains("Always push with `git push origin HEAD`"),
+        "pinned body should re-appear at PostCompact: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("safe.md"),
+        "---\ntags: [universal]\n---\n\n# Safe Pattern\n\nLegitimate body content.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    // Tamper a chunk row so its source_file points outside knowledge_dir.
+    // No public API exposes this on purpose — the test exercises the defensive
+    // guard against exactly this kind of out-of-band tampering.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO chunks (id, title, body, tags, source_file, heading_path, is_universal) \
+         VALUES ('escape-attempt', 'Tampered', 'Body', 'universal', \
+         '../../../etc/passwd', '', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-path-traversal");
+
+    assert!(
+        ctx.contains("Legitimate body content"),
+        "the safe universal pattern should still render: {ctx}"
+    );
+    assert!(
+        !ctx.contains("/etc/passwd") && !ctx.contains("root:"),
+        "the tampered source_file should never be read or surfaced: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_skips_pinned_pattern_when_source_file_missing() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("ghost.md"),
+        "---\ntags: [universal]\n---\n\n# Ghost Pattern\n\nBody content here.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("present.md"),
+        "---\ntags: [universal]\n---\n\n# Present Pattern\n\nDistinctive body marker xyzzy123.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    // Remove ghost.md from disk after ingest — the chunk row still references it.
+    fs::remove_file(dir.join("ghost.md")).unwrap();
+
+    let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-missing-pinned-file");
+
+    assert!(
+        ctx.contains("xyzzy123"),
+        "the present universal pattern should still render: {ctx}"
+    );
+    assert!(
+        !ctx.contains("Body content here."),
+        "the missing-file universal pattern should not surface a body: {ctx}"
+    );
+}

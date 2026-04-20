@@ -1207,7 +1207,7 @@ fn index_single_file(
 ///
 /// This prevents path traversal attacks where a `source_file` like
 /// `../../../etc/passwd` could escape the knowledge directory.
-fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> anyhow::Result<()> {
     let canon_dir = knowledge_dir.canonicalize()?;
     let canon_file = file_path.canonicalize()?;
     if !canon_file.starts_with(&canon_dir) {

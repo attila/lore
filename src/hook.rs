@@ -445,6 +445,11 @@ fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Res
         );
     }
 
+    let pinned = render_pinned_conventions(db, knowledge_dir)?;
+    if !pinned.is_empty() {
+        out.push_str(&pinned);
+    }
+
     out.push_str("\nAvailable patterns:\n");
 
     for p in &patterns {
@@ -452,6 +457,61 @@ fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Res
             let _ = writeln!(out, "- {}", p.title);
         } else {
             let _ = writeln!(out, "- {} [{}]", p.title, p.tags);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Build the `## Pinned conventions` block for `SessionStart` and `PostCompact`.
+///
+/// Returns an empty string when no universal patterns exist (the section
+/// header is then omitted entirely from the `SessionStart` payload). For each
+/// universal pattern, validates the `source_file` against `knowledge_dir`
+/// via `validate_within_dir` before reading it from disk — defends against
+/// DB-tampering attacks where a `source_file` like `../../../etc/passwd`
+/// could otherwise leak arbitrary file contents into the agent context.
+///
+/// Pattern files that fail validation, are missing, or fail to read are
+/// individually skipped with a stderr log; the rest of the section still
+/// renders. The hook's broader "never break the agent" contract means
+/// any error here degrades to an empty pinned section rather than a hard
+/// failure.
+fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Result<String> {
+    let universal = db.universal_patterns()?;
+    if universal.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut out = String::from("\n## Pinned conventions\n\n");
+    out.push_str(
+        "These patterns are tagged `universal` and apply across every tool call \
+         in this session. Treat them as always-on conventions.\n",
+    );
+
+    for pattern in &universal {
+        let candidate = knowledge_dir.join(&pattern.source_file);
+        if let Err(e) = crate::ingest::validate_within_dir(knowledge_dir, &candidate) {
+            eprintln!("lore hook: skipping pinned `{}`: {e}", pattern.source_file);
+            lore_debug!(
+                "pinned containment check failed for {}: {e}",
+                pattern.source_file
+            );
+            continue;
+        }
+        match std::fs::read_to_string(&candidate) {
+            Ok(body) => {
+                let _ = writeln!(out, "\n### {}\n", pattern.title);
+                out.push_str(body.trim_end());
+                out.push('\n');
+            }
+            Err(e) => {
+                eprintln!(
+                    "lore hook: skipping pinned `{}`: read failed ({e})",
+                    pattern.source_file
+                );
+                lore_debug!("pinned read failed for {}: {e}", pattern.source_file);
+            }
         }
     }
 
