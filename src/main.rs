@@ -451,6 +451,44 @@ fn print_ingest_summary(result: &ingest::IngestResult) {
             }
         }
     }
+
+    print_universal_advisories(result);
+}
+
+/// Emit the always-on `Universal patterns: N` summary line plus the three
+/// optional advisories (>3 patterns, oversized body, near-miss spelling).
+///
+/// Suppressed for single-file ingest failures so stderr does not interleave
+/// "Universal patterns: 0" with the error list.
+fn print_universal_advisories(result: &ingest::IngestResult) {
+    if matches!(result.mode, ingest::IngestMode::SingleFile { .. }) && !result.errors.is_empty() {
+        return;
+    }
+
+    eprintln!("Universal patterns: {}", result.universal_sources.len());
+
+    if result.universal_sources.len() > 3 {
+        eprintln!(
+            "Note: {} patterns tagged `universal`. Consider whether all of them need always-on visibility:",
+            result.universal_sources.len()
+        );
+        for source in &result.universal_sources {
+            eprintln!("  - {source}");
+        }
+    }
+
+    for source in &result.oversized_universal_bodies {
+        eprintln!(
+            "Note: universal pattern `{source}` has a body larger than 1KB. \
+             Universal patterns re-inject on every relevant tool call; consider trimming."
+        );
+    }
+
+    for entry in &result.near_miss_universal_tags {
+        eprintln!(
+            "Note: tag `{entry}` looks like a misspelling of `universal` (case-sensitive exact match required)."
+        );
+    }
 }
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {

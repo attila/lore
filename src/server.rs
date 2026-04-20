@@ -1186,6 +1186,7 @@ mod tests {
             tags: "rust".into(),
             source_file: "patterns.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1272,6 +1273,7 @@ mod tests {
             tags: "rust".into(),
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1336,6 +1338,7 @@ mod tests {
             tags: "rust".into(),
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1429,6 +1432,7 @@ mod tests {
                 tags: "rust".into(),
                 source_file: "rust/cargo-deny.md".into(),
                 heading_path: format!("section-{i}"),
+                is_universal: false,
             };
             let emb = embedder.embed(&chunk.body).unwrap();
             db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1500,6 +1504,7 @@ mod tests {
             tags: "rust".into(),
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -1566,6 +1571,7 @@ mod tests {
             tags: "rust".into(),
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -1614,6 +1620,7 @@ mod tests {
                 tags: "rust".into(),
                 source_file: format!("rust/pattern-{i}.md"),
                 heading_path: String::new(),
+                is_universal: false,
             };
             let emb = h.embedder.embed(&chunk.body).unwrap();
             h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2136,6 +2143,7 @@ mod tests {
             tags: String::new(),
             source_file: "fts-test.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2543,6 +2551,7 @@ mod tests {
             tags: String::new(),
             source_file: "warn.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2593,6 +2602,7 @@ mod tests {
             tags: String::new(),
             source_file: "nowarn.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2630,6 +2640,7 @@ mod tests {
             tags: String::new(),
             source_file: "relevant.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2666,6 +2677,7 @@ mod tests {
             tags: String::new(),
             source_file: "always.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2709,6 +2721,7 @@ mod tests {
             tags: String::new(),
             source_file: "fts-bypass.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2759,6 +2772,7 @@ mod tests {
             tags: String::new(),
             source_file: "fallback.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2808,6 +2822,7 @@ mod tests {
             tags: String::new(),
             source_file: "limit.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         h.db.insert_chunk(&chunk, None).unwrap();
 

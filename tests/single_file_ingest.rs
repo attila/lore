@@ -424,3 +424,118 @@ fn done_line_is_suppressed_when_single_file_ingest_fails() {
     assert_eq!(result.files_processed, 0);
     assert_eq!(result.chunks_created, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Universal-pattern detection at ingest
+// ---------------------------------------------------------------------------
+
+fn write_universal_pattern(dir: &Path, name: &str, title: &str, body: &str) {
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(
+        &path,
+        format!("---\ntags: [universal, conventions]\n---\n\n# {title}\n\n{body} that is long enough for chunking.\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn ingest_universal_pattern_records_source_and_emits_no_oversized_warning() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    write_universal_pattern(dir, "wf.md", "Workflow", "Always git push origin HEAD");
+
+    let db = memory_db();
+    let result = single_file_ingest(&db, dir, "wf.md", false);
+
+    assert_eq!(result.universal_sources, vec!["wf.md".to_string()]);
+    assert!(result.oversized_universal_bodies.is_empty());
+    assert!(result.near_miss_universal_tags.is_empty());
+}
+
+#[test]
+fn ingest_does_not_record_universal_source_when_tag_absent() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    write_md(dir, "plain.md", "Plain", "Just a regular pattern");
+
+    let db = memory_db();
+    let result = single_file_ingest(&db, dir, "plain.md", false);
+
+    assert!(result.universal_sources.is_empty());
+}
+
+#[test]
+fn ingest_emits_per_pattern_body_size_warning_above_threshold() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let big_body = "Repeated content. ".repeat(80); // > 1024 bytes
+    fs::write(
+        dir.join("big.md"),
+        format!("---\ntags: [universal]\n---\n\n# Big\n\n{big_body}"),
+    )
+    .unwrap();
+
+    let db = memory_db();
+    let result = single_file_ingest(&db, dir, "big.md", false);
+
+    assert_eq!(result.universal_sources, vec!["big.md".to_string()]);
+    assert_eq!(
+        result.oversized_universal_bodies,
+        vec!["big.md".to_string()]
+    );
+}
+
+#[test]
+fn ingest_emits_near_miss_advisory_for_capitalised_universal_tag() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("typo.md"),
+        "---\ntags: [Universal, conventions]\n---\n\n# Typo\n\nBody is long enough for chunking.\n",
+    )
+    .unwrap();
+
+    let db = memory_db();
+    let result = single_file_ingest(&db, dir, "typo.md", false);
+
+    assert!(
+        result.universal_sources.is_empty(),
+        "case-sensitive: should not match"
+    );
+    assert_eq!(
+        result.near_miss_universal_tags,
+        vec!["typo.md: Universal".to_string()]
+    );
+}
+
+#[test]
+fn ingest_universal_tag_removal_via_single_file_ingest() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    write_universal_pattern(dir, "wf.md", "Workflow", "Body content");
+    let db = memory_db();
+    let first = single_file_ingest(&db, dir, "wf.md", false);
+    assert_eq!(first.universal_sources, vec!["wf.md".to_string()]);
+
+    // Remove the universal tag and re-ingest the same file.
+    fs::write(
+        dir.join("wf.md"),
+        "---\ntags: [conventions]\n---\n\n# Workflow\n\nBody content that is long enough for chunking.\n",
+    )
+    .unwrap();
+    let second = single_file_ingest(&db, dir, "wf.md", false);
+
+    assert!(
+        second.universal_sources.is_empty(),
+        "tag removal must take effect"
+    );
+    let universal_in_db = db.universal_patterns().unwrap();
+    assert!(
+        universal_in_db.is_empty(),
+        "DB should reflect the untagging"
+    );
+}

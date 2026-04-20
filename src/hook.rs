@@ -1160,6 +1160,7 @@ mod tests {
             source_file: "errors.md".into(),
             heading_path: String::new(),
             score: 0.8,
+            is_universal: false,
         }];
 
         let formatted = format_imperative(&results);
@@ -1179,6 +1180,7 @@ mod tests {
                 source_file: "errors.md".into(),
                 heading_path: String::new(),
                 score: 0.8,
+                is_universal: false,
             },
             SearchResult {
                 id: "c2".into(),
@@ -1188,6 +1190,7 @@ mod tests {
                 source_file: "naming.md".into(),
                 heading_path: String::new(),
                 score: 0.7,
+                is_universal: false,
             },
         ];
 
@@ -1525,6 +1528,7 @@ mod tests {
             source_file: "test.md".to_string(),
             heading_path: String::new(),
             score: 1.0,
+            is_universal: false,
         }
     }
 
