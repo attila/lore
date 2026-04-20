@@ -657,10 +657,11 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&patterns)?);
     } else {
         for p in &patterns {
+            let universal_suffix = if p.is_universal { " [universal]" } else { "" };
             if p.tags.is_empty() {
-                println!("{}", p.title);
+                println!("{}{universal_suffix}", p.title);
             } else {
-                println!("{} [{}]", p.title, p.tags);
+                println!("{} [{}]{universal_suffix}", p.title, p.tags);
             }
         }
     }

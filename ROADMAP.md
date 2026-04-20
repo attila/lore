@@ -3,16 +3,6 @@
 ## Up Next
 
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
-- [ ] Universal patterns via tag-based SessionStart injection — patterns tagged `universal` get full
-      content at SessionStart, not just titles. Covers process-level conventions that don't surface
-      through file-edit hooks. **Motivating example (2026-04-06):** during the `.loreignore` work an
-      agent ran a plain `git push`, hit `main`-protection rejection, and only then realised the
-      `workflows/git-branch-pr.md` "Pushing" section already prescribed `git push origin HEAD`. The
-      pattern was discoverable (relevance 1.0), the hook injected it on the first git command of the
-      session, and session deduplication then correctly suppressed it on every subsequent git call —
-      including the failing push. Tagging git workflow conventions as `universal` would keep them
-      visible at every SessionStart, bypassing dedup for meta-rules that need continuous
-      reinforcement
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -97,3 +87,11 @@
       and iterating on edit suggestions until the surfaced-query set stabilises. Ships alongside the
       fenced `lore-metadata` content-block pivot for MCP tool responses. See
       `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+- [x] Universal patterns via tag-based SessionStart injection — patterns whose `tags:` frontmatter
+      list contains `universal` get full body emitted in a `## Pinned conventions` section at every
+      SessionStart and PostCompact, AND bypass the PreToolUse dedup filter so they re-inject on
+      every relevant tool call (additively beyond `top_k`, with the relevance gate intact). Closes
+      the always-on discoverability gap for process-level conventions like push discipline that the
+      coverage-check skill cannot address. Schema change requires `lore ingest --force` once after
+      upgrading; a startup `PRAGMA table_info` probe refuses to start with a friendly advisory
+      otherwise. See `docs/plans/2026-04-20-001-feat-universal-patterns-plan.md`

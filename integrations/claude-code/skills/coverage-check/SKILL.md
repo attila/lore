@@ -422,6 +422,12 @@ into exactly one of four states:
   lowest rank wins).
 - **not_present** — no row's `source_file` matches the target.
 
+**Universal-tag annotation.** If any matching row has `is_universal: true` in the metadata, append
+`[universal — bypasses PreToolUse dedup]` to the per-query state line in the report. Universal
+patterns re-inject on every relevant tool call regardless of the dedup filter, so a coverage score
+on them is informative about lexical matching but not about runtime discoverability — the marker
+prevents authors from chasing low coverage scores on patterns that always re-inject.
+
 ## 9. Coverage ratio refusal on degraded queries
 
 **If any query in this iteration is in the `degraded` state, do not compute or display a coverage

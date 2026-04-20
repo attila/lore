@@ -929,6 +929,7 @@ fn build_search_metadata(
                 "title": r.title,
                 "source_file": r.source_file,
                 "score": r.score,
+                "is_universal": r.is_universal,
             })
         })
         .collect();
