@@ -1,8 +1,9 @@
 ---
 title: Universal patterns via tag-based SessionStart injection
 type: feat
-status: active
+status: complete
 date: 2026-04-20
+completed: 2026-04-21
 origin: docs/brainstorms/2026-04-20-universal-patterns-requirements.md
 ---
 
@@ -51,6 +52,79 @@ pattern-recognition-specialist.
   future cycle-based primitive. The partition-in-search-layer choice (point #1) eases that future
   refactor; the binary `is_universal` flag will need to generalise into a per-chunk re-injection
   policy when TTL lands.
+
+## Post-review changes (2026-04-21 ce-review)
+
+A full ce-review pass on the first four commits (`1310092`, `dd04a2b`, `58a9eff`, `3191511`)
+surfaced blockers and parked follow-ups. All blockers landed before merge across four follow-up
+commits. Two architectural follow-ups were parked as todos:
+
+**Landed in this branch (post-plan commits):**
+
+1. **`clear_all` rebuild.** The original plan relied on `clear_all` clearing chunks, but
+   `DELETE FROM chunks` preserves the column list. A user hitting the schema-mismatch probe and
+   running the advised `lore ingest --force` would hit `no such column: is_universal` on the first
+   insert. Fixed: `clear_all` now `DROP TABLE chunks` + recreate from the shared `CHUNKS_DDL` const,
+   and `cmd_ingest` uses a new `KnowledgeDB::open_skipping_schema_check` when `--force` is set so
+   the probe doesn't block the only path that actually fixes the condition it warns about.
+2. **Path-traversal TOCTOU closed.** `validate_within_dir` now returns the canonical `PathBuf`; all
+   four callers (`render_pinned_conventions`, `ingest_single_file`, `update_pattern`,
+   `append_to_pattern`) read or write through the returned canonical instead of the pre-canonical
+   input. Closes the symlink-swap race between validation and file access.
+3. **MCP degraded mode for schema mismatch.** `start_mcp_server` on `KnowledgeDB::open` failure now
+   enters a degraded stdio loop: `initialize` and `tools/list` respond normally, every `tools/call`
+   returns a JSON-RPC error carrying the upgrade advisory. The message reaches the agent inside a
+   tool response instead of dying at handshake with stderr discarded.
+4. **Per-file body-size hard cap (8 KB) at ingest.** `enforce_universal_body_cap` is called from
+   every ingest entry point before DB writes; a file whose universal-chunk bodies total over 8 KB is
+   rejected atomically with an error message naming the cap. Complements the existing 1 KB soft
+   advisory.
+5. **Render-time total cap (32 KB) with visible truncation marker.** Belt-and-braces against a
+   tampered DB bypassing the ingest-time check. `render_pinned_conventions` tracks cumulative bytes
+   and emits a `_[pinned conventions truncated at … bytes — trim or retag universal
+   patterns]_`
+   marker before stopping.
+6. **`update_pattern` preserves tags on `None`.** Signature changed from `tags: &[&str]` to
+   `tags: Option<&[&str]>`. Absent tags on the MCP call now preserve existing frontmatter (including
+   `universal`); `Some(&[])` clears; `Some(&[...])` replaces wholesale. Closes the
+   silent-de-universalisation footgun.
+7. **Log-string escaping.** A new `sanitize_for_log` helper runs DB-sourced strings through
+   `char::escape_debug` before they land in stderr or `lore_debug!`. Tampered chunk rows can no
+   longer inject ANSI escapes or newlines into operator logs.
+8. **Unicode homoglyph detection in `frontmatter_near_miss_tags`.** Tags with non-ASCII characters
+   whose character count equals `universal`'s now flag as near-misses. Catches Cyrillic-i
+   substitutions without a full Unicode confusables dependency.
+9. **`list_patterns` MCP tool.** Closes the CLI-only gap — agents enumerating patterns via MCP now
+   get a parity tool matching `lore list` output, including the `[universal]` marker.
+10. **Ingest advisories surfaced on `lore_status`.** `cmd_ingest` persists the universal advisories
+    (count, oversized bodies, near-miss tags, thresholds) to `ingest_metadata` under
+    `universal_advisories`. `handle_lore_status` reads them back into the structured metadata fence.
+    Agents without access to operator stderr now see the `>3 universal` warning and misspelling
+    flags.
+11. **Prose `[universal]` marker in `search_patterns` output.** Matches the marker already present
+    on `lore list` and now `list_patterns` MCP tool.
+12. **Tool descriptions document `universal` mechanism.** `add_pattern` and `update_pattern` tool
+    descriptions explicitly call out the `universal` tag affordance in the `tags` parameter
+    description, so agents reading `tools/list` can discover it.
+13. **Simplification cleanups.** `PartitionedResults` removed — `search_with_threshold` now returns
+    `Vec<SearchResult>` directly. `expand_to_siblings` called once instead of twice in
+    `handle_pre_tool_use`. `IngestResult` derives `Default`. `SEARCH_OVERFETCH_MULTIPLIER` constant
+    inlined at its one call site. `extract_frontmatter_tags` reduced to a thin wrapper over
+    `parse_frontmatter_tag_list`.
+14. **`PRAGMA user_version` probe** replaces `PRAGMA table_info` column parsing. Single-integer
+    read, scales to future schema bumps, future-proof than cross-referencing column names.
+
+**Parked as follow-up todos:**
+
+- [`docs/todos/pinned-conventions-render-from-db-not-disk.md`](../todos/pinned-conventions-render-from-db-not-disk.md)
+  (P2, architecture) — render pinned-section bodies from chunk rows instead of re-reading the source
+  markdown. Eliminates the disk I/O and makes the path-traversal guard unnecessary for the pinned
+  section. Deferred because it's a meaningful behavioural shift (edit-ingest-session timing
+  semantics change) deserving its own benchmark + test pass.
+- [`docs/todos/index-single-file-reconciliation-single-transaction.md`](../todos/index-single-file-reconciliation-single-transaction.md)
+  (P3, correctness) — wrap `delete_by_source` + per-chunk `insert_chunk` in a single outer
+  transaction and hoist embedder calls outside the lock window. Pre-existing reliability gap,
+  orthogonal to universal patterns.
 
 ## Overview
 
@@ -386,65 +460,69 @@ non-empty, emit friendly stderr + return error.
 
 ### Functional
 
-- [ ] **R1** A pattern with `tags:` containing `universal` (case-sensitive, exact match) is treated
+- [x] **R1** A pattern with `tags:` containing `universal` (case-sensitive, exact match) is treated
       as universal. Other tags coexist normally. A near-miss tag (lowercased form equals `universal`
-      but exact match fails) emits a stderr advisory at ingest.
-- [ ] **R2** SessionStart payload contains a `## Pinned conventions` section above the existing
+      but exact match fails) emits a stderr advisory at ingest. **Expanded post-review:** homoglyph
+      candidates (non-ASCII tags matching `universal`'s character count) are also flagged.
+- [x] **R2** SessionStart payload contains a `## Pinned conventions` section above the existing
       `Available patterns:` index, with each universal pattern's full body in source-file order. The
       header is omitted entirely when no universal patterns exist (not emitted as an empty section).
-- [ ] **R3** PostCompact re-emits the same SessionStart payload (`##
-      Pinned conventions`
-      section included) — falls out of going through `format_session_context`.
-- [ ] **R4** PreToolUse: universal patterns matching the current query above `min_relevance` are
+- [x] **R3** PostCompact re-emits the same SessionStart payload (`## Pinned conventions` section
+      included) — falls out of going through `format_session_context`.
+- [x] **R4** PreToolUse: universal patterns matching the current query above `min_relevance` are
       present in `additionalContext` on every call, not just the first. Universal patterns NOT
       matching the current query are absent.
-- [ ] **R5** PreToolUse: universal results are additive — non-universal results are still up to
+- [x] **R5** PreToolUse: universal results are additive — non-universal results are still up to
       `top_k`, regardless of how many universal results are present.
-- [ ] **R6** `lore ingest` always emits a `Universal patterns: N` summary line after the existing
+- [x] **R6** `lore ingest` always emits a `Universal patterns: N` summary line after the existing
       summary lines (zero or more). When N > 3, an additional advisory line names the patterns and
       prompts deliberation. When any single universal pattern body exceeds ~1KB, a per-pattern
-      body-size advisory names the file. Ingest exit code unchanged.
-- [ ] **R7** `docs/pattern-authoring-guide.md` gains a "When to use the universal tag" subsection,
+      body-size advisory names the file. Ingest exit code unchanged. **Expanded post-review:** per-
+      file body totals above 8 KB now error out at ingest (hard cap), and advisories persist to
+      `lore_status` for agents that don't see stderr.
+- [x] **R7** `docs/pattern-authoring-guide.md` gains a "When to use the universal tag" subsection,
       sibling to "Vocabulary Coverage Technique" and "Tag Strategy". Includes guidance on the
-      `## Pinned
-      conventions` ↔ "universal" naming divergence (the `tags:` value is
-      `universal`; the section header in SessionStart is `## Pinned
-      conventions` — chosen
-      because it reads better as user-facing copy).
-- [ ] **R8** `search_patterns` MCP tool results include `is_universal:
-      bool` per result. The
-      `tools_list_returns_all_five_tools` insta snapshot is regenerated to reflect the schema
-      change.
-- [ ] **R9** `lore list` CLI output marks universal patterns with a `[universal]` suffix after the
-      existing tag display.
-- [ ] **R10** `LORE_DEBUG=1` traces distinguish `[universal injected]`, `[ranked injected]`, and
+      `## Pinned conventions` ↔ "universal" naming divergence (the `tags:` value is `universal`; the
+      section header in SessionStart is `## Pinned conventions` — chosen because it reads better as
+      user-facing copy).
+- [x] **R8** `search_patterns` MCP tool results include `is_universal: bool` per result. The
+      `tools_list_returns_all_six_tools` insta snapshot is regenerated to reflect the schema change.
+      **Renamed post-review** (was `_five_tools`) to cover the new `list_patterns` tool.
+- [x] **R9** `lore list` CLI output marks universal patterns with a `[universal]` suffix after the
+      existing tag display. **Expanded post-review:** the same marker appears on the new
+      `list_patterns` MCP tool and in prose search output from `search_patterns`.
+- [x] **R10** `LORE_DEBUG=1` traces distinguish `[universal injected]`, `[ranked injected]`, and
       `[ranked filtered by dedup]` so the dedup-bypass mutation route is traceable.
-- [ ] **R11** Pattern body files referenced from `is_universal` chunks are passed through
+- [x] **R11** Pattern body files referenced from `is_universal` chunks are passed through
       `validate_within_dir` before re-read at SessionStart. Tampered DB rows naming paths outside
       `knowledge_dir` cause the pattern to be omitted with a stderr log; no read attempt is made.
+      **Hardened post-review:** `validate_within_dir` now returns the canonical `PathBuf`; the
+      `read_to_string` call uses that canonical path so a symlink swap between validation and open
+      cannot redirect the read.
 
 ### Non-functional
 
-- [ ] SessionStart wall-clock time impact: < 50ms additional with up to five universal patterns of
+- [x] SessionStart wall-clock time impact: < 50ms additional with up to five universal patterns of
       typical body size (~2KB each) on local filesystems. NFS-backed `knowledge_dir` may add
       25-250ms aggregate due to per-file round-trip latency; this is documented but not mitigated.
-- [ ] PreToolUse wall-clock time impact: zero measurable difference for sessions with no universal
+- [x] PreToolUse wall-clock time impact: zero measurable difference for sessions with no universal
       patterns. With universal patterns, the partition + concatenation step is bounded by result
       count (microseconds, sub-millisecond using `into_iter().partition`).
-- [ ] Binary size impact: negligible. No new dependencies.
+- [x] Binary size impact: negligible. No new dependencies.
 
 ### Quality gates
 
-- [ ] All new code paths have unit tests (database, chunking, hook partition, dedup-read filter,
-      schema probe, `validate_within_dir` guard).
-- [ ] All new SessionStart and PreToolUse code paths have integration tests in `tests/hook.rs` using
+- [x] All new code paths have unit tests (database, chunking, hook partition, dedup-read filter,
+      schema probe, `validate_within_dir` guard, body-cap enforcement, log sanitisation,
+      `list_patterns` MCP tool, degraded-mode handler).
+- [x] All new SessionStart and PreToolUse code paths have integration tests in `tests/hook.rs` using
       `assert_cmd::Command` and the existing `FakeEmbedder` harness. Test names follow the existing
       `hook_*` prefix convention for `tests/hook.rs` and the bare snake-case predicate convention
       for `src/*::tests` modules.
-- [ ] `just ci` clean: `dprint check`, `cargo clippy --all-targets -- -D
-      warnings`,
+- [x] `just ci` clean: `dprint check`, `cargo clippy --all-targets -- -D warnings`,
       `cargo test --all-targets`, `cargo deny check`, `cargo doc --no-deps`.
-- [ ] `tools_list_returns_all_five_tools` insta snapshot regenerated for R8.
+- [x] `tools_list_returns_all_six_tools` insta snapshot regenerated for R8 plus the new
+      `list_patterns` tool.
 
 ## Implementation Units
 
