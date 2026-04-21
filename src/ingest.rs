@@ -89,9 +89,10 @@ fn universal_advisories_json(result: &IngestResult) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Whether the ingest ran in full, delta, or single-file mode.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub enum IngestMode {
     /// Full re-index (cleared database and re-embedded everything).
+    #[default]
     Full,
     /// Delta update — only changed files were processed.
     Delta {
@@ -107,7 +108,7 @@ pub enum IngestMode {
 }
 
 /// Summary returned after a directory ingest.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IngestResult {
     pub mode: IngestMode,
     pub files_processed: usize,
@@ -135,20 +136,14 @@ pub struct IngestResult {
 }
 
 impl IngestResult {
-    /// Construct an empty `IngestResult` with the given mode and all counters
-    /// zeroed. Used by every ingest entry point as a starting point that
-    /// callers then mutate as work progresses.
+    /// Construct an empty `IngestResult` carrying `mode` with every other
+    /// field at its default (zero counters, empty vectors). Every ingest
+    /// entry point uses this as its starting point; callers then mutate as
+    /// work progresses.
     pub fn with_mode(mode: IngestMode) -> Self {
         Self {
             mode,
-            files_processed: 0,
-            chunks_created: 0,
-            reconciled_removed: 0,
-            reconciled_added: 0,
-            errors: Vec::new(),
-            universal_sources: Vec::new(),
-            oversized_universal_bodies: Vec::new(),
-            near_miss_universal_tags: Vec::new(),
+            ..Self::default()
         }
     }
 }

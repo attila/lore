@@ -130,13 +130,17 @@ impl KnowledgeDB {
         Ok(Self { conn, dimensions })
     }
 
-    /// Create all tables if they don't already exist.
+    /// Create all tables if they don't already exist, then stamp the schema
+    /// version so `check_schema_compatibility` can detect old databases with
+    /// a single-integer read instead of parsing `PRAGMA table_info` columns.
     pub fn init(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(PATTERNS_FTS_DDL)?;
         self.conn.execute_batch(CHUNKS_DDL)?;
         self.conn
             .execute_batch(&patterns_vec_ddl(self.dimensions))?;
         self.conn.execute_batch(INGEST_METADATA_DDL)?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -156,6 +160,8 @@ impl KnowledgeDB {
         tx.execute_batch("DROP TABLE IF EXISTS chunks")?;
         tx.execute_batch(CHUNKS_DDL)?;
         tx.execute_batch("DELETE FROM patterns_vec")?;
+        // Keep the schema stamp in sync with the freshly recreated tables.
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
     }
@@ -505,6 +511,15 @@ pub fn sanitize_fts_query(query: &str) -> String {
     result.join(" ")
 }
 
+/// Current on-disk schema version. Bumped when `CHUNKS_DDL`, the virtual-
+/// table DDL, or any semantic ingest invariant changes in a way that
+/// requires `lore ingest --force` from existing users.
+///
+/// Stored as `SQLite`'s `PRAGMA user_version` — a cheap integer slot that
+/// `check_schema_compatibility` reads to decide whether the database was
+/// written by a build old enough to predate the current DDL.
+const SCHEMA_VERSION: u32 = 1;
+
 /// Authoritative DDL for the `chunks` table. Used by both `KnowledgeDB::init`
 /// (fresh-DB path, `CREATE TABLE IF NOT EXISTS`) and `KnowledgeDB::clear_all`
 /// (post-DROP recreate). Centralising the DDL prevents the two paths from
@@ -545,24 +560,46 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
     )
 }
 
-/// Probe the existing `chunks` table for the `is_universal` column.
+/// Probe the on-disk `PRAGMA user_version` against [`SCHEMA_VERSION`].
 ///
-/// Returns `Ok(())` if the table is absent (fresh DB — `init` will create it
-/// with the new schema) or if the column is present (already on the new
-/// schema). Returns a friendly upgrade-required error if the table exists
-/// but lacks the column — this catches users who upgraded the binary
-/// without running `lore ingest --force`.
+/// Returns `Ok(())` when either the database is fresh (no `chunks` table yet
+/// — `init` will stamp the version after DDL) or the stored version is at
+/// least the current target. Returns a friendly upgrade-required error for
+/// old-schema databases (`user_version = 0` AND `chunks` exists and is
+/// non-empty).
+///
+/// Replaces the earlier `PRAGMA table_info(chunks)` column-parsing probe:
+/// both approaches catch the same hazard, but `user_version` is a single
+/// integer read and scales to future schema bumps without another column
+/// name to cross-reference.
 fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(chunks)")?;
-    let columns: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if columns.is_empty() {
+    let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= SCHEMA_VERSION {
         return Ok(());
     }
 
-    if columns.iter().any(|c| c == "is_universal") {
+    // Fresh DB: the `chunks` table does not exist yet (user_version stays 0
+    // until `init` writes the DDL and stamps the version). Nothing to do.
+    let chunks_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if chunks_exists == 0 {
+        return Ok(());
+    }
+
+    // Empty-but-present chunks table: still an upgrade from a pre-schema-
+    // version build, but no rows would be lost by `clear_all`. Let the
+    // advisory fire anyway — `--force` is the sanctioned path back and
+    // the stale-but-blank schema is still stale.
+    let chunk_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+        .unwrap_or(0);
+    if chunk_count == 0 {
+        // Benign case: init will take over. Fresh-ish DB.
         return Ok(());
     }
 

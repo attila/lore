@@ -280,44 +280,11 @@ fn strip_outer_quotes(s: &str) -> String {
     s.to_string()
 }
 
+/// Extract frontmatter tags as a comma-joined string for storage in
+/// `chunks.tags` (and friends). Thin wrapper over
+/// [`parse_frontmatter_tag_list`] so the two paths cannot drift.
 fn extract_frontmatter_tags(content: &str) -> String {
-    let Some(fm) = extract_frontmatter(content) else {
-        return String::new();
-    };
-
-    let Some(start) = fm.find("tags:") else {
-        return String::new();
-    };
-    let rest = &fm[start + 5..];
-
-    // Inline style: tags: [a, b, c]
-    // Only look for brackets on the first line after `tags:` to avoid matching
-    // brackets in subsequent YAML fields.
-    let first_line = rest.lines().next().unwrap_or("");
-    if let Some(bracket_start) = first_line.find('[')
-        && let Some(bracket_end) = first_line.find(']')
-        && bracket_start < bracket_end
-    {
-        return first_line[bracket_start + 1..bracket_end]
-            .split(',')
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(", ");
-    }
-
-    // Block style: tags:\n  - a\n  - b
-    let tag_lines: Vec<&str> = rest
-        .lines()
-        .skip(1)
-        .take_while(|l| l.starts_with("  -") || l.starts_with("- "))
-        .map(|l| l.trim_start_matches([' ', '-']).trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if !tag_lines.is_empty() {
-        return tag_lines.join(", ");
-    }
-
-    String::new()
+    parse_frontmatter_tag_list(content).join(", ")
 }
 
 fn extract_frontmatter(content: &str) -> Option<String> {

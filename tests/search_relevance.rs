@@ -161,9 +161,7 @@ fn search(
     config: &Config,
     query: &str,
 ) -> Vec<SearchResult> {
-    hook::search_with_threshold(db, embedder, config, query)
-        .expect("search should not fail")
-        .flatten()
+    hook::search_with_threshold(db, embedder, config, query).expect("search should not fail")
 }
 
 /// Assert that at least one result's `source_file` contains the given substring.

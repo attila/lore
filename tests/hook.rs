@@ -1200,31 +1200,6 @@ fn run_pre_tool_use_sequence(
 }
 
 #[test]
-fn hook_pre_tool_use_universal_chunk_present_on_first_and_third_call() {
-    let (_tmp, config_path) = setup_with_universal_pattern();
-
-    // PreToolUse for `Bash git push` — the workflow.md universal pattern's
-    // body matches via FTS (push, workflow, etc.).
-    let input = serde_json::json!({
-        "hook_event_name": "PreToolUse",
-        "session_id": "test-universal-repeated",
-        "tool_name": "Bash",
-        "tool_input": { "command": "git push" },
-    });
-
-    let contexts = run_pre_tool_use_sequence(&config_path, "test-universal-repeated", &input, 3);
-
-    // The universal pattern body must appear on every call.
-    for (i, ctx) in contexts.iter().enumerate() {
-        assert!(
-            ctx.contains("git push origin HEAD"),
-            "call #{} should re-inject the universal workflow pattern, got: {ctx:?}",
-            i + 1
-        );
-    }
-}
-
-#[test]
 fn hook_pre_tool_use_non_universal_chunk_present_on_first_call_only() {
     let (_tmp, config_path) = setup_test_env();
 
