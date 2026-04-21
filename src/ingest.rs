@@ -48,8 +48,9 @@ pub(crate) const META_UNIVERSAL_ADVISORIES: &str = "universal_advisories";
 
 /// Persist the universal-pattern advisories from a completed ingest so the
 /// MCP `lore_status` tool can surface them to agents. The value is a JSON
-/// document matching the shape emitted by [`universal_advisories_json`] so
-/// consumers only parse one field.
+/// object with fields `universal_count`, `universal_sources`,
+/// `oversized_bodies`, `near_miss_tags`, `count_warning`,
+/// `body_size_hard_limit_bytes`, and `body_size_warning_threshold_bytes`.
 ///
 /// Only overwrites when the ingest touched any universal-related field.
 /// A delta ingest that touches no universal-tagged files leaves the last
