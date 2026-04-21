@@ -2626,6 +2626,121 @@ mod tests {
         assert!(content.contains("# Existing Pattern"));
     }
 
+    #[test]
+    fn update_pattern_without_tags_preserves_universal_through_mcp_wire() {
+        // Pins the preserve-on-absent contract end-to-end through the
+        // JSON-RPC surface. The lib-level `update_pattern_with_none_tags_...`
+        // test covers the ingest logic; this one pins the `args.get("tags")`
+        // → `None` mapping in `handle_update` and the full round-trip to
+        // disk + DB. If the MCP glue drops to `Some(&[])` by mistake, the
+        // `universal` tag would silently disappear despite lib-level tests
+        // still passing.
+        let h = TestHarness::new();
+
+        let file = h.config.knowledge_dir.join("pinned.md");
+        std::fs::write(
+            &file,
+            "---\ntags: [universal, workflow]\n---\n\n# Pinned\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        // Ingest so update_pattern's existence check passes and the DB row
+        // carries `is_universal = 1`.
+        let ingest_result = crate::ingest::ingest_single_file(
+            &h.db,
+            &h.embedder,
+            &h.config.knowledge_dir,
+            &file,
+            "heading",
+            false,
+            &|_| {},
+        );
+        assert!(
+            ingest_result.errors.is_empty(),
+            "ingest errors: {:?}",
+            ingest_result.errors
+        );
+
+        // Call update_pattern via JSON-RPC without a `tags` field.
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":95,"method":"tools/call",
+                "params":{
+                    "name":"update_pattern",
+                    "arguments":{
+                        "source_file":"pinned.md",
+                        "body":"New body long enough for a chunk."
+                    }
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null(), "tool call failed: {resp:?}");
+
+        // The `universal` tag must survive both on disk and in the DB.
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("tags: [universal, workflow]"),
+            "frontmatter tags must survive tags-omitted update, got:\n{content}"
+        );
+        assert!(
+            content.contains("New body long enough"),
+            "body must still be the new one, got:\n{content}"
+        );
+        assert!(
+            h.db.universal_patterns()
+                .unwrap()
+                .iter()
+                .any(|p| p.source_file == "pinned.md"),
+            "DB is_universal flag must survive through the MCP wire"
+        );
+    }
+
+    #[test]
+    fn update_pattern_with_empty_tags_array_clears_universal_through_mcp_wire() {
+        // Counterpart to the preserve test: `Some(&[])` from the MCP wire
+        // (explicit empty array) is the escape hatch that DOES clear tags.
+        // Pinning both sides of the contract keeps the mapping honest.
+        let h = TestHarness::new();
+
+        let file = h.config.knowledge_dir.join("cleared.md");
+        std::fs::write(
+            &file,
+            "---\ntags: [universal]\n---\n\n# Cleared\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        crate::ingest::ingest_single_file(
+            &h.db,
+            &h.embedder,
+            &h.config.knowledge_dir,
+            &file,
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":96,"method":"tools/call",
+                "params":{
+                    "name":"update_pattern",
+                    "arguments":{
+                        "source_file":"cleared.md",
+                        "body":"New body long enough for a chunk.",
+                        "tags":[]
+                    }
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null(), "tool call failed: {resp:?}");
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !content.contains("tags:"),
+            "explicit empty tags array must clear frontmatter, got:\n{content}"
+        );
+    }
+
     // -- append_to_pattern_appends_section ---------------------------------
 
     #[test]

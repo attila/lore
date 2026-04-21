@@ -318,8 +318,7 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     // the schema-compatibility probe bails. It drops and recreates the
     // tables via `clear_all`, so the probe must not run first — otherwise
     // the very advisory it emits would never be actionable.
-    let skip_probe = force && file.is_none();
-    let db = if skip_probe {
+    let db = if should_skip_schema_probe(force, file) {
         KnowledgeDB::open_skipping_schema_check(&config.database, ollama.dimensions())?
     } else {
         KnowledgeDB::open(&config.database, ollama.dimensions())?
@@ -574,6 +573,23 @@ fn cmd_search(
     Ok(())
 }
 
+/// Decide whether `cmd_ingest` should bypass the schema-compatibility probe.
+///
+/// Only `--force` without `--file` rebuilds the schema (via `clear_all` →
+/// drop-and-recreate); that's the single path where the probe's advisory
+/// would be strictly counter-productive. Every other combination — plain
+/// delta ingest, single-file ingest with or without `--force` overriding
+/// `.loreignore` — must still honour the probe so users with an old schema
+/// get the friendly "run `lore ingest --force`" error instead of a
+/// `no such column` stacktrace.
+///
+/// Extracted as a testable helper because the four-cell truth table is
+/// load-bearing for the upgrade UX: flipping any cell silently would leave
+/// a class of user unable to reach the remedy.
+fn should_skip_schema_probe(force: bool, file: Option<&Path>) -> bool {
+    force && file.is_none()
+}
+
 /// Find the largest byte index at or before `index` that is a valid UTF-8
 /// char boundary. Equivalent to `str::floor_char_boundary` (stabilized in
 /// Rust 1.86) but works on Rust 1.85.
@@ -742,4 +758,42 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- should_skip_schema_probe -------------------------------------------
+
+    #[test]
+    fn skip_probe_true_for_force_without_file() {
+        // The one cell where the probe must step aside: `lore ingest --force`
+        // drops and recreates the schema, so the probe would block its own
+        // advisory from landing.
+        assert!(should_skip_schema_probe(true, None));
+    }
+
+    #[test]
+    fn skip_probe_false_for_force_with_file() {
+        // Single-file ingest — even with `--force` overriding `.loreignore` —
+        // does NOT rebuild the schema. Skipping the probe here would let an
+        // old-schema DB reach `insert_chunk` and fail with the confusing
+        // `no such column` error.
+        let path = Path::new("draft.md");
+        assert!(!should_skip_schema_probe(true, Some(path)));
+    }
+
+    #[test]
+    fn skip_probe_false_for_delta_ingest() {
+        // Plain `lore ingest` is delta mode; never rebuilds schema.
+        assert!(!should_skip_schema_probe(false, None));
+    }
+
+    #[test]
+    fn skip_probe_false_for_single_file_ingest() {
+        // `lore ingest --file path` without `--force`; orthogonal to schema.
+        let path = Path::new("draft.md");
+        assert!(!should_skip_schema_probe(false, Some(path)));
+    }
 }

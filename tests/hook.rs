@@ -1112,6 +1112,133 @@ fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
 }
 
 #[test]
+fn hook_session_start_truncates_pinned_section_at_render_budget() {
+    // Construct five universal-tagged files, each under the 8 KB per-file cap
+    // but collectively exceeding the 32 KB render-time ceiling. SessionStart
+    // must emit the truncation marker and stop rather than blowing past the
+    // cap. The `_[pinned conventions truncated ...]_` string is load-bearing
+    // for the "defense-in-depth against DB tampering" argument.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Each padding line is 68 bytes; 100 repeats = 6800 bytes of body.
+    // Plus title + blank lines puts each file around 6900 bytes on disk.
+    // Five of them = ~34.5 KB, comfortably over the 32 KB render cap,
+    // each individual file still under the 8 KB per-file ingest cap.
+    let padding_line = "padding content for render-cap truncation test that crosses 32 KB.\n";
+    let padding: String = padding_line.repeat(100);
+
+    for i in 1..=5 {
+        fs::write(
+            dir.join(format!("u{i}.md")),
+            format!("---\ntags: [universal]\n---\n\n# Universal {i}\n\n{padding}"),
+        )
+        .unwrap();
+    }
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    assert!(
+        result.errors.is_empty(),
+        "no file should hit the per-file cap: {:?}",
+        result.errors
+    );
+    assert_eq!(result.universal_sources.len(), 5);
+
+    let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-render-cap");
+
+    assert!(
+        ctx.contains("_[pinned conventions truncated at 32768 bytes"),
+        "expected truncation marker once cumulative body crossed 32 KB; \
+         got {} bytes of systemMessage starting {:?}",
+        ctx.len(),
+        &ctx.chars().take(200).collect::<String>(),
+    );
+    // The pinned section header is still present — we don't collapse the
+    // section, we truncate inside it.
+    assert!(ctx.contains("## Pinned conventions"));
+    // And the first few patterns did render before truncation.
+    assert!(ctx.contains("### Universal 1"));
+}
+
+#[test]
+fn hook_session_start_escapes_ansi_in_tampered_source_file_logs() {
+    // Pin the `sanitize_for_log` call site inside `render_pinned_conventions`:
+    // a tampered chunk row whose `source_file` contains raw ESC bytes must
+    // not leak those bytes into stderr. Agents running with terminal-aware
+    // stderr consumers could otherwise be ANSI-spoofed by a pattern author
+    // (or a tampered DB). Without this test, a refactor that drops the
+    // `sanitize_for_log(&pattern.source_file)` call would silently regress.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("safe.md"),
+        "---\ntags: [universal]\n---\n\n# Safe\n\nLegitimate body content.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    // Tamper: insert a chunk row whose `source_file` carries raw ANSI CSI
+    // sequences (ESC = 0x1b). `validate_within_dir` will reject the path
+    // (the file doesn't exist under `knowledge_dir`), triggering the skip
+    // log path that interpolates `source_file` into stderr.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO chunks (id, title, body, tags, source_file, heading_path, is_universal) \
+         VALUES ('ansi-tamper', 'Evil', 'Body', 'universal', \
+         char(27) || '[2Jmalicious' || char(27) || '[0m', '', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let config_path = write_config(dir, &db_path);
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(r#"{"hook_event_name":"SessionStart","session_id":"ansi-escape-test"}"#)
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+
+    // Raw ESC must never reach stderr — that's the security property.
+    assert!(
+        !stderr.contains('\x1b'),
+        "raw ESC leaked through sanitize_for_log; stderr = {stderr:?}"
+    );
+    // The skip-log path fired (which means sanitize ran on the path).
+    assert!(
+        stderr.contains("skipping pinned"),
+        "expected pinned-skip log line, got: {stderr:?}"
+    );
+    // And the escaped form appears — the helper actually substituted.
+    assert!(
+        stderr.contains("\\u{1b}"),
+        "expected escaped ESC (\\u{{1b}}) in stderr, got: {stderr:?}"
+    );
+
+    // The safe pattern still renders so the section degrades gracefully,
+    // not globally — this preserves the "never break the agent" contract.
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("Legitimate body content"),
+        "the safe universal pattern must still render: {stdout}"
+    );
+}
+
+#[test]
 fn hook_session_start_skips_pinned_pattern_when_source_file_missing() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
