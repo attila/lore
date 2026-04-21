@@ -130,12 +130,27 @@ expression: resp
         "name": "append_to_pattern"
       },
       {
+        "description": "List every pattern indexed in the knowledge base: title, source file, tags, and whether the pattern is universal (always injected at SessionStart and bypasses PreToolUse deduplication). Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, especially the `universal` marker.",
+        "inputSchema": {
+          "properties": {
+            "include_metadata": {
+              "default": false,
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with an array of patterns, each carrying `title`, `source_file`, `tags`, and `is_universal`. Defaults to false.",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "list_patterns"
+      },
+      {
         "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), whether the inbox branch workflow is configured, and whether a .loreignore file is active (filtering files out of the index). Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git or whether files in a particular path are excluded from search.",
         "inputSchema": {
           "properties": {
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, git_repository, last_ingested_commit, chunks_indexed, sources_indexed, inbox_workflow_configured, delta_ingest_available, and loreignore_active fields. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, git_repository, last_ingested_commit, chunks_indexed, sources_indexed, inbox_workflow_configured, delta_ingest_available, loreignore_active, and universal_advisories (count, oversized bodies, near-miss tags from the most recent full or single-file ingest). Defaults to false.",
               "type": "boolean"
             }
           },

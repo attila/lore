@@ -41,6 +41,48 @@ pub(crate) const META_LAST_COMMIT: &str = "last_ingested_commit";
 /// Key used to store the FNV-1a content hash of `.loreignore` so the next
 /// ingest can detect when the ignore list has changed.
 const META_LOREIGNORE_HASH: &str = "loreignore_hash";
+/// Key used to stash the last ingest's universal-pattern advisories
+/// (count summary, >3 warning, oversized-body flags, near-miss tags). The
+/// MCP `lore_status` tool surfaces these to agents that can't see stderr.
+pub(crate) const META_UNIVERSAL_ADVISORIES: &str = "universal_advisories";
+
+/// Persist the universal-pattern advisories from a completed ingest so the
+/// MCP `lore_status` tool can surface them to agents. The value is a JSON
+/// document matching the shape emitted by [`universal_advisories_json`] so
+/// consumers only parse one field.
+///
+/// Only overwrites when the ingest touched any universal-related field.
+/// A delta ingest that touches no universal-tagged files leaves the last
+/// persisted summary intact — otherwise every non-universal-touching delta
+/// would zero the advisory payload and agents would see a stale-looking
+/// "Universal patterns: 0" after routine edits.
+pub fn persist_universal_advisories(db: &KnowledgeDB, result: &IngestResult) -> anyhow::Result<()> {
+    if !matches!(
+        result.mode,
+        IngestMode::Full | IngestMode::SingleFile { .. }
+    ) && result.universal_sources.is_empty()
+        && result.oversized_universal_bodies.is_empty()
+        && result.near_miss_universal_tags.is_empty()
+    {
+        return Ok(());
+    }
+    let payload = universal_advisories_json(result);
+    db.set_metadata(META_UNIVERSAL_ADVISORIES, &payload.to_string())
+}
+
+/// Build the structured JSON document persisted under
+/// [`META_UNIVERSAL_ADVISORIES`] and returned verbatim by `lore_status`.
+fn universal_advisories_json(result: &IngestResult) -> serde_json::Value {
+    serde_json::json!({
+        "universal_count": result.universal_sources.len(),
+        "universal_sources": result.universal_sources,
+        "oversized_bodies": result.oversized_universal_bodies,
+        "near_miss_tags": result.near_miss_universal_tags,
+        "count_warning": result.universal_sources.len() > 3,
+        "body_size_hard_limit_bytes": UNIVERSAL_BODY_HARD_LIMIT_BYTES,
+        "body_size_warning_threshold_bytes": UNIVERSAL_BODY_SIZE_WARNING_BYTES,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Result types

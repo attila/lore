@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 
 use crate::config::Config;
@@ -59,11 +60,36 @@ struct JsonRpcResponse {
 /// Start the MCP server on stdin/stdout.
 ///
 /// Opens the knowledge database using dimensions from `embedder`, then enters
-/// a line-oriented JSON-RPC read loop.
+/// a line-oriented JSON-RPC read loop. When the database open fails (most
+/// commonly on a schema-mismatch upgrade advisory), the server enters a
+/// degraded mode: `initialize` and `tools/list` still respond so clients can
+/// negotiate and enumerate, but every `tools/call` returns a structured error
+/// carrying the underlying message. This surfaces the `lore ingest --force`
+/// advisory to the agent as a tool-call result rather than dying at handshake
+/// time with the message trapped on stderr that most MCP hosts discard.
 pub fn start_mcp_server(config: &Config, embedder: &dyn Embedder) -> anyhow::Result<()> {
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions())?;
-    db.init()?;
+    match KnowledgeDB::open(&config.database, embedder.dimensions()) {
+        Ok(db) => {
+            db.init()?;
+            run_healthy_loop(&db, embedder, config)
+        }
+        Err(open_err) => {
+            let msg = format!("{open_err:#}");
+            eprintln!("[lore] MCP server started in DEGRADED mode — database unavailable:");
+            for line in msg.lines() {
+                eprintln!("[lore]   {line}");
+            }
+            eprintln!("[lore] tools/call requests will return a structured error.");
+            run_degraded_loop(&msg)
+        }
+    }
+}
 
+fn run_healthy_loop(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+) -> anyhow::Result<()> {
     let mode = if config.search.hybrid {
         "hybrid"
     } else {
@@ -80,7 +106,7 @@ pub fn start_mcp_server(config: &Config, embedder: &dyn Embedder) -> anyhow::Res
     }
 
     let ctx = ServerContext {
-        db: &db,
+        db,
         embedder,
         config,
     };
@@ -113,6 +139,94 @@ pub fn start_mcp_server(config: &Config, embedder: &dyn Embedder) -> anyhow::Res
     }
 
     Ok(())
+}
+
+/// Read-loop for the degraded server. `initialize` and `tools/list` respond
+/// normally so clients can handshake; every `tools/call` returns a structured
+/// JSON-RPC error carrying the original open-time error, so the agent sees
+/// the upgrade advisory inside a tool response instead of losing it to stderr.
+fn run_degraded_loop(schema_error: &str) -> anyhow::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[lore] Failed to parse request: {e}");
+                continue;
+            }
+        };
+        if let Some(resp) = handle_degraded_request(&request, schema_error) {
+            let json = serde_json::to_string(&resp)?;
+            writeln!(out, "{json}")?;
+            out.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_degraded_request(req: &JsonRpcRequest, schema_error: &str) -> Option<JsonRpcResponse> {
+    if req.jsonrpc != "2.0" {
+        return Some(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.clone(),
+            result: None,
+            error: Some(json!({
+                "code": -32600,
+                "message": format!("Invalid jsonrpc version: {}", req.jsonrpc)
+            })),
+        });
+    }
+
+    match req.method.as_str() {
+        "initialize" => Some(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.clone(),
+            result: Some(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "lore",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            })),
+            error: None,
+        }),
+        "notifications/initialized" => None,
+        "tools/list" => Some(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.clone(),
+            result: Some(json!({ "tools": tool_definitions() })),
+            error: None,
+        }),
+        "tools/call" => Some(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.clone(),
+            result: None,
+            error: Some(json!({
+                "code": -32000,
+                "message": format!(
+                    "lore database unavailable: {schema_error}"
+                ),
+            })),
+        }),
+        _ => Some(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.clone(),
+            result: None,
+            error: Some(json!({
+                "code": -32601,
+                "message": format!("Unknown method: {}", req.method)
+            })),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +441,31 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "list_patterns",
+            "description":
+                "List every pattern indexed in the knowledge base: title, source file, \
+                 tags, and whether the pattern is universal (always injected at SessionStart \
+                 and bypasses PreToolUse deduplication). Use when an agent needs to enumerate \
+                 available patterns without issuing a keyword search — the CLI equivalent is \
+                 `lore list`. Useful before `update_pattern` to check current tags, especially \
+                 the `universal` marker.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_metadata": {
+                        "type": "boolean",
+                        "description":
+                            "When true, appends a `lore-metadata` fenced code block to the \
+                             end of the response containing machine-readable JSON with an \
+                             array of patterns, each carrying `title`, `source_file`, \
+                             `tags`, and `is_universal`. Defaults to false.",
+                        "default": false
+                    }
+                },
+                "required": []
+            }
+        },
+        {
             "name": "lore_status",
             "description":
                 "Report knowledge base health: whether it is a git repository, the indexed \
@@ -346,7 +485,9 @@ fn tool_definitions() -> Value {
                              end of the response containing machine-readable JSON with \
                              knowledge_dir, git_repository, last_ingested_commit, \
                              chunks_indexed, sources_indexed, inbox_workflow_configured, \
-                             delta_ingest_available, and loreignore_active fields. \
+                             delta_ingest_available, loreignore_active, and \
+                             universal_advisories (count, oversized bodies, near-miss tags \
+                             from the most recent full or single-file ingest). \
                              Defaults to false.",
                         "default": false
                     }
@@ -378,6 +519,7 @@ fn handle_tool_call(req: &JsonRpcRequest, ctx: &ServerContext<'_>) -> JsonRpcRes
         "add_pattern" => handle_add(req, ctx, &arguments),
         "update_pattern" => handle_update(req, ctx, &arguments),
         "append_to_pattern" => handle_append(req, ctx, &arguments),
+        "list_patterns" => handle_list_patterns(req, ctx, &arguments),
         "lore_status" => handle_lore_status(req, ctx, &arguments),
         _ => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -507,8 +649,9 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 .iter()
                 .enumerate()
                 .map(|(i, r)| {
+                    let universal_marker = if r.is_universal { " [universal]" } else { "" };
                     let mut lines = vec![format!(
-                        "[{}] {} (source: {})",
+                        "[{}] {} (source: {}){universal_marker}",
                         i + 1,
                         r.title,
                         r.source_file
@@ -754,6 +897,45 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     }
 }
 
+/// Enumerate every indexed pattern. Mirrors the `lore list` CLI for agents
+/// that need the full inventory without keyword-searching. Each row carries
+/// the universal marker so agents can reason about which patterns would
+/// re-inject on every tool call.
+fn handle_list_patterns(
+    req: &JsonRpcRequest,
+    ctx: &ServerContext<'_>,
+    args: &Value,
+) -> JsonRpcResponse {
+    let include_metadata = include_metadata_arg(args);
+
+    let patterns = match ctx.db.list_patterns() {
+        Ok(p) => p,
+        Err(e) => return error_response(req, &format!("list_patterns failed: {e}")),
+    };
+
+    let prose = if patterns.is_empty() {
+        "No patterns indexed.".to_string()
+    } else {
+        let mut out = String::new();
+        for p in &patterns {
+            let universal_suffix = if p.is_universal { " [universal]" } else { "" };
+            if p.tags.is_empty() {
+                let _ = writeln!(out, "- {}{universal_suffix}", p.title);
+            } else {
+                let _ = writeln!(out, "- {} [{}]{universal_suffix}", p.title, p.tags);
+            }
+        }
+        out
+    };
+
+    let metadata = json!({
+        "pattern_count": patterns.len(),
+        "patterns": patterns,
+    });
+    let response = maybe_append_lore_metadata_fence(prose, &metadata, include_metadata);
+    text_response(req, &response)
+}
+
 /// Report knowledge base health: git repository status, indexed counts, and
 /// inbox workflow configuration. Designed for agents that need to know whether
 /// pending writes will be committed before they call `add_pattern`,
@@ -782,6 +964,17 @@ fn handle_lore_status(
         .matcher
         .is_some();
 
+    // Surface the last-ingest universal-pattern advisories so agents can
+    // see the >3 warning, per-pattern body-size warnings, and near-miss
+    // typo flags without needing access to the stderr of the operator's
+    // `lore ingest` run.
+    let universal_advisories = ctx
+        .db
+        .get_metadata(crate::ingest::META_UNIVERSAL_ADVISORIES)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+
     let metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
         "git_repository": is_git_repo,
@@ -791,6 +984,7 @@ fn handle_lore_status(
         "inbox_workflow_configured": inbox_workflow_configured,
         "delta_ingest_available": delta_ingest_available,
         "loreignore_active": loreignore_active,
+        "universal_advisories": universal_advisories,
     });
 
     let summary = format!(
@@ -1166,12 +1360,12 @@ mod tests {
     // -- tools/list --------------------------------------------------------
 
     #[test]
-    fn tools_list_returns_all_five_tools() {
+    fn tools_list_returns_all_six_tools() {
         let h = TestHarness::new();
         let resp = h.request_value(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
 
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(
@@ -1181,11 +1375,45 @@ mod tests {
                 "add_pattern",
                 "update_pattern",
                 "append_to_pattern",
-                "lore_status"
+                "list_patterns",
+                "lore_status",
             ]
         );
 
         insta::assert_json_snapshot!(resp);
+    }
+
+    #[test]
+    fn degraded_request_handler_returns_error_for_tools_call() {
+        let schema_error = "lore: this database predates the universal-patterns feature.\n\
+                            Run `lore ingest --force` to rebuild the index with the new schema.";
+        let req: JsonRpcRequest = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_patterns","arguments":{"query":"anything"}}}"#,
+        )
+        .unwrap();
+        let resp = handle_degraded_request(&req, schema_error).unwrap();
+        let value = serde_json::to_value(&resp).unwrap();
+        assert!(value["error"].is_object(), "expected error, got: {value}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("lore ingest --force"),
+            "upgrade advisory must reach the agent: {message}"
+        );
+    }
+
+    #[test]
+    fn degraded_request_handler_still_responds_to_tools_list() {
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{}}"#)
+                .unwrap();
+        let resp = handle_degraded_request(&req, "db broken").unwrap();
+        let value = serde_json::to_value(&resp).unwrap();
+        assert!(
+            value["error"].is_null(),
+            "tools/list must still work in degraded mode"
+        );
+        let tools = value["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 6);
     }
 
     // -- search_patterns ---------------------------------------------------
@@ -1223,6 +1451,130 @@ mod tests {
             text.contains("Error Handling"),
             "search result should contain the title, got: {text}"
         );
+    }
+
+    #[test]
+    fn search_patterns_prose_marks_universal_results() {
+        let h = TestHarness::new();
+        let chunk = crate::chunking::Chunk {
+            id: "u1".into(),
+            title: "Git Workflow".into(),
+            body: "Always git push origin HEAD on feature branches.".into(),
+            tags: "universal, workflow".into(),
+            source_file: "git-workflow.md".into(),
+            heading_path: String::new(),
+            is_universal: true,
+        };
+        let emb = h.embedder.embed(&chunk.body).unwrap();
+        h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":60,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"git workflow"}
+                }
+            }"#,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("[universal]"),
+            "universal results must carry a visible marker in prose, got:\n{text}"
+        );
+    }
+
+    // -- list_patterns -----------------------------------------------------
+
+    #[test]
+    fn list_patterns_enumerates_every_source_with_universal_marker() {
+        let h = TestHarness::new();
+        for chunk in [
+            crate::chunking::Chunk {
+                id: "u1".into(),
+                title: "Git Workflow".into(),
+                body: "Always git push origin HEAD.".into(),
+                tags: "universal".into(),
+                source_file: "workflows/git.md".into(),
+                heading_path: String::new(),
+                is_universal: true,
+            },
+            crate::chunking::Chunk {
+                id: "n1".into(),
+                title: "Rust Style".into(),
+                body: "Prefer anyhow for application errors.".into(),
+                tags: "rust".into(),
+                source_file: "rust/style.md".into(),
+                heading_path: String::new(),
+                is_universal: false,
+            },
+        ] {
+            h.db.insert_chunk(&chunk, None).unwrap();
+        }
+
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":70,"method":"tools/call",
+                "params":{"name":"list_patterns","arguments":{}}}"#,
+        );
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Git Workflow"),
+            "prose must list every pattern: {text}"
+        );
+        assert!(
+            text.contains("[universal]"),
+            "prose must mark universal: {text}"
+        );
+        assert!(text.contains("Rust Style"));
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.contains("Rust Style") && l.contains("[universal]")),
+            "non-universal rows must not carry the marker: {text}"
+        );
+    }
+
+    #[test]
+    fn list_patterns_returns_empty_prose_on_fresh_db() {
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":71,"method":"tools/call",
+                "params":{"name":"list_patterns","arguments":{}}}"#,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No patterns indexed"),
+            "empty DB should say so: {text}"
+        );
+    }
+
+    #[test]
+    fn list_patterns_metadata_fence_carries_structured_rows() {
+        let h = TestHarness::new();
+        h.db.insert_chunk(
+            &crate::chunking::Chunk {
+                id: "u1".into(),
+                title: "Conventions".into(),
+                body: "Body long enough for a chunk.".into(),
+                tags: "universal".into(),
+                source_file: "c.md".into(),
+                heading_path: String::new(),
+                is_universal: true,
+            },
+            None,
+        )
+        .unwrap();
+
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":72,"method":"tools/call",
+                "params":{"name":"list_patterns","arguments":{"include_metadata":true}}}"#,
+        );
+        let meta = metadata_from_response(&resp);
+        assert_eq!(meta["pattern_count"], 1);
+        let patterns = meta["patterns"].as_array().unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0]["is_universal"], true);
     }
 
     /// Build a `TestHarness` whose embedder always fails. Used to pin the
@@ -1784,6 +2136,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lore_status_exposes_universal_advisories_when_persisted() {
+        let h = TestHarness::new();
+        // Persist a universal-advisories payload as the ingest pipeline would.
+        let payload = serde_json::json!({
+            "universal_count": 4,
+            "universal_sources": ["a.md", "b.md", "c.md", "d.md"],
+            "oversized_bodies": ["b.md"],
+            "near_miss_tags": ["e.md: Universal"],
+            "count_warning": true,
+            "body_size_hard_limit_bytes": 8192,
+            "body_size_warning_threshold_bytes": 1024,
+        });
+        h.db.set_metadata(
+            crate::ingest::META_UNIVERSAL_ADVISORIES,
+            &payload.to_string(),
+        )
+        .unwrap();
+
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":80,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}}"#,
+        );
+
+        let metadata = metadata_from_response(&resp);
+        let advisories = &metadata["universal_advisories"];
+        assert!(!advisories.is_null(), "advisories should be surfaced");
+        assert_eq!(advisories["universal_count"], 4);
+        assert_eq!(advisories["count_warning"], true);
+        assert_eq!(advisories["oversized_bodies"], serde_json::json!(["b.md"]));
+        assert_eq!(
+            advisories["near_miss_tags"],
+            serde_json::json!(["e.md: Universal"])
+        );
+    }
+
+    #[test]
+    fn lore_status_universal_advisories_null_when_no_ingest_has_run() {
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":81,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}}"#,
+        );
+        let metadata = metadata_from_response(&resp);
+        assert!(
+            metadata["universal_advisories"].is_null(),
+            "advisories must be null before any ingest has persisted them"
+        );
+    }
+
     /// When the caller does NOT pass `include_metadata: true`, `lore_status`
     /// must return the prose summary with no `lore-metadata` fence. Pins
     /// the opt-in contract: default callers pay no token cost for the
@@ -2310,7 +2712,7 @@ mod tests {
             h.request_value(r#"{"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}"#);
         assert!(resp["error"].is_null());
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
 
         // -- add_pattern ------------------------------------------------------
         let resp = h.request_value(

@@ -344,6 +344,13 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
 
     print_ingest_summary(&result);
 
+    // Persist the universal-pattern advisories so the `lore_status` MCP tool
+    // can surface them to agents (who don't see stderr). Failure here is a
+    // cosmetic issue, never a reason to fail the ingest.
+    if let Err(e) = ingest::persist_universal_advisories(&db, &result) {
+        lore_debug!("failed to persist universal advisories: {e}");
+    }
+
     if !result.errors.is_empty() {
         eprintln!("Errors: {}", result.errors.len());
         for err in &result.errors {
