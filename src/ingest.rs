@@ -788,7 +788,8 @@ pub fn ingest_single_file(
 
     // Ensure the file lies inside the knowledge directory. Uses the same
     // guard as add_pattern / update_pattern so path-traversal protection is
-    // uniform across write paths.
+    // uniform across write paths. The returned canonical path is the same
+    // value we already have, so we ignore it here.
     if let Err(e) = validate_within_dir(knowledge_dir, &canonical) {
         result.errors.push(e.to_string());
         return result;
@@ -949,9 +950,12 @@ pub fn update_pattern(
         anyhow::bail!("File not found: {source_file}");
     }
 
-    validate_within_dir(knowledge_dir, &file_path)?;
+    // Use the canonical path returned by validation for every subsequent
+    // read and write so an attacker cannot race a symlink swap between the
+    // containment check and file access.
+    let canonical = validate_within_dir(knowledge_dir, &file_path)?;
 
-    let title = extract_title(&std::fs::read_to_string(&file_path)?)
+    let title = extract_title(&std::fs::read_to_string(&canonical)?)
         .unwrap_or_else(|| file_stem(source_file));
 
     let content = build_file_content(&title, body, tags);
@@ -976,13 +980,13 @@ pub fn update_pattern(
         });
     }
 
-    std::fs::write(&file_path, &content)?;
+    std::fs::write(&canonical, &content)?;
 
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
         ..
-    } = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1018,9 +1022,12 @@ pub fn append_to_pattern(
         anyhow::bail!("File not found: {source_file}");
     }
 
-    validate_within_dir(knowledge_dir, &file_path)?;
+    // Use the canonical path returned by validation for every subsequent
+    // read and write so an attacker cannot race a symlink swap between the
+    // containment check and file access.
+    let canonical = validate_within_dir(knowledge_dir, &file_path)?;
 
-    let existing = std::fs::read_to_string(&file_path)?;
+    let existing = std::fs::read_to_string(&canonical)?;
     let title = extract_title(&existing).unwrap_or_else(|| file_stem(source_file));
 
     let mut content = existing;
@@ -1051,13 +1058,13 @@ pub fn append_to_pattern(
         });
     }
 
-    std::fs::write(&file_path, &content)?;
+    std::fs::write(&canonical, &content)?;
 
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
         ..
-    } = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1203,11 +1210,18 @@ fn index_single_file(
     })
 }
 
-/// Validate that `file_path` lies within `knowledge_dir` after canonicalization.
+/// Validate that `file_path` lies within `knowledge_dir` after canonicalisation
+/// and return the canonical form of `file_path`.
 ///
 /// This prevents path traversal attacks where a `source_file` like
-/// `../../../etc/passwd` could escape the knowledge directory.
-pub(crate) fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> anyhow::Result<()> {
+/// `../../../etc/passwd` could escape the knowledge directory. Callers must
+/// use the returned canonical `PathBuf` for subsequent reads and writes —
+/// reading from the pre-canonical input re-opens the TOCTOU window between
+/// validation and access (a symlink could be swapped in between).
+pub(crate) fn validate_within_dir(
+    knowledge_dir: &Path,
+    file_path: &Path,
+) -> anyhow::Result<PathBuf> {
     let canon_dir = knowledge_dir.canonicalize()?;
     let canon_file = file_path.canonicalize()?;
     if !canon_file.starts_with(&canon_dir) {
@@ -1216,7 +1230,7 @@ pub(crate) fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> any
             file_path.display()
         );
     }
-    Ok(())
+    Ok(canon_file)
 }
 
 /// Validate that a slug-derived filename does not contain path traversal components.

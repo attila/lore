@@ -551,6 +551,15 @@ fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Res
     Ok(out)
 }
 
+/// Escape control characters (ANSI escapes, newlines, tabs) in strings that
+/// originate from the database or other semi-trusted sources before writing
+/// them to stderr or `lore_debug!`. A tampered chunk row whose `source_file`
+/// contains `\x1b[2J` must not clear the operator's terminal, and a row with
+/// embedded newlines must not spoof structured output downstream.
+pub fn sanitize_for_log(s: &str) -> String {
+    s.chars().flat_map(char::escape_debug).collect()
+}
+
 /// Build the `## Pinned conventions` block for `SessionStart` and `PostCompact`.
 ///
 /// Returns an empty string when no universal patterns exist (the section
@@ -579,26 +588,28 @@ fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::
 
     for pattern in &universal {
         let candidate = knowledge_dir.join(&pattern.source_file);
-        if let Err(e) = crate::ingest::validate_within_dir(knowledge_dir, &candidate) {
-            eprintln!("lore hook: skipping pinned `{}`: {e}", pattern.source_file);
-            lore_debug!(
-                "pinned containment check failed for {}: {e}",
-                pattern.source_file
-            );
-            continue;
-        }
-        match std::fs::read_to_string(&candidate) {
+        let safe_source = sanitize_for_log(&pattern.source_file);
+        let canonical = match crate::ingest::validate_within_dir(knowledge_dir, &candidate) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("lore hook: skipping pinned `{safe_source}`: {e}");
+                lore_debug!("pinned containment check failed for {safe_source}: {e}");
+                continue;
+            }
+        };
+        // Read from the canonical path returned by validation. Reading from
+        // the pre-canonical `candidate` re-opens the TOCTOU window — a
+        // symlink swap between validation and open could redirect the read
+        // to a file outside `knowledge_dir`.
+        match std::fs::read_to_string(&canonical) {
             Ok(body) => {
                 let _ = writeln!(out, "\n### {}\n", pattern.title);
                 out.push_str(body.trim_end());
                 out.push('\n');
             }
             Err(e) => {
-                eprintln!(
-                    "lore hook: skipping pinned `{}`: read failed ({e})",
-                    pattern.source_file
-                );
-                lore_debug!("pinned read failed for {}: {e}", pattern.source_file);
+                eprintln!("lore hook: skipping pinned `{safe_source}`: read failed ({e})");
+                lore_debug!("pinned read failed for {safe_source}: {e}");
             }
         }
     }
@@ -1673,6 +1684,34 @@ mod tests {
         reset_dedup(&path).unwrap();
         let ids = read_dedup(&path);
         assert!(ids.is_empty(), "reset should truncate existing content");
+    }
+
+    // -- sanitize_for_log ----------------------------------------------------
+
+    #[test]
+    fn sanitize_for_log_escapes_ansi_and_newlines() {
+        // ANSI CSI sequence must be rendered as visible escapes so a tampered
+        // DB row cannot clear or recolour the operator's terminal.
+        let payload = "\x1b[2J\x1b[31malert\x1b[0m\nnext";
+        let sanitized = sanitize_for_log(payload);
+        assert!(
+            !sanitized.contains('\x1b'),
+            "raw ESC must not leak through: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains('\n'),
+            "raw newline must not leak through: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("alert"),
+            "visible content should survive sanitisation: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_log_passes_through_printable_ascii() {
+        let payload = "patterns/git-branch-pr.md";
+        assert_eq!(sanitize_for_log(payload), payload);
     }
 
     // -- dedup_filter_and_record -----------------------------------------------

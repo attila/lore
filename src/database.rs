@@ -103,6 +103,19 @@ impl KnowledgeDB {
     /// friendly upgrade-required error instead of letting individual SELECTs
     /// fail later with a confusing `no such column` message.
     pub fn open(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, dimensions, true)
+    }
+
+    /// Open the database without the schema-compatibility probe. Reserved for
+    /// `lore ingest --force`: the very next step after opening is `clear_all`,
+    /// which drops and recreates the tables with the current DDL, so running
+    /// the probe would block the only path that actually fixes the condition
+    /// it warns about.
+    pub fn open_skipping_schema_check(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, dimensions, false)
+    }
+
+    fn open_inner(db_path: &Path, dimensions: usize, check_schema: bool) -> anyhow::Result<Self> {
         register_sqlite_vec();
 
         let conn = Connection::open(db_path)?;
@@ -110,61 +123,39 @@ impl KnowledgeDB {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
 
-        check_schema_compatibility(&conn)?;
+        if check_schema {
+            check_schema_compatibility(&conn)?;
+        }
 
         Ok(Self { conn, dimensions })
     }
 
     /// Create all tables if they don't already exist.
     pub fn init(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts USING fts5(
-                title, body, tags, source_file, chunk_id UNINDEXED,
-                tokenize = 'porter unicode61'
-            )",
-        )?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chunks (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                body TEXT NOT NULL,
-                tags TEXT DEFAULT '',
-                source_file TEXT NOT NULL,
-                heading_path TEXT DEFAULT '',
-                is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
-                ingested_at TEXT DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)",
-        )?;
-
-        self.conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_vec USING vec0(
-                id TEXT PRIMARY KEY,
-                embedding float[{}]
-            )",
-            self.dimensions
-        ))?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)",
-        )?;
-
+        self.conn.execute_batch(PATTERNS_FTS_DDL)?;
+        self.conn.execute_batch(CHUNKS_DDL)?;
+        self.conn
+            .execute_batch(&patterns_vec_ddl(self.dimensions))?;
+        self.conn.execute_batch(INGEST_METADATA_DDL)?;
         Ok(())
     }
 
-    /// Drop and recreate all tables, ensuring schema changes (like tokenizer
-    /// updates) take effect.  Used by `lore ingest --force`.
+    /// Drop and recreate all tables so that any column additions, index
+    /// changes, or tokenizer updates in the DDL take effect. Used by
+    /// `lore ingest --force` as the authoritative path back to a clean
+    /// on-disk schema after a binary upgrade.
+    ///
+    /// `chunks` is dropped and recreated too — `DELETE FROM chunks` would
+    /// leave the old column list intact, so an old-schema database that
+    /// somehow bypassed `check_schema_compatibility` would still reject
+    /// subsequent inserts against the missing `is_universal` column.
     pub fn clear_all(&self) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
-        tx.execute_batch(
-            "CREATE VIRTUAL TABLE patterns_fts USING fts5(
-                title, body, tags, source_file, chunk_id UNINDEXED,
-                tokenize = 'porter unicode61'
-            )",
-        )?;
-        tx.execute_batch("DELETE FROM chunks; DELETE FROM patterns_vec;")?;
+        tx.execute_batch(PATTERNS_FTS_DDL)?;
+        tx.execute_batch("DROP TABLE IF EXISTS chunks")?;
+        tx.execute_batch(CHUNKS_DDL)?;
+        tx.execute_batch("DELETE FROM patterns_vec")?;
         tx.commit()?;
         Ok(())
     }
@@ -512,6 +503,46 @@ pub fn sanitize_fts_query(query: &str) -> String {
         .collect();
 
     result.join(" ")
+}
+
+/// Authoritative DDL for the `chunks` table. Used by both `KnowledgeDB::init`
+/// (fresh-DB path, `CREATE TABLE IF NOT EXISTS`) and `KnowledgeDB::clear_all`
+/// (post-DROP recreate). Centralising the DDL prevents the two paths from
+/// drifting when a column is added or removed.
+const CHUNKS_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS chunks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        tags TEXT DEFAULT '',
+        source_file TEXT NOT NULL,
+        heading_path TEXT DEFAULT '',
+        is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
+        ingested_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)";
+
+/// Authoritative DDL for the `patterns_fts` virtual table. Shared between
+/// `init` and `clear_all` so tokenizer and column-list changes stay in lockstep.
+const PATTERNS_FTS_DDL: &str = "\
+    CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts USING fts5(
+        title, body, tags, source_file, chunk_id UNINDEXED,
+        tokenize = 'porter unicode61'
+    )";
+
+/// Authoritative DDL for `ingest_metadata`.
+const INGEST_METADATA_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)";
+
+/// DDL for the dimensions-bound `patterns_vec` virtual table. Returned as a
+/// `String` because the embedding width is a runtime value.
+fn patterns_vec_ddl(dimensions: usize) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_vec USING vec0(
+            id TEXT PRIMARY KEY,
+            embedding float[{dimensions}]
+        )"
+    )
 }
 
 /// Probe the existing `chunks` table for the `is_universal` column.
@@ -1429,6 +1460,100 @@ mod tests {
         // Open a brand-new file: no chunks table yet, probe is satisfied.
         let db = KnowledgeDB::open(&db_path, 4).expect("fresh DB should open cleanly");
         db.init().expect("init should succeed");
+    }
+
+    #[test]
+    fn knowledge_db_open_skipping_schema_check_bypasses_probe_for_force_ingest() {
+        // Build an old-schema database (no `is_universal` column). The
+        // regular `open` path rejects this with the upgrade advisory —
+        // `open_skipping_schema_check` must accept it so that
+        // `lore ingest --force` can reach `clear_all` and rebuild.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("old.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    source_file TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, title, body, source_file) \
+                 VALUES ('c1', 'T', 'B', 'f.md')",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(KnowledgeDB::open(&db_path, 4).is_err());
+
+        let db = KnowledgeDB::open_skipping_schema_check(&db_path, 4)
+            .expect("skip-probe open must succeed on old schema");
+        db.init().expect("init under skip-probe open must succeed");
+        db.clear_all()
+            .expect("clear_all must drop+recreate the old chunks table");
+
+        // After clear_all the new schema is live — a re-open through the
+        // probe path succeeds, confirming the advertised remedy works.
+        drop(db);
+        KnowledgeDB::open(&db_path, 4).expect("re-open after clear_all must pass the probe");
+    }
+
+    #[test]
+    fn clear_all_drops_and_recreates_chunks_with_current_ddl() {
+        // Open a DB, init, drop the is_universal column via raw SQL to
+        // simulate an incomplete migration, then confirm `clear_all`
+        // restores the expected column set.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("chunks_ddl.db");
+        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        db.init().unwrap();
+
+        // Forcibly swap the chunks table to the old shape — no `is_universal`.
+        db.conn
+            .execute_batch(
+                "DROP TABLE chunks;
+                 CREATE TABLE chunks (
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     body TEXT NOT NULL,
+                     source_file TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO chunks (id, title, body, source_file) \
+                 VALUES ('c1', 'T', 'B', 'f.md')",
+                [],
+            )
+            .unwrap();
+
+        db.clear_all().unwrap();
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            columns.iter().any(|c| c == "is_universal"),
+            "chunks must carry is_universal after clear_all, got: {columns:?}"
+        );
+
+        // And the row seeded under the old schema is gone.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "clear_all must leave chunks empty");
     }
 
     // -- ingest_metadata -----------------------------------------------

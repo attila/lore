@@ -314,7 +314,16 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     );
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    // `lore ingest --force` (without `--file`) is the documented remedy when
+    // the schema-compatibility probe bails. It drops and recreates the
+    // tables via `clear_all`, so the probe must not run first — otherwise
+    // the very advisory it emits would never be actionable.
+    let skip_probe = force && file.is_none();
+    let db = if skip_probe {
+        KnowledgeDB::open_skipping_schema_check(&config.database, ollama.dimensions())?
+    } else {
+        KnowledgeDB::open(&config.database, ollama.dimensions())?
+    };
     db.init()?;
 
     let on_progress = &|msg: &str| {
@@ -473,20 +482,22 @@ fn print_universal_advisories(result: &ingest::IngestResult) {
             result.universal_sources.len()
         );
         for source in &result.universal_sources {
-            eprintln!("  - {source}");
+            eprintln!("  - {}", hook::sanitize_for_log(source));
         }
     }
 
     for source in &result.oversized_universal_bodies {
         eprintln!(
-            "Note: universal pattern `{source}` has a body larger than 1KB. \
-             Universal patterns re-inject on every relevant tool call; consider trimming."
+            "Note: universal pattern `{}` has a body larger than 1KB. \
+             Universal patterns re-inject on every relevant tool call; consider trimming.",
+            hook::sanitize_for_log(source),
         );
     }
 
     for entry in &result.near_miss_universal_tags {
         eprintln!(
-            "Note: tag `{entry}` looks like a misspelling of `universal` (case-sensitive exact match required)."
+            "Note: tag `{}` looks like a misspelling of `universal` (case-sensitive exact match required).",
+            hook::sanitize_for_log(entry),
         );
     }
 }
