@@ -46,7 +46,7 @@ expression: resp
               "type": "boolean"
             },
             "tags": {
-              "description": "Optional tags for categorisation",
+              "description": "Optional tags for categorisation. Passing `\"universal\"` opts the pattern into the always-on injection tier — its body is emitted at every SessionStart and bypasses PreToolUse deduplication (see docs/pattern-authoring-guide.md §\"When to use the universal tag\").",
               "items": {
                 "type": "string"
               },
@@ -83,7 +83,7 @@ expression: resp
               "type": "string"
             },
             "tags": {
-              "description": "Optional updated tags",
+              "description": "Optional. Omit to preserve the existing frontmatter tags (including `universal`). Pass an empty array `[]` to clear all tags. Pass a non-empty array to replace the tag list wholesale; include `\"universal\"` to keep or opt the pattern into the always-on injection tier.",
               "items": {
                 "type": "string"
               },

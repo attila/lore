@@ -200,21 +200,41 @@ pub fn frontmatter_has_tag(content: &str, tag: &str) -> bool {
     parse_frontmatter_tag_list(content).iter().any(|t| t == tag)
 }
 
-/// Return frontmatter tag values whose lowercased form equals `tag` but whose
-/// exact form does not. Used to surface near-miss spellings (`Universal`,
-/// `universally`, `UNIVERSAL`) at ingest time so authors notice typos.
+/// Return frontmatter tag values that look like typos of `tag` but aren't
+/// exact matches. Flags two classes at ingest time so authors notice
+/// silent-inert tags:
+///
+/// 1. Case variants (`Universal`, `UNIVERSAL`) — lowercased form equals the
+///    target.
+/// 2. Homoglyph candidates — tags containing non-ASCII characters whose
+///    character count equals the target's. Catches Cyrillic-i for ASCII-i
+///    style substitutions (`unіversal` with Cyrillic `і` U+0456) without
+///    pulling in a full Unicode confusables table. Legitimate non-ASCII
+///    tags like `résumé` pass through silently because their character
+///    count differs from the target's.
 pub fn frontmatter_near_miss_tags(content: &str, tag: &str) -> Vec<String> {
     let target_lower = tag.to_lowercase();
+    let target_char_count = target_lower.chars().count();
+
     parse_frontmatter_tag_list(content)
         .into_iter()
-        .filter(|t| t != tag && t.to_lowercase() == target_lower)
+        .filter(|t| {
+            if t == tag {
+                return false;
+            }
+            let t_lower = t.to_lowercase();
+            if t_lower == target_lower {
+                return true;
+            }
+            !t_lower.is_ascii() && t_lower.chars().count() == target_char_count
+        })
         .collect()
 }
 
 /// Parse the frontmatter `tags:` list into a `Vec<String>` (one entry per tag).
 /// Reuses the existing inline / block style logic from `extract_frontmatter_tags`
 /// so the two functions never drift.
-fn parse_frontmatter_tag_list(content: &str) -> Vec<String> {
+pub fn parse_frontmatter_tag_list(content: &str) -> Vec<String> {
     let Some(fm) = extract_frontmatter(content) else {
         return Vec::new();
     };
@@ -762,6 +782,26 @@ Body text that is definitely long enough for a chunk.
         let md = "---\ntags: [universal]\n---\n\n# Hello\nBody.\n";
         let near = frontmatter_near_miss_tags(md, "universal");
         assert!(near.is_empty());
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_flags_cyrillic_homoglyph() {
+        // Cyrillic `і` (U+0456) lowercases to itself, not ASCII `i`, so a
+        // pure `to_lowercase()` comparison would silently miss this typo.
+        // The length-plus-non-ASCII heuristic catches it.
+        let md = "---\ntags: [unіversal]\n---\n\n# Hello\nEnough body.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert_eq!(near, vec!["unіversal".to_string()]);
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_does_not_flag_unrelated_unicode_tags() {
+        // Legitimate non-ASCII tags with different character counts must
+        // pass through silently — we don't want spurious warnings on every
+        // non-English-tag knowledge base.
+        let md = "---\ntags: [résumé, emoji-🚀, universal]\n---\n\n# Hello\nBody.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert!(near.is_empty(), "got: {near:?}");
     }
 
     #[test]

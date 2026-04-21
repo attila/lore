@@ -560,6 +560,16 @@ pub fn sanitize_for_log(s: &str) -> String {
     s.chars().flat_map(char::escape_debug).collect()
 }
 
+/// Total-body cap (bytes) across all rendered universal patterns in a single
+/// `## Pinned conventions` section.
+///
+/// Complements the per-file `UNIVERSAL_BODY_HARD_LIMIT_BYTES` ingest-time
+/// reject. Even a single oversized file should never reach the agent context,
+/// but this is the belt-and-braces guard against a tampered DB bypassing the
+/// ingest-time check: once cumulative bytes exceed this cap, render emits a
+/// visible truncation marker and stops.
+pub const PINNED_SECTION_TOTAL_LIMIT_BYTES: usize = 32 * 1024;
+
 /// Build the `## Pinned conventions` block for `SessionStart` and `PostCompact`.
 ///
 /// Returns an empty string when no universal patterns exist (the section
@@ -580,11 +590,11 @@ fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::
         return Ok(String::new());
     }
 
-    let mut out = String::from("\n## Pinned conventions\n\n");
-    out.push_str(
-        "These patterns are tagged `universal` and apply across every tool call \
-         in this session. Treat them as always-on conventions.\n",
-    );
+    let header = "\n## Pinned conventions\n\n\
+                  These patterns are tagged `universal` and apply across every \
+                  tool call in this session. Treat them as always-on conventions.\n";
+    let mut out = String::from(header);
+    let budget_start = out.len();
 
     for pattern in &universal {
         let candidate = knowledge_dir.join(&pattern.source_file);
@@ -603,8 +613,30 @@ fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::
         // to a file outside `knowledge_dir`.
         match std::fs::read_to_string(&canonical) {
             Ok(body) => {
-                let _ = writeln!(out, "\n### {}\n", pattern.title);
-                out.push_str(body.trim_end());
+                let body = body.trim_end();
+                let consumed = out.len() - budget_start;
+                let remaining = PINNED_SECTION_TOTAL_LIMIT_BYTES.saturating_sub(consumed);
+                let heading = format!("\n### {}\n\n", pattern.title);
+                if heading.len() + body.len() + 1 > remaining {
+                    // The next pattern body would push the section over the
+                    // render-time cap. Emit a visible truncation marker and
+                    // stop. Ingest already rejects oversized universal
+                    // patterns per file (UNIVERSAL_BODY_HARD_LIMIT_BYTES);
+                    // hitting this guard means either a DB tamper bypassed
+                    // the ingest check or the operator has so many universal
+                    // files that the aggregate pushes over budget.
+                    let _ = writeln!(
+                        out,
+                        "\n_[pinned conventions truncated at {PINNED_SECTION_TOTAL_LIMIT_BYTES} bytes — trim or retag universal patterns]_",
+                    );
+                    lore_debug!(
+                        "pinned render truncated at {} bytes (next pattern: {safe_source})",
+                        PINNED_SECTION_TOTAL_LIMIT_BYTES,
+                    );
+                    break;
+                }
+                out.push_str(&heading);
+                out.push_str(body);
                 out.push('\n');
             }
             Err(e) => {

@@ -489,6 +489,67 @@ fn ingest_emits_per_pattern_body_size_warning_above_threshold() {
 }
 
 #[test]
+fn ingest_rejects_universal_body_above_hard_cap() {
+    // The hard cap (8 KB) is an error, not a warning. A universal pattern
+    // above it must not land in the index at all, and its soft-warning
+    // counterpart must also not fire because the file never passed ingest.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    // 800 × 12 bytes = 9600 bytes of body, comfortably over the 8192 cap.
+    let huge_body = "word word ab\n".repeat(800);
+    fs::write(
+        dir.join("huge.md"),
+        format!("---\ntags: [universal]\n---\n\n# Huge\n\n{huge_body}"),
+    )
+    .unwrap();
+
+    let db = memory_db();
+    let result = single_file_ingest(&db, dir, "huge.md", false);
+
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.contains("per-file hard limit")),
+        "expected hard-limit error, got errors: {:?}",
+        result.errors
+    );
+    assert!(
+        result.universal_sources.is_empty(),
+        "rejected pattern must not count as an indexed universal source"
+    );
+    assert_eq!(
+        result.chunks_created, 0,
+        "rejected pattern must leave no chunks behind"
+    );
+}
+
+#[test]
+fn ingest_accepts_non_universal_body_above_universal_hard_cap() {
+    // The hard cap applies only to universal-tagged patterns. A large
+    // non-universal pattern is fine because it does not re-inject on every
+    // tool call.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let huge_body = "word word ab\n".repeat(800);
+    fs::write(
+        dir.join("huge-plain.md"),
+        format!("---\ntags: [conventions]\n---\n\n# Huge Plain\n\n{huge_body}"),
+    )
+    .unwrap();
+
+    let db = memory_db();
+    let result = single_file_ingest(&db, dir, "huge-plain.md", false);
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    assert!(
+        result.chunks_created > 0,
+        "non-universal oversized pattern must still index"
+    );
+    assert!(result.universal_sources.is_empty());
+}
+
+#[test]
 fn ingest_emits_near_miss_advisory_for_capitalised_universal_tag() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();

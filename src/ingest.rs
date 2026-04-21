@@ -669,6 +669,14 @@ pub fn full_ingest(
 
         let chunks = dispatch_chunking(strategy, &content, &rel_path);
 
+        // Enforce the per-file universal body-size hard cap before insert.
+        // Per-file atomic rejection: a too-large universal file is skipped
+        // entirely rather than leaving some chunks indexed.
+        if let Err(e) = enforce_universal_body_cap(&rel_path, &chunks) {
+            result.errors.push(e.to_string());
+            continue;
+        }
+
         for chunk in &chunks {
             let embedding = match embedder.embed(&embed_text(chunk)) {
                 Ok(emb) => Some(emb),
@@ -935,13 +943,20 @@ pub fn add_pattern(
 /// When `inbox_branch_prefix` is `Some`, the modification is committed to a
 /// per-submission branch and pushed. The file must exist on the working tree
 /// (trunk) — inbox-only files are not supported.
+///
+/// `tags` has three cases:
+/// - `None` — preserve the existing frontmatter tags. This is the default
+///   path for agents that rewrite only the body and would otherwise silently
+///   drop every tag (including `universal`, de-universalising the pattern).
+/// - `Some(&[])` — explicitly clear all tags.
+/// - `Some(&[...])` — replace the tag list wholesale.
 pub fn update_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     knowledge_dir: &Path,
     source_file: &str,
     body: &str,
-    tags: &[&str],
+    tags: Option<&[&str]>,
     inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     let file_path = knowledge_dir.join(source_file);
@@ -955,10 +970,24 @@ pub fn update_pattern(
     // containment check and file access.
     let canonical = validate_within_dir(knowledge_dir, &file_path)?;
 
-    let title = extract_title(&std::fs::read_to_string(&canonical)?)
-        .unwrap_or_else(|| file_stem(source_file));
+    let existing = std::fs::read_to_string(&canonical)?;
+    let title = extract_title(&existing).unwrap_or_else(|| file_stem(source_file));
 
-    let content = build_file_content(&title, body, tags);
+    // Preserve-on-`None` resolves the subtle footgun where an agent rewrites
+    // the body through `update_pattern` but forgets to pass `tags`, which
+    // previously silently cleared every tag — including `universal`, which
+    // would de-universalise a pinned pattern without any signal.
+    let preserved: Vec<String>;
+    let preserved_refs: Vec<&str>;
+    let tags_to_apply: &[&str] = if let Some(t) = tags {
+        t
+    } else {
+        preserved = crate::chunking::parse_frontmatter_tag_list(&existing);
+        preserved_refs = preserved.iter().map(String::as_str).collect();
+        &preserved_refs
+    };
+
+    let content = build_file_content(&title, body, tags_to_apply);
 
     if let Some(prefix) = inbox_branch_prefix {
         let slug = file_stem(source_file);
@@ -1084,13 +1113,43 @@ pub fn append_to_pattern(
 // Universal-pattern detection at ingest
 // ---------------------------------------------------------------------------
 
-/// Body-size threshold (bytes) for the per-pattern universal-body advisory.
+/// Soft threshold (bytes) for the per-pattern universal-body advisory.
 ///
 /// Universal patterns re-inject on every relevant `PreToolUse` call, so a large
 /// body compounds quickly: a 2KB body matched 50 times in a session costs
 /// 100KB of repeated context. The advisory fires per-pattern when the body
 /// exceeds this threshold so authors notice unintended bloat at ingest time.
 const UNIVERSAL_BODY_SIZE_WARNING_BYTES: usize = 1024;
+
+/// Hard cap (bytes) on the total chunked-body size of a single universal file.
+///
+/// Exceeding this at ingest is a rejected error rather than a stderr advisory:
+/// universal bodies re-inject on every relevant tool call, so a 50KB universal
+/// file multiplied across 100 tool calls is a 5MB context-window liability.
+/// The cap is deliberately 8× the soft warning so authors get a warning band
+/// between "notice this" and "reject this".
+pub const UNIVERSAL_BODY_HARD_LIMIT_BYTES: usize = 8 * 1024;
+
+/// Enforce the per-file universal body-size cap. Returns an error naming the
+/// file, observed size, and the cap when any universal-tagged file exceeds
+/// [`UNIVERSAL_BODY_HARD_LIMIT_BYTES`]. Called from every ingest entry point
+/// before touching the database so rejection is atomic at the file level.
+pub(crate) fn enforce_universal_body_cap(rel_path: &str, chunks: &[Chunk]) -> anyhow::Result<()> {
+    let total: usize = chunks
+        .iter()
+        .filter(|c| c.is_universal)
+        .map(|c| c.body.len())
+        .sum();
+    if total > UNIVERSAL_BODY_HARD_LIMIT_BYTES {
+        anyhow::bail!(
+            "universal pattern `{rel_path}` body totals {total} bytes, over the \
+             {UNIVERSAL_BODY_HARD_LIMIT_BYTES}-byte per-file hard limit. \
+             Universal patterns re-inject on every relevant tool call — trim \
+             the body or remove the `universal` tag."
+        );
+    }
+    Ok(())
+}
 
 /// Per-file accounting for universal-pattern detection during ingest.
 ///
@@ -1182,10 +1241,15 @@ fn index_single_file(
         .to_string_lossy()
         .to_string();
 
+    let chunks = dispatch_chunking(strategy, &content, &rel_path);
+
+    // Enforce the per-file universal body-size hard cap before touching
+    // the database so a rejection leaves the existing index untouched.
+    enforce_universal_body_cap(&rel_path, &chunks)?;
+
     // Remove old chunks for this file.
     db.delete_by_source(&rel_path)?;
 
-    let chunks = dispatch_chunking(strategy, &content, &rel_path);
     let mut count = 0;
     let mut embedding_failures = 0;
 
@@ -1547,7 +1611,7 @@ mod tests {
             dir,
             "doc.md",
             "Brand new body that is long enough for a chunk.",
-            &["updated"],
+            Some(&["updated"]),
             None,
         )
         .unwrap();
@@ -1563,6 +1627,83 @@ mod tests {
         assert!(content.contains("tags: [updated]"));
         // Old body should be gone.
         assert!(!content.contains("Old body"));
+    }
+
+    #[test]
+    fn update_pattern_with_none_tags_preserves_existing_frontmatter_tags() {
+        // An agent that rewrites only the body through update_pattern must
+        // not silently strip the `universal` tag. The None branch preserves
+        // whatever was in the frontmatter.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("pinned.md"),
+            "---\ntags: [universal, workflow]\n---\n\n# Pinned\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "pinned.md",
+            "New body long enough for a chunk.",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.chunks_indexed >= 1);
+
+        let content = fs::read_to_string(dir.join("pinned.md")).unwrap();
+        assert!(
+            content.contains("tags: [universal, workflow]"),
+            "existing tags must be preserved; got:\n{content}"
+        );
+        assert!(content.contains("New body"));
+
+        // The DB flag also survives: universal_patterns() still returns it.
+        let universal = db.universal_patterns().unwrap();
+        assert!(
+            universal.iter().any(|p| p.source_file == "pinned.md"),
+            "is_universal must still be true after a None-tags update"
+        );
+    }
+
+    #[test]
+    fn update_pattern_with_empty_tags_clears_frontmatter_tags() {
+        // The explicit "clear all tags" path — distinguishes Some(&[]) from
+        // None so agents can opt into tag removal when they actually mean
+        // to.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("pinned.md"),
+            "---\ntags: [universal]\n---\n\n# Pinned\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "pinned.md",
+            "New body long enough.",
+            Some(&[]),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("pinned.md")).unwrap();
+        assert!(
+            !content.contains("tags:"),
+            "empty tags must remove the frontmatter block, got:\n{content}"
+        );
     }
 
     // -- append_to_pattern -------------------------------------------------
@@ -2037,7 +2178,7 @@ mod tests {
             dir,
             "doc.md",
             "Replacement body that is long enough.",
-            &[],
+            Some(&[]),
             Some("inbox/"),
         );
 
@@ -2116,7 +2257,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = update_pattern(&db, &embedder, dir, &rel, "new body", &[], None);
+        let result = update_pattern(&db, &embedder, dir, &rel, "new body", Some(&[]), None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

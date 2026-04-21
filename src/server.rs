@@ -231,7 +231,11 @@ fn tool_definitions() -> Value {
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional tags for categorisation"
+                        "description":
+                            "Optional tags for categorisation. Passing `\"universal\"` opts the \
+                             pattern into the always-on injection tier — its body is emitted at \
+                             every SessionStart and bypasses PreToolUse deduplication (see \
+                             docs/pattern-authoring-guide.md §\"When to use the universal tag\")."
                     },
                     "include_metadata": {
                         "type": "boolean",
@@ -268,7 +272,12 @@ fn tool_definitions() -> Value {
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional updated tags"
+                        "description":
+                            "Optional. Omit to preserve the existing frontmatter tags (including \
+                             `universal`). Pass an empty array `[]` to clear all tags. Pass a \
+                             non-empty array to replace the tag list wholesale; include \
+                             `\"universal\"` to keep or opt the pattern into the always-on \
+                             injection tier."
                     },
                     "include_metadata": {
                         "type": "boolean",
@@ -625,11 +634,17 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         return err;
     }
 
-    let tags: Vec<&str> = args
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    // `tags` has three semantics on update:
+    //   - key absent        → `None`, preserve existing frontmatter tags
+    //   - key present, []   → `Some(&[])`, clear all tags
+    //   - key present, [..] → `Some(&[..])`, replace wholesale
+    // Preserve-on-absent avoids the silent de-universalisation footgun
+    // where an agent rewrites the body without re-supplying `tags`.
+    let tags_owned: Option<Vec<&str>> = args.get("tags").map(|val| {
+        val.as_array()
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    });
 
     if let Some(err) = check_tags_limit(req, args) {
         return err;
@@ -652,7 +667,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         &ctx.config.knowledge_dir,
         source_file,
         body,
-        &tags,
+        tags_owned.as_deref(),
         ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
