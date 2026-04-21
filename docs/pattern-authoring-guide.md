@@ -230,6 +230,54 @@ handling" in every paragraph adds no search value.
 - Avoid generic tags such as "best-practice" or "convention" — they match too broadly
 - Tags are comma-separated in YAML: `tags: [rust, clippy, linting, code-quality]`
 
+## When to use the `universal` tag
+
+A pattern tagged `universal` opts into lore's always-on injection tier. Its full body is emitted at
+every `SessionStart` (and re-emitted at every `PostCompact`) under a dedicated
+`## Pinned
+conventions` section, AND it bypasses the `PreToolUse` dedup filter so it re-injects on
+every relevant tool call instead of being suppressed after the first appearance. The relevance gate
+stays intact — the pattern still has to match the agent's tool call to inject.
+
+The header in the SessionStart payload reads `## Pinned conventions` rather than
+`## Universal
+patterns` because that phrasing reads better as agent-facing copy. Both names refer to
+the same mechanism: the `tags:` value is `universal`; the section header is `## Pinned conventions`.
+
+**Use `universal` for patterns where:**
+
+- The pattern is a process-level convention (commit messages, push discipline, branch naming, PR
+  etiquette, code review process). These rules need continuous reinforcement throughout a session,
+  not one-shot relevance.
+- One reminder is not enough. The motivating example was a `git push` failure mid-session because
+  dedup had correctly suppressed the workflow pattern after its first appearance hours earlier.
+- The body is small enough to justify per-call re-injection. A 2 KB universal pattern matched 50
+  times in a session adds 100 KB of repeated context. Lore emits a per-pattern advisory at ingest
+  time when any single universal body exceeds 1 KB.
+
+**Do not use `universal` for:**
+
+- Code-style conventions whose authority is naturally scoped to specific file types or tool calls
+  (Rust naming, TypeScript imports). The PreToolUse hook surfaces these correctly without the
+  always-on cost.
+- Reference material the agent reads once at the top of a session and remembers (terminology,
+  architecture overviews). The standard pattern index handles these.
+- Long-form documentation. Universal bodies should be short and directive. If your pattern needs
+  more than ~1 KB to express, split it.
+
+**Operational notes:**
+
+- Keep the count low. Lore emits a stderr advisory when more than three patterns are tagged
+  `universal` so authors notice the count growing past intent.
+- Tag changes take effect at the next `lore ingest`. Both adding and removing the tag work the same
+  way — re-ingest the file (delta or single-file) and the next session reflects the new state.
+- The tag is case-sensitive: `universal` is the only form that opts in. Lore emits a near-miss
+  advisory at ingest if it sees `Universal`, `UNIVERSAL`, or any other case-shifted variant in a
+  pattern's tag list.
+- Universal patterns are exempt from the coverage-check skill's discoverability scoring (they bypass
+  the channel coverage-check measures), but the report marks them so authors do not pointlessly
+  chase low coverage scores on a pattern that always re-injects.
+
 ## File Structure and Grouping
 
 Lore splits each markdown file into chunks by heading and indexes them separately. However, when any

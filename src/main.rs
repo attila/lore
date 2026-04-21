@@ -314,7 +314,15 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     );
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    // `lore ingest --force` (without `--file`) is the documented remedy when
+    // the schema-compatibility probe bails. It drops and recreates the
+    // tables via `clear_all`, so the probe must not run first — otherwise
+    // the very advisory it emits would never be actionable.
+    let db = if should_skip_schema_probe(force, file) {
+        KnowledgeDB::open_skipping_schema_check(&config.database, ollama.dimensions())?
+    } else {
+        KnowledgeDB::open(&config.database, ollama.dimensions())?
+    };
     db.init()?;
 
     let on_progress = &|msg: &str| {
@@ -334,6 +342,13 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     );
 
     print_ingest_summary(&result);
+
+    // Persist the universal-pattern advisories so the `lore_status` MCP tool
+    // can surface them to agents (who don't see stderr). Failure here is a
+    // cosmetic issue, never a reason to fail the ingest.
+    if let Err(e) = ingest::persist_universal_advisories(&db, &result) {
+        lore_debug!("failed to persist universal advisories: {e}");
+    }
 
     if !result.errors.is_empty() {
         eprintln!("Errors: {}", result.errors.len());
@@ -451,6 +466,46 @@ fn print_ingest_summary(result: &ingest::IngestResult) {
             }
         }
     }
+
+    print_universal_advisories(result);
+}
+
+/// Emit the always-on `Universal patterns: N` summary line plus the three
+/// optional advisories (>3 patterns, oversized body, near-miss spelling).
+///
+/// Suppressed for single-file ingest failures so stderr does not interleave
+/// "Universal patterns: 0" with the error list.
+fn print_universal_advisories(result: &ingest::IngestResult) {
+    if matches!(result.mode, ingest::IngestMode::SingleFile { .. }) && !result.errors.is_empty() {
+        return;
+    }
+
+    eprintln!("Universal patterns: {}", result.universal_sources.len());
+
+    if result.universal_sources.len() > 3 {
+        eprintln!(
+            "Note: {} patterns tagged `universal`. Consider whether all of them need always-on visibility:",
+            result.universal_sources.len()
+        );
+        for source in &result.universal_sources {
+            eprintln!("  - {}", hook::sanitize_for_log(source));
+        }
+    }
+
+    for source in &result.oversized_universal_bodies {
+        eprintln!(
+            "Note: universal pattern `{}` has a body larger than 1KB. \
+             Universal patterns re-inject on every relevant tool call; consider trimming.",
+            hook::sanitize_for_log(source),
+        );
+    }
+
+    for entry in &result.near_miss_universal_tags {
+        eprintln!(
+            "Note: tag `{}` looks like a misspelling of `universal` (case-sensitive exact match required).",
+            hook::sanitize_for_log(entry),
+        );
+    }
 }
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
@@ -516,6 +571,23 @@ fn cmd_search(
     }
 
     Ok(())
+}
+
+/// Decide whether `cmd_ingest` should bypass the schema-compatibility probe.
+///
+/// Only `--force` without `--file` rebuilds the schema (via `clear_all` →
+/// drop-and-recreate); that's the single path where the probe's advisory
+/// would be strictly counter-productive. Every other combination — plain
+/// delta ingest, single-file ingest with or without `--force` overriding
+/// `.loreignore` — must still honour the probe so users with an old schema
+/// get the friendly "run `lore ingest --force`" error instead of a
+/// `no such column` stacktrace.
+///
+/// Extracted as a testable helper because the four-cell truth table is
+/// load-bearing for the upgrade UX: flipping any cell silently would leave
+/// a class of user unable to reach the remedy.
+fn should_skip_schema_probe(force: bool, file: Option<&Path>) -> bool {
+    force && file.is_none()
 }
 
 /// Find the largest byte index at or before `index` that is a valid UTF-8
@@ -619,10 +691,11 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&patterns)?);
     } else {
         for p in &patterns {
+            let universal_suffix = if p.is_universal { " [universal]" } else { "" };
             if p.tags.is_empty() {
-                println!("{}", p.title);
+                println!("{}{universal_suffix}", p.title);
             } else {
-                println!("{} [{}]", p.title, p.tags);
+                println!("{} [{}]{universal_suffix}", p.title, p.tags);
             }
         }
     }
@@ -685,4 +758,42 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- should_skip_schema_probe -------------------------------------------
+
+    #[test]
+    fn skip_probe_true_for_force_without_file() {
+        // The one cell where the probe must step aside: `lore ingest --force`
+        // drops and recreates the schema, so the probe would block its own
+        // advisory from landing.
+        assert!(should_skip_schema_probe(true, None));
+    }
+
+    #[test]
+    fn skip_probe_false_for_force_with_file() {
+        // Single-file ingest — even with `--force` overriding `.loreignore` —
+        // does NOT rebuild the schema. Skipping the probe here would let an
+        // old-schema DB reach `insert_chunk` and fail with the confusing
+        // `no such column` error.
+        let path = Path::new("draft.md");
+        assert!(!should_skip_schema_probe(true, Some(path)));
+    }
+
+    #[test]
+    fn skip_probe_false_for_delta_ingest() {
+        // Plain `lore ingest` is delta mode; never rebuilds schema.
+        assert!(!should_skip_schema_probe(false, None));
+    }
+
+    #[test]
+    fn skip_probe_false_for_single_file_ingest() {
+        // `lore ingest --file path` without `--force`; orthogonal to schema.
+        let path = Path::new("draft.md");
+        assert!(!should_skip_schema_probe(false, Some(path)));
+    }
 }

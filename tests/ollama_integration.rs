@@ -246,7 +246,7 @@ fn ollama_lifecycle() {
         "Use OpenTelemetry for all telemetry collection.\n\
          Export metrics via Prometheus endpoints.\n\
          Never use println for diagnostic output in production.\n",
-        &["observability", "production"],
+        Some(&["observability", "production"]),
         None,
     )
     .unwrap();

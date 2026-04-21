@@ -41,15 +41,59 @@ pub(crate) const META_LAST_COMMIT: &str = "last_ingested_commit";
 /// Key used to store the FNV-1a content hash of `.loreignore` so the next
 /// ingest can detect when the ignore list has changed.
 const META_LOREIGNORE_HASH: &str = "loreignore_hash";
+/// Key used to stash the last ingest's universal-pattern advisories
+/// (count summary, >3 warning, oversized-body flags, near-miss tags). The
+/// MCP `lore_status` tool surfaces these to agents that can't see stderr.
+pub(crate) const META_UNIVERSAL_ADVISORIES: &str = "universal_advisories";
+
+/// Persist the universal-pattern advisories from a completed ingest so the
+/// MCP `lore_status` tool can surface them to agents. The value is a JSON
+/// object with fields `universal_count`, `universal_sources`,
+/// `oversized_bodies`, `near_miss_tags`, `count_warning`,
+/// `body_size_hard_limit_bytes`, and `body_size_warning_threshold_bytes`.
+///
+/// Only overwrites when the ingest touched any universal-related field.
+/// A delta ingest that touches no universal-tagged files leaves the last
+/// persisted summary intact — otherwise every non-universal-touching delta
+/// would zero the advisory payload and agents would see a stale-looking
+/// "Universal patterns: 0" after routine edits.
+pub fn persist_universal_advisories(db: &KnowledgeDB, result: &IngestResult) -> anyhow::Result<()> {
+    if !matches!(
+        result.mode,
+        IngestMode::Full | IngestMode::SingleFile { .. }
+    ) && result.universal_sources.is_empty()
+        && result.oversized_universal_bodies.is_empty()
+        && result.near_miss_universal_tags.is_empty()
+    {
+        return Ok(());
+    }
+    let payload = universal_advisories_json(result);
+    db.set_metadata(META_UNIVERSAL_ADVISORIES, &payload.to_string())
+}
+
+/// Build the structured JSON document persisted under
+/// [`META_UNIVERSAL_ADVISORIES`] and returned verbatim by `lore_status`.
+fn universal_advisories_json(result: &IngestResult) -> serde_json::Value {
+    serde_json::json!({
+        "universal_count": result.universal_sources.len(),
+        "universal_sources": result.universal_sources,
+        "oversized_bodies": result.oversized_universal_bodies,
+        "near_miss_tags": result.near_miss_universal_tags,
+        "count_warning": result.universal_sources.len() > 3,
+        "body_size_hard_limit_bytes": UNIVERSAL_BODY_HARD_LIMIT_BYTES,
+        "body_size_warning_threshold_bytes": UNIVERSAL_BODY_SIZE_WARNING_BYTES,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
 /// Whether the ingest ran in full, delta, or single-file mode.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub enum IngestMode {
     /// Full re-index (cleared database and re-embedded everything).
+    #[default]
     Full,
     /// Delta update — only changed files were processed.
     Delta {
@@ -65,7 +109,7 @@ pub enum IngestMode {
 }
 
 /// Summary returned after a directory ingest.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IngestResult {
     pub mode: IngestMode,
     pub files_processed: usize,
@@ -78,6 +122,31 @@ pub struct IngestResult {
     /// from the database.
     pub reconciled_added: usize,
     pub errors: Vec<String>,
+    /// Distinct source files that ingested at least one chunk tagged
+    /// `universal` in this run. Drives the always-on `Universal patterns: N`
+    /// summary line and the >3 advisory.
+    pub universal_sources: Vec<String>,
+    /// Universal-tagged chunks whose body exceeded the body-size advisory
+    /// threshold (currently 1024 bytes). Each entry is the source file path.
+    /// Drives the per-pattern body-size advisory at ingest time.
+    pub oversized_universal_bodies: Vec<String>,
+    /// Tag values whose lowercased form equals `universal` but whose exact
+    /// form does not (e.g. `Universal`, `UNIVERSAL`). Each entry is
+    /// `<source_file>: <tag>`. Drives the near-miss spelling advisory.
+    pub near_miss_universal_tags: Vec<String>,
+}
+
+impl IngestResult {
+    /// Construct an empty `IngestResult` carrying `mode` with every other
+    /// field at its default (zero counters, empty vectors). Every ingest
+    /// entry point uses this as its starting point; callers then mutate as
+    /// work progresses.
+    pub fn with_mode(mode: IngestMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
 }
 
 /// Outcome of the git step in a write operation.
@@ -215,14 +284,12 @@ pub fn ingest(
                 reconcile_errors.push(format!("Failed to record commit SHA: {e}"));
             }
         }
-        return IngestResult {
-            mode: IngestMode::Delta { unchanged: 0 },
-            files_processed: 0,
-            chunks_created: reconcile_chunks,
-            reconciled_removed,
-            reconciled_added,
-            errors: reconcile_errors,
-        };
+        let mut result = IngestResult::with_mode(IngestMode::Delta { unchanged: 0 });
+        result.chunks_created = reconcile_chunks;
+        result.reconciled_removed = reconciled_removed;
+        result.reconciled_added = reconciled_added;
+        result.errors = reconcile_errors;
+        return result;
     }
 
     let mut result = delta_ingest(
@@ -360,10 +427,13 @@ fn reconcile_ignored(
             continue;
         }
         match index_single_file(db, embedder, knowledge_dir, &full_path, strategy) {
-            Ok((chunks, _)) => {
+            Ok(indexed) => {
                 stats.added += 1;
-                stats.chunks_added += chunks;
-                lore_debug!("loreignore: reconciled {rel_path} (re-indexed, {chunks} chunks)");
+                stats.chunks_added += indexed.chunks_indexed;
+                lore_debug!(
+                    "loreignore: reconciled {rel_path} (re-indexed, {} chunks)",
+                    indexed.chunks_indexed
+                );
                 on_progress(&format!("  {rel_path} (reconciled — re-indexed)"));
             }
             Err(e) => {
@@ -412,14 +482,7 @@ fn delta_ingest(
 
     on_progress(&format!("Delta ingest: {} file(s) changed", changes.len()));
 
-    let mut result = IngestResult {
-        mode: IngestMode::Delta { unchanged },
-        files_processed: 0,
-        chunks_created: 0,
-        reconciled_removed: 0,
-        reconciled_added: 0,
-        errors: Vec::new(),
-    };
+    let mut result = IngestResult::with_mode(IngestMode::Delta { unchanged });
 
     for change in changes {
         let processed = process_change(
@@ -471,9 +534,10 @@ fn process_change(
             }
             let file_path = knowledge_dir.join(path);
             match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
-                Ok((chunks, _)) => {
-                    result.chunks_created += chunks;
-                    on_progress(&format!("  {path} → {chunks} chunks"));
+                Ok(indexed) => {
+                    result.chunks_created += indexed.chunks_indexed;
+                    fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
+                    on_progress(&format!("  {path} → {} chunks", indexed.chunks_indexed));
                 }
                 Err(e) => {
                     result.errors.push(format!("Failed to index {path}: {e}"));
@@ -508,9 +572,13 @@ fn process_change(
             }
             let file_path = knowledge_dir.join(to);
             match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
-                Ok((chunks, _)) => {
-                    result.chunks_created += chunks;
-                    on_progress(&format!("  {from} → {to} ({chunks} chunks)"));
+                Ok(indexed) => {
+                    result.chunks_created += indexed.chunks_indexed;
+                    fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
+                    on_progress(&format!(
+                        "  {from} → {to} ({} chunks)",
+                        indexed.chunks_indexed
+                    ));
                 }
                 Err(e) => {
                     result.errors.push(format!("Failed to index {to}: {e}"));
@@ -598,14 +666,7 @@ pub fn full_ingest(
     strategy: &str,
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
-    let mut result = IngestResult {
-        mode: IngestMode::Full,
-        files_processed: 0,
-        chunks_created: 0,
-        reconciled_removed: 0,
-        reconciled_added: 0,
-        errors: Vec::new(),
-    };
+    let mut result = IngestResult::with_mode(IngestMode::Full);
 
     // Single read of .loreignore: matcher and hash come from the same bytes.
     let loaded_ignore = loreignore::load(knowledge_dir);
@@ -646,6 +707,14 @@ pub fn full_ingest(
 
         let chunks = dispatch_chunking(strategy, &content, &rel_path);
 
+        // Enforce the per-file universal body-size hard cap before insert.
+        // Per-file atomic rejection: a too-large universal file is skipped
+        // entirely rather than leaving some chunks indexed.
+        if let Err(e) = enforce_universal_body_cap(&rel_path, &chunks) {
+            result.errors.push(e.to_string());
+            continue;
+        }
+
         for chunk in &chunks {
             let embedding = match embedder.embed(&embed_text(chunk)) {
                 Ok(emb) => Some(emb),
@@ -665,6 +734,9 @@ pub fn full_ingest(
                 result.chunks_created += 1;
             }
         }
+
+        let universal_metadata = detect_universal_metadata(&content, &chunks);
+        fold_universal_metadata(&mut result, &rel_path, &universal_metadata);
 
         result.files_processed += 1;
         on_progress(&format!("  {} → {} chunks", rel_path, chunks.len()));
@@ -720,16 +792,9 @@ pub fn ingest_single_file(
     // Seed the mode with the caller-supplied path so that early-return error
     // branches (before rel_path is computed) still carry a meaningful path
     // for downstream consumers that pattern-match on IngestMode::SingleFile.
-    let mut result = IngestResult {
-        mode: IngestMode::SingleFile {
-            path: file_path.to_string_lossy().into_owned(),
-        },
-        files_processed: 0,
-        chunks_created: 0,
-        reconciled_removed: 0,
-        reconciled_added: 0,
-        errors: Vec::new(),
-    };
+    let mut result = IngestResult::with_mode(IngestMode::SingleFile {
+        path: file_path.to_string_lossy().into_owned(),
+    });
 
     // Canonicalise the file path. This also implicitly checks that it exists
     // and is accessible. Include the current working directory in the error
@@ -769,7 +834,8 @@ pub fn ingest_single_file(
 
     // Ensure the file lies inside the knowledge directory. Uses the same
     // guard as add_pattern / update_pattern so path-traversal protection is
-    // uniform across write paths.
+    // uniform across write paths. The returned canonical path is the same
+    // value we already have, so we ignore it here.
     if let Err(e) = validate_within_dir(knowledge_dir, &canonical) {
         result.errors.push(e.to_string());
         return result;
@@ -811,15 +877,17 @@ pub fn ingest_single_file(
     on_progress(&format!("Single-file ingest: {rel_path}"));
 
     match index_single_file(db, embedder, &canonical_dir, &canonical, strategy) {
-        Ok((chunks, embedding_failures)) => {
+        Ok(indexed) => {
             result.files_processed = 1;
-            result.chunks_created = chunks;
-            if embedding_failures > 0 {
+            result.chunks_created = indexed.chunks_indexed;
+            if indexed.embedding_failures > 0 {
                 result.errors.push(format!(
-                    "{embedding_failures} embedding failure(s) while indexing {rel_path}"
+                    "{} embedding failure(s) while indexing {rel_path}",
+                    indexed.embedding_failures
                 ));
             }
-            on_progress(&format!("  {rel_path} → {chunks} chunks"));
+            fold_universal_metadata(&mut result, &indexed.rel_path, &indexed.universal_metadata);
+            on_progress(&format!("  {rel_path} → {} chunks", indexed.chunks_indexed));
         }
         Err(e) => {
             result
@@ -888,8 +956,11 @@ pub fn add_pattern(
 
     std::fs::write(&file_path, &content)?;
 
-    let (chunks, embedding_failures) =
-        index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let IndexedFile {
+        chunks_indexed: chunks,
+        embedding_failures,
+        ..
+    } = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -910,13 +981,20 @@ pub fn add_pattern(
 /// When `inbox_branch_prefix` is `Some`, the modification is committed to a
 /// per-submission branch and pushed. The file must exist on the working tree
 /// (trunk) — inbox-only files are not supported.
+///
+/// `tags` has three cases:
+/// - `None` — preserve the existing frontmatter tags. This is the default
+///   path for agents that rewrite only the body and would otherwise silently
+///   drop every tag (including `universal`, de-universalising the pattern).
+/// - `Some(&[])` — explicitly clear all tags.
+/// - `Some(&[...])` — replace the tag list wholesale.
 pub fn update_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     knowledge_dir: &Path,
     source_file: &str,
     body: &str,
-    tags: &[&str],
+    tags: Option<&[&str]>,
     inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     let file_path = knowledge_dir.join(source_file);
@@ -925,12 +1003,29 @@ pub fn update_pattern(
         anyhow::bail!("File not found: {source_file}");
     }
 
-    validate_within_dir(knowledge_dir, &file_path)?;
+    // Use the canonical path returned by validation for every subsequent
+    // read and write so an attacker cannot race a symlink swap between the
+    // containment check and file access.
+    let canonical = validate_within_dir(knowledge_dir, &file_path)?;
 
-    let title = extract_title(&std::fs::read_to_string(&file_path)?)
-        .unwrap_or_else(|| file_stem(source_file));
+    let existing = std::fs::read_to_string(&canonical)?;
+    let title = extract_title(&existing).unwrap_or_else(|| file_stem(source_file));
 
-    let content = build_file_content(&title, body, tags);
+    // Preserve-on-`None` resolves the subtle footgun where an agent rewrites
+    // the body through `update_pattern` but forgets to pass `tags`, which
+    // previously silently cleared every tag — including `universal`, which
+    // would de-universalise a pinned pattern without any signal.
+    let preserved: Vec<String>;
+    let preserved_refs: Vec<&str>;
+    let tags_to_apply: &[&str] = if let Some(t) = tags {
+        t
+    } else {
+        preserved = crate::chunking::parse_frontmatter_tag_list(&existing);
+        preserved_refs = preserved.iter().map(String::as_str).collect();
+        &preserved_refs
+    };
+
+    let content = build_file_content(&title, body, tags_to_apply);
 
     if let Some(prefix) = inbox_branch_prefix {
         let slug = file_stem(source_file);
@@ -952,10 +1047,13 @@ pub fn update_pattern(
         });
     }
 
-    std::fs::write(&file_path, &content)?;
+    std::fs::write(&canonical, &content)?;
 
-    let (chunks, embedding_failures) =
-        index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let IndexedFile {
+        chunks_indexed: chunks,
+        embedding_failures,
+        ..
+    } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -991,9 +1089,12 @@ pub fn append_to_pattern(
         anyhow::bail!("File not found: {source_file}");
     }
 
-    validate_within_dir(knowledge_dir, &file_path)?;
+    // Use the canonical path returned by validation for every subsequent
+    // read and write so an attacker cannot race a symlink swap between the
+    // containment check and file access.
+    let canonical = validate_within_dir(knowledge_dir, &file_path)?;
 
-    let existing = std::fs::read_to_string(&file_path)?;
+    let existing = std::fs::read_to_string(&canonical)?;
     let title = extract_title(&existing).unwrap_or_else(|| file_stem(source_file));
 
     let mut content = existing;
@@ -1024,10 +1125,13 @@ pub fn append_to_pattern(
         });
     }
 
-    std::fs::write(&file_path, &content)?;
+    std::fs::write(&canonical, &content)?;
 
-    let (chunks, embedding_failures) =
-        index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let IndexedFile {
+        chunks_indexed: chunks,
+        embedding_failures,
+        ..
+    } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1044,22 +1148,130 @@ pub fn append_to_pattern(
 }
 
 // ---------------------------------------------------------------------------
+// Universal-pattern detection at ingest
+// ---------------------------------------------------------------------------
+
+/// Soft threshold (bytes) for the per-pattern universal-body advisory.
+///
+/// Universal patterns re-inject on every relevant `PreToolUse` call, so a large
+/// body compounds quickly: a 2KB body matched 50 times in a session costs
+/// 100KB of repeated context. The advisory fires per-pattern when the body
+/// exceeds this threshold so authors notice unintended bloat at ingest time.
+const UNIVERSAL_BODY_SIZE_WARNING_BYTES: usize = 1024;
+
+/// Hard cap (bytes) on the total chunked-body size of a single universal file.
+///
+/// Exceeding this at ingest is a rejected error rather than a stderr advisory:
+/// universal bodies re-inject on every relevant tool call, so a 50KB universal
+/// file multiplied across 100 tool calls is a 5MB context-window liability.
+/// The cap is deliberately 8× the soft warning so authors get a warning band
+/// between "notice this" and "reject this".
+pub const UNIVERSAL_BODY_HARD_LIMIT_BYTES: usize = 8 * 1024;
+
+/// Enforce the per-file universal body-size cap. Returns an error naming the
+/// file, observed size, and the cap when any universal-tagged file exceeds
+/// [`UNIVERSAL_BODY_HARD_LIMIT_BYTES`]. Called from every ingest entry point
+/// before touching the database so rejection is atomic at the file level.
+pub(crate) fn enforce_universal_body_cap(rel_path: &str, chunks: &[Chunk]) -> anyhow::Result<()> {
+    let total: usize = chunks
+        .iter()
+        .filter(|c| c.is_universal)
+        .map(|c| c.body.len())
+        .sum();
+    if total > UNIVERSAL_BODY_HARD_LIMIT_BYTES {
+        anyhow::bail!(
+            "universal pattern `{rel_path}` body totals {total} bytes, over the \
+             {UNIVERSAL_BODY_HARD_LIMIT_BYTES}-byte per-file hard limit. \
+             Universal patterns re-inject on every relevant tool call — trim \
+             the body or remove the `universal` tag."
+        );
+    }
+    Ok(())
+}
+
+/// Per-file accounting for universal-pattern detection during ingest.
+///
+/// Folded into `IngestResult` by every ingest path (full / delta / single-file)
+/// so the summary line, the >3 advisory, the body-size advisory, and the
+/// near-miss-tag advisory all see the same data shape.
+#[derive(Debug, Default)]
+struct UniversalMetadata {
+    /// `true` when at least one inserted chunk carries `is_universal = true`.
+    is_universal_source: bool,
+    /// `true` when at least one universal chunk's body exceeds the warning
+    /// threshold. Populated only when `is_universal_source` is also `true`.
+    body_oversized: bool,
+    /// Frontmatter tag values whose lowercased form equals `universal` but
+    /// whose exact form does not.
+    near_miss_tags: Vec<String>,
+}
+
+/// Inspect a file's frontmatter and chunks to derive the universal-pattern
+/// metadata for this ingest. Pure — no I/O.
+fn detect_universal_metadata(content: &str, chunks: &[Chunk]) -> UniversalMetadata {
+    let universal_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.is_universal).collect();
+
+    UniversalMetadata {
+        is_universal_source: !universal_chunks.is_empty(),
+        body_oversized: universal_chunks
+            .iter()
+            .any(|c| c.body.len() > UNIVERSAL_BODY_SIZE_WARNING_BYTES),
+        near_miss_tags: crate::chunking::frontmatter_near_miss_tags(content, "universal"),
+    }
+}
+
+/// Fold the per-file metadata into the running `IngestResult`. Deduplicates
+/// universal-source paths and oversized-body paths so each file appears at
+/// most once in each list, regardless of how many chunks it produced.
+fn fold_universal_metadata(
+    result: &mut IngestResult,
+    rel_path: &str,
+    metadata: &UniversalMetadata,
+) {
+    if metadata.is_universal_source && !result.universal_sources.iter().any(|s| s == rel_path) {
+        result.universal_sources.push(rel_path.to_string());
+    }
+    if metadata.body_oversized
+        && !result
+            .oversized_universal_bodies
+            .iter()
+            .any(|s| s == rel_path)
+    {
+        result.oversized_universal_bodies.push(rel_path.to_string());
+    }
+    for tag in &metadata.near_miss_tags {
+        let entry = format!("{rel_path}: {tag}");
+        if !result.near_miss_universal_tags.contains(&entry) {
+            result.near_miss_universal_tags.push(entry);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Per-file outcome of [`index_single_file`]. Carries enough information for
+/// the calling ingest path to fold both chunk-count and universal-metadata
+/// state into its `IngestResult`.
+struct IndexedFile {
+    chunks_indexed: usize,
+    embedding_failures: usize,
+    rel_path: String,
+    universal_metadata: UniversalMetadata,
+}
 
 /// Index (or re-index) a single file: delete old chunks, chunk, embed, insert.
 ///
 /// The `strategy` parameter selects the chunking approach (`"heading"` or
 /// `"document"`).
-///
-/// Returns `(chunks_indexed, embedding_failures)`.
 fn index_single_file(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     knowledge_dir: &Path,
     file_path: &Path,
     strategy: &str,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<IndexedFile> {
     let content = std::fs::read_to_string(file_path)?;
     let rel_path = file_path
         .strip_prefix(knowledge_dir)
@@ -1067,10 +1279,15 @@ fn index_single_file(
         .to_string_lossy()
         .to_string();
 
+    let chunks = dispatch_chunking(strategy, &content, &rel_path);
+
+    // Enforce the per-file universal body-size hard cap before touching
+    // the database so a rejection leaves the existing index untouched.
+    enforce_universal_body_cap(&rel_path, &chunks)?;
+
     // Remove old chunks for this file.
     db.delete_by_source(&rel_path)?;
 
-    let chunks = dispatch_chunking(strategy, &content, &rel_path);
     let mut count = 0;
     let mut embedding_failures = 0;
 
@@ -1085,14 +1302,28 @@ fn index_single_file(
         count += 1;
     }
 
-    Ok((count, embedding_failures))
+    let universal_metadata = detect_universal_metadata(&content, &chunks);
+
+    Ok(IndexedFile {
+        chunks_indexed: count,
+        embedding_failures,
+        rel_path,
+        universal_metadata,
+    })
 }
 
-/// Validate that `file_path` lies within `knowledge_dir` after canonicalization.
+/// Validate that `file_path` lies within `knowledge_dir` after canonicalisation
+/// and return the canonical form of `file_path`.
 ///
 /// This prevents path traversal attacks where a `source_file` like
-/// `../../../etc/passwd` could escape the knowledge directory.
-fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> anyhow::Result<()> {
+/// `../../../etc/passwd` could escape the knowledge directory. Callers must
+/// use the returned canonical `PathBuf` for subsequent reads and writes —
+/// reading from the pre-canonical input re-opens the TOCTOU window between
+/// validation and access (a symlink could be swapped in between).
+pub(crate) fn validate_within_dir(
+    knowledge_dir: &Path,
+    file_path: &Path,
+) -> anyhow::Result<PathBuf> {
     let canon_dir = knowledge_dir.canonicalize()?;
     let canon_file = file_path.canonicalize()?;
     if !canon_file.starts_with(&canon_dir) {
@@ -1101,7 +1332,7 @@ fn validate_within_dir(knowledge_dir: &Path, file_path: &Path) -> anyhow::Result
             file_path.display()
         );
     }
-    Ok(())
+    Ok(canon_file)
 }
 
 /// Validate that a slug-derived filename does not contain path traversal components.
@@ -1218,6 +1449,7 @@ mod tests {
             tags: "rust, anyhow".into(),
             source_file: "errors.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         assert_eq!(
             embed_text(&chunk),
@@ -1234,6 +1466,7 @@ mod tests {
             tags: String::new(),
             source_file: "test.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         assert_eq!(embed_text(&chunk), "Title\n\nBody");
     }
@@ -1416,7 +1649,7 @@ mod tests {
             dir,
             "doc.md",
             "Brand new body that is long enough for a chunk.",
-            &["updated"],
+            Some(&["updated"]),
             None,
         )
         .unwrap();
@@ -1432,6 +1665,83 @@ mod tests {
         assert!(content.contains("tags: [updated]"));
         // Old body should be gone.
         assert!(!content.contains("Old body"));
+    }
+
+    #[test]
+    fn update_pattern_with_none_tags_preserves_existing_frontmatter_tags() {
+        // An agent that rewrites only the body through update_pattern must
+        // not silently strip the `universal` tag. The None branch preserves
+        // whatever was in the frontmatter.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("pinned.md"),
+            "---\ntags: [universal, workflow]\n---\n\n# Pinned\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "pinned.md",
+            "New body long enough for a chunk.",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.chunks_indexed >= 1);
+
+        let content = fs::read_to_string(dir.join("pinned.md")).unwrap();
+        assert!(
+            content.contains("tags: [universal, workflow]"),
+            "existing tags must be preserved; got:\n{content}"
+        );
+        assert!(content.contains("New body"));
+
+        // The DB flag also survives: universal_patterns() still returns it.
+        let universal = db.universal_patterns().unwrap();
+        assert!(
+            universal.iter().any(|p| p.source_file == "pinned.md"),
+            "is_universal must still be true after a None-tags update"
+        );
+    }
+
+    #[test]
+    fn update_pattern_with_empty_tags_clears_frontmatter_tags() {
+        // The explicit "clear all tags" path — distinguishes Some(&[]) from
+        // None so agents can opt into tag removal when they actually mean
+        // to.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("pinned.md"),
+            "---\ntags: [universal]\n---\n\n# Pinned\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "pinned.md",
+            "New body long enough.",
+            Some(&[]),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("pinned.md")).unwrap();
+        assert!(
+            !content.contains("tags:"),
+            "empty tags must remove the frontmatter block, got:\n{content}"
+        );
     }
 
     // -- append_to_pattern -------------------------------------------------
@@ -1487,17 +1797,20 @@ mod tests {
         let db_doc = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let (heading_count, _) = index_single_file(
+        let heading_count = index_single_file(
             &db_heading,
             &embedder,
             dir,
             &dir.join("multi.md"),
             "heading",
         )
-        .unwrap();
+        .unwrap()
+        .chunks_indexed;
 
-        let (doc_count, _) =
-            index_single_file(&db_doc, &embedder, dir, &dir.join("multi.md"), "document").unwrap();
+        let doc_count =
+            index_single_file(&db_doc, &embedder, dir, &dir.join("multi.md"), "document")
+                .unwrap()
+                .chunks_indexed;
 
         // heading strategy should produce more chunks than document strategy.
         assert!(
@@ -1903,7 +2216,7 @@ mod tests {
             dir,
             "doc.md",
             "Replacement body that is long enough.",
-            &[],
+            Some(&[]),
             Some("inbox/"),
         );
 
@@ -1982,7 +2295,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = update_pattern(&db, &embedder, dir, &rel, "new body", &[], None);
+        let result = update_pattern(&db, &embedder, dir, &rel, "new body", Some(&[]), None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

@@ -167,19 +167,98 @@ fn handle_pre_tool_use(
 
     lore_debug!("extracted query: {query}");
 
-    let results = search_with_threshold(db, embedder, config, &query)?;
+    let seeds = search_with_threshold(db, embedder, config, &query)?;
 
-    if results.is_empty() {
+    if seeds.is_empty() {
         lore_debug!("search returned no results");
         return Ok(None);
     }
 
-    // Expand: fetch all sibling chunks from matched source files.
-    // If Error Handling matched, also inject Functions, Naming, etc. from the
-    // same document.
+    let seed_universal = seeds.iter().filter(|r| r.is_universal).count();
+
+    // Sibling expansion is a single DB call — `is_universal` is a file-level
+    // tag stored on every chunk row, so expanding the combined seed list
+    // still yields universal-only siblings for universal seeds and
+    // non-universal siblings for non-universal seeds.
+    let expanded = expand_to_siblings(db, &seeds);
+    lore_debug!(
+        "expand: {} seeds -> {} after sibling expansion ({} universal seeds)",
+        seeds.len(),
+        expanded.len(),
+        seed_universal,
+    );
+
+    // Route the full set through dedup. `dedup_filter_and_record` bypasses
+    // the `seen.contains` check for universal chunks (read-side filter) and
+    // still appends every surfaced chunk to the dedup file (write side).
+    // The dedup file therefore remains a faithful "what was injected this
+    // session" log — defensive consistency per the session-dedup-lifecycle
+    // learning.
+    let dedup_path = session_dedup_path(input);
+    let combined = if let Some(ref path) = dedup_path
+        && path.exists()
+    {
+        let pre_count = expanded.len();
+        match dedup_filter_and_record(path, &expanded) {
+            Ok(filtered) => {
+                let kept_universal = filtered.iter().filter(|r| r.is_universal).count();
+                lore_debug!(
+                    "dedup: {} before -> {} after ({} universal kept by read-bypass) ({})",
+                    pre_count,
+                    filtered.len(),
+                    kept_universal,
+                    path.display()
+                );
+                filtered
+            }
+            Err(e) => {
+                eprintln!("lore hook: dedup filter error: {e}");
+                lore_debug!("dedup filter error (continuing without dedup): {e}");
+                expanded
+            }
+        }
+    } else {
+        lore_debug!("dedup inactive (no session file)");
+        expanded
+    };
+
+    if combined.is_empty() {
+        lore_debug!("nothing to inject after expansion + dedup");
+        return Ok(None);
+    }
+
+    let kept_universal = combined.iter().filter(|r| r.is_universal).count();
+    let kept_ranked = combined.len() - kept_universal;
+    let sources: HashSet<&str> = combined.iter().map(|r| r.source_file.as_str()).collect();
+    lore_debug!(
+        "injecting {} chunks ({} universal + {} ranked) from {} sources",
+        combined.len(),
+        kept_universal,
+        kept_ranked,
+        sources.len()
+    );
+
+    let context = format_imperative(&combined);
+
+    Ok(Some(HookOutput::HookSpecific {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            additional_context: context,
+        },
+    }))
+}
+
+/// Expand a result slice to include all sibling chunks from the matched
+/// source files (e.g. if Error Handling matched, also inject Functions and
+/// Naming from the same document). Falls back to the original slice when
+/// the database query fails.
+fn expand_to_siblings(db: &KnowledgeDB, seeds: &[SearchResult]) -> Vec<SearchResult> {
+    if seeds.is_empty() {
+        return Vec::new();
+    }
     let source_files: Vec<&str> = {
         let mut seen = HashSet::new();
-        results
+        seeds
             .iter()
             .filter_map(|r| {
                 if seen.insert(r.source_file.as_str()) {
@@ -190,65 +269,8 @@ fn handle_pre_tool_use(
             })
             .collect()
     };
-
-    lore_debug!("expanding {} source files", source_files.len());
-    let results = db.chunks_by_sources(&source_files).unwrap_or(results);
-
-    if results.is_empty() {
-        return Ok(None);
-    }
-
-    // Dedup: filter out already-injected chunk IDs for this session.
-    // Only activate dedup when the dedup file exists (SessionStart ran).
-    // Manual CLI calls and sessions without SessionStart skip dedup entirely.
-    // The read-filter-write sequence is held under a single file lock to
-    // prevent TOCTOU races between concurrent hook invocations.
-    let dedup_path = session_dedup_path(input);
-    let pre_dedup_count = results.len();
-    let results = if let Some(ref path) = dedup_path
-        && path.exists()
-    {
-        match dedup_filter_and_record(path, &results) {
-            Ok(filtered) => {
-                lore_debug!(
-                    "dedup: {} before, {} after filtering ({})",
-                    pre_dedup_count,
-                    filtered.len(),
-                    path.display()
-                );
-                filtered
-            }
-            Err(e) => {
-                eprintln!("lore hook: dedup filter error: {e}");
-                lore_debug!("dedup filter error (continuing without dedup): {e}");
-                // Fall through with unfiltered results — dedup is non-critical.
-                results
-            }
-        }
-    } else {
-        lore_debug!("dedup inactive (no session file)");
-        results
-    };
-
-    if results.is_empty() {
-        return Ok(None);
-    }
-
-    let context = format_imperative(&results);
-
-    let sources: HashSet<&str> = results.iter().map(|r| r.source_file.as_str()).collect();
-    lore_debug!(
-        "injecting {} chunks from {} sources",
-        results.len(),
-        sources.len()
-    );
-
-    Ok(Some(HookOutput::HookSpecific {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            additional_context: context,
-        },
-    }))
+    db.chunks_by_sources(&source_files)
+        .unwrap_or_else(|_| seeds.to_vec())
 }
 
 /// Handle `PostCompact`: truncate dedup, re-emit `SessionStart` content.
@@ -344,10 +366,19 @@ fn handle_post_tool_use(
     }))
 }
 
-/// Shared search pipeline: embed, hybrid search, threshold filter.
+/// Shared search pipeline: embed, hybrid search, threshold filter,
+/// partition-and-cap, then flatten into a single `Vec<SearchResult>` with
+/// universal chunks ordered first, followed by ranked non-universal chunks
+/// capped at `config.search.top_k`.
 ///
-/// Extracted so that `cmd_search` and the hook handler both call the same
-/// function, avoiding drift between the two code paths.
+/// Universal chunks are additive beyond `top_k` — they are re-injected on
+/// every relevant `PreToolUse` call regardless of cap. Non-universal chunks
+/// respect `top_k`. Every returned row carries `is_universal` so callers
+/// that need to treat the two classes differently (e.g. `dedup_filter_and_record`)
+/// can read the flag directly.
+///
+/// Called by `cmd_search`, the `PreToolUse` handler, and the `PostToolUse`
+/// handler so all three share the same pipeline and cannot drift.
 pub fn search_with_threshold(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -380,7 +411,11 @@ pub fn search_with_threshold(
         None
     };
 
-    let results = db.search_hybrid(query, query_embedding.as_deref(), config.search.top_k)?;
+    // Over-fetch by 10× so universal chunks scattered in the ranking still
+    // surface — the additive promise only works if search sees the universal
+    // rows. `saturating_mul` bounds the cost when `top_k` is already large.
+    let overfetch_limit = config.search.top_k.saturating_mul(10);
+    let results = db.search_hybrid(query, query_embedding.as_deref(), overfetch_limit)?;
     lore_debug!("search: {} raw results", results.len());
 
     let apply_threshold =
@@ -408,7 +443,21 @@ pub fn search_with_threshold(
         results
     };
 
-    Ok(results)
+    // Partition to apply `top_k` to ranked non-universal rows only — universal
+    // rows remain uncapped — then flatten with universal ordered first.
+    let (mut universal, mut ranked): (Vec<_>, Vec<_>) =
+        results.into_iter().partition(|r| r.is_universal);
+    ranked.truncate(config.search.top_k);
+
+    lore_debug!(
+        "search: {} universal + {} ranked (top_k={})",
+        universal.len(),
+        ranked.len(),
+        config.search.top_k,
+    );
+
+    universal.append(&mut ranked);
+    Ok(universal)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +494,11 @@ fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Res
         );
     }
 
+    let pinned = render_pinned_conventions(db, knowledge_dir)?;
+    if !pinned.is_empty() {
+        out.push_str(&pinned);
+    }
+
     out.push_str("\nAvailable patterns:\n");
 
     for p in &patterns {
@@ -452,6 +506,104 @@ fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Res
             let _ = writeln!(out, "- {}", p.title);
         } else {
             let _ = writeln!(out, "- {} [{}]", p.title, p.tags);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Escape control characters (ANSI escapes, newlines, tabs) in strings that
+/// originate from the database or other semi-trusted sources before writing
+/// them to stderr or `lore_debug!`. A tampered chunk row whose `source_file`
+/// contains `\x1b[2J` must not clear the operator's terminal, and a row with
+/// embedded newlines must not spoof structured output downstream.
+pub fn sanitize_for_log(s: &str) -> String {
+    s.chars().flat_map(char::escape_debug).collect()
+}
+
+/// Total-body cap (bytes) across all rendered universal patterns in a single
+/// `## Pinned conventions` section.
+///
+/// Complements the per-file `UNIVERSAL_BODY_HARD_LIMIT_BYTES` ingest-time
+/// reject. Even a single oversized file should never reach the agent context,
+/// but this is the belt-and-braces guard against a tampered DB bypassing the
+/// ingest-time check: once cumulative bytes exceed this cap, render emits a
+/// visible truncation marker and stops.
+pub const PINNED_SECTION_TOTAL_LIMIT_BYTES: usize = 32 * 1024;
+
+/// Build the `## Pinned conventions` block for `SessionStart` and `PostCompact`.
+///
+/// Returns an empty string when no universal patterns exist (the section
+/// header is then omitted entirely from the `SessionStart` payload). For each
+/// universal pattern, validates the `source_file` against `knowledge_dir`
+/// via `validate_within_dir` before reading it from disk — defends against
+/// DB-tampering attacks where a `source_file` like `../../../etc/passwd`
+/// could otherwise leak arbitrary file contents into the agent context.
+///
+/// Pattern files that fail validation, are missing, or fail to read are
+/// individually skipped with a stderr log; the rest of the section still
+/// renders. The hook's broader "never break the agent" contract means
+/// any error here degrades to an empty pinned section rather than a hard
+/// failure.
+fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Result<String> {
+    let universal = db.universal_patterns()?;
+    if universal.is_empty() {
+        return Ok(String::new());
+    }
+
+    let header = "\n## Pinned conventions\n\n\
+                  These patterns are tagged `universal` and apply across every \
+                  tool call in this session. Treat them as always-on conventions.\n";
+    let mut out = String::from(header);
+    let budget_start = out.len();
+
+    for pattern in &universal {
+        let candidate = knowledge_dir.join(&pattern.source_file);
+        let safe_source = sanitize_for_log(&pattern.source_file);
+        let canonical = match crate::ingest::validate_within_dir(knowledge_dir, &candidate) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("lore hook: skipping pinned `{safe_source}`: {e}");
+                lore_debug!("pinned containment check failed for {safe_source}: {e}");
+                continue;
+            }
+        };
+        // Read from the canonical path returned by validation. Reading from
+        // the pre-canonical `candidate` re-opens the TOCTOU window — a
+        // symlink swap between validation and open could redirect the read
+        // to a file outside `knowledge_dir`.
+        match std::fs::read_to_string(&canonical) {
+            Ok(body) => {
+                let body = body.trim_end();
+                let consumed = out.len() - budget_start;
+                let remaining = PINNED_SECTION_TOTAL_LIMIT_BYTES.saturating_sub(consumed);
+                let heading = format!("\n### {}\n\n", pattern.title);
+                if heading.len() + body.len() + 1 > remaining {
+                    // The next pattern body would push the section over the
+                    // render-time cap. Emit a visible truncation marker and
+                    // stop. Ingest already rejects oversized universal
+                    // patterns per file (UNIVERSAL_BODY_HARD_LIMIT_BYTES);
+                    // hitting this guard means either a DB tamper bypassed
+                    // the ingest check or the operator has so many universal
+                    // files that the aggregate pushes over budget.
+                    let _ = writeln!(
+                        out,
+                        "\n_[pinned conventions truncated at {PINNED_SECTION_TOTAL_LIMIT_BYTES} bytes — trim or retag universal patterns]_",
+                    );
+                    lore_debug!(
+                        "pinned render truncated at {} bytes (next pattern: {safe_source})",
+                        PINNED_SECTION_TOTAL_LIMIT_BYTES,
+                    );
+                    break;
+                }
+                out.push_str(&heading);
+                out.push_str(body);
+                out.push('\n');
+            }
+            Err(e) => {
+                eprintln!("lore hook: skipping pinned `{safe_source}`: read failed ({e})");
+                lore_debug!("pinned read failed for {safe_source}: {e}");
+            }
         }
     }
 
@@ -525,6 +677,13 @@ pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
 ///
 /// Takes results by reference so the caller retains ownership and can fall
 /// back to the unfiltered set on error.
+///
+/// Universal-tagged chunks bypass the read-side `seen.contains` check so
+/// they re-inject on every relevant tool call regardless of dedup state.
+/// They are still recorded on the write side — the dedup file remains a
+/// faithful "what was injected this session" log, and the read-side
+/// exemption is the defensive choice per
+/// `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`.
 fn dedup_filter_and_record(
     path: &Path,
     results: &[SearchResult],
@@ -547,14 +706,17 @@ fn dedup_filter_and_record(
         .map(String::from)
         .collect();
 
-    // Filter out already-injected chunks.
+    // Filter out already-injected chunks. Universal chunks bypass the
+    // `seen.contains` check entirely.
     let filtered: Vec<SearchResult> = results
         .iter()
-        .filter(|r| !seen.contains(&r.id))
+        .filter(|r| r.is_universal || !seen.contains(&r.id))
         .cloned()
         .collect();
 
-    // Record newly seen chunk IDs while still holding the lock.
+    // Record newly seen chunk IDs while still holding the lock. Universal
+    // chunks are recorded too — the dedup file is the canonical injection
+    // log and must reflect every chunk we surfaced this session.
     for r in &filtered {
         writeln!(&mut *guard, "{}", r.id)?;
     }
@@ -1160,6 +1322,7 @@ mod tests {
             source_file: "errors.md".into(),
             heading_path: String::new(),
             score: 0.8,
+            is_universal: false,
         }];
 
         let formatted = format_imperative(&results);
@@ -1179,6 +1342,7 @@ mod tests {
                 source_file: "errors.md".into(),
                 heading_path: String::new(),
                 score: 0.8,
+                is_universal: false,
             },
             SearchResult {
                 id: "c2".into(),
@@ -1188,6 +1352,7 @@ mod tests {
                 source_file: "naming.md".into(),
                 heading_path: String::new(),
                 score: 0.7,
+                is_universal: false,
             },
         ];
 
@@ -1514,6 +1679,34 @@ mod tests {
         assert!(ids.is_empty(), "reset should truncate existing content");
     }
 
+    // -- sanitize_for_log ----------------------------------------------------
+
+    #[test]
+    fn sanitize_for_log_escapes_ansi_and_newlines() {
+        // ANSI CSI sequence must be rendered as visible escapes so a tampered
+        // DB row cannot clear or recolour the operator's terminal.
+        let payload = "\x1b[2J\x1b[31malert\x1b[0m\nnext";
+        let sanitized = sanitize_for_log(payload);
+        assert!(
+            !sanitized.contains('\x1b'),
+            "raw ESC must not leak through: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains('\n'),
+            "raw newline must not leak through: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("alert"),
+            "visible content should survive sanitisation: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_log_passes_through_printable_ascii() {
+        let payload = "patterns/git-branch-pr.md";
+        assert_eq!(sanitize_for_log(payload), payload);
+    }
+
     // -- dedup_filter_and_record -----------------------------------------------
 
     fn make_search_result(id: &str) -> crate::database::SearchResult {
@@ -1525,6 +1718,7 @@ mod tests {
             source_file: "test.md".to_string(),
             heading_path: String::new(),
             score: 1.0,
+            is_universal: false,
         }
     }
 

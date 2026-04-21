@@ -29,9 +29,14 @@ deduplication file, then returns a `systemMessage` containing:
 
 - A meta-instruction telling the agent that patterns are injected automatically and should be
   followed as default conventions
+- A `## Pinned conventions` section with the full body of every pattern tagged `universal` (omitted
+  entirely when no universal patterns exist). Bodies are re-read from disk on each session start
+  through a `validate_within_dir` containment check that defends against tampered `source_file` rows
+  escaping the knowledge directory
 - A compact index listing every pattern by title and tags
 
-This gives the agent awareness of the knowledge base without injecting full content upfront.
+This gives the agent awareness of the knowledge base, full content for the always-on tier, and
+title-only awareness for everything else.
 
 ### PreToolUse
 
@@ -39,9 +44,13 @@ Fires before every Edit, Write, or Bash tool invocation. This is the primary inj
 hook:
 
 1. Extracts search terms from the tool input (file path, bash command, transcript context)
-2. Searches the knowledge base for matching patterns
-3. Expands results to include all sibling chunks from matched source files
-4. Filters out patterns already injected in this session (deduplication)
+2. Searches the knowledge base for matching patterns and partitions the result into universal
+   (uncapped, additive) and ranked (capped at `top_k`) slices
+3. Expands each slice independently to include sibling chunks from matched source files
+4. Routes the combined slice through deduplication. Universal chunks bypass the read-side
+   `seen.contains` check so they re-inject on every relevant tool call; non-universal chunks are
+   filtered as before. Every surfaced chunk (universal or not) is appended to the dedup file so it
+   remains a faithful injection log.
 5. Formats the results as imperative directives and returns them in `additionalContext`
 
 The output format groups chunks by source file:

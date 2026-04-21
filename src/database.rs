@@ -69,6 +69,9 @@ pub struct SearchResult {
     pub source_file: String,
     pub heading_path: String,
     pub score: f64,
+    /// `true` when the chunk's source pattern is tagged `universal` —
+    /// re-injected on every relevant `PreToolUse` call (bypasses dedup).
+    pub is_universal: bool,
 }
 
 /// Aggregate statistics about the database contents.
@@ -83,6 +86,8 @@ pub struct PatternSummary {
     pub title: String,
     pub source_file: String,
     pub tags: String,
+    /// `true` when any chunk from this source pattern is tagged `universal`.
+    pub is_universal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +97,25 @@ pub struct PatternSummary {
 impl KnowledgeDB {
     /// Open (or create) a database at `db_path` configured for `dimensions`-wide
     /// embeddings.
+    ///
+    /// Probes the `chunks` table for the `is_universal` column. If the table
+    /// exists from a prior version of lore but lacks the column, returns a
+    /// friendly upgrade-required error instead of letting individual SELECTs
+    /// fail later with a confusing `no such column` message.
     pub fn open(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, dimensions, true)
+    }
+
+    /// Open the database without the schema-compatibility probe. Reserved for
+    /// `lore ingest --force`: the very next step after opening is `clear_all`,
+    /// which drops and recreates the tables with the current DDL, so running
+    /// the probe would block the only path that actually fixes the condition
+    /// it warns about.
+    pub fn open_skipping_schema_check(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, dimensions, false)
+    }
+
+    fn open_inner(db_path: &Path, dimensions: usize, check_schema: bool) -> anyhow::Result<Self> {
         register_sqlite_vec();
 
         let conn = Connection::open(db_path)?;
@@ -100,58 +123,45 @@ impl KnowledgeDB {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
 
+        if check_schema {
+            check_schema_compatibility(&conn)?;
+        }
+
         Ok(Self { conn, dimensions })
     }
 
-    /// Create all tables if they don't already exist.
+    /// Create all tables if they don't already exist, then stamp the schema
+    /// version so `check_schema_compatibility` can detect old databases with
+    /// a single-integer read instead of parsing `PRAGMA table_info` columns.
     pub fn init(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts USING fts5(
-                title, body, tags, source_file, chunk_id UNINDEXED,
-                tokenize = 'porter unicode61'
-            )",
-        )?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chunks (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                body TEXT NOT NULL,
-                tags TEXT DEFAULT '',
-                source_file TEXT NOT NULL,
-                heading_path TEXT DEFAULT '',
-                ingested_at TEXT DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)",
-        )?;
-
-        self.conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_vec USING vec0(
-                id TEXT PRIMARY KEY,
-                embedding float[{}]
-            )",
-            self.dimensions
-        ))?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)",
-        )?;
-
+        self.conn.execute_batch(PATTERNS_FTS_DDL)?;
+        self.conn.execute_batch(CHUNKS_DDL)?;
+        self.conn
+            .execute_batch(&patterns_vec_ddl(self.dimensions))?;
+        self.conn.execute_batch(INGEST_METADATA_DDL)?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
-    /// Drop and recreate all tables, ensuring schema changes (like tokenizer
-    /// updates) take effect.  Used by `lore ingest --force`.
+    /// Drop and recreate all tables so that any column additions, index
+    /// changes, or tokenizer updates in the DDL take effect. Used by
+    /// `lore ingest --force` as the authoritative path back to a clean
+    /// on-disk schema after a binary upgrade.
+    ///
+    /// `chunks` is dropped and recreated too — `DELETE FROM chunks` would
+    /// leave the old column list intact, so an old-schema database that
+    /// somehow bypassed `check_schema_compatibility` would still reject
+    /// subsequent inserts against the missing `is_universal` column.
     pub fn clear_all(&self) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
-        tx.execute_batch(
-            "CREATE VIRTUAL TABLE patterns_fts USING fts5(
-                title, body, tags, source_file, chunk_id UNINDEXED,
-                tokenize = 'porter unicode61'
-            )",
-        )?;
-        tx.execute_batch("DELETE FROM chunks; DELETE FROM patterns_vec;")?;
+        tx.execute_batch(PATTERNS_FTS_DDL)?;
+        tx.execute_batch("DROP TABLE IF EXISTS chunks")?;
+        tx.execute_batch(CHUNKS_DDL)?;
+        tx.execute_batch("DELETE FROM patterns_vec")?;
+        // Keep the schema stamp in sync with the freshly recreated tables.
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
     }
@@ -195,8 +205,8 @@ impl KnowledgeDB {
         tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
 
         tx.execute(
-            "INSERT OR REPLACE INTO chunks (id, title, body, tags, source_file, heading_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO chunks (id, title, body, tags, source_file, heading_path, is_universal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 chunk.id,
                 chunk.title,
@@ -204,6 +214,7 @@ impl KnowledgeDB {
                 chunk.tags,
                 chunk.source_file,
                 chunk.heading_path,
+                i64::from(chunk.is_universal),
             ],
         )?;
 
@@ -246,7 +257,7 @@ impl KnowledgeDB {
 
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
-                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score
+                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score, c.is_universal
              FROM patterns_fts f
              JOIN chunks c ON c.id = f.chunk_id
              WHERE patterns_fts MATCH ?1
@@ -265,6 +276,7 @@ impl KnowledgeDB {
                 source_file: row.get(4)?,
                 heading_path: row.get(5)?,
                 score: row.get(6)?,
+                is_universal: row.get::<_, i64>(7)? != 0,
             })
         })?;
 
@@ -280,7 +292,7 @@ impl KnowledgeDB {
         let blob = vec_to_blob(query_embedding);
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
-                    v.distance AS score
+                    v.distance AS score, c.is_universal
              FROM patterns_vec v
              JOIN chunks c ON c.id = v.id
              WHERE v.embedding MATCH ?1
@@ -299,6 +311,7 @@ impl KnowledgeDB {
                 source_file: row.get(4)?,
                 heading_path: row.get(5)?,
                 score: row.get(6)?,
+                is_universal: row.get::<_, i64>(7)? != 0,
             })
         })?;
 
@@ -332,17 +345,23 @@ impl KnowledgeDB {
     /// which corresponds to the root or top-level section.
     pub fn list_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_file, title, tags FROM chunks
-             WHERE id IN (
+            "SELECT
+                 root.source_file,
+                 root.title,
+                 root.tags,
+                 (SELECT MAX(is_universal) FROM chunks c WHERE c.source_file = root.source_file)
+                     AS is_universal
+             FROM chunks AS root
+             WHERE root.id IN (
                  SELECT id FROM chunks c1
                  WHERE LENGTH(c1.heading_path) = (
                      SELECT MIN(LENGTH(c2.heading_path))
                      FROM chunks c2
                      WHERE c2.source_file = c1.source_file
                  )
-                 GROUP BY source_file
+                 GROUP BY c1.source_file
              )
-             ORDER BY source_file",
+             ORDER BY root.source_file",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -350,10 +369,21 @@ impl KnowledgeDB {
                 source_file: row.get(0)?,
                 title: row.get(1)?,
                 tags: row.get(2)?,
+                is_universal: row.get::<_, i64>(3)? != 0,
             })
         })?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Return one entry per source document where any chunk is `is_universal = 1`.
+    /// Used by the `SessionStart` hook to emit the `## Pinned conventions` section.
+    pub fn universal_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
+        Ok(self
+            .list_patterns()?
+            .into_iter()
+            .filter(|p| p.is_universal)
+            .collect())
     }
 
     /// Return all chunks from the given source files.
@@ -368,7 +398,7 @@ impl KnowledgeDB {
 
         let placeholders: Vec<String> = (1..=source_files.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
-            "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score \
+            "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score, is_universal \
              FROM chunks WHERE source_file IN ({}) ORDER BY source_file, id",
             placeholders.join(", ")
         );
@@ -388,6 +418,7 @@ impl KnowledgeDB {
                 source_file: row.get(4)?,
                 heading_path: row.get(5)?,
                 score: row.get(6)?,
+                is_universal: row.get::<_, i64>(7)? != 0,
             })
         })?;
 
@@ -480,6 +511,105 @@ pub fn sanitize_fts_query(query: &str) -> String {
     result.join(" ")
 }
 
+/// Current on-disk schema version. Bumped when `CHUNKS_DDL`, the virtual-
+/// table DDL, or any semantic ingest invariant changes in a way that
+/// requires `lore ingest --force` from existing users.
+///
+/// Stored as `SQLite`'s `PRAGMA user_version` — a cheap integer slot that
+/// `check_schema_compatibility` reads to decide whether the database was
+/// written by a build old enough to predate the current DDL.
+const SCHEMA_VERSION: u32 = 1;
+
+/// Authoritative DDL for the `chunks` table. Used by both `KnowledgeDB::init`
+/// (fresh-DB path, `CREATE TABLE IF NOT EXISTS`) and `KnowledgeDB::clear_all`
+/// (post-DROP recreate). Centralising the DDL prevents the two paths from
+/// drifting when a column is added or removed.
+const CHUNKS_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS chunks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        tags TEXT DEFAULT '',
+        source_file TEXT NOT NULL,
+        heading_path TEXT DEFAULT '',
+        is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
+        ingested_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)";
+
+/// Authoritative DDL for the `patterns_fts` virtual table. Shared between
+/// `init` and `clear_all` so tokenizer and column-list changes stay in lockstep.
+const PATTERNS_FTS_DDL: &str = "\
+    CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts USING fts5(
+        title, body, tags, source_file, chunk_id UNINDEXED,
+        tokenize = 'porter unicode61'
+    )";
+
+/// Authoritative DDL for `ingest_metadata`.
+const INGEST_METADATA_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)";
+
+/// DDL for the dimensions-bound `patterns_vec` virtual table. Returned as a
+/// `String` because the embedding width is a runtime value.
+fn patterns_vec_ddl(dimensions: usize) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_vec USING vec0(
+            id TEXT PRIMARY KEY,
+            embedding float[{dimensions}]
+        )"
+    )
+}
+
+/// Probe the on-disk `PRAGMA user_version` against [`SCHEMA_VERSION`].
+///
+/// Returns `Ok(())` when either the database is fresh (no `chunks` table yet
+/// — `init` will stamp the version after DDL) or the stored version is at
+/// least the current target. Returns a friendly upgrade-required error for
+/// old-schema databases (`user_version = 0` AND `chunks` exists and is
+/// non-empty).
+///
+/// Replaces the earlier `PRAGMA table_info(chunks)` column-parsing probe:
+/// both approaches catch the same hazard, but `user_version` is a single
+/// integer read and scales to future schema bumps without another column
+/// name to cross-reference.
+fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
+    let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // Fresh DB: the `chunks` table does not exist yet (user_version stays 0
+    // until `init` writes the DDL and stamps the version). Nothing to do.
+    let chunks_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if chunks_exists == 0 {
+        return Ok(());
+    }
+
+    // Empty-but-present chunks table: still an upgrade from a pre-schema-
+    // version build, but no rows would be lost by `clear_all`. Let the
+    // advisory fire anyway — `--force` is the sanctioned path back and
+    // the stale-but-blank schema is still stale.
+    let chunk_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+        .unwrap_or(0);
+    if chunk_count == 0 {
+        // Benign case: init will take over. Fresh-ish DB.
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "lore: this database predates the universal-patterns feature.\n\
+         Run `lore ingest --force` to rebuild the index with the new schema.\n\
+         This is expected after upgrading; see CHANGELOG for details."
+    )
+}
+
 /// Convert an `f32` slice to a little-endian byte blob for sqlite-vec.
 fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -549,7 +679,7 @@ mod tests {
         KnowledgeDB::open(Path::new(":memory:"), dimensions).expect("failed to open in-memory DB")
     }
 
-    /// Helper: build a `Chunk` for test use.
+    /// Helper: build a non-universal `Chunk` for test use.
     fn make_chunk(id: &str, title: &str, body: &str, source: &str) -> Chunk {
         Chunk {
             id: id.to_string(),
@@ -558,6 +688,20 @@ mod tests {
             tags: String::new(),
             source_file: source.to_string(),
             heading_path: String::new(),
+            is_universal: false,
+        }
+    }
+
+    /// Helper: build a universal `Chunk` for test use.
+    fn make_universal_chunk(id: &str, title: &str, body: &str, source: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            tags: "universal".to_string(),
+            source_file: source.to_string(),
+            heading_path: String::new(),
+            is_universal: true,
         }
     }
 
@@ -645,6 +789,7 @@ mod tests {
             tags: "design".into(),
             source_file: "patterns.md".into(),
             heading_path: "Alpha".into(),
+            is_universal: false,
         };
         let c2 = Chunk {
             id: "c2".into(),
@@ -653,6 +798,7 @@ mod tests {
             tags: "design".into(),
             source_file: "patterns.md".into(),
             heading_path: "Beta".into(),
+            is_universal: false,
         };
 
         db.insert_chunk(&c1, Some(&[1.0, 0.0, 0.0, 0.0])).unwrap();
@@ -832,47 +978,18 @@ mod tests {
 
     #[test]
     fn rrf_merges_two_ranked_lists() {
-        let a = vec![
-            SearchResult {
-                id: "x".into(),
-                title: String::new(),
-                body: String::new(),
-                tags: String::new(),
-                source_file: String::new(),
-                heading_path: String::new(),
-                score: 0.0,
-            },
-            SearchResult {
-                id: "y".into(),
-                title: String::new(),
-                body: String::new(),
-                tags: String::new(),
-                source_file: String::new(),
-                heading_path: String::new(),
-                score: 0.0,
-            },
-        ];
-
-        let b = vec![
-            SearchResult {
-                id: "y".into(),
-                title: String::new(),
-                body: String::new(),
-                tags: String::new(),
-                source_file: String::new(),
-                heading_path: String::new(),
-                score: 0.0,
-            },
-            SearchResult {
-                id: "z".into(),
-                title: String::new(),
-                body: String::new(),
-                tags: String::new(),
-                source_file: String::new(),
-                heading_path: String::new(),
-                score: 0.0,
-            },
-        ];
+        let stub = |id: &str| SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: String::new(),
+            source_file: String::new(),
+            heading_path: String::new(),
+            score: 0.0,
+            is_universal: false,
+        };
+        let a = vec![stub("x"), stub("y")];
+        let b = vec![stub("y"), stub("z")];
 
         let merged = reciprocal_rank_fusion(&a, &b, 10);
         assert_eq!(merged.len(), 3);
@@ -947,6 +1064,7 @@ mod tests {
             tags: "typescript, conventions".to_string(),
             source_file: "ts.md".to_string(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&tagged, None).unwrap();
 
@@ -958,6 +1076,7 @@ mod tests {
             tags: "rust, wasm".to_string(),
             source_file: "rust.md".to_string(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&body_only, None).unwrap();
 
@@ -1148,6 +1267,7 @@ mod tests {
             tags: "rust, conventions".into(),
             source_file: "rust.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         let c2 = Chunk {
             id: "c2".into(),
@@ -1156,6 +1276,7 @@ mod tests {
             tags: "typescript, conventions".into(),
             source_file: "ts.md".into(),
             heading_path: String::new(),
+            is_universal: false,
         };
         db.insert_chunk(&c1, None).unwrap();
         db.insert_chunk(&c2, None).unwrap();
@@ -1203,6 +1324,7 @@ mod tests {
             tags: "rust, style".into(),
             source_file: "rust.md".into(),
             heading_path: "Naming".into(),
+            is_universal: false,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -1237,6 +1359,238 @@ mod tests {
             sanitize_fts_query("rust-lang/rust:main"),
             "rust lang rust main"
         );
+    }
+
+    // -- universal patterns + schema probe ----------------------------
+
+    #[test]
+    fn insert_and_select_chunk_round_trips_is_universal() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let universal =
+            make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md");
+        db.insert_chunk(&universal, None).unwrap();
+
+        let normal = make_chunk("n1", "Style", "Use anyhow for errors.", "style.md");
+        db.insert_chunk(&normal, None).unwrap();
+
+        let results = db.search_fts("workflow OR style", 10).unwrap();
+        let by_id: std::collections::HashMap<_, _> = results
+            .iter()
+            .map(|r| (r.id.as_str(), r.is_universal))
+            .collect();
+        assert!(by_id["u1"], "u1 should be universal");
+        assert!(!by_id["n1"], "n1 should not be universal");
+    }
+
+    #[test]
+    fn chunk_check_constraint_rejects_invalid_is_universal_value() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let result = db.conn.execute(
+            "INSERT INTO chunks (id, title, body, source_file, is_universal) \
+             VALUES ('bad', 'Bad', 'Body', 'bad.md', 2)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject is_universal = 2"
+        );
+    }
+
+    #[test]
+    fn universal_patterns_returns_only_universal_tagged() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        db.insert_chunk(
+            &make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md"),
+            None,
+        )
+        .unwrap();
+        db.insert_chunk(
+            &make_chunk("n1", "Style", "Use anyhow for errors.", "style.md"),
+            None,
+        )
+        .unwrap();
+        db.insert_chunk(
+            &make_chunk("n2", "SQLite", "Use bundled sqlite.", "sql.md"),
+            None,
+        )
+        .unwrap();
+
+        let universal = db.universal_patterns().unwrap();
+        assert_eq!(universal.len(), 1);
+        assert_eq!(universal[0].source_file, "wf.md");
+        assert!(universal[0].is_universal);
+    }
+
+    #[test]
+    fn list_patterns_marks_universal_when_any_chunk_is_universal() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        db.insert_chunk(
+            &make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md"),
+            None,
+        )
+        .unwrap();
+        db.insert_chunk(
+            &make_chunk("n1", "Style", "Use anyhow for errors.", "style.md"),
+            None,
+        )
+        .unwrap();
+
+        let patterns = db.list_patterns().unwrap();
+        let by_source: std::collections::HashMap<_, _> = patterns
+            .iter()
+            .map(|p| (p.source_file.as_str(), p.is_universal))
+            .collect();
+        assert!(by_source["wf.md"], "wf.md should be universal");
+        assert!(!by_source["style.md"], "style.md should not be universal");
+    }
+
+    #[test]
+    fn knowledge_db_open_probe_detects_missing_is_universal_column() {
+        // Build a database manually with the OLD schema (no is_universal column).
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("old.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                )",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, title, body, source_file) \
+                 VALUES ('c1', 'T', 'B', 'f.md')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let err = match KnowledgeDB::open(&db_path, 4) {
+            Ok(_) => panic!("expected open to fail on old schema"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("lore ingest --force"),
+            "expected upgrade advisory, got: {err}"
+        );
+    }
+
+    #[test]
+    fn knowledge_db_open_does_not_error_on_fresh_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("fresh.db");
+        // Open a brand-new file: no chunks table yet, probe is satisfied.
+        let db = KnowledgeDB::open(&db_path, 4).expect("fresh DB should open cleanly");
+        db.init().expect("init should succeed");
+    }
+
+    #[test]
+    fn knowledge_db_open_skipping_schema_check_bypasses_probe_for_force_ingest() {
+        // Build an old-schema database (no `is_universal` column). The
+        // regular `open` path rejects this with the upgrade advisory —
+        // `open_skipping_schema_check` must accept it so that
+        // `lore ingest --force` can reach `clear_all` and rebuild.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("old.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    source_file TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, title, body, source_file) \
+                 VALUES ('c1', 'T', 'B', 'f.md')",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(KnowledgeDB::open(&db_path, 4).is_err());
+
+        let db = KnowledgeDB::open_skipping_schema_check(&db_path, 4)
+            .expect("skip-probe open must succeed on old schema");
+        db.init().expect("init under skip-probe open must succeed");
+        db.clear_all()
+            .expect("clear_all must drop+recreate the old chunks table");
+
+        // After clear_all the new schema is live — a re-open through the
+        // probe path succeeds, confirming the advertised remedy works.
+        drop(db);
+        KnowledgeDB::open(&db_path, 4).expect("re-open after clear_all must pass the probe");
+    }
+
+    #[test]
+    fn clear_all_drops_and_recreates_chunks_with_current_ddl() {
+        // Open a DB, init, drop the is_universal column via raw SQL to
+        // simulate an incomplete migration, then confirm `clear_all`
+        // restores the expected column set.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("chunks_ddl.db");
+        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        db.init().unwrap();
+
+        // Forcibly swap the chunks table to the old shape — no `is_universal`.
+        db.conn
+            .execute_batch(
+                "DROP TABLE chunks;
+                 CREATE TABLE chunks (
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     body TEXT NOT NULL,
+                     source_file TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO chunks (id, title, body, source_file) \
+                 VALUES ('c1', 'T', 'B', 'f.md')",
+                [],
+            )
+            .unwrap();
+
+        db.clear_all().unwrap();
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            columns.iter().any(|c| c == "is_universal"),
+            "chunks must carry is_universal after clear_all, got: {columns:?}"
+        );
+
+        // And the row seeded under the old schema is gone.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "clear_all must leave chunks empty");
     }
 
     // -- ingest_metadata -----------------------------------------------

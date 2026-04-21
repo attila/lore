@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// A single chunk of knowledge extracted from a markdown file.
+///
+/// No `Default` impl by design: every chunk-construction site must explicitly
+/// set `is_universal` so that future fixtures and write paths cannot silently
+/// default it to `false`.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     /// Unique identifier: `source_file:heading_path` (or `source_file` for document mode).
@@ -23,6 +27,10 @@ pub struct Chunk {
     pub source_file: String,
     /// Breadcrumb trail of headings, e.g. `"Foo > Bar > Baz"`.
     pub heading_path: String,
+    /// `true` when the source pattern's frontmatter tags include `universal`,
+    /// which opts the pattern into the always-on injection tier (always
+    /// emitted at `SessionStart`, bypasses `PreToolUse` dedup).
+    pub is_universal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -41,12 +49,14 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
     let mut current_body: Vec<&str> = Vec::new();
     let mut current_title = file_stem(source_file);
     let tags = extract_frontmatter_tags(content);
+    let is_universal = frontmatter_has_tag(content, "universal");
     let mut id_counts: HashMap<String, usize> = HashMap::new();
 
     let flush = |body: &[&str],
                  title: &str,
                  stack: &[(usize, String)],
                  tags: &str,
+                 is_universal: bool,
                  source_file: &str,
                  chunks: &mut Vec<Chunk>,
                  id_counts: &mut HashMap<String, usize>| {
@@ -85,6 +95,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
             tags: tags.to_string(),
             source_file: source_file.to_string(),
             heading_path,
+            is_universal,
         });
     };
 
@@ -95,6 +106,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
                 &current_title,
                 &heading_stack,
                 &tags,
+                is_universal,
                 source_file,
                 &mut chunks,
                 &mut id_counts,
@@ -115,6 +127,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
         &current_title,
         &heading_stack,
         &tags,
+        is_universal,
         source_file,
         &mut chunks,
         &mut id_counts,
@@ -136,6 +149,7 @@ pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
 
     let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
     let tags = extract_frontmatter_tags(content);
+    let is_universal = frontmatter_has_tag(content, "universal");
 
     vec![Chunk {
         id: source_file.to_string(),
@@ -144,6 +158,7 @@ pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
         tags,
         source_file: source_file.to_string(),
         heading_path: String::new(),
+        is_universal,
     }]
 }
 
@@ -178,19 +193,56 @@ fn parse_heading(line: &str) -> Option<(usize, String)> {
     Some((level, text))
 }
 
-fn extract_frontmatter_tags(content: &str) -> String {
-    let Some(fm) = extract_frontmatter(content) else {
-        return String::new();
-    };
+/// Return `true` when the parsed frontmatter `tags:` list contains an exact
+/// match for `tag` (case-sensitive). Used to detect the `universal` opt-in
+/// without re-parsing the markdown body.
+pub fn frontmatter_has_tag(content: &str, tag: &str) -> bool {
+    parse_frontmatter_tag_list(content).iter().any(|t| t == tag)
+}
 
+/// Return frontmatter tag values that look like typos of `tag` but aren't
+/// exact matches. Flags two classes at ingest time so authors notice
+/// silent-inert tags:
+///
+/// 1. Case variants (`Universal`, `UNIVERSAL`) — lowercased form equals the
+///    target.
+/// 2. Homoglyph candidates — tags containing non-ASCII characters whose
+///    character count equals the target's. Catches Cyrillic-i for ASCII-i
+///    style substitutions (`unіversal` with Cyrillic `і` U+0456) without
+///    pulling in a full Unicode confusables table. Legitimate non-ASCII
+///    tags like `résumé` pass through silently because their character
+///    count differs from the target's.
+pub fn frontmatter_near_miss_tags(content: &str, tag: &str) -> Vec<String> {
+    let target_lower = tag.to_lowercase();
+    let target_char_count = target_lower.chars().count();
+
+    parse_frontmatter_tag_list(content)
+        .into_iter()
+        .filter(|t| {
+            if t == tag {
+                return false;
+            }
+            let t_lower = t.to_lowercase();
+            if t_lower == target_lower {
+                return true;
+            }
+            !t_lower.is_ascii() && t_lower.chars().count() == target_char_count
+        })
+        .collect()
+}
+
+/// Parse the frontmatter `tags:` list into a `Vec<String>` (one entry per tag).
+/// Reuses the existing inline / block style logic from `extract_frontmatter_tags`
+/// so the two functions never drift.
+pub fn parse_frontmatter_tag_list(content: &str) -> Vec<String> {
+    let Some(fm) = extract_frontmatter(content) else {
+        return Vec::new();
+    };
     let Some(start) = fm.find("tags:") else {
-        return String::new();
+        return Vec::new();
     };
     let rest = &fm[start + 5..];
 
-    // Inline style: tags: [a, b, c]
-    // Only look for brackets on the first line after `tags:` to avoid matching
-    // brackets in subsequent YAML fields.
     let first_line = rest.lines().next().unwrap_or("");
     if let Some(bracket_start) = first_line.find('[')
         && let Some(bracket_end) = first_line.find(']')
@@ -198,24 +250,41 @@ fn extract_frontmatter_tags(content: &str) -> String {
     {
         return first_line[bracket_start + 1..bracket_end]
             .split(',')
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|t| strip_outer_quotes(t.trim()))
+            .filter(|t| !t.is_empty())
+            .collect();
     }
 
-    // Block style: tags:\n  - a\n  - b
-    let tag_lines: Vec<&str> = rest
-        .lines()
+    rest.lines()
         .skip(1)
         .take_while(|l| l.starts_with("  -") || l.starts_with("- "))
-        .map(|l| l.trim_start_matches([' ', '-']).trim())
+        .map(|l| strip_outer_quotes(l.trim_start_matches([' ', '-']).trim()))
         .filter(|l| !l.is_empty())
-        .collect();
-    if !tag_lines.is_empty() {
-        return tag_lines.join(", ");
-    }
+        .collect()
+}
 
-    String::new()
+/// Strip a single matched pair of surrounding quotes from `s` (only when both
+/// ends carry the same quote character). Avoids the half-quote bug where
+/// `"universal` and `thing"` (the two halves of a comma-split quoted token)
+/// would each get their stray quote stripped and falsely register as the
+/// tag `universal`.
+fn strip_outer_quotes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Extract frontmatter tags as a comma-joined string for storage in
+/// `chunks.tags` (and friends). Thin wrapper over
+/// [`parse_frontmatter_tag_list`] so the two paths cannot drift.
+fn extract_frontmatter_tags(content: &str) -> String {
+    parse_frontmatter_tag_list(content).join(", ")
 }
 
 fn extract_frontmatter(content: &str) -> Option<String> {
@@ -615,6 +684,119 @@ Body text that is definitely long enough for a chunk.
         let tags = extract_frontmatter_tags(md);
         // Should only pick up alpha and beta, not "not, tags" from other_field.
         assert_eq!(tags, "alpha, beta");
+    }
+
+    // -- frontmatter_has_tag / universal flag -----------------------------
+
+    #[test]
+    fn frontmatter_has_tag_matches_exact_tag_in_inline_list() {
+        let md = "---\ntags: [foo, universal, bar]\n---\n\n# Hello\nBody.\n";
+        assert!(frontmatter_has_tag(md, "universal"));
+    }
+
+    #[test]
+    fn frontmatter_has_tag_matches_exact_tag_in_block_list() {
+        let md = "---\ntags:\n  - foo\n  - universal\n  - bar\n---\n\n# Hello\nBody.\n";
+        assert!(frontmatter_has_tag(md, "universal"));
+    }
+
+    #[test]
+    fn frontmatter_has_tag_rejects_substring_matches() {
+        let md = "---\ntags: [foo, universally, bar]\n---\n\n# Hello\nBody.\n";
+        assert!(!frontmatter_has_tag(md, "universal"));
+    }
+
+    #[test]
+    fn frontmatter_has_tag_is_case_sensitive() {
+        let md = "---\ntags: [Universal]\n---\n\n# Hello\nBody.\n";
+        assert!(!frontmatter_has_tag(md, "universal"));
+    }
+
+    #[test]
+    fn frontmatter_has_tag_returns_false_when_no_frontmatter() {
+        let md = "# Hello\nBody.\n";
+        assert!(!frontmatter_has_tag(md, "universal"));
+    }
+
+    #[test]
+    fn frontmatter_has_tag_does_not_match_quoted_tag_with_internal_comma() {
+        // Hand-rolled parser fragility check: a quoted tag with a comma
+        // in the middle would split into two tokens, neither equal to
+        // "universal" exactly.
+        let md = "---\ntags: [\"universal,thing\"]\n---\n\n# Hello\nBody.\n";
+        assert!(!frontmatter_has_tag(md, "universal"));
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_finds_capitalised_variants() {
+        let md = "---\ntags: [Universal, foo, UNIVERSAL]\n---\n\n# Hello\nBody.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert_eq!(near, vec!["Universal".to_string(), "UNIVERSAL".to_string()]);
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_finds_pluralised_variants() {
+        // `universally` is a different word, lowercased it's still "universally"
+        // so it won't match. But `Universals` lowercased is "universals" — not
+        // "universal" either. Only exact-lowercase-matches count as near-misses.
+        let md = "---\ntags: [universally]\n---\n\n# Hello\nBody.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert!(near.is_empty(), "got: {near:?}");
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_excludes_exact_match() {
+        let md = "---\ntags: [universal]\n---\n\n# Hello\nBody.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert!(near.is_empty());
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_flags_cyrillic_homoglyph() {
+        // Cyrillic `і` (U+0456) lowercases to itself, not ASCII `i`, so a
+        // pure `to_lowercase()` comparison would silently miss this typo.
+        // The length-plus-non-ASCII heuristic catches it.
+        let md = "---\ntags: [unіversal]\n---\n\n# Hello\nEnough body.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert_eq!(near, vec!["unіversal".to_string()]);
+    }
+
+    #[test]
+    fn frontmatter_near_miss_tags_does_not_flag_unrelated_unicode_tags() {
+        // Legitimate non-ASCII tags with different character counts must
+        // pass through silently — we don't want spurious warnings on every
+        // non-English-tag knowledge base.
+        let md = "---\ntags: [résumé, emoji-🚀, universal]\n---\n\n# Hello\nBody.\n";
+        let near = frontmatter_near_miss_tags(md, "universal");
+        assert!(near.is_empty(), "got: {near:?}");
+    }
+
+    #[test]
+    fn chunk_by_heading_propagates_universal_flag() {
+        let md = "---\ntags: [universal, conventions]\n---\n\n# Top\nEnough body text here.\n\n## Sub\nAnother section with enough body text.\n";
+        let chunks = chunk_by_heading(md, "uni.md");
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(chunk.is_universal, "chunk {:?} missing flag", chunk.id);
+        }
+    }
+
+    #[test]
+    fn chunk_by_heading_does_not_set_universal_when_tag_absent() {
+        let md = "---\ntags: [conventions]\n---\n\n# Top\nEnough body text here.\n";
+        let chunks = chunk_by_heading(md, "uni.md");
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(!chunk.is_universal);
+        }
+    }
+
+    #[test]
+    fn chunk_as_document_propagates_universal_flag() {
+        let md = "---\ntags: [universal]\n---\n\nNo headings here, just a long enough paragraph.\n";
+        let chunks = chunk_as_document(md, "uni.md");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_universal);
     }
 
     #[test]

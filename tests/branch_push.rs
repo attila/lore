@@ -175,7 +175,7 @@ fn update_pattern_pushes_modified_file() {
         dir,
         "testing.md",
         "New testing content with property-based tests.\n",
-        &["testing"],
+        Some(&["testing"]),
         Some("inbox/"),
     )
     .unwrap();

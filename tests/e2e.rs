@@ -181,7 +181,7 @@ fn full_lifecycle() {
         "Use structured logging exclusively via the tracing crate.\n\
          Instrument all async functions with tracing spans.\n\
          Never use println for diagnostic output in production.\n",
-        &["observability", "production"],
+        Some(&["observability", "production"]),
         None,
     )
     .unwrap();

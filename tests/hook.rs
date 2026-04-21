@@ -952,3 +952,555 @@ fn hook_pretooluse_all_results_deduped_no_output() {
     let dedup_path = lore::hook::dedup_file_path(&session_id);
     let _ = std::fs::remove_file(dedup_path);
 }
+
+// ---------------------------------------------------------------------------
+// Universal patterns: SessionStart pinned-conventions section
+// ---------------------------------------------------------------------------
+
+/// Set up a knowledge directory containing one universal pattern alongside the
+/// usual seeded patterns. Returns the temp dir handle and config path.
+fn setup_with_universal_pattern() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("workflow.md"),
+        "---\ntags: [universal, conventions]\n---\n\n\
+         # Workflow Conventions\n\n\
+         Always push with `git push origin HEAD`, never plain `git push`.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+    (tmp, config_path)
+}
+
+fn invoke_session_start(config_path: &Path, session_id: &str) -> String {
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    parsed["systemMessage"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn hook_session_start_omits_pinned_section_when_no_universal_patterns() {
+    let (_tmp, config_path) = setup_test_env();
+    let ctx = invoke_session_start(&config_path, "test-no-universal");
+    assert!(
+        !ctx.contains("## Pinned conventions"),
+        "section header should be omitted when no patterns are universal: {ctx}"
+    );
+    assert!(
+        ctx.contains("Available patterns:"),
+        "index should still be present: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_emits_pinned_section_with_body_above_index_when_universal_present() {
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let ctx = invoke_session_start(&config_path, "test-pinned-present");
+
+    let pinned_idx = ctx
+        .find("## Pinned conventions")
+        .expect("pinned conventions section should be present");
+    let index_idx = ctx
+        .find("Available patterns:")
+        .expect("available patterns index should be present");
+
+    assert!(
+        pinned_idx < index_idx,
+        "pinned conventions section should appear above the available-patterns index"
+    );
+    assert!(
+        ctx.contains("Always push with `git push origin HEAD`"),
+        "pinned section should contain the body of the universal pattern: {ctx}"
+    );
+    assert!(
+        ctx.contains("### Workflow Conventions"),
+        "pinned section should label each pattern with its title: {ctx}"
+    );
+}
+
+#[test]
+fn hook_post_compact_re_emits_pinned_section() {
+    let (_tmp, config_path) = setup_with_universal_pattern();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": "test-post-compact-pinned",
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
+
+    assert!(
+        ctx.contains("## Pinned conventions"),
+        "PostCompact should re-emit the pinned section: {ctx}"
+    );
+    assert!(
+        ctx.contains("Always push with `git push origin HEAD`"),
+        "pinned body should re-appear at PostCompact: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("safe.md"),
+        "---\ntags: [universal]\n---\n\n# Safe Pattern\n\nLegitimate body content.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    // Tamper a chunk row so its source_file points outside knowledge_dir.
+    // No public API exposes this on purpose — the test exercises the defensive
+    // guard against exactly this kind of out-of-band tampering.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO chunks (id, title, body, tags, source_file, heading_path, is_universal) \
+         VALUES ('escape-attempt', 'Tampered', 'Body', 'universal', \
+         '../../../etc/passwd', '', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-path-traversal");
+
+    assert!(
+        ctx.contains("Legitimate body content"),
+        "the safe universal pattern should still render: {ctx}"
+    );
+    assert!(
+        !ctx.contains("/etc/passwd") && !ctx.contains("root:"),
+        "the tampered source_file should never be read or surfaced: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_truncates_pinned_section_at_render_budget() {
+    // Construct five universal-tagged files, each under the 8 KB per-file cap
+    // but collectively exceeding the 32 KB render-time ceiling. SessionStart
+    // must emit the truncation marker and stop rather than blowing past the
+    // cap. The `_[pinned conventions truncated ...]_` string is load-bearing
+    // for the "defense-in-depth against DB tampering" argument.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Each padding line is 68 bytes; 100 repeats = 6800 bytes of body.
+    // Plus title + blank lines puts each file around 6900 bytes on disk.
+    // Five of them = ~34.5 KB, comfortably over the 32 KB render cap,
+    // each individual file still under the 8 KB per-file ingest cap.
+    let padding_line = "padding content for render-cap truncation test that crosses 32 KB.\n";
+    let padding: String = padding_line.repeat(100);
+
+    for i in 1..=5 {
+        fs::write(
+            dir.join(format!("u{i}.md")),
+            format!("---\ntags: [universal]\n---\n\n# Universal {i}\n\n{padding}"),
+        )
+        .unwrap();
+    }
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    assert!(
+        result.errors.is_empty(),
+        "no file should hit the per-file cap: {:?}",
+        result.errors
+    );
+    assert_eq!(result.universal_sources.len(), 5);
+
+    let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-render-cap");
+
+    assert!(
+        ctx.contains("_[pinned conventions truncated at 32768 bytes"),
+        "expected truncation marker once cumulative body crossed 32 KB; \
+         got {} bytes of systemMessage starting {:?}",
+        ctx.len(),
+        &ctx.chars().take(200).collect::<String>(),
+    );
+    // The pinned section header is still present — we don't collapse the
+    // section, we truncate inside it.
+    assert!(ctx.contains("## Pinned conventions"));
+    // And the first few patterns did render before truncation.
+    assert!(ctx.contains("### Universal 1"));
+}
+
+#[test]
+fn hook_session_start_escapes_ansi_in_tampered_source_file_logs() {
+    // Pin the `sanitize_for_log` call site inside `render_pinned_conventions`:
+    // a tampered chunk row whose `source_file` contains raw ESC bytes must
+    // not leak those bytes into stderr. Agents running with terminal-aware
+    // stderr consumers could otherwise be ANSI-spoofed by a pattern author
+    // (or a tampered DB). Without this test, a refactor that drops the
+    // `sanitize_for_log(&pattern.source_file)` call would silently regress.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("safe.md"),
+        "---\ntags: [universal]\n---\n\n# Safe\n\nLegitimate body content.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    // Tamper: insert a chunk row whose `source_file` carries raw ANSI CSI
+    // sequences (ESC = 0x1b). `validate_within_dir` will reject the path
+    // (the file doesn't exist under `knowledge_dir`), triggering the skip
+    // log path that interpolates `source_file` into stderr.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO chunks (id, title, body, tags, source_file, heading_path, is_universal) \
+         VALUES ('ansi-tamper', 'Evil', 'Body', 'universal', \
+         char(27) || '[2Jmalicious' || char(27) || '[0m', '', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let config_path = write_config(dir, &db_path);
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(r#"{"hook_event_name":"SessionStart","session_id":"ansi-escape-test"}"#)
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+
+    // Raw ESC must never reach stderr — that's the security property.
+    assert!(
+        !stderr.contains('\x1b'),
+        "raw ESC leaked through sanitize_for_log; stderr = {stderr:?}"
+    );
+    // The skip-log path fired (which means sanitize ran on the path).
+    assert!(
+        stderr.contains("skipping pinned"),
+        "expected pinned-skip log line, got: {stderr:?}"
+    );
+    // And the escaped form appears — the helper actually substituted.
+    assert!(
+        stderr.contains("\\u{1b}"),
+        "expected escaped ESC (\\u{{1b}}) in stderr, got: {stderr:?}"
+    );
+
+    // The safe pattern still renders so the section degrades gracefully,
+    // not globally — this preserves the "never break the agent" contract.
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("Legitimate body content"),
+        "the safe universal pattern must still render: {stdout}"
+    );
+}
+
+#[test]
+fn hook_session_start_skips_pinned_pattern_when_source_file_missing() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("ghost.md"),
+        "---\ntags: [universal]\n---\n\n# Ghost Pattern\n\nBody content here.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("present.md"),
+        "---\ntags: [universal]\n---\n\n# Present Pattern\n\nDistinctive body marker xyzzy123.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db_path = dir.join("knowledge.db");
+    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    // Remove ghost.md from disk after ingest — the chunk row still references it.
+    fs::remove_file(dir.join("ghost.md")).unwrap();
+
+    let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-missing-pinned-file");
+
+    assert!(
+        ctx.contains("xyzzy123"),
+        "the present universal pattern should still render: {ctx}"
+    );
+    assert!(
+        !ctx.contains("Body content here."),
+        "the missing-file universal pattern should not surface a body: {ctx}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Universal patterns: PreToolUse partition + dedup bypass
+// ---------------------------------------------------------------------------
+
+/// Run a `SessionStart` followed by N `PreToolUse` calls with the same input,
+/// returning the `additional_context` string from each call (empty when no
+/// output was produced). Cleans up the dedup file on drop.
+fn run_pre_tool_use_sequence(
+    config_path: &Path,
+    session_id: &str,
+    pre_tool_input: &serde_json::Value,
+    repeats: usize,
+) -> Vec<String> {
+    // SessionStart first to create the dedup file.
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let mut outputs = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let output = Command::cargo_bin("lore")
+            .unwrap()
+            .args(["hook", "--config", config_path.to_str().unwrap()])
+            .write_stdin(serde_json::to_string(pre_tool_input).unwrap())
+            .assert()
+            .success();
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        let context = if stdout.is_empty() {
+            String::new()
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            parsed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        outputs.push(context);
+    }
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(session_id));
+    outputs
+}
+
+#[test]
+fn hook_pre_tool_use_non_universal_chunk_present_on_first_call_only() {
+    let (_tmp, config_path) = setup_test_env();
+
+    // PreToolUse for an Edit that matches the seeded rust pattern.
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "test-non-universal-deduped",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/lib.rs" },
+    });
+
+    let contexts = run_pre_tool_use_sequence(&config_path, "test-non-universal-deduped", &input, 2);
+
+    // Either nothing matches at all (then both calls are empty), or the
+    // non-universal pattern appears on the first call but is deduped on the
+    // second. The contract is: dedup still works for non-universal chunks.
+    if !contexts[0].is_empty() {
+        assert!(
+            contexts[1].is_empty()
+                || !contexts[1].contains("anyhow for application-level error propagation"),
+            "second call must dedup the non-universal pattern, got: {:?}",
+            contexts[1]
+        );
+    }
+}
+
+#[test]
+fn hook_pre_tool_use_universal_persists_after_post_compact_truncation() {
+    // Composition cascade hazard pin (per docs/solutions/best-practices/
+    // composition-cascades-...): the dedup file is mutated by both
+    // SessionStart truncation, PostCompact truncation, AND PreToolUse writes.
+    // Ensure universal chunks survive all three mutation routes.
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = "test-cascade";
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    });
+
+    // SessionStart
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    // 3x PreToolUse (writes universal IDs to dedup, but read-side bypass)
+    for _ in 0..3 {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(["hook", "--config", config_path.to_str().unwrap()])
+            .write_stdin(serde_json::to_string(&input).unwrap())
+            .assert()
+            .success();
+    }
+
+    // PostCompact (truncates dedup, re-emits SessionStart content)
+    let post_compact = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&post_compact).unwrap())
+        .assert()
+        .success();
+
+    // 4th PreToolUse — universal must still inject after the truncate cycle.
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("git push origin HEAD"),
+        "universal pattern must persist across PostCompact truncation: {stdout}"
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(session_id));
+}
+
+#[test]
+fn hook_pre_tool_use_universal_chunk_absent_when_query_does_not_match() {
+    // R4 negative pin: a universal pattern only injects when it passes the
+    // search relevance gate for the current tool call.
+    //
+    // workflow.md universal pattern is about `git push origin HEAD`. An
+    // Edit against a Cargo.toml file with no overlap in extracted query
+    // terms must NOT pull in the workflow pattern.
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = "test-irrelevant-tool-call";
+
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "Cargo.toml" },
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        !stdout.contains("git push origin HEAD"),
+        "universal git pattern must not inject for an unrelated Cargo.toml edit: {stdout}"
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(session_id));
+}
+
+#[test]
+fn hook_pre_tool_use_dedup_file_records_universal_chunks() {
+    // Pins the read-side semantic: universal IDs ARE written to the dedup
+    // file (the file remains a faithful injection log) but ignored on read.
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = "test-dedup-records-universal";
+
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let dedup_path = lore::hook::dedup_file_path(session_id);
+    let contents = std::fs::read_to_string(&dedup_path).unwrap();
+    assert!(
+        contents.contains("workflow.md"),
+        "dedup file should record the universal chunk's id (which contains its source_file): {contents}"
+    );
+
+    let _ = std::fs::remove_file(dedup_path);
+}

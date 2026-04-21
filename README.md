@@ -95,7 +95,10 @@ claude mcp add --scope user --transport stdio lore -- \
 The manual approach gives only the MCP server. The plugin also includes hooks that inject relevant
 patterns before edits, a `/search` skill for on-demand queries, and a `/coverage-check` skill that
 audits a draft pattern's vocabulary coverage by simulating the PreToolUse hook's own query
-extraction against synthetic tool calls.
+extraction against synthetic tool calls. Patterns whose `tags:` frontmatter list contains
+`universal` opt into an always-on tier — emitted in full at every SessionStart and re-injected on
+every relevant tool call — for process-level conventions like push discipline that need continuous
+reinforcement (see the "When to use the universal tag" section in the pattern authoring guide).
 
 ## Commands
 
