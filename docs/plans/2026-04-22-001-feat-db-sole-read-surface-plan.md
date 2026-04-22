@@ -1,9 +1,11 @@
 ---
 title: Restore DB-as-sole-read-surface and render pinned conventions from DB
 type: feat
-status: active
+status: complete
 date: 2026-04-22
+completed: 2026-04-22
 origin: docs/brainstorms/2026-04-21-read-surface-invariant-requirements.md
+pr: https://github.com/attila/lore/pull/34
 ---
 
 # Restore DB-as-sole-read-surface and render pinned conventions from DB
@@ -832,6 +834,44 @@ cleanly from the CHANGELOG.
 - `docs/todos/index-single-file-reconciliation-single-transaction.md` — P3 partially overlapping
   with R4. Planning confirms: R4 closes the patterns+chunks atomicity half; the embedder-
   outside-lock half remains open.
+
+### Post-ship notes (2026-04-22)
+
+What actually shipped on PR #34, for anyone reading this after merge.
+
+**Delivered (R1-R9 all green).** Schema v2, `patterns` table, ingest refactor (embedder outside
+transaction, 1:1 invariant enforced by new `delete_pattern_and_chunks_in_tx` /
+`upsert_pattern_in_tx` / `insert_chunk_in_tx` helpers), `universal_patterns()` migrated to return
+the new `UniversalPattern` shape with `raw_body`, `render_pinned_conventions` reads from DB, four
+pattern-level queries migrated, `SCHEMA_VERSION = 2` + version-agnostic advisory, R4d
+`debug_assert!` post-commit invariant check, `tests/invariants.rs` with two static-grep checks,
+`docs/architecture.md` with the DB-as-sole-read-surface invariant + explicit trust-boundary clause,
+`CONTRIBUTING.md` link, `CHANGELOG` entry with the rollback-is-unsafe warning, the two related
+`docs/todos/` entries removed (one closed by this work, one closed by R4's atomicity).
+
+**Deferred from plan, documented on PR.** `BEGIN IMMEDIATE` could not be used — rusqlite's
+`transaction_with_behavior` requires `&mut Connection`, which the codebase's `KnowledgeDB` does not
+hold, so the implementation falls back to `unchecked_transaction()` (`BEGIN DEFERRED`). The R4b
+guarantee (embedder runs outside the transaction window) is unaffected, and the write-lock hold time
+is measured in milliseconds regardless. `begin_immediate_tx`'s docstring notes the trade-off for
+future readers.
+
+**Bonus finding surfaced during smoke test.** Delta ingest doesn't reconcile against disk when an
+MCP-authored file's lifecycle (`add_pattern` → `update_pattern` → `append_to_pattern` → `git
+rm`)
+cancels out in git-diff terms across the `last_ingested_commit..HEAD` window. The orphan row stays
+in the DB until the next `lore ingest --force`. This is pre-existing (MCP single-file writes don't
+bump `last_ingested_commit`) and out of this PR's scope, but captured as a learning: see
+[`docs/solutions/best-practices/out-of-band-writers-bypass-delta-checkpoint-2026-04-22.md`](../solutions/best-practices/out-of-band-writers-bypass-delta-checkpoint-2026-04-22.md)
+and
+[`docs/todos/mcp-writes-bump-last-ingested-commit.md`](../todos/mcp-writes-bump-last-ingested-commit.md)
+for the follow-up.
+
+**Smoke-tested live** against the author's `lore-patterns` knowledge base on 2026-04-22: v1-DB
+advisory fires correctly, `--force` rebuilds into v2 cleanly, patterns dir at chmod 000 still
+renders pinned conventions (the original motivating sandbox case), MCP add/update/append round-trips
+refresh `raw_body` in the DB, next `SessionStart` renders the new body, invariant lint catches a
+planted drift regression. Nine scripted tests, all green.
 
 ### Brainstorm-to-plan notes
 
