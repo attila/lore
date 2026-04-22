@@ -464,6 +464,31 @@ impl KnowledgeDB {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Count `patterns` rows matching `source_file`. Used by debug-build
+    /// invariant assertions in single-file ingest to verify the 1:1
+    /// patterns↔chunks invariant held across the outer transaction.
+    /// Release builds never call this.
+    pub fn pattern_count_for_source(&self, source_file: &str) -> anyhow::Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM patterns WHERE source_file = ?1",
+            params![source_file],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count `chunks` rows matching `source_file`. Companion to
+    /// [`Self::pattern_count_for_source`] for the same debug-assertion
+    /// invariant check.
+    pub fn chunk_count_for_source(&self, source_file: &str) -> anyhow::Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE source_file = ?1",
+            params![source_file],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Read a metadata value by key.
     pub fn get_metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut stmt = self

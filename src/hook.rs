@@ -433,12 +433,12 @@ pub fn search_with_threshold(
             filtered.len(),
         );
         for r in &filtered {
-            lore_debug!("  {:.4} {}", r.score, r.title);
+            lore_debug!("  {:.4} {}", r.score, sanitize_for_log(&r.title));
         }
         filtered
     } else {
         for r in &results {
-            lore_debug!("  {:.4} {}", r.score, r.title);
+            lore_debug!("  {:.4} {}", r.score, sanitize_for_log(&r.title));
         }
         results
     };

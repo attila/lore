@@ -30,6 +30,14 @@ following are explicitly not covered and may read from disk at runtime without c
 - Configuration: `knowledge.toml` loaded at CLI startup.
 - Git metadata: `git rev-parse` subprocess invocations to detect repository state.
 
+**Trust boundary.** Any caller with DB write access — the ingest pipeline, and the three MCP write
+tools (`add_pattern` / `update_pattern` / `append_to_pattern`) — is trusted to produce content that
+may render verbatim into agent context. Pattern-body content (chunks at every `PreToolUse`,
+`raw_body` at every `SessionStart` / `PostCompact`) is never runtime-sanitised: user-authored
+markdown legitimately contains control characters, escape sequences, and code-block examples that
+must survive the round-trip. If an untrusted-MCP-agent threat model becomes relevant, the entire
+agent-context surface needs re-examination — not just the pinned render path.
+
 **Why this invariant exists.** The documented violation it corrects: PR #33 (universal patterns)
 shipped a `render_pinned_conventions` implementation that re-read source markdown at `SessionStart`
 to populate the `## Pinned conventions` section. Before #33, every runtime reader of indexed content

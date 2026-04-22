@@ -1284,7 +1284,8 @@ fn index_single_file(
     // Single outer transaction: delete any existing patterns/chunks rows
     // for this source, then upsert the patterns row and insert every
     // chunk. Any reader on a second connection sees either the old state
-    // or the new state — never a mismatch. BEGIN IMMEDIATE per R4.
+    // or the new state — never a mismatch. See `begin_immediate_tx` doc
+    // for why this is effectively `BEGIN DEFERRED` and why that's fine.
     let tx = db.begin_immediate_tx()?;
     crate::database::delete_pattern_and_chunks_in_tx(&tx, &rel_path)?;
     if let Some(row) = &pattern_row {
@@ -1296,6 +1297,28 @@ fn index_single_file(
     tx.commit()?;
 
     let count = chunks_with_embeddings.len();
+
+    // R4d: in debug builds, verify the 1:1 invariant actually held across
+    // the commit. Catches a future regression where a write path forgets
+    // the outer transaction or where `delete_pattern_and_chunks_in_tx`
+    // loses a table. Release builds skip the asserts — the DB writes are
+    // correct without them; the checks are a drift-detection belt.
+    #[cfg(debug_assertions)]
+    {
+        let expected_pattern_rows = i64::from(pattern_row.is_some());
+        let pattern_count = db.pattern_count_for_source(&rel_path).unwrap_or(-1);
+        debug_assert_eq!(
+            pattern_count, expected_pattern_rows,
+            "patterns row count mismatch for {rel_path}: expected {expected_pattern_rows}, got {pattern_count}"
+        );
+        let chunk_count = db.chunk_count_for_source(&rel_path).unwrap_or(-1);
+        let expected_chunks = i64::try_from(count).unwrap_or(-1);
+        debug_assert_eq!(
+            chunk_count, expected_chunks,
+            "chunk count mismatch for {rel_path}: expected {expected_chunks}, got {chunk_count}"
+        );
+    }
+
     let universal_metadata = detect_universal_metadata(&content, &chunks);
 
     Ok(IndexedFile {
