@@ -13,11 +13,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use serde::Serialize;
 
-use crate::chunking::Chunk;
+use crate::chunking::{Chunk, PatternRow};
 
 // ---------------------------------------------------------------------------
 // sqlite-vec FFI registration
@@ -80,7 +80,12 @@ pub struct DBStats {
     pub sources: usize,
 }
 
-/// One entry per source document, used by `lore list`.
+/// One entry per source document, used by `lore list` and the MCP
+/// `list_patterns` tool.
+///
+/// Intentionally body-free: listing surfaces never need `raw_body` and
+/// shipping it over MCP would bloat responses. [`UniversalPattern`] is the
+/// dedicated shape for render callers that do need the body.
 #[derive(Debug, Clone, Serialize)]
 pub struct PatternSummary {
     pub title: String,
@@ -88,6 +93,20 @@ pub struct PatternSummary {
     pub tags: String,
     /// `true` when any chunk from this source pattern is tagged `universal`.
     pub is_universal: bool,
+}
+
+/// A universal-tagged pattern with its full authorial body, returned by
+/// [`KnowledgeDB::universal_patterns`] for the `## Pinned conventions`
+/// render at `SessionStart` / `PostCompact`. Distinct from
+/// [`PatternSummary`] because rendering needs the body and listing does
+/// not — keeping the shapes separate prevents accidental body leakage
+/// into listing surfaces.
+#[derive(Debug, Clone)]
+pub struct UniversalPattern {
+    pub source_file: String,
+    pub title: String,
+    pub tags: String,
+    pub raw_body: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +158,7 @@ impl KnowledgeDB {
         self.conn
             .execute_batch(&patterns_vec_ddl(self.dimensions))?;
         self.conn.execute_batch(INGEST_METADATA_DDL)?;
+        self.conn.execute_batch(PATTERNS_DDL)?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -160,84 +180,36 @@ impl KnowledgeDB {
         tx.execute_batch("DROP TABLE IF EXISTS chunks")?;
         tx.execute_batch(CHUNKS_DDL)?;
         tx.execute_batch("DELETE FROM patterns_vec")?;
+        tx.execute_batch("DROP TABLE IF EXISTS patterns")?;
+        tx.execute_batch(PATTERNS_DDL)?;
         // Keep the schema stamp in sync with the freshly recreated tables.
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Delete all chunks belonging to a specific source file.
+    /// Delete all chunks AND the `patterns` row belonging to a specific
+    /// source file, atomically. Used for single-file re-indexing after writes
+    /// and for deletions observed by delta-ingest.
     ///
-    /// Used for single-file re-indexing after writes.
+    /// The `patterns` row deletion is part of the same transaction as the
+    /// chunk deletions — no reader ever observes a state where chunks exist
+    /// without a matching patterns row (or vice versa). Enforces the 1:1
+    /// invariant per R4.
     pub fn delete_by_source(&self, source_file: &str) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM patterns_fts WHERE chunk_id IN \
-             (SELECT id FROM chunks WHERE source_file = ?1)",
-            params![source_file],
-        )?;
-        tx.execute(
-            "DELETE FROM patterns_vec WHERE id IN \
-             (SELECT id FROM chunks WHERE source_file = ?1)",
-            params![source_file],
-        )?;
-        tx.execute(
-            "DELETE FROM chunks WHERE source_file = ?1",
-            params![source_file],
-        )?;
+        delete_pattern_and_chunks_in_tx(&tx, source_file)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Insert a chunk (with optional embedding) into all three tables.
-    ///
-    /// Uses a transaction to ensure atomicity. Deletes any existing FTS5 and
-    /// vec0 rows for this chunk ID first to prevent ghost rows on duplicate
-    /// inserts.
+    /// Insert a chunk (with optional embedding) into all three tables under
+    /// a self-contained transaction. Callers composing multiple writes into
+    /// one outer transaction (single-file ingest) should use
+    /// [`insert_chunk_in_tx`] instead.
     pub fn insert_chunk(&self, chunk: &Chunk, embedding: Option<&[f32]>) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-
-        // Delete old FTS and vec rows if they exist to prevent ghost rows.
-        tx.execute(
-            "DELETE FROM patterns_fts WHERE chunk_id = ?1",
-            params![chunk.id],
-        )?;
-        tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
-
-        tx.execute(
-            "INSERT OR REPLACE INTO chunks (id, title, body, tags, source_file, heading_path, is_universal)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                chunk.id,
-                chunk.title,
-                chunk.body,
-                chunk.tags,
-                chunk.source_file,
-                chunk.heading_path,
-                i64::from(chunk.is_universal),
-            ],
-        )?;
-
-        tx.execute(
-            "INSERT INTO patterns_fts (chunk_id, title, body, tags, source_file)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                chunk.id,
-                chunk.title,
-                chunk.body,
-                chunk.tags,
-                chunk.source_file,
-            ],
-        )?;
-
-        if let Some(emb) = embedding {
-            let blob = vec_to_blob(emb);
-            tx.execute(
-                "INSERT INTO patterns_vec (id, embedding) VALUES (?1, ?2)",
-                params![chunk.id, blob],
-            )?;
-        }
-
+        insert_chunk_in_tx(&tx, chunk, embedding)?;
         tx.commit()?;
         Ok(())
     }
@@ -338,30 +310,17 @@ impl KnowledgeDB {
         Ok(reciprocal_rank_fusion(&fts_results, &vec_results, limit))
     }
 
-    /// Return one entry per source document (the shallowest chunk per file).
+    /// Return one entry per source document.
     ///
-    /// Used by `lore list` to show a compact pattern index.
-    /// Selects the chunk with the shortest `heading_path` per source file,
-    /// which corresponds to the root or top-level section.
+    /// Used by `lore list` and the MCP `list_patterns` tool to show a
+    /// compact pattern index. Queries the `patterns` table directly — one
+    /// row per indexed file, keyed on `source_file` — so the result is a
+    /// simple ordered scan with no `DISTINCT`/`GROUP BY` gymnastics.
     pub fn list_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT
-                 root.source_file,
-                 root.title,
-                 root.tags,
-                 (SELECT MAX(is_universal) FROM chunks c WHERE c.source_file = root.source_file)
-                     AS is_universal
-             FROM chunks AS root
-             WHERE root.id IN (
-                 SELECT id FROM chunks c1
-                 WHERE LENGTH(c1.heading_path) = (
-                     SELECT MIN(LENGTH(c2.heading_path))
-                     FROM chunks c2
-                     WHERE c2.source_file = c1.source_file
-                 )
-                 GROUP BY c1.source_file
-             )
-             ORDER BY root.source_file",
+            "SELECT source_file, title, tags, is_universal \
+             FROM patterns \
+             ORDER BY source_file",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -376,14 +335,59 @@ impl KnowledgeDB {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Return one entry per source document where any chunk is `is_universal = 1`.
-    /// Used by the `SessionStart` hook to emit the `## Pinned conventions` section.
-    pub fn universal_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
-        Ok(self
-            .list_patterns()?
-            .into_iter()
-            .filter(|p| p.is_universal)
-            .collect())
+    /// Return one entry per universal-tagged source document, including the
+    /// full authorial `raw_body` for rendering. Used by the `SessionStart`
+    /// hook to emit the `## Pinned conventions` section without re-reading
+    /// the source markdown from disk — the DB is the sole runtime read
+    /// surface for indexed content (see `docs/architecture.md`).
+    pub fn universal_patterns(&self) -> anyhow::Result<Vec<UniversalPattern>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_file, title, tags, raw_body \
+             FROM patterns \
+             WHERE is_universal = 1 \
+             ORDER BY source_file",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(UniversalPattern {
+                source_file: row.get(0)?,
+                title: row.get(1)?,
+                tags: row.get(2)?,
+                raw_body: row.get(3)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Insert or replace a `patterns` row under a self-contained transaction.
+    /// Callers composing multiple writes into one outer transaction should
+    /// use [`upsert_pattern_in_tx`] instead.
+    pub fn upsert_pattern(&self, row: &PatternRow) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_pattern_in_tx(&tx, row)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Begin an outer transaction for multi-write ingest composition.
+    ///
+    /// Opens with `BEGIN DEFERRED` via rusqlite's `unchecked_transaction` —
+    /// the plan called for `BEGIN IMMEDIATE` (acquires the write lock at
+    /// BEGIN so writer-vs-writer races don't force rollbacks), but rusqlite
+    /// exposes `transaction_with_behavior` only on `&mut Connection`, and
+    /// `KnowledgeDB` holds an immutable `Connection` so hook reads and
+    /// ingest writes can share the handle. The trade-off is acceptable
+    /// because ingest is the only writer path in this codebase and the
+    /// critical concurrency guarantee (R4b: embedder runs outside the
+    /// transaction window) is unaffected by DEFERRED vs IMMEDIATE — the
+    /// write lock hold time is measured in milliseconds either way.
+    ///
+    /// Used by single-file ingest to wrap `delete_pattern_and_chunks_in_tx`,
+    /// `upsert_pattern_in_tx`, and per-chunk `insert_chunk_in_tx` in one
+    /// transaction so no reader ever observes a mismatched state.
+    pub fn begin_immediate_tx(&self) -> anyhow::Result<Transaction<'_>> {
+        self.conn.unchecked_transaction().map_err(Into::into)
     }
 
     /// Return all chunks from the given source files.
@@ -426,16 +430,17 @@ impl KnowledgeDB {
     }
 
     /// Return aggregate statistics about the database.
+    ///
+    /// `sources` counts rows in the `patterns` table directly — the authorial
+    /// view of indexed files. `chunks` still counts rows in `chunks`.
     #[allow(clippy::cast_sign_loss)]
     pub fn stats(&self) -> anyhow::Result<DBStats> {
         let chunks: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
-        let sources: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT source_file) FROM chunks",
-            [],
-            |row| row.get(0),
-        )?;
+        let sources: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM patterns", [], |row| row.get(0))?;
         Ok(DBStats {
             // COUNT(*) is always non-negative, so sign loss is not a concern.
             #[allow(clippy::cast_possible_truncation)]
@@ -445,17 +450,43 @@ impl KnowledgeDB {
         })
     }
 
-    /// Return every distinct `source_file` currently indexed.
+    /// Return every `source_file` currently indexed, in alphabetical order.
     ///
     /// Used by the `.loreignore` reconciliation pass to find files that need
-    /// to be removed when ignore patterns change. Results are sorted
-    /// alphabetically. Uses the `idx_chunks_source_file` index for efficiency.
+    /// to be removed when ignore patterns change. Queries the `patterns`
+    /// table directly — `source_file` is the primary key so the result is a
+    /// simple ordered index scan.
     pub fn source_files(&self) -> anyhow::Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT source_file FROM chunks ORDER BY source_file")?;
+            .prepare("SELECT source_file FROM patterns ORDER BY source_file")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count `patterns` rows matching `source_file`. Used by debug-build
+    /// invariant assertions in single-file ingest to verify the 1:1
+    /// patterns↔chunks invariant held across the outer transaction.
+    /// Release builds never call this.
+    pub fn pattern_count_for_source(&self, source_file: &str) -> anyhow::Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM patterns WHERE source_file = ?1",
+            params![source_file],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count `chunks` rows matching `source_file`. Companion to
+    /// [`Self::pattern_count_for_source`] for the same debug-assertion
+    /// invariant check.
+    pub fn chunk_count_for_source(&self, source_file: &str) -> anyhow::Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE source_file = ?1",
+            params![source_file],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Read a metadata value by key.
@@ -518,7 +549,7 @@ pub fn sanitize_fts_query(query: &str) -> String {
 /// Stored as `SQLite`'s `PRAGMA user_version` — a cheap integer slot that
 /// `check_schema_compatibility` reads to decide whether the database was
 /// written by a build old enough to predate the current DDL.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Authoritative DDL for the `chunks` table. Used by both `KnowledgeDB::init`
 /// (fresh-DB path, `CREATE TABLE IF NOT EXISTS`) and `KnowledgeDB::clear_all`
@@ -548,6 +579,29 @@ const PATTERNS_FTS_DDL: &str = "\
 /// Authoritative DDL for `ingest_metadata`.
 const INGEST_METADATA_DDL: &str =
     "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)";
+
+/// Authoritative DDL for the `patterns` table. Stores one row per pattern
+/// file — the authorial view of an indexed document, complementary to the
+/// heading-split fragments in `chunks`.
+///
+/// The table is the sole runtime read surface for pattern bodies: the
+/// `SessionStart` / `PostCompact` pinned-section render path reads
+/// `raw_body` from here instead of re-opening the source markdown on disk.
+/// See `docs/architecture.md` for the "`knowledge.db` is the sole runtime
+/// read surface for indexed content" invariant.
+///
+/// `ingested_at` uses `datetime('now')` to match the `ingest_metadata`
+/// convention — ISO-8601-ish `YYYY-MM-DD HH:MM:SS` in UTC.
+const PATTERNS_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS patterns (
+        source_file  TEXT PRIMARY KEY,
+        title        TEXT NOT NULL,
+        tags         TEXT NOT NULL,
+        is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
+        raw_body     TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        ingested_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )";
 
 /// DDL for the dimensions-bound `patterns_vec` virtual table. Returned as a
 /// `String` because the embedding width is a runtime value.
@@ -603,11 +657,119 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let target = SCHEMA_VERSION;
     anyhow::bail!(
-        "lore: this database predates the universal-patterns feature.\n\
+        "lore: this database was written by an older version of lore \
+         (schema v{version} < v{target}).\n\
          Run `lore ingest --force` to rebuild the index with the new schema.\n\
          This is expected after upgrading; see CHANGELOG for details."
     )
+}
+
+// ---------------------------------------------------------------------------
+// In-transaction write helpers
+// ---------------------------------------------------------------------------
+
+/// Insert or replace a `patterns` row inside a caller-managed transaction.
+/// Used by single-file ingest to compose patterns-row and chunk writes
+/// atomically — see [`KnowledgeDB::begin_immediate_tx`].
+pub fn upsert_pattern_in_tx(tx: &Transaction<'_>, row: &PatternRow) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO patterns \
+         (source_file, title, tags, is_universal, raw_body, content_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            row.source_file,
+            row.title,
+            row.tags,
+            i64::from(row.is_universal),
+            row.raw_body,
+            row.content_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete the `patterns` row plus all FTS / vec / chunk rows belonging to a
+/// source file, inside a caller-managed transaction. Enforces the 1:1
+/// patterns↔chunks invariant (R4) when composed inside an outer ingest
+/// transaction.
+pub fn delete_pattern_and_chunks_in_tx(
+    tx: &Transaction<'_>,
+    source_file: &str,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "DELETE FROM patterns_fts WHERE chunk_id IN \
+         (SELECT id FROM chunks WHERE source_file = ?1)",
+        params![source_file],
+    )?;
+    tx.execute(
+        "DELETE FROM patterns_vec WHERE id IN \
+         (SELECT id FROM chunks WHERE source_file = ?1)",
+        params![source_file],
+    )?;
+    tx.execute(
+        "DELETE FROM chunks WHERE source_file = ?1",
+        params![source_file],
+    )?;
+    tx.execute(
+        "DELETE FROM patterns WHERE source_file = ?1",
+        params![source_file],
+    )?;
+    Ok(())
+}
+
+/// Insert a chunk (with optional embedding) into all three chunk-related
+/// tables, inside a caller-managed transaction. Counterpart to
+/// [`KnowledgeDB::insert_chunk`] for callers that need to compose multiple
+/// writes into one outer transaction (single-file ingest).
+pub fn insert_chunk_in_tx(
+    tx: &Transaction<'_>,
+    chunk: &Chunk,
+    embedding: Option<&[f32]>,
+) -> anyhow::Result<()> {
+    // Delete old FTS and vec rows if they exist to prevent ghost rows.
+    tx.execute(
+        "DELETE FROM patterns_fts WHERE chunk_id = ?1",
+        params![chunk.id],
+    )?;
+    tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO chunks (id, title, body, tags, source_file, heading_path, is_universal)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            chunk.id,
+            chunk.title,
+            chunk.body,
+            chunk.tags,
+            chunk.source_file,
+            chunk.heading_path,
+            i64::from(chunk.is_universal),
+        ],
+    )?;
+
+    tx.execute(
+        "INSERT INTO patterns_fts (chunk_id, title, body, tags, source_file)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            chunk.id,
+            chunk.title,
+            chunk.body,
+            chunk.tags,
+            chunk.source_file,
+        ],
+    )?;
+
+    if let Some(emb) = embedding {
+        let blob = vec_to_blob(emb);
+        tx.execute(
+            "INSERT INTO patterns_vec (id, embedding) VALUES (?1, ?2)",
+            params![chunk.id, blob],
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Convert an `f32` slice to a little-endian byte blob for sqlite-vec.
@@ -703,6 +865,23 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
         }
+    }
+
+    /// Helper: insert a chunk AND the matching `patterns` row. Mirrors the
+    /// 1:1 invariant that real ingest paths enforce — tests inserting only
+    /// chunks directly would break listing queries that now read the
+    /// `patterns` table.
+    fn seed_pattern_and_chunk(db: &KnowledgeDB, chunk: &Chunk, embedding: Option<&[f32]>) {
+        db.upsert_pattern(&PatternRow {
+            source_file: chunk.source_file.clone(),
+            title: chunk.title.clone(),
+            tags: chunk.tags.clone(),
+            is_universal: chunk.is_universal,
+            raw_body: chunk.body.clone(),
+            content_hash: "0000000000000000".to_string(),
+        })
+        .unwrap();
+        db.insert_chunk(chunk, embedding).unwrap();
     }
 
     // -- FFI verification -------------------------------------------------
@@ -869,16 +1048,16 @@ mod tests {
         let db = open_memory_db(4);
         db.init().unwrap();
 
-        db.insert_chunk(
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("c1", "T1", "Body one content", "a.md"),
             Some(&[1.0, 0.0, 0.0, 0.0]),
-        )
-        .unwrap();
-        db.insert_chunk(
+        );
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("c2", "T2", "Body two content", "b.md"),
             Some(&[0.0, 1.0, 0.0, 0.0]),
-        )
-        .unwrap();
+        );
 
         db.delete_by_source("a.md").unwrap();
 
@@ -907,12 +1086,18 @@ mod tests {
         assert_eq!(stats.chunks, 0);
         assert_eq!(stats.sources, 0);
 
-        db.insert_chunk(&make_chunk("c1", "T1", "Body one content", "a.md"), None)
-            .unwrap();
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk("c1", "T1", "Body one content", "a.md"),
+            None,
+        );
         db.insert_chunk(&make_chunk("c2", "T2", "Body two content", "a.md"), None)
             .unwrap();
-        db.insert_chunk(&make_chunk("c3", "T3", "Body three content", "b.md"), None)
-            .unwrap();
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk("c3", "T3", "Body three content", "b.md"),
+            None,
+        );
 
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 3);
@@ -926,16 +1111,16 @@ mod tests {
         let db = open_memory_db(4);
         db.init().unwrap();
 
-        db.insert_chunk(
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("c1", "T1", "Body one content", "rust/b.md"),
             None,
-        )
-        .unwrap();
-        db.insert_chunk(
+        );
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("c2", "T2", "Body two content", "rust/a.md"),
             None,
-        )
-        .unwrap();
+        );
         db.insert_chunk(
             &make_chunk("c3", "T3", "Body three content", "rust/a.md"),
             None,
@@ -963,10 +1148,16 @@ mod tests {
         let db = open_memory_db(4);
         db.init().unwrap();
 
-        db.insert_chunk(&make_chunk("c1", "T1", "Body one content", "a.md"), None)
-            .unwrap();
-        db.insert_chunk(&make_chunk("c2", "T2", "Body two content", "b.md"), None)
-            .unwrap();
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk("c1", "T1", "Body one content", "a.md"),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk("c2", "T2", "Body two content", "b.md"),
+            None,
+        );
 
         db.delete_by_source("a.md").unwrap();
 
@@ -1230,13 +1421,14 @@ mod tests {
         let db = open_memory_db(4);
         db.init().unwrap();
 
-        // Two chunks from same source, one from another.
-        db.insert_chunk(&make_chunk("c1", "Alpha", "Body A1", "alpha.md"), None)
-            .unwrap();
+        // Two chunks from same source, one from another. `list_patterns`
+        // reads the `patterns` table directly so tests must seed both.
+        seed_pattern_and_chunk(&db, &make_chunk("c1", "Alpha", "Body A1", "alpha.md"), None);
+        // Second chunk for the same source_file — upsert is idempotent on
+        // `patterns` and `insert_chunk` is additive on `chunks`.
         db.insert_chunk(&make_chunk("c2", "Alpha Sub", "Body A2", "alpha.md"), None)
             .unwrap();
-        db.insert_chunk(&make_chunk("c3", "Beta", "Body B1", "beta.md"), None)
-            .unwrap();
+        seed_pattern_and_chunk(&db, &make_chunk("c3", "Beta", "Body B1", "beta.md"), None);
 
         let patterns = db.list_patterns().unwrap();
         assert_eq!(patterns.len(), 2);
@@ -1326,7 +1518,7 @@ mod tests {
             heading_path: "Naming".into(),
             is_universal: false,
         };
-        db.insert_chunk(&chunk, None).unwrap();
+        seed_pattern_and_chunk(&db, &chunk, None);
 
         let patterns = db.list_patterns().unwrap();
         assert_eq!(patterns.len(), 1);
@@ -1405,26 +1597,31 @@ mod tests {
         let db = open_memory_db(4);
         db.init().unwrap();
 
-        db.insert_chunk(
+        seed_pattern_and_chunk(
+            &db,
             &make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md"),
             None,
-        )
-        .unwrap();
-        db.insert_chunk(
+        );
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("n1", "Style", "Use anyhow for errors.", "style.md"),
             None,
-        )
-        .unwrap();
-        db.insert_chunk(
+        );
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("n2", "SQLite", "Use bundled sqlite.", "sql.md"),
             None,
-        )
-        .unwrap();
+        );
 
         let universal = db.universal_patterns().unwrap();
         assert_eq!(universal.len(), 1);
         assert_eq!(universal[0].source_file, "wf.md");
-        assert!(universal[0].is_universal);
+        // `universal_patterns()` returns only universal rows by construction;
+        // no `is_universal` field — the filter is in the WHERE clause.
+        assert_eq!(
+            universal[0].raw_body, "Always git push origin HEAD.",
+            "raw_body should carry the authorial body for render"
+        );
     }
 
     #[test]
@@ -1432,16 +1629,16 @@ mod tests {
         let db = open_memory_db(4);
         db.init().unwrap();
 
-        db.insert_chunk(
+        seed_pattern_and_chunk(
+            &db,
             &make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md"),
             None,
-        )
-        .unwrap();
-        db.insert_chunk(
+        );
+        seed_pattern_and_chunk(
+            &db,
             &make_chunk("n1", "Style", "Use anyhow for errors.", "style.md"),
             None,
-        )
-        .unwrap();
+        );
 
         let patterns = db.list_patterns().unwrap();
         let by_source: std::collections::HashMap<_, _> = patterns

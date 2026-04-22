@@ -1509,6 +1509,15 @@ mod tests {
                 is_universal: false,
             },
         ] {
+            h.db.upsert_pattern(&crate::chunking::PatternRow {
+                source_file: chunk.source_file.clone(),
+                title: chunk.title.clone(),
+                tags: chunk.tags.clone(),
+                is_universal: chunk.is_universal,
+                raw_body: chunk.body.clone(),
+                content_hash: "0000000000000000".into(),
+            })
+            .unwrap();
             h.db.insert_chunk(&chunk, None).unwrap();
         }
 
@@ -1552,19 +1561,25 @@ mod tests {
     #[test]
     fn list_patterns_metadata_fence_carries_structured_rows() {
         let h = TestHarness::new();
-        h.db.insert_chunk(
-            &crate::chunking::Chunk {
-                id: "u1".into(),
-                title: "Conventions".into(),
-                body: "Body long enough for a chunk.".into(),
-                tags: "universal".into(),
-                source_file: "c.md".into(),
-                heading_path: String::new(),
-                is_universal: true,
-            },
-            None,
-        )
+        let chunk = crate::chunking::Chunk {
+            id: "u1".into(),
+            title: "Conventions".into(),
+            body: "Body long enough for a chunk.".into(),
+            tags: "universal".into(),
+            source_file: "c.md".into(),
+            heading_path: String::new(),
+            is_universal: true,
+        };
+        h.db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: chunk.source_file.clone(),
+            title: chunk.title.clone(),
+            tags: chunk.tags.clone(),
+            is_universal: chunk.is_universal,
+            raw_body: chunk.body.clone(),
+            content_hash: "0000000000000000".into(),
+        })
         .unwrap();
+        h.db.insert_chunk(&chunk, None).unwrap();
 
         let resp = h.request_value(
             r#"{"jsonrpc":"2.0","id":72,"method":"tools/call",
