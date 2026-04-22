@@ -1188,15 +1188,24 @@ fn hook_session_start_escapes_ansi_in_tampered_source_file_logs() {
     db.init().unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
-    // Tamper: insert a chunk row whose `source_file` carries raw ANSI CSI
-    // sequences (ESC = 0x1b). `validate_within_dir` will reject the path
-    // (the file doesn't exist under `knowledge_dir`), triggering the skip
-    // log path that interpolates `source_file` into stderr.
+    // Tamper: insert BOTH a chunk row and a `patterns` row whose
+    // `source_file` carries raw ANSI CSI sequences (ESC = 0x1b).
+    // `universal_patterns()` reads the `patterns` table; the render path
+    // then calls `validate_within_dir` which rejects the path (the file
+    // doesn't exist under `knowledge_dir`), triggering the skip log path
+    // that interpolates `source_file` into stderr.
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
         "INSERT INTO chunks (id, title, body, tags, source_file, heading_path, is_universal) \
          VALUES ('ansi-tamper', 'Evil', 'Body', 'universal', \
          char(27) || '[2Jmalicious' || char(27) || '[0m', '', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO patterns (source_file, title, tags, is_universal, raw_body, content_hash) \
+         VALUES (char(27) || '[2Jmalicious' || char(27) || '[0m', \
+                 'Evil', 'universal', 1, 'Body', '0000000000000000')",
         [],
     )
     .unwrap();

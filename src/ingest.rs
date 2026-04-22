@@ -689,57 +689,26 @@ pub fn full_ingest(
     }
 
     for file_path in &md_files {
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(c) => c,
+        match index_single_file(db, embedder, knowledge_dir, file_path, strategy) {
+            Ok(indexed) => {
+                result.chunks_created += indexed.chunks_indexed;
+                fold_universal_metadata(
+                    &mut result,
+                    &indexed.rel_path,
+                    &indexed.universal_metadata,
+                );
+                result.files_processed += 1;
+                on_progress(&format!(
+                    "  {} → {} chunks",
+                    indexed.rel_path, indexed.chunks_indexed
+                ));
+            }
             Err(e) => {
                 result
                     .errors
-                    .push(format!("Failed to read {}: {e}", file_path.display()));
-                continue;
-            }
-        };
-
-        let rel_path = file_path
-            .strip_prefix(knowledge_dir)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
-
-        let chunks = dispatch_chunking(strategy, &content, &rel_path);
-
-        // Enforce the per-file universal body-size hard cap before insert.
-        // Per-file atomic rejection: a too-large universal file is skipped
-        // entirely rather than leaving some chunks indexed.
-        if let Err(e) = enforce_universal_body_cap(&rel_path, &chunks) {
-            result.errors.push(e.to_string());
-            continue;
-        }
-
-        for chunk in &chunks {
-            let embedding = match embedder.embed(&embed_text(chunk)) {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Embedding failed for {}: {e}", chunk.id));
-                    None
-                }
-            };
-
-            if let Err(e) = db.insert_chunk(chunk, embedding.as_deref()) {
-                result
-                    .errors
-                    .push(format!("Insert failed for {}: {e}", chunk.id));
-            } else {
-                result.chunks_created += 1;
+                    .push(format!("Failed to index {}: {e}", file_path.display()));
             }
         }
-
-        let universal_metadata = detect_universal_metadata(&content, &chunks);
-        fold_universal_metadata(&mut result, &rel_path, &universal_metadata);
-
-        result.files_processed += 1;
-        on_progress(&format!("  {} → {} chunks", rel_path, chunks.len()));
     }
 
     // Record the HEAD commit for future delta ingests.
@@ -1285,23 +1254,48 @@ fn index_single_file(
     // the database so a rejection leaves the existing index untouched.
     enforce_universal_body_cap(&rel_path, &chunks)?;
 
-    // Remove old chunks for this file.
-    db.delete_by_source(&rel_path)?;
+    // Compute embeddings BEFORE opening the outer transaction so the SQLite
+    // write lock is never held across Ollama HTTP round-trips. R4b in
+    // `docs/plans/2026-04-22-001-feat-db-sole-read-surface-plan.md`.
+    // Collecting into a Vec materialises all embed calls up front; the
+    // transaction block below contains only in-memory DB work.
+    let mut embedding_failures = 0_usize;
+    let chunks_with_embeddings: Vec<(Chunk, Option<Vec<f32>>)> = chunks
+        .iter()
+        .map(|chunk| {
+            let embedding = if let Ok(emb) = embedder.embed(&embed_text(chunk)) {
+                Some(emb)
+            } else {
+                embedding_failures += 1;
+                None
+            };
+            (chunk.clone(), embedding)
+        })
+        .collect();
 
-    let mut count = 0;
-    let mut embedding_failures = 0;
+    let pattern_row = if chunks.is_empty() {
+        None
+    } else {
+        Some(crate::chunking::pattern_row_from(
+            &content, &rel_path, &chunks,
+        ))
+    };
 
-    for chunk in &chunks {
-        let embedding = if let Ok(emb) = embedder.embed(&embed_text(chunk)) {
-            Some(emb)
-        } else {
-            embedding_failures += 1;
-            None
-        };
-        db.insert_chunk(chunk, embedding.as_deref())?;
-        count += 1;
+    // Single outer transaction: delete any existing patterns/chunks rows
+    // for this source, then upsert the patterns row and insert every
+    // chunk. Any reader on a second connection sees either the old state
+    // or the new state — never a mismatch. BEGIN IMMEDIATE per R4.
+    let tx = db.begin_immediate_tx()?;
+    crate::database::delete_pattern_and_chunks_in_tx(&tx, &rel_path)?;
+    if let Some(row) = &pattern_row {
+        crate::database::upsert_pattern_in_tx(&tx, row)?;
     }
+    for (chunk, embedding) in &chunks_with_embeddings {
+        crate::database::insert_chunk_in_tx(&tx, chunk, embedding.as_deref())?;
+    }
+    tx.commit()?;
 
+    let count = chunks_with_embeddings.len();
     let universal_metadata = detect_universal_metadata(&content, &chunks);
 
     Ok(IndexedFile {

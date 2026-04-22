@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::hash::fnv1a;
+
 /// A single chunk of knowledge extracted from a markdown file.
 ///
 /// No `Default` impl by design: every chunk-construction site must explicitly
@@ -160,6 +162,54 @@ pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
         heading_path: String::new(),
         is_universal,
     }]
+}
+
+/// One row per pattern file for the `patterns` table — the authorial view
+/// of an indexed document.
+///
+/// Built from the file's full raw contents plus the chunks already produced
+/// for it (see [`pattern_row_from`]), then handed to
+/// [`crate::database::upsert_pattern_in_tx`] as part of single-file ingest.
+///
+/// `raw_body` is the frontmatter-stripped document — what agents see
+/// rendered into `## Pinned conventions`. `content_hash` is over the whole
+/// file (frontmatter included) so tag-only edits still invalidate the hash
+/// for future delta-ingest short-circuiting.
+#[derive(Debug, Clone)]
+pub struct PatternRow {
+    pub source_file: String,
+    pub title: String,
+    pub tags: String,
+    pub is_universal: bool,
+    pub raw_body: String,
+    pub content_hash: String,
+}
+
+/// Build a [`PatternRow`] from the file's raw contents and its produced
+/// chunks. Pure — no I/O.
+///
+/// Caller is expected to have chunked the file first and verified that at
+/// least one chunk was produced; callers that see an empty chunk set should
+/// skip upserting a pattern row and let `delete_pattern_and_chunks_in_tx`
+/// remove any stale row.
+pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> PatternRow {
+    // All chunks from a single file share the frontmatter-derived
+    // `is_universal` flag — we read it from the first chunk instead of
+    // re-parsing the frontmatter, keeping the two paths in sync by
+    // construction.
+    let is_universal = chunks.first().is_some_and(|c| c.is_universal);
+    let tags = chunks.first().map_or_else(String::new, |c| c.tags.clone());
+    let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
+    let raw_body = strip_frontmatter(content).trim().to_string();
+    let content_hash = format!("{:016x}", fnv1a(content.as_bytes()));
+    PatternRow {
+        source_file: source_file.to_string(),
+        title,
+        tags,
+        is_universal,
+        raw_body,
+        content_hash,
+    }
 }
 
 /// Extract the first `# Heading` from `content` (after frontmatter).
