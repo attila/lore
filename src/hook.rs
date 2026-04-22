@@ -545,7 +545,7 @@ pub const PINNED_SECTION_TOTAL_LIMIT_BYTES: usize = 32 * 1024;
 /// renders. The hook's broader "never break the agent" contract means
 /// any error here degrades to an empty pinned section rather than a hard
 /// failure.
-fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Result<String> {
+fn render_pinned_conventions(db: &KnowledgeDB, _knowledge_dir: &Path) -> anyhow::Result<String> {
     let universal = db.universal_patterns()?;
     if universal.is_empty() {
         return Ok(String::new());
@@ -557,54 +557,41 @@ fn render_pinned_conventions(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::
     let mut out = String::from(header);
     let budget_start = out.len();
 
+    // Render pattern bodies directly from the DB — the patterns table holds
+    // the authorial `raw_body` populated at ingest. `_knowledge_dir` is
+    // retained on the signature for backwards-compatible callers but is no
+    // longer read: per R2 of the db-sole-read-surface PR, no disk reads
+    // remain in this path. DB write access is the existing trust boundary
+    // (R2b); no control-character sanitisation is applied to `raw_body`
+    // because user-authored markdown legitimately contains escape sequences
+    // (code blocks, shell examples) that must render verbatim.
     for pattern in &universal {
-        let candidate = knowledge_dir.join(&pattern.source_file);
-        let safe_source = sanitize_for_log(&pattern.source_file);
-        let canonical = match crate::ingest::validate_within_dir(knowledge_dir, &candidate) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("lore hook: skipping pinned `{safe_source}`: {e}");
-                lore_debug!("pinned containment check failed for {safe_source}: {e}");
-                continue;
-            }
-        };
-        // Read from the canonical path returned by validation. Reading from
-        // the pre-canonical `candidate` re-opens the TOCTOU window — a
-        // symlink swap between validation and open could redirect the read
-        // to a file outside `knowledge_dir`.
-        match std::fs::read_to_string(&canonical) {
-            Ok(body) => {
-                let body = body.trim_end();
-                let consumed = out.len() - budget_start;
-                let remaining = PINNED_SECTION_TOTAL_LIMIT_BYTES.saturating_sub(consumed);
-                let heading = format!("\n### {}\n\n", pattern.title);
-                if heading.len() + body.len() + 1 > remaining {
-                    // The next pattern body would push the section over the
-                    // render-time cap. Emit a visible truncation marker and
-                    // stop. Ingest already rejects oversized universal
-                    // patterns per file (UNIVERSAL_BODY_HARD_LIMIT_BYTES);
-                    // hitting this guard means either a DB tamper bypassed
-                    // the ingest check or the operator has so many universal
-                    // files that the aggregate pushes over budget.
-                    let _ = writeln!(
-                        out,
-                        "\n_[pinned conventions truncated at {PINNED_SECTION_TOTAL_LIMIT_BYTES} bytes — trim or retag universal patterns]_",
-                    );
-                    lore_debug!(
-                        "pinned render truncated at {} bytes (next pattern: {safe_source})",
-                        PINNED_SECTION_TOTAL_LIMIT_BYTES,
-                    );
-                    break;
-                }
-                out.push_str(&heading);
-                out.push_str(body);
-                out.push('\n');
-            }
-            Err(e) => {
-                eprintln!("lore hook: skipping pinned `{safe_source}`: read failed ({e})");
-                lore_debug!("pinned read failed for {safe_source}: {e}");
-            }
+        let body = pattern.raw_body.trim_end();
+        let consumed = out.len() - budget_start;
+        let remaining = PINNED_SECTION_TOTAL_LIMIT_BYTES.saturating_sub(consumed);
+        let heading = format!("\n### {}\n\n", pattern.title);
+        if heading.len() + body.len() + 1 > remaining {
+            // The next pattern body would push the section over the
+            // render-time cap. Emit a visible truncation marker and stop.
+            // Ingest already rejects oversized universal patterns per file
+            // (UNIVERSAL_BODY_HARD_LIMIT_BYTES); hitting this guard means
+            // either a DB tamper bypassed the ingest check or the operator
+            // has so many universal files that the aggregate pushes over
+            // budget.
+            let safe_source = sanitize_for_log(&pattern.source_file);
+            let _ = writeln!(
+                out,
+                "\n_[pinned conventions truncated at {PINNED_SECTION_TOTAL_LIMIT_BYTES} bytes — trim or retag universal patterns]_",
+            );
+            lore_debug!(
+                "pinned render truncated at {} bytes (next pattern: {safe_source})",
+                PINNED_SECTION_TOTAL_LIMIT_BYTES,
+            );
+            break;
         }
+        out.push_str(&heading);
+        out.push_str(body);
+        out.push('\n');
     }
 
     Ok(out)

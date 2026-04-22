@@ -84,9 +84,8 @@ pub struct DBStats {
 /// `list_patterns` tool.
 ///
 /// Intentionally body-free: listing surfaces never need `raw_body` and
-/// shipping it over MCP would bloat responses. Render callers that need the
-/// body get a dedicated shape carrying `raw_body` (added in the Unit 2
-/// follow-up migration).
+/// shipping it over MCP would bloat responses. [`UniversalPattern`] is the
+/// dedicated shape for render callers that do need the body.
 #[derive(Debug, Clone, Serialize)]
 pub struct PatternSummary {
     pub title: String,
@@ -94,6 +93,20 @@ pub struct PatternSummary {
     pub tags: String,
     /// `true` when any chunk from this source pattern is tagged `universal`.
     pub is_universal: bool,
+}
+
+/// A universal-tagged pattern with its full authorial body, returned by
+/// [`KnowledgeDB::universal_patterns`] for the `## Pinned conventions`
+/// render at `SessionStart` / `PostCompact`. Distinct from
+/// [`PatternSummary`] because rendering needs the body and listing does
+/// not — keeping the shapes separate prevents accidental body leakage
+/// into listing surfaces.
+#[derive(Debug, Clone)]
+pub struct UniversalPattern {
+    pub source_file: String,
+    pub title: String,
+    pub tags: String,
+    pub raw_body: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,26 +335,25 @@ impl KnowledgeDB {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Return one entry per universal-tagged source document. Used by the
-    /// `SessionStart` hook to emit the `## Pinned conventions` section.
-    /// Unit 2 of the DB-as-sole-read-surface PR switches the return type
-    /// to include `raw_body` so the hook can render from this directly;
-    /// for now (Unit 1) the shape still matches `list_patterns` so the
-    /// hook's existing code path continues to compile unchanged.
-    pub fn universal_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
+    /// Return one entry per universal-tagged source document, including the
+    /// full authorial `raw_body` for rendering. Used by the `SessionStart`
+    /// hook to emit the `## Pinned conventions` section without re-reading
+    /// the source markdown from disk — the DB is the sole runtime read
+    /// surface for indexed content (see `docs/architecture.md`).
+    pub fn universal_patterns(&self) -> anyhow::Result<Vec<UniversalPattern>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_file, title, tags \
+            "SELECT source_file, title, tags, raw_body \
              FROM patterns \
              WHERE is_universal = 1 \
              ORDER BY source_file",
         )?;
 
         let rows = stmt.query_map([], |row| {
-            Ok(PatternSummary {
+            Ok(UniversalPattern {
                 source_file: row.get(0)?,
                 title: row.get(1)?,
                 tags: row.get(2)?,
-                is_universal: true,
+                raw_body: row.get(3)?,
             })
         })?;
 
@@ -1579,7 +1591,12 @@ mod tests {
         let universal = db.universal_patterns().unwrap();
         assert_eq!(universal.len(), 1);
         assert_eq!(universal[0].source_file, "wf.md");
-        assert!(universal[0].is_universal);
+        // `universal_patterns()` returns only universal rows by construction;
+        // no `is_universal` field — the filter is in the WHERE clause.
+        assert_eq!(
+            universal[0].raw_body, "Always git push origin HEAD.",
+            "raw_body should carry the authorial body for render"
+        );
     }
 
     #[test]

@@ -1166,13 +1166,15 @@ fn hook_session_start_truncates_pinned_section_at_render_budget() {
 }
 
 #[test]
-fn hook_session_start_escapes_ansi_in_tampered_source_file_logs() {
-    // Pin the `sanitize_for_log` call site inside `render_pinned_conventions`:
-    // a tampered chunk row whose `source_file` contains raw ESC bytes must
-    // not leak those bytes into stderr. Agents running with terminal-aware
-    // stderr consumers could otherwise be ANSI-spoofed by a pattern author
-    // (or a tampered DB). Without this test, a refactor that drops the
-    // `sanitize_for_log(&pattern.source_file)` call would silently regress.
+fn hook_session_start_renders_raw_body_control_chars_verbatim() {
+    // Pin R2b of the db-sole-read-surface PR: the render path does NOT
+    // sanitise `raw_body` control characters. DB write access is the
+    // existing trust boundary — an adversary who can tamper patterns rows
+    // can already influence agent context via chunks. Sanitising here
+    // would mangle legitimate code-block examples and escape-sequence
+    // documentation that pattern authors must be able to write. A future
+    // refactor that adds `sanitize_for_log` (or similar) to the render
+    // path will fail this test and have to justify the change.
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
 
@@ -1188,78 +1190,58 @@ fn hook_session_start_escapes_ansi_in_tampered_source_file_logs() {
     db.init().unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
-    // Tamper: insert BOTH a chunk row and a `patterns` row whose
-    // `source_file` carries raw ANSI CSI sequences (ESC = 0x1b).
-    // `universal_patterns()` reads the `patterns` table; the render path
-    // then calls `validate_within_dir` which rejects the path (the file
-    // doesn't exist under `knowledge_dir`), triggering the skip log path
-    // that interpolates `source_file` into stderr.
+    // Tamper: insert a `patterns` row whose `raw_body` carries raw ANSI
+    // CSI sequences. Render must pass them through verbatim.
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
-        "INSERT INTO chunks (id, title, body, tags, source_file, heading_path, is_universal) \
-         VALUES ('ansi-tamper', 'Evil', 'Body', 'universal', \
-         char(27) || '[2Jmalicious' || char(27) || '[0m', '', 1)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
         "INSERT INTO patterns (source_file, title, tags, is_universal, raw_body, content_hash) \
-         VALUES (char(27) || '[2Jmalicious' || char(27) || '[0m', \
-                 'Evil', 'universal', 1, 'Body', '0000000000000000')",
+         VALUES ('tamper.md', 'Tampered', 'universal', 1, \
+                 'escape:' || char(27) || '[2Jpayload' || char(27) || '[0m', \
+                 '0000000000000000')",
         [],
     )
     .unwrap();
     drop(conn);
 
     let config_path = write_config(dir, &db_path);
+    let ctx = invoke_session_start(&config_path, "test-raw-body-verbatim");
 
-    let output = Command::cargo_bin("lore")
-        .unwrap()
-        .args(["hook", "--config", config_path.to_str().unwrap()])
-        .write_stdin(r#"{"hook_event_name":"SessionStart","session_id":"ansi-escape-test"}"#)
-        .assert()
-        .success();
-
-    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
-
-    // Raw ESC must never reach stderr — that's the security property.
+    // The safe pattern still renders.
     assert!(
-        !stderr.contains('\x1b'),
-        "raw ESC leaked through sanitize_for_log; stderr = {stderr:?}"
+        ctx.contains("Legitimate body content"),
+        "safe universal pattern must still render: {ctx}"
     );
-    // The skip-log path fired (which means sanitize ran on the path).
+    // The tampered body appears with ESC bytes intact — verbatim is the
+    // contract. Stringify the ctx bytes to match against the raw escape.
     assert!(
-        stderr.contains("skipping pinned"),
-        "expected pinned-skip log line, got: {stderr:?}"
-    );
-    // And the escaped form appears — the helper actually substituted.
-    assert!(
-        stderr.contains("\\u{1b}"),
-        "expected escaped ESC (\\u{{1b}}) in stderr, got: {stderr:?}"
-    );
-
-    // The safe pattern still renders so the section degrades gracefully,
-    // not globally — this preserves the "never break the agent" contract.
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    assert!(
-        stdout.contains("Legitimate body content"),
-        "the safe universal pattern must still render: {stdout}"
+        ctx.contains("escape:\x1b[2Jpayload\x1b[0m"),
+        "raw_body must render verbatim including control chars"
     );
 }
 
 #[test]
-fn hook_session_start_skips_pinned_pattern_when_source_file_missing() {
+fn hook_session_start_renders_from_db_even_when_source_file_removed() {
+    // Pin the DB-as-sole-read-surface invariant: once a pattern file has
+    // been ingested, removing it from disk does NOT remove the body from
+    // the rendered pinned section. Render reads from the `patterns` table,
+    // not the filesystem.
+    //
+    // This is a deliberate behavioural change from #33-era behaviour,
+    // where the render path re-read source markdown at SessionStart and
+    // would skip any file that had vanished. The new contract is: ingest
+    // writes, render reads DB — the patterns directory is no longer a
+    // runtime dependency.
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
 
     fs::write(
         dir.join("ghost.md"),
-        "---\ntags: [universal]\n---\n\n# Ghost Pattern\n\nBody content here.\n",
+        "---\ntags: [universal]\n---\n\n# Ghost Pattern\n\nBody content marker alpha-xyzzy.\n",
     )
     .unwrap();
     fs::write(
         dir.join("present.md"),
-        "---\ntags: [universal]\n---\n\n# Present Pattern\n\nDistinctive body marker xyzzy123.\n",
+        "---\ntags: [universal]\n---\n\n# Present Pattern\n\nDistinctive body marker beta-xyzzy.\n",
     )
     .unwrap();
 
@@ -1269,19 +1251,20 @@ fn hook_session_start_skips_pinned_pattern_when_source_file_missing() {
     db.init().unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
-    // Remove ghost.md from disk after ingest — the chunk row still references it.
+    // Remove ghost.md from disk after ingest — its patterns row stays in
+    // the DB and the render still surfaces its body.
     fs::remove_file(dir.join("ghost.md")).unwrap();
 
     let config_path = write_config(dir, &db_path);
-    let ctx = invoke_session_start(&config_path, "test-missing-pinned-file");
+    let ctx = invoke_session_start(&config_path, "test-ghost-file-still-renders");
 
     assert!(
-        ctx.contains("xyzzy123"),
-        "the present universal pattern should still render: {ctx}"
+        ctx.contains("beta-xyzzy"),
+        "the present universal pattern should render: {ctx}"
     );
     assert!(
-        !ctx.contains("Body content here."),
-        "the missing-file universal pattern should not surface a body: {ctx}"
+        ctx.contains("alpha-xyzzy"),
+        "ghost pattern should still render from DB despite disk file removed: {ctx}"
     );
 }
 
