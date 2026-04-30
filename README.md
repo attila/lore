@@ -44,7 +44,62 @@ Markdown files (git repo, source of truth)
 
 ### Install
 
-Prebuilt binaries and package manager installs are planned. For now, build from source:
+Prebuilt binaries are published with every tagged release on the
+[releases page](https://github.com/attila/lore/releases). Each release ships tarballs for four
+targets plus a `SHA256SUMS` file for integrity verification. Pick the snippet that matches your
+platform; the `releases/latest/download/...` URLs always resolve to the most recent stable release.
+
+#### Linux (glibc — most distros)
+
+```sh
+curl -LO https://github.com/attila/lore/releases/latest/download/lore-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar xzf lore-x86_64-unknown-linux-gnu.tar.gz
+sudo mv lore /usr/local/bin/
+# (no sudo? use `mkdir -p ~/.local/bin && mv lore ~/.local/bin/` and ensure ~/.local/bin is on PATH)
+```
+
+#### Linux (Alpine / musl)
+
+```sh
+curl -LO https://github.com/attila/lore/releases/latest/download/lore-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar xzf lore-x86_64-unknown-linux-musl.tar.gz
+sudo mv lore /usr/local/bin/
+```
+
+#### macOS (Apple Silicon)
+
+```sh
+curl -LO https://github.com/attila/lore/releases/latest/download/lore-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar xzf lore-aarch64-apple-darwin.tar.gz
+sudo mv lore /usr/local/bin/
+```
+
+#### macOS (Intel)
+
+```sh
+curl -LO https://github.com/attila/lore/releases/latest/download/lore-x86_64-apple-darwin.tar.gz
+curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar xzf lore-x86_64-apple-darwin.tar.gz
+sudo mv lore /usr/local/bin/
+```
+
+> **macOS Gatekeeper note**: tarballs downloaded via `curl` run without further intervention. If you
+> download via a browser, macOS may attach the `com.apple.quarantine` extended attribute and refuse
+> to launch the binary. Clear it with `xattr -d com.apple.quarantine ./lore` after extraction (or
+> right-click → Open the first time). The binary is not Apple-notarized — that requires a paid
+> Developer ID certificate, which the project does not currently hold.
+
+For older versions, browse the [releases page](https://github.com/attila/lore/releases) and
+substitute the version into the URL: `releases/download/v0.1.0-alpha.1/lore-...tar.gz`.
+
+#### Build from source
 
 ```sh
 just install
@@ -179,6 +234,7 @@ Always use Result<T, E> for fallible operations...
 | [Search Mechanics Reference](docs/search-mechanics.md)                | Full search pipeline internals for debugging discoverability |
 | [Hook Pipeline and Plugin Reference](docs/hook-pipeline-reference.md) | Hook lifecycle, plugin setup, and injection tuning           |
 | [Configuration Reference](docs/configuration.md)                      | `lore.toml` options, environment variables, CLI flags        |
+| [Release Process](docs/release-process.md)                            | Maintainer runbook for cutting releases                      |
 
 ## Development
 
