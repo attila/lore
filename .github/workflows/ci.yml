@@ -75,15 +75,39 @@ jobs:
           tool: just
       - run: just doc
 
+  cross-compile:
+    name: Cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          rustflags: ""
+          target: ${{ matrix.target }}
+      - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: zig@0.13.0,cargo-zigbuild@0.20.0
+      - run: cargo zigbuild --release --target ${{ matrix.target }}
+
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, deny, doc]
+    needs: [fmt, clippy, test, deny, doc, cross-compile]
     if: always()
     steps:
       - name: Check all jobs
         run: |
-          results=("${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.deny.result }}" "${{ needs.doc.result }}")
+          results=("${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.deny.result }}" "${{ needs.doc.result }}" "${{ needs.cross-compile.result }}")
           for r in "${results[@]}"; do
             if [[ "$r" != "success" ]]; then
               echo "Job failed with result: $r"
