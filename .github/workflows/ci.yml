@@ -78,6 +78,7 @@ jobs:
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

@@ -6,9 +6,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
-use predicates::Predicate;
+use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
 
@@ -25,13 +24,10 @@ fn write_changelog(dir: &TempDir, body: &str) {
     fs::write(dir.path().join("CHANGELOG.md"), body).unwrap();
 }
 
-fn run_release_prep(dir: &TempDir, version: &str) -> std::process::Output {
-    Command::new("bash")
-        .arg(script_path())
-        .arg(version)
-        .current_dir(dir.path())
-        .output()
-        .expect("failed to spawn bash")
+fn release_prep(dir: &TempDir, version: &str) -> Command {
+    let mut cmd = Command::new("bash");
+    cmd.arg(script_path()).arg(version).current_dir(dir.path());
+    cmd
 }
 
 fn populated_changelog() -> &'static str {
@@ -53,20 +49,11 @@ fn populated_changelog() -> &'static str {
 
 #[test]
 fn happy_path_bumps_cargo_and_rotates_changelog() {
-    // Arrange
     let dir = TempDir::new().unwrap();
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, populated_changelog());
 
-    // Act
-    let output = run_release_prep(&dir, "0.1.0-alpha.1");
-
-    // Assert
-    assert!(
-        output.status.success(),
-        "script failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    release_prep(&dir, "0.1.0-alpha.1").assert().success();
 
     let cargo = fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(
@@ -89,29 +76,53 @@ fn happy_path_bumps_cargo_and_rotates_changelog() {
         unreleased_idx < version_idx,
         "[Unreleased] should precede the new version heading"
     );
+    // Pin rotation semantics: previous Unreleased entries must sit UNDER the
+    // new dated heading, not remain under the now-empty [Unreleased].
+    let between_unreleased_and_version = &changelog[unreleased_idx..version_idx];
     assert!(
-        changelog.contains("A shiny new feature"),
+        !between_unreleased_and_version.contains("A shiny new feature"),
+        "previous Unreleased entries leaked into new [Unreleased]: {between_unreleased_and_version}"
+    );
+    assert!(
+        changelog[version_idx..].contains("A shiny new feature"),
         "previous Unreleased entries should now sit under the dated heading: {changelog}"
     );
 }
 
 #[test]
-fn rejects_invalid_version_format() {
-    // Arrange
+fn happy_path_accepts_rc_suffix() {
     let dir = TempDir::new().unwrap();
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, populated_changelog());
 
-    // Act
-    let output = run_release_prep(&dir, "1.0");
+    release_prep(&dir, "0.1.0-rc.2").assert().success();
 
-    // Assert
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        contains("not a valid semver").eval(&stderr),
-        "stderr should mention semver: {stderr}"
-    );
+    let cargo = fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("version = \"0.1.0-rc.2\""));
+}
+
+#[test]
+fn happy_path_accepts_beta_double_digit_suffix() {
+    let dir = TempDir::new().unwrap();
+    write_cargo_toml(&dir, "0.1.0");
+    write_changelog(&dir, populated_changelog());
+
+    release_prep(&dir, "0.1.0-beta.10").assert().success();
+
+    let cargo = fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("version = \"0.1.0-beta.10\""));
+}
+
+#[test]
+fn rejects_invalid_version_format() {
+    let dir = TempDir::new().unwrap();
+    write_cargo_toml(&dir, "0.1.0");
+    write_changelog(&dir, populated_changelog());
+
+    release_prep(&dir, "1.0")
+        .assert()
+        .failure()
+        .stderr(contains("not a valid semver"));
 
     let cargo = fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(
@@ -122,41 +133,30 @@ fn rejects_invalid_version_format() {
 
 #[test]
 fn rejects_v_prefixed_version() {
-    // Arrange
     let dir = TempDir::new().unwrap();
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, populated_changelog());
 
-    // Act
-    let output = run_release_prep(&dir, "v0.1.0");
-
-    // Assert
-    assert!(!output.status.success());
-    assert!(contains("not a valid semver").eval(&String::from_utf8_lossy(&output.stderr)));
+    release_prep(&dir, "v0.1.0")
+        .assert()
+        .failure()
+        .stderr(contains("not a valid semver"));
 }
 
 #[test]
 fn rejects_when_changelog_lacks_unreleased_heading() {
-    // Arrange
     let dir = TempDir::new().unwrap();
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, "# Changelog\n\n## [0.0.1]\n\n- prior release\n");
 
-    // Act
-    let output = run_release_prep(&dir, "0.1.0-alpha.1");
-
-    // Assert
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        contains("no '## [Unreleased]' heading").eval(&stderr),
-        "stderr should mention missing Unreleased heading: {stderr}"
-    );
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("no '## [Unreleased]' heading"));
 }
 
 #[test]
 fn rejects_when_version_already_exists_in_changelog() {
-    // Arrange
     let existing = "\
 # Changelog
 
@@ -172,21 +172,14 @@ fn rejects_when_version_already_exists_in_changelog() {
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, existing);
 
-    // Act
-    let output = run_release_prep(&dir, "0.1.0-alpha.1");
-
-    // Assert
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        contains("already has a '## [0.1.0-alpha.1]' heading").eval(&stderr),
-        "stderr should name the conflicting heading: {stderr}"
-    );
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("already has a '## [0.1.0-alpha.1]' heading"));
 }
 
 #[test]
 fn rejects_empty_unreleased_block() {
-    // Arrange
     let empty_unreleased = "\
 # Changelog
 
@@ -200,57 +193,74 @@ fn rejects_empty_unreleased_block() {
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, empty_unreleased);
 
-    // Act
-    let output = run_release_prep(&dir, "0.1.0-alpha.1");
-
-    // Assert
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        contains("has no entries").eval(&stderr),
-        "stderr should explain there is nothing to release: {stderr}"
-    );
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("has no entries"));
 }
 
 #[test]
 fn second_run_with_same_version_fails() {
-    // Arrange
     let dir = TempDir::new().unwrap();
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, populated_changelog());
 
-    let first = run_release_prep(&dir, "0.1.0-alpha.1");
-    assert!(first.status.success(), "first run should succeed");
+    release_prep(&dir, "0.1.0-alpha.1").assert().success();
 
-    // Act — second invocation against the rotated CHANGELOG
-    let second = run_release_prep(&dir, "0.1.0-alpha.1");
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("already has a '## [0.1.0-alpha.1]'"));
+}
 
-    // Assert
-    assert!(!second.status.success(), "second run must refuse");
-    let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(
-        contains("already has a '## [0.1.0-alpha.1]'").eval(&stderr),
-        "stderr should name the conflicting heading on rerun: {stderr}"
-    );
+#[test]
+fn rejects_when_cargo_toml_is_missing() {
+    let dir = TempDir::new().unwrap();
+    write_changelog(&dir, populated_changelog());
+
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("Cargo.toml not found"));
+}
+
+#[test]
+fn rejects_when_changelog_is_missing() {
+    let dir = TempDir::new().unwrap();
+    write_cargo_toml(&dir, "0.1.0");
+
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("CHANGELOG.md not found"));
+}
+
+#[test]
+fn rejects_when_cargo_toml_lacks_top_level_version() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .unwrap();
+    write_changelog(&dir, populated_changelog());
+
+    release_prep(&dir, "0.1.0-alpha.1")
+        .assert()
+        .failure()
+        .stderr(contains("no top-level 'version = ...' line"));
 }
 
 #[test]
 fn missing_version_argument_is_rejected() {
-    // Arrange
     let dir = TempDir::new().unwrap();
     write_cargo_toml(&dir, "0.1.0");
     write_changelog(&dir, populated_changelog());
 
-    // Act
-    let output = Command::new("bash")
+    Command::new("bash")
         .arg(script_path())
         .current_dir(dir.path())
-        .output()
-        .expect("failed to spawn bash");
-
-    // Assert
-    assert!(!output.status.success());
-    assert!(
-        contains("VERSION argument is required").eval(&String::from_utf8_lossy(&output.stderr))
-    );
+        .assert()
+        .failure()
+        .stderr(contains("VERSION argument is required"));
 }

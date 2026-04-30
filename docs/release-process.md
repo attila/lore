@@ -16,9 +16,21 @@ ship a release.
 
 One-time setup, performed by the repository owner:
 
-1. **GitHub Environment**: Settings → Environments → New environment → name it `release` → add the
-   repository owner as a required reviewer. The first tag push will pause the workflow indefinitely
-   until this is configured.
+1. **GitHub Environment**. The `release` Environment with a required-reviewers list is the security
+   boundary that prevents push-only contributors from shipping a release. Configure via Settings →
+   Environments → New environment → name it `release` → add the repository owner as a required
+   reviewer. The equivalent `gh` API call:
+
+   ```sh
+   USER_ID=$(gh api /users/<your-handle> --jq .id)
+   gh api -X PUT /repos/<owner>/<repo>/environments/release \
+     -F "reviewers[][type]=User" \
+     -F "reviewers[][id]=$USER_ID"
+   ```
+
+   The first tag push will pause the workflow indefinitely until this is configured. Removing or
+   emptying the reviewers list collapses the security boundary — do not change without an explicit
+   security review.
 2. **Local tooling**: `just`, `dprint`, `git-cliff`, and the GitHub CLI (`gh`) authenticated against
    the repo (`gh auth login`).
 3. **Clean working tree** before starting any release procedure.
@@ -89,13 +101,13 @@ demand" framing this project was built on. Cut a release when there is something
    instructions. Refuses on bad input (invalid semver, missing `[Unreleased]`, conflicting
    `[VERSION]`, or empty `[Unreleased]` block) before mutating any file.
 
-5. **Open a release-prep PR**. Branch prefix `feat/` is wrong for a release commit; use the `chore:`
-   conventional-commit type. The project's branch-naming and conventional-commit conventions live in
-   the `workflows/git-branch-pr.md` universal pattern (injected into every Claude Code session via
-   lore's hook):
+5. **Open a release-prep PR**. Use the `chore:` conventional-commit type for the message. The
+   branch-prefix allowlist (`workflows/git-branch-pr.md`, injected universal pattern) covers
+   `feat/`, `fix/`, `refactor/`, `doc/`, `ci/`, `deps/` — `chore/` is not on the list, so name the
+   branch with the `ci/` prefix (release plumbing is closest to CI):
 
    ```sh
-   git checkout -b chore/release-v0.1.0-alpha.1   # branch prefix per convention
+   git checkout -b ci/release-v0.1.0-alpha.1
    git commit -am 'chore(release): cut v0.1.0-alpha.1'
    git push --set-upstream origin HEAD
    gh pr create --draft --title 'chore(release): cut v0.1.0-alpha.1' --body-file /tmp/pr-body.md
@@ -118,6 +130,18 @@ demand" framing this project was built on. Cut a release when there is something
 7. **Approve the publish job**. The workflow runs `verify` and `build` automatically. When the
    matrix completes, `publish` pauses for owner approval at the `release` Environment gate. Open the
    workflow run in the GitHub Actions UI and click "Review deployments → Approve".
+
+   The `gh` API equivalent (only members of the `release` Environment's required-reviewers list can
+   use it — that is the security boundary):
+
+   ```sh
+   RUN_ID=<workflow-run-id>
+   ENV_ID=$(gh api /repos/<owner>/<repo>/environments/release --jq .id)
+   gh api -X POST "/repos/<owner>/<repo>/actions/runs/$RUN_ID/pending_deployments" \
+     -F "environment_ids[]=$ENV_ID" \
+     -F "state=approved" \
+     -F "comment=approving v0.1.0-alpha.1"
+   ```
 
 ## Post-release verification
 
@@ -222,10 +246,10 @@ retag-without-thinking is how broken artifacts ship.
 
 ### 5. Workflow re-run vs. retag
 
-Do **not** use the GitHub UI's "re-run failed jobs" button on `release.yml`. The first run already
-created (or partially created) state at github.com that the re-run will collide with. Always: delete
-release + tag, bump version, re-cut. The re-run button is safe for `ci.yml`; it is **unsafe** for
-`release.yml`.
+Do **not** re-run a failed `release.yml` workflow — neither via the GitHub UI's "re-run failed jobs"
+button nor via `gh run rerun --failed`. The first run already created (or partially created) state
+at github.com that the re-run will collide with. Always: delete release + tag, bump version, re-cut.
+Re-running is safe for `ci.yml`; it is **unsafe** for `release.yml`.
 
 ## Yank / rollback
 

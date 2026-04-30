@@ -24,6 +24,7 @@ jobs:
   verify:
     name: Verify (just ci)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -46,6 +47,7 @@ jobs:
     name: Build (${{ matrix.target }})
     needs: [verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -89,16 +91,30 @@ jobs:
           name: lore-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
-          retention-days: 1
+          # 7 days, not 1 — the publish job pauses at the `release` Environment
+          # gate for owner approval. A 1-day retention races a weekend / OOO
+          # window: the owner approves on Monday, downloads find no artifacts,
+          # and recovery requires a full re-tag + rebuild.
+          retention-days: 7
 
   publish:
     name: Publish release
     needs: [verify, build]
     runs-on: ubuntu-latest
+    # 30-minute cap on the post-approval steps only. The Environment gate
+    # itself does not count against `timeout-minutes` (GitHub charges only
+    # active execution time), so a long approval wait does not consume this.
+    timeout-minutes: 30
     # Owner-approval gate. The `release` Environment is configured in repo
     # settings with the repository owner as a required reviewer. The publish
     # job pauses here until the owner approves it in the GitHub Actions UI.
-    # Push permission alone cannot ship a release.
+    #
+    # Security boundary: the `release` Environment's required-reviewers list
+    # is the ONLY thing preventing any actor with `gh` access from approving
+    # via `gh api -X POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments`.
+    # Push permission alone cannot ship a release. Removing or emptying the
+    # reviewers list collapses this boundary — do not change without an
+    # explicit security review.
     environment: release
     permissions:
       contents: write
@@ -120,22 +136,29 @@ jobs:
       - name: Extract release notes from CHANGELOG
         env:
           VERSION: ${{ github.ref_name }}
-        # Anchor on `^## \[` (literal bracket), not `^##`, so stray `##` lines
-        # inside fenced code blocks in CHANGELOG entries do not truncate the
-        # body. The extracted file is data — passed to `gh release create` via
-        # `--notes-file` only. NEVER interpolate CHANGELOG content into a
-        # `run:` block via `${{ }}`: expression interpolation happens before
-        # shell parsing, so backticks/$() in CHANGELOG would execute.
+        # The section-start match uses `index($0, "## [" ver "]") == 1` rather
+        # than a regex, so version strings containing regex metacharacters
+        # (e.g. `+`, `.`, `[`) cannot mismatch or silently produce an empty
+        # body. The section-end check anchors on `^## \[` (literal bracket),
+        # not `^##`, so stray `##` lines inside fenced code blocks do not
+        # truncate the body. The extracted file is data — passed to
+        # `gh release create` via `--notes-file` only. NEVER interpolate
+        # CHANGELOG content into a `run:` block via `${{ }}`: expression
+        # interpolation happens before shell parsing, so backticks/$() in
+        # CHANGELOG would execute.
         run: |
           set -euo pipefail
           ver="${VERSION#v}"
           awk -v ver="$ver" '
-              $0 ~ "^## \\[" ver "\\]" { in_section = 1; next }
-              in_section && /^## \[/    { in_section = 0 }
-              in_section                { print }
+              !in_section && index($0, "## [" ver "]") == 1 { in_section = 1; next }
+              in_section && /^## \[/                        { in_section = 0 }
+              in_section                                    { print }
           ' CHANGELOG.md > /tmp/release-body.md
-          if [ ! -s /tmp/release-body.md ]; then
-            echo "Error: CHANGELOG.md has no '## [${ver}]' section." >&2
+          # Reject whitespace-only bodies. `[ -s file ]` accepts a single
+          # newline as non-empty, so a section heading immediately followed
+          # by another heading would otherwise pass with a one-line body.
+          if ! grep -q '[^[:space:]]' /tmp/release-body.md; then
+            echo "Error: CHANGELOG.md has no usable '## [${ver}]' section body." >&2
             echo "Did you forget to run 'just release-prep ${ver}'?" >&2
             exit 1
           fi
