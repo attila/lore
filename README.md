@@ -51,7 +51,7 @@ integrity verification. Pick `VERSION` from the releases page and set `TARGET` t
 `aarch64-apple-darwin` (Apple Silicon), or `x86_64-apple-darwin` (Intel Mac):
 
 ```sh
-VERSION=0.1.0-alpha.1
+VERSION=0.1.0
 TARGET=x86_64-unknown-linux-gnu
 
 curl -LO https://github.com/attila/lore/releases/download/v${VERSION}/lore-${VERSION}-${TARGET}.tar.gz

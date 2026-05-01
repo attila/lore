@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-01
+
+First stable release. No user-facing changes since `0.1.0-alpha.1`; promoting after end-to-end
+pipeline validation. See `[0.1.0-alpha.1]` below for the full feature list.
+
 ## [0.1.0-alpha.1] - 2026-05-01
 
 ### Added
