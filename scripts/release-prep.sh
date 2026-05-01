@@ -84,8 +84,18 @@ if command -v dprint >/dev/null 2>&1 && [ -f dprint.json ]; then
     dprint fmt CHANGELOG.md Cargo.toml
 fi
 
+# Run the full quality gate against the post-mutation tree. Without this, a
+# version bump or CHANGELOG rotation that breaks a snapshot test (or anything
+# else that depends on Cargo.toml content) only surfaces in CI after push —
+# wasting a feedback cycle. set -e propagates the failure; the maintainer fixes
+# the issue against the bumped tree and either re-runs the script or commits.
+# Skipped in test environments without a justfile.
+if command -v just >/dev/null 2>&1 && [ -f justfile ]; then
+    just ci
+fi
+
 cat <<EOF
-release-prep complete for v$VERSION.
+release-prep complete for v$VERSION (just ci passed).
 
 Next steps:
   1. Review the diff: git diff

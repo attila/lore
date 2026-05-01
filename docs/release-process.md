@@ -16,10 +16,13 @@ ship a release.
 
 One-time setup, performed by the repository owner:
 
-1. **GitHub Environment**. The `release` Environment with a required-reviewers list is the security
-   boundary that prevents push-only contributors from shipping a release. Configure via Settings →
-   Environments → New environment → name it `release` → add the repository owner as a required
-   reviewer. The equivalent `gh` API call:
+1. **GitHub Environment**. The `release` Environment with a required-reviewers list AND a deployment
+   branches/tags policy is the security boundary that prevents push-only contributors from shipping
+   a release. Both halves are required — reviewers gate the publish step, and the deployment policy
+   gates which refs are allowed to request the gate at all.
+
+   **Required reviewers**: Settings → Environments → New environment → name it `release` → enable
+   "Required reviewers" → add the repository owner. The equivalent `gh` API call:
 
    ```sh
    USER_ID=$(gh api /users/<your-handle> --jq .id)
@@ -28,7 +31,40 @@ One-time setup, performed by the repository owner:
      -F "reviewers[][id]=$USER_ID"
    ```
 
-   The first tag push will pause the workflow indefinitely until this is configured. Removing or
+   **Deployment branches and tags**: still in the `release` Environment, enable "Deployment branches
+   and tags" → "Selected branches and tags" → add a rule with name `v*` and type `Tag`. Without
+   this, the first tag push fails immediately with
+   `Tag X is not allowed to deploy to
+   release due to environment protection rules` because the
+   GitHub default of "no rule" rejects tag-ref deployments. The default rule the UI suggests (`main`
+   branch) does not apply — this project deploys from tag refs, not branches. The equivalent `gh`
+   API calls:
+
+   ```sh
+   gh api -X PUT /repos/<owner>/<repo>/environments/release \
+     -F "deployment_branch_policy[protected_branches]=false" \
+     -F "deployment_branch_policy[custom_branch_policies]=true"
+   gh api -X POST /repos/<owner>/<repo>/environments/release/deployment-branch-policies \
+     -F "name=v*" \
+     -F "type=tag"
+   ```
+
+   Verify both halves are in place:
+
+   ```sh
+   gh api /repos/<owner>/<repo>/environments/release \
+     --jq '{reviewers: .protection_rules[] | select(.type=="required_reviewers").reviewers[].reviewer.login,
+            deployment_policy: .deployment_branch_policy}'
+   gh api /repos/<owner>/<repo>/environments/release/deployment-branch-policies \
+     --jq '.branch_policies[] | {name, type}'
+   ```
+
+   Without reviewers, the publish job pauses indefinitely (recoverable: configure reviewers, then
+   approve the still-pending deployment retroactively — no re-tag needed). Without the deployment
+   tag rule, the publish job fails fast at the gate (recoverable: add the tag rule, then
+   `gh run rerun <run-id> --failed` — safe in this specific failure mode because no
+   `gh release
+   create` ran, so there is no github.com state to collide with). Removing or
    emptying the reviewers list collapses the security boundary — do not change without an explicit
    security review.
 2. **Local tooling**: `just`, `dprint`, `git-cliff`, and the GitHub CLI (`gh`) authenticated against
