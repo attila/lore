@@ -1339,7 +1339,10 @@ mod tests {
     fn initialize_response() {
         let h = TestHarness::new();
         let resp = h.request_value(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
-        insta::assert_json_snapshot!(resp, @r#"
+        // Redact the version field so this snapshot survives release bumps in Cargo.toml.
+        // The `initialize` response interpolates env!("CARGO_PKG_VERSION"); pinning the literal
+        // version would force a snapshot update at every release.
+        insta::assert_json_snapshot!(resp, {".result.serverInfo.version" => "[VERSION]"}, @r#"
         {
           "id": 1,
           "jsonrpc": "2.0",
@@ -1350,7 +1353,7 @@ mod tests {
             "protocolVersion": "2024-11-05",
             "serverInfo": {
               "name": "lore",
-              "version": "0.1.0"
+              "version": "[VERSION]"
             }
           }
         }
