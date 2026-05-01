@@ -1,4 +1,8 @@
 /target/
+
+# cargo-zigbuild scratch file (Apple linker workaround for empty rlibs).
+.intentionally-empty-file.o
+
 **/*.rs.bk
 *.pdb
 tmp
