@@ -9,7 +9,6 @@
       inference side is non-trivial: each language has multiple tools (`bundle`/`gem`/`rake` → Ruby,
       `javac`/`gradle`/`mvn` → Java, `dotnet` → C#, `swift build` → Swift, etc.). Consider
       extracting both maps into a shared data structure to prevent drift between them
-- [ ] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases)
 
 ## Future
 
@@ -32,6 +31,12 @@
 
 ## Completed
 
+- [x] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases). Tag-triggered
+      `release.yml` cross-compiles four targets from a single Linux runner, packages tarballs +
+      `SHA256SUMS`, publishes via `gh release create` behind an owner-approval Environment gate.
+      Per-platform install snippets in README, maintainer runbook at `docs/release-process.md`.
+      First tag (`v0.1.0-alpha.1`) is the owner's follow-up. See
+      `docs/plans/2026-04-30-001-feat-release-process-plan.md`
 - [x] Project infrastructure (CI, quality gates, formatting, lints)
 - [x] Port scaffold into working Rust binary (all modules compile, 96 tests)
 - [x] Progress bar during model pull

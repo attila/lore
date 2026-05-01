@@ -1,7 +1,7 @@
 ---
 title: "feat: Release process — prebuilt binaries via cargo-zigbuild and GitHub Releases"
 type: feat
-status: active
+status: completed
 date: 2026-04-30
 deepened: 2026-04-30
 ---
