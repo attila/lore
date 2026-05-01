@@ -45,49 +45,21 @@ Markdown files (git repo, source of truth)
 ### Install
 
 Prebuilt binaries are published with every tagged release on the
-[releases page](https://github.com/attila/lore/releases). Each release ships tarballs for four
-targets plus a `SHA256SUMS` file for integrity verification. Pick the snippet that matches your
-platform; the `releases/latest/download/...` URLs always resolve to the most recent stable release.
-
-#### Linux (glibc — most distros)
-
-```sh
-curl -LO https://github.com/attila/lore/releases/latest/download/lore-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
-tar xzf lore-x86_64-unknown-linux-gnu.tar.gz
-sudo mv lore /usr/local/bin/
-# (no sudo? use `mkdir -p ~/.local/bin && mv lore ~/.local/bin/` and ensure ~/.local/bin is on PATH)
-```
-
-#### Linux (Alpine / musl)
+[releases page](https://github.com/attila/lore/releases), accompanied by a `SHA256SUMS` file for
+integrity verification. Pick `VERSION` from the releases page and set `TARGET` to one of
+`x86_64-unknown-linux-gnu` (most Linux), `x86_64-unknown-linux-musl` (Alpine and musl distros),
+`aarch64-apple-darwin` (Apple Silicon), or `x86_64-apple-darwin` (Intel Mac):
 
 ```sh
-curl -LO https://github.com/attila/lore/releases/latest/download/lore-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
-tar xzf lore-x86_64-unknown-linux-musl.tar.gz
+VERSION=0.1.0-alpha.1
+TARGET=x86_64-unknown-linux-gnu
+
+curl -LO https://github.com/attila/lore/releases/download/v${VERSION}/lore-${VERSION}-${TARGET}.tar.gz
+curl -LO https://github.com/attila/lore/releases/download/v${VERSION}/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing   # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+tar xzf lore-${VERSION}-${TARGET}.tar.gz
 sudo mv lore /usr/local/bin/
-```
-
-#### macOS (Apple Silicon)
-
-```sh
-curl -LO https://github.com/attila/lore/releases/latest/download/lore-aarch64-apple-darwin.tar.gz
-curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
-shasum -a 256 -c SHA256SUMS --ignore-missing
-tar xzf lore-aarch64-apple-darwin.tar.gz
-sudo mv lore /usr/local/bin/
-```
-
-#### macOS (Intel)
-
-```sh
-curl -LO https://github.com/attila/lore/releases/latest/download/lore-x86_64-apple-darwin.tar.gz
-curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
-shasum -a 256 -c SHA256SUMS --ignore-missing
-tar xzf lore-x86_64-apple-darwin.tar.gz
-sudo mv lore /usr/local/bin/
+# (no sudo? mkdir -p ~/.local/bin && mv lore ~/.local/bin/, then ensure ~/.local/bin is on PATH)
 ```
 
 > **macOS Gatekeeper note**: tarballs downloaded via `curl` run without further intervention. If you
@@ -95,9 +67,6 @@ sudo mv lore /usr/local/bin/
 > to launch the binary. Clear it with `xattr -d com.apple.quarantine ./lore` after extraction (or
 > right-click → Open the first time). The binary is not Apple-notarized — that requires a paid
 > Developer ID certificate, which the project does not currently hold.
-
-For older versions, browse the [releases page](https://github.com/attila/lore/releases) and
-substitute the version into the URL: `releases/download/v0.1.0-alpha.1/lore-...tar.gz`.
 
 #### Build from source
 
