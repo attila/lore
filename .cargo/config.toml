@@ -1,0 +1,14 @@
+# Cargo build env vars.
+#
+# Scoped by env-var name (CFLAGS_<target>) so each entry only takes effect for
+# the matching target. Native and other-target builds are unaffected.
+
+[env]
+# sqlite-vec 0.1.7 sqlite-vec.c lines 68-70 do `typedef u_int8_t uint8_t;`
+# (etc.), assuming the BSD-style `u_int*_t` typedefs are present. glibc provides
+# them via <sys/types.h>; musl does not. Predefine them as the standard C99
+# `uint*_t` (already in scope from <stdint.h> on line 10) so the typedefs become
+# redundant self-typedefs, which C11 §6.7p3 explicitly allows.
+#
+# Drop this when sqlite-vec ships a fix or we move off the 0.1 line.
+CFLAGS_x86_64_unknown_linux_musl = "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t"

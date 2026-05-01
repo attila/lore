@@ -116,6 +116,10 @@ connections opened afterward get sqlite-vec automatically. This replaces the old
 
 ## Related Issues
 
+- Sibling sqlite-vec build issue:
+  [`sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md`](sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md)
+  — same crate, C-compilation layer; required for cross-compiling to `x86_64-unknown-linux-musl`.
+  Reading both gives the full picture of integrating sqlite-vec into a Rust project.
 - Origin plan: `docs/plans/2026-03-27-001-feat-scaffold-porting-plan.md` (Key Technical Decisions:
   sqlite-vec registration)
 - Phase 0 requirements: R5 (`unsafe_code = "deny"`) established the policy requiring targeted allows

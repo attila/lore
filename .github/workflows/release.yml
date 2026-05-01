@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+
+# Deny by default; per-job permissions grant only what each job needs.
+# `verify` and `build` rely on the implicit `contents: read` they get for
+# checkout. Only `publish` may mutate releases.
+permissions: {}
+
+# Serialise concurrent runs for the same tag (network retry, double-push). The
+# queued run will fail fast on `gh release create` because the release already
+# exists — preferable to two parallel publishes racing each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify (just ci)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          rustflags: ""
+      - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: just
+      - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: dprint@0.53.1
+      - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-deny
+      - run: just ci
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          rustflags: ""
+          target: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-zigbuild@0.20.0
+
+      - name: Build release binary
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          stage="$(mktemp -d)"
+          archive="lore-${version}-${target}.tar.gz"
+          cp "target/${target}/release/lore" "${stage}/lore"
+          cp LICENSE-MIT LICENSE-APACHE README.md "${stage}/"
+          tar -czf "${archive}" -C "${stage}" .
+          mkdir -p dist
+          mv "${archive}" "dist/${archive}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lore-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          # 7 days, not 1 — the publish job pauses at the `release` Environment
+          # gate for owner approval. A 1-day retention races a weekend / OOO
+          # window: the owner approves on Monday, downloads find no artifacts,
+          # and recovery requires a full re-tag + rebuild.
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    # 30-minute cap on the post-approval steps only. The Environment gate
+    # itself does not count against `timeout-minutes` (GitHub charges only
+    # active execution time), so a long approval wait does not consume this.
+    timeout-minutes: 30
+    # Owner-approval gate. The `release` Environment is configured in repo
+    # settings with the repository owner as a required reviewer. The publish
+    # job pauses here until the owner approves it in the GitHub Actions UI.
+    #
+    # Security boundary: the `release` Environment's required-reviewers list
+    # is the ONLY thing preventing any actor with `gh` access from approving
+    # via `gh api -X POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments`.
+    # Push permission alone cannot ship a release. Removing or emptying the
+    # reviewers list collapses this boundary — do not change without an
+    # explicit security review.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG
+        env:
+          VERSION: ${{ github.ref_name }}
+        # The section-start match uses `index($0, "## [" ver "]") == 1` rather
+        # than a regex, so version strings containing regex metacharacters
+        # (e.g. `+`, `.`, `[`) cannot mismatch or silently produce an empty
+        # body. The section-end check anchors on `^## \[` (literal bracket),
+        # not `^##`, so stray `##` lines inside fenced code blocks do not
+        # truncate the body. The extracted file is data — passed to
+        # `gh release create` via `--notes-file` only. NEVER interpolate
+        # CHANGELOG content into a `run:` block via `${{ }}`: expression
+        # interpolation happens before shell parsing, so backticks/$() in
+        # CHANGELOG would execute.
+        run: |
+          set -euo pipefail
+          ver="${VERSION#v}"
+          awk -v ver="$ver" '
+              !in_section && index($0, "## [" ver "]") == 1 { in_section = 1; next }
+              in_section && /^## \[/                        { in_section = 0 }
+              in_section                                    { print }
+          ' CHANGELOG.md > /tmp/release-body.md
+          # Reject whitespace-only bodies. `[ -s file ]` accepts a single
+          # newline as non-empty, so a section heading immediately followed
+          # by another heading would otherwise pass with a one-line body.
+          if ! grep -q '[^[:space:]]' /tmp/release-body.md; then
+            echo "Error: CHANGELOG.md has no usable '## [${ver}]' section body." >&2
+            echo "Did you forget to run 'just release-prep ${ver}'?" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=false
+          if [[ "$VERSION" == *-alpha* || "$VERSION" == *-beta* || "$VERSION" == *-rc* ]]; then
+            prerelease=true
+          fi
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes-file /tmp/release-body.md \
+            --prerelease="$prerelease" \
+            --repo "${{ github.repository }}"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$VERSION" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS \
+            --repo "${{ github.repository }}"

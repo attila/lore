@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Release process** — pushing a `v*` tag to GitHub now triggers a release workflow
+  (`.github/workflows/release.yml`) that cross-compiles `lore` for four targets via `cargo-zigbuild`
+  from a single Linux runner (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
+  `aarch64-apple-darwin`, `x86_64-apple-darwin`), packages each binary into a tarball with both
+  license files and the README, computes a single `SHA256SUMS` file for integrity verification, and
+  publishes a GitHub Release with the matching CHANGELOG section as the body. The publish step is
+  gated by a `release` GitHub Environment that requires owner approval — push permission alone
+  cannot ship a release. CI gains a cross-compile smoke job for the same four targets so
+  cross-compile breakage surfaces on every PR. New `just release-prep VERSION` recipe rotates the
+  CHANGELOG `[Unreleased]` block to a dated version heading and bumps `Cargo.toml`. README install
+  section now documents the prebuilt-binary path with per-platform snippets including checksum
+  verification. Full maintainer runbook lives at
+  [`docs/release-process.md`](docs/release-process.md). Owner setup before the first tag: configure
+  the `release` Environment in repo Settings → Environments with the owner as a required reviewer;
+  otherwise the publish job pauses indefinitely.
 - **DB as sole runtime read surface** — pattern bodies now live in a new `patterns` table
   (`source_file` PK, `title`, `tags`, `is_universal`, `raw_body`, `content_hash`, `ingested_at`);
   `SessionStart` / `PostCompact` render from the DB instead of re-reading the source markdown.

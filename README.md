@@ -44,7 +44,31 @@ Markdown files (git repo, source of truth)
 
 ### Install
 
-Prebuilt binaries and package manager installs are planned. For now, build from source:
+Prebuilt binaries are published with every tagged release on the
+[releases page](https://github.com/attila/lore/releases), accompanied by a `SHA256SUMS` file for
+integrity verification. Pick `VERSION` from the releases page and set `TARGET` to one of
+`x86_64-unknown-linux-gnu` (most Linux), `x86_64-unknown-linux-musl` (Alpine and musl distros),
+`aarch64-apple-darwin` (Apple Silicon), or `x86_64-apple-darwin` (Intel Mac):
+
+```sh
+VERSION=0.1.0-alpha.1
+TARGET=x86_64-unknown-linux-gnu
+
+curl -LO https://github.com/attila/lore/releases/download/v${VERSION}/lore-${VERSION}-${TARGET}.tar.gz
+curl -LO https://github.com/attila/lore/releases/download/v${VERSION}/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing   # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+tar xzf lore-${VERSION}-${TARGET}.tar.gz
+sudo mv lore /usr/local/bin/
+# (no sudo? mkdir -p ~/.local/bin && mv lore ~/.local/bin/, then ensure ~/.local/bin is on PATH)
+```
+
+> **macOS Gatekeeper note**: tarballs downloaded via `curl` run without further intervention. If you
+> download via a browser, macOS may attach the `com.apple.quarantine` extended attribute and refuse
+> to launch the binary. Clear it with `xattr -d com.apple.quarantine ./lore` after extraction (or
+> right-click → Open the first time). The binary is not Apple-notarized — that requires a paid
+> Developer ID certificate, which the project does not currently hold.
+
+#### Build from source
 
 ```sh
 just install
@@ -179,6 +203,7 @@ Always use Result<T, E> for fallible operations...
 | [Search Mechanics Reference](docs/search-mechanics.md)                | Full search pipeline internals for debugging discoverability |
 | [Hook Pipeline and Plugin Reference](docs/hook-pipeline-reference.md) | Hook lifecycle, plugin setup, and injection tuning           |
 | [Configuration Reference](docs/configuration.md)                      | `lore.toml` options, environment variables, CLI flags        |
+| [Release Process](docs/release-process.md)                            | Maintainer runbook for cutting releases                      |
 
 ## Development
 

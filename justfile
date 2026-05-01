@@ -34,10 +34,19 @@ doc:
 install:
     cargo install --path .
 
-# Regenerate CHANGELOG.md from git history
+# Regenerate CHANGELOG.md from git history.
+#
+# Do NOT run this as part of release-prep — git-cliff regeneration clobbers
+# hand-curated breaking notices. Use `just release-prep VERSION` instead, which
+# rotates the existing CHANGELOG block in place. See docs/release-process.md.
 changelog:
     git cliff -o CHANGELOG.md
     dprint fmt CHANGELOG.md
+
+# Bump Cargo.toml version and rotate CHANGELOG [Unreleased] for a release.
+# See docs/release-process.md for the full procedure.
+release-prep VERSION:
+    bash scripts/release-prep.sh {{ VERSION }}
 
 # Run integration tests that require Ollama
 test-integration:
