@@ -80,9 +80,14 @@ reliability, agent-native, learnings-researcher.
 ## Reference: Past learnings consulted
 
 - `docs/solutions/build-errors/rust-toolchain-action-does-not-read-toml.md` — toolchain-action
-  conventions already followed in this PR. Worth capturing this PR's release-pipeline learnings via
-  `/ce-compound` after it lands; no prior solutions covered cargo-zigbuild, gh release flags, GitHub
-  Environments, or sed/awk file mutation.
+  conventions already followed in this PR.
+- `docs/solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md` —
+  captures the BSD/musl typedef divergence in sqlite-vec 0.1.7 and the `.cargo/config.toml [env]`
+  workaround that unblocked the musl matrix leg.
+- `docs/solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md` — captures the
+  install-action zig-not-in-registry failure and the `mlugg/setup-zig` swap.
+- Other potential learnings from this PR (gh release flags, GitHub Environments, sed/awk file
+  mutation) remain uncaptured; capture if they recur.
 
 ## Owner action items before tagging `v0.1.0-alpha.1`
 

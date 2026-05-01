@@ -289,3 +289,17 @@ The deliberate design decisions behind this process — single-runner zigbuild, 
 git-cliff round-trip, retag-fails-fast, owner-approval Environment gate — are documented in
 [`docs/plans/2026-04-30-001-feat-release-process-plan.md`](plans/2026-04-30-001-feat-release-process-plan.md).
 Read that plan if you need to understand _why_ before changing the workflow.
+
+## Known cross-compile workarounds
+
+Two solution docs cover gotchas the release pipeline encountered. If a future maintainer hits the
+same surface — locally or in CI — start here:
+
+- [`solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md`](solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md)
+  — sqlite-vec 0.1.7 fails on `x86_64-unknown-linux-musl` because of BSD-style typedefs absent from
+  musl libc. Workaround is encoded in `.cargo/config.toml [env]` and applies automatically; the doc
+  explains the why and the drop condition.
+- [`solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md`](solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md)
+  — `taiki-e/install-action` does not ship `zig` itself; install via `mlugg/setup-zig`. Already
+  applied in `release.yml` and `ci.yml`; the doc explains the failure mode if anyone tries to
+  consolidate the install steps later.
