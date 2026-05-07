@@ -22,9 +22,15 @@
 
 pub mod call_context;
 pub mod predicate;
+pub mod query;
+pub mod text;
 
 pub use call_context::CallContext;
 pub use predicate::{command_matches_with_wrappers, evaluate_applies_when};
+pub use query::{
+    clean_terms, extract_query, filename_terms, language_from_bash, language_from_extension,
+};
+pub use text::{split_into_words, truncate_str};
 
 // `AppliesWhen` is parsed by `chunking.rs` (where the frontmatter parser
 // lives) and evaluated by `engine::predicate`. Re-export from the engine

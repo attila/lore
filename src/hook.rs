@@ -18,19 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::Embedder;
+use crate::engine::{self, CallContext};
 use crate::lore_debug;
-
-// ---------------------------------------------------------------------------
-// Stop words
-// ---------------------------------------------------------------------------
-
-const STOP_WORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "into", "that", "this", "then", "when", "will", "has",
-    "have", "was", "are", "not", "but", "can", "all", "its", "our", "use", "new", "let", "set",
-    "get", "add", "run", "see", "how", "may", "per", "via", "yet", "also", "just", "some", "been",
-    "were", "what", "they", "each", "which", "their", "there", "about", "would", "could", "should",
-    "these", "those", "other", "than", "them", "your", "does", "here",
-];
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -338,8 +327,8 @@ fn handle_post_tool_use(
     }
 
     // Use stderr as a search query (clean it into terms).
-    let terms = split_into_words(stderr);
-    let cleaned = clean_terms(&terms);
+    let terms = engine::split_into_words(stderr);
+    let cleaned = engine::clean_terms(&terms);
     if cleaned.is_empty() {
         return Ok(None);
     }
@@ -715,62 +704,47 @@ fn dedup_filter_and_record(
 // Query extraction
 // ---------------------------------------------------------------------------
 
-/// Build an FTS5 query from tool input signals.
+/// Build an FTS5 query from a Claude Code `HookInput`.
 ///
-/// Returns `None` when no meaningful terms can be extracted.
+/// Thin shim around [`crate::engine::extract_query`]: builds a
+/// [`CallContext`] from the input (eagerly reading the transcript tail when
+/// present and `$HOME`-validated) and delegates to the engine. The engine
+/// performs no I/O; the adapter owns the filesystem access.
+///
+/// **Tracking note (U4 → U5):** this shim exists so U4 can land the engine
+/// migration without forcing the wider `handle_pre_tool_use` refactor that
+/// inserts the predicate filter and reorders `skip_agent`. U5 will replace
+/// callers with `HookInput::to_call_context()` plus a single
+/// `engine::extract_query` call, retiring this shim.
 pub fn extract_query(input: &HookInput) -> Option<String> {
-    let mut terms: Vec<String> = Vec::new();
-    let mut language: Option<String> = None;
+    let ctx = build_call_context(input);
+    engine::extract_query(&ctx)
+}
 
-    // 1. File path signals (Edit, Write, Read, etc.)
-    if let Some(file_path) = tool_input_str(input, "file_path") {
-        if let Some(lang) = language_from_extension(&file_path) {
-            language = Some(lang);
-        }
-        terms.extend(filename_terms(&file_path));
-    }
+/// Build a [`CallContext`] from a Claude Code `HookInput` (U4 transitional
+/// helper).
+///
+/// Eagerly reads the transcript tail when `transcript_path` is set and
+/// passes `validate_transcript_path`'s `$HOME`-rooted canonicalisation.
+/// Failures (no path, validation rejection, missing file, IO error) leave
+/// `transcript_tail = None` — silent fall-through matches the existing
+/// `extract_query` behaviour where transcript-tail terms are best-effort.
+///
+/// U5 will replace this with `HookInput::to_call_context()` proper. The
+/// behaviour is identical; only the call site changes.
+fn build_call_context(input: &HookInput) -> CallContext {
+    let transcript_tail = input
+        .transcript_path
+        .as_deref()
+        .and_then(|p| validate_transcript_path(Path::new(p)))
+        .and_then(|canonical| last_user_message(&canonical));
 
-    // 2. Bash signals
-    if input.tool_name.as_deref() == Some("Bash") {
-        let text = tool_input_str(input, "description")
-            .or_else(|| tool_input_str(input, "command"))
-            .unwrap_or_default();
-
-        if language.is_none() {
-            language = language_from_bash(&text);
-        }
-
-        terms.extend(split_into_words(&text));
-    }
-
-    // 3. Transcript tail (last user message).
-    // Validate that the transcript path is under $HOME before reading.
-    // Use the canonical path returned from validation to prevent symlink
-    // TOCTOU between validation and file open.
-    if let Some(ref path) = input.transcript_path
-        && let Some(canonical) = validate_transcript_path(Path::new(path))
-        && let Some(msg) = last_user_message(&canonical)
-    {
-        let truncated = truncate_str(&msg, 200);
-        terms.extend(split_into_words(truncated));
-    }
-
-    // 4. Clean terms
-    let cleaned = clean_terms(&terms);
-
-    // 5. Assemble FTS5 query
-    match (language, cleaned.is_empty()) {
-        // Language anchor + enrichment terms: `lang AND (term1 OR term2 OR ...)`
-        (Some(lang), false) => {
-            let or_clause = cleaned.join(" OR ");
-            Some(format!("{lang} AND ({or_clause})"))
-        }
-        // Language anchor only (no enrichment survived cleaning): just the language
-        (Some(lang), true) => Some(lang),
-        // No language anchor, but enrichment terms: OR-only query
-        (None, false) => Some(cleaned.join(" OR ")),
-        // Nothing useful extracted
-        (None, true) => None,
+    CallContext {
+        tool_name: input.tool_name.clone(),
+        command: tool_input_str(input, "command"),
+        file_path: tool_input_str(input, "file_path"),
+        description: tool_input_str(input, "description"),
+        transcript_tail,
     }
 }
 
@@ -788,85 +762,6 @@ fn tool_input_str(input: &HookInput, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(String::from)
-}
-
-/// Map file extension to a language keyword for FTS anchor.
-fn language_from_extension(path: &str) -> Option<String> {
-    let ext = Path::new(path).extension()?.to_str()?;
-    match ext.to_lowercase().as_str() {
-        "ts" | "tsx" => Some("typescript".to_string()),
-        "rs" => Some("rust".to_string()),
-        "js" | "jsx" => Some("javascript".to_string()),
-        "yml" | "yaml" => Some("yaml".to_string()),
-        "py" => Some("python".to_string()),
-        "go" => Some("golang".to_string()),
-        _ => None,
-    }
-}
-
-/// Infer language from a Bash command string.
-fn language_from_bash(command: &str) -> Option<String> {
-    let lower = command.to_lowercase();
-    if lower.contains("npm")
-        || lower.contains("npx")
-        || lower.contains("yarn")
-        || lower.contains("bun")
-    {
-        return Some("typescript".to_string());
-    }
-    if lower.contains("cargo") {
-        return Some("rust".to_string());
-    }
-    if lower.contains("pip") || lower.contains("python") {
-        return Some("python".to_string());
-    }
-    None
-}
-
-/// Extract terms from a filename: take the basename (without extension),
-/// split `camelCase` and `PascalCase`, lowercase everything.
-fn filename_terms(path: &str) -> Vec<String> {
-    let basename = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-
-    split_camel_case(basename)
-        .into_iter()
-        .flat_map(|w| split_into_words(&w))
-        .collect()
-}
-
-/// Split a `camelCase` or `PascalCase` string into individual words.
-fn split_camel_case(s: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
-    for ch in s.chars() {
-        if ch.is_uppercase() && !current.is_empty() {
-            words.push(current.clone());
-            current.clear();
-        }
-        if ch.is_alphanumeric() {
-            current.push(ch.to_lowercase().next().unwrap_or(ch));
-        } else if !current.is_empty() {
-            // Non-alphanumeric boundary (hyphens, underscores, dots, etc.)
-            words.push(current.clone());
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
-/// Split a string on whitespace and non-alphabetic boundaries, lowercase.
-fn split_into_words(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphabetic())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect()
 }
 
 /// Validate that a transcript path is under `$HOME`.
@@ -944,62 +839,6 @@ fn last_user_message(path: &Path) -> Option<String> {
     None
 }
 
-/// Truncate a string to at most `max_bytes` bytes (on a valid UTF-8 char
-/// boundary).
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the largest byte offset that is both <= max_bytes and a valid
-    // char boundary.
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Clean terms: strip non-alpha, filter short, filter hex-like, filter stop
-/// words, deduplicate while preserving order.
-fn clean_terms(raw: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-
-    for term in raw {
-        // Strip non-alphabetic characters.
-        let cleaned: String = term.chars().filter(|c| c.is_alphabetic()).collect();
-        let lower = cleaned.to_lowercase();
-
-        // Filter terms shorter than 3 chars.
-        if lower.len() < 3 {
-            continue;
-        }
-
-        // Filter hex-like strings (6+ hex characters).
-        if is_hex_like(&lower) {
-            continue;
-        }
-
-        // Filter stop words.
-        if STOP_WORDS.contains(&lower.as_str()) {
-            continue;
-        }
-
-        // Deduplicate.
-        if seen.insert(lower.clone()) {
-            result.push(lower);
-        }
-    }
-
-    result
-}
-
-/// Returns `true` if the string looks like a hex fragment (>= 6 chars,
-/// all `[0-9a-f]`).
-fn is_hex_like(s: &str) -> bool {
-    s.len() >= 6 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 // ---------------------------------------------------------------------------
 // Imperative formatting
 // ---------------------------------------------------------------------------
@@ -1049,7 +888,12 @@ pub fn format_imperative(results: &[SearchResult]) -> String {
 mod tests {
     use super::*;
 
-    // -- extract_query -------------------------------------------------------
+    // -- extract_query (shim coverage) ---------------------------------------
+    //
+    // The full engine-side coverage lives in
+    // `src/engine/query.rs::tests` (against `CallContext` directly). The
+    // tests below pin the `HookInput` → `CallContext` → engine shim end to
+    // end so behaviour stays equivalent until U5 retires the shim.
 
     #[test]
     fn extract_query_rs_file_path() {
@@ -1224,79 +1068,6 @@ mod tests {
         assert!(!skip_agent(&input));
     }
 
-    // -- split_camel_case ----------------------------------------------------
-
-    #[test]
-    fn split_camel_validate_email() {
-        let parts = split_camel_case("validateEmail");
-        assert_eq!(parts, vec!["validate", "email"]);
-    }
-
-    #[test]
-    fn split_camel_pascal_case() {
-        let parts = split_camel_case("UserProfile");
-        assert_eq!(parts, vec!["user", "profile"]);
-    }
-
-    #[test]
-    fn split_camel_snake_case() {
-        let parts = split_camel_case("error_handling");
-        assert_eq!(parts, vec!["error", "handling"]);
-    }
-
-    // -- is_hex_like ---------------------------------------------------------
-
-    #[test]
-    fn hex_like_true() {
-        assert!(is_hex_like("abcdef"));
-        assert!(is_hex_like("1a2b3c4d"));
-        assert!(is_hex_like("deadbeef"));
-    }
-
-    #[test]
-    fn hex_like_false() {
-        assert!(!is_hex_like("abcde")); // too short
-        assert!(!is_hex_like("abcxyz")); // non-hex chars
-        assert!(!is_hex_like("rust")); // not hex
-    }
-
-    // -- clean_terms ---------------------------------------------------------
-
-    #[test]
-    fn clean_removes_stop_words_and_short() {
-        let terms: Vec<String> = vec![
-            "the".into(),
-            "a".into(),
-            "rust".into(),
-            "error".into(),
-            "handling".into(),
-        ];
-        let cleaned = clean_terms(&terms);
-        assert!(!cleaned.contains(&"the".to_string()));
-        assert!(!cleaned.contains(&"a".to_string()));
-        assert!(cleaned.contains(&"rust".to_string()));
-        assert!(cleaned.contains(&"error".to_string()));
-    }
-
-    #[test]
-    fn clean_deduplicates() {
-        let terms: Vec<String> = vec!["error".into(), "error".into(), "handling".into()];
-        let cleaned = clean_terms(&terms);
-        assert_eq!(
-            cleaned.iter().filter(|t| *t == "error").count(),
-            1,
-            "should deduplicate"
-        );
-    }
-
-    #[test]
-    fn clean_filters_hex() {
-        let terms: Vec<String> = vec!["deadbeef".into(), "rust".into()];
-        let cleaned = clean_terms(&terms);
-        assert!(!cleaned.contains(&"deadbeef".to_string()));
-        assert!(cleaned.contains(&"rust".to_string()));
-    }
-
     // -- format_imperative ---------------------------------------------------
 
     #[test]
@@ -1355,60 +1126,6 @@ mod tests {
     fn format_imperative_empty_results() {
         let formatted = format_imperative(&[]);
         assert!(formatted.is_empty());
-    }
-
-    // -- language_from_extension ---------------------------------------------
-
-    #[test]
-    fn language_extension_rs() {
-        assert_eq!(
-            language_from_extension("src/main.rs"),
-            Some("rust".to_string())
-        );
-    }
-
-    #[test]
-    fn language_extension_tsx() {
-        assert_eq!(
-            language_from_extension("App.tsx"),
-            Some("typescript".to_string())
-        );
-    }
-
-    #[test]
-    fn language_extension_unknown() {
-        assert_eq!(language_from_extension("notes.txt"), None);
-    }
-
-    // -- language_from_bash --------------------------------------------------
-
-    #[test]
-    fn bash_npm_is_typescript() {
-        assert_eq!(
-            language_from_bash("npm install express"),
-            Some("typescript".to_string())
-        );
-    }
-
-    #[test]
-    fn bash_cargo_is_rust() {
-        assert_eq!(
-            language_from_bash("cargo build --release"),
-            Some("rust".to_string())
-        );
-    }
-
-    #[test]
-    fn bash_pip_is_python() {
-        assert_eq!(
-            language_from_bash("pip install requests"),
-            Some("python".to_string())
-        );
-    }
-
-    #[test]
-    fn bash_unknown_is_none() {
-        assert_eq!(language_from_bash("ls -la"), None);
     }
 
     // -- transcript_path ---------------------------------------------------
