@@ -15,11 +15,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::chunking::AppliesWhen;
 use crate::config::Config;
 use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::Embedder;
 use crate::engine::{self, CallContext};
 use crate::lore_debug;
+
+/// Maximum bytes of a Bash command echoed in `predicate suppress:` debug
+/// lines. Predicate-suppression logs name the offending pattern source plus
+/// the first ~60 bytes of the command so operators can correlate without
+/// flooding the terminal with long pipelines.
+const PREDICATE_LOG_CMD_HEAD_BYTES: usize = 60;
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -137,25 +144,58 @@ fn handle_session_start(
     }))
 }
 
-/// Handle `PreToolUse`: extract query, search, dedup-filter, format imperatives.
+/// Handle `PreToolUse`: extract query, search, predicate-filter, dedup-filter,
+/// format imperatives.
+///
+/// Ordering matters and is load-bearing for invariants tested elsewhere:
+///
+/// 1. **`skip_agent` runs FIRST** — Explore / Plan subagents short-circuit
+///    before the eager transcript-tail read in `to_call_context`. Preserves
+///    the existing zero-I/O guarantee for read-only subagent calls.
+/// 2. Build the [`CallContext`] once via [`HookInput::to_call_context`]
+///    (eager transcript-tail read happens here for non-skip paths).
+/// 3. Engine [`engine::extract_query`] for the FTS query string.
+/// 4. [`search_with_threshold`] for seeds. (U6 will branch on
+///    `min_relevance_universal` for universal results.)
+/// 5. [`expand_to_siblings`] to pull every chunk of each matched source.
+/// 6. **Predicate filter** (Track 1, R8): for each universal chunk with a
+///    non-`None` `applies_when_json`, deserialise to [`AppliesWhen`] and
+///    call [`engine::evaluate_applies_when`]. Suppressed chunks are dropped
+///    from the local `Vec<SearchResult>` BEFORE the dedup call, so the
+///    dedup file never records their ids — neither read-side nor write-side
+///    (per the dedup-bypass-on-suppression invariant; pinned by the
+///    `predicate_filter_byte_for_byte_dedup_file_unchanged_on_suppression`
+///    integration test).
+/// 7. [`dedup_filter_and_record`] on the surviving chunks.
+/// 8. [`format_imperative`] + emit `additionalContext`.
 fn handle_pre_tool_use(
     input: &HookInput,
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
+    // 1. skip_agent FIRST — before the eager transcript-tail read so
+    //    Explore/Plan subagents never trigger filesystem I/O.
     if skip_agent(input) {
         lore_debug!("skipping subagent");
         return Ok(None);
     }
 
-    let Some(query) = extract_query(input) else {
+    // 2. Build the CallContext once. The eager transcript-tail read with
+    //    `$HOME` validation happens inside `to_call_context` — adapter-only
+    //    filesystem responsibility (engine remains disk-I/O-free, see
+    //    `tests/invariants.rs`).
+    let cc = input.to_call_context();
+
+    // 3. Engine query extraction.
+    let Some(query) = engine::extract_query(&cc) else {
         lore_debug!("no query extracted from tool input");
         return Ok(None);
     };
 
     lore_debug!("extracted query: {query}");
 
+    // 4. Hybrid / FTS search with the configured relevance floor.
     let seeds = search_with_threshold(db, embedder, config, &query)?;
 
     if seeds.is_empty() {
@@ -165,10 +205,10 @@ fn handle_pre_tool_use(
 
     let seed_universal = seeds.iter().filter(|r| r.is_universal).count();
 
-    // Sibling expansion is a single DB call — `is_universal` is a file-level
-    // tag stored on every chunk row, so expanding the combined seed list
-    // still yields universal-only siblings for universal seeds and
-    // non-universal siblings for non-universal seeds.
+    // 5. Sibling expansion — single DB call. `is_universal` and
+    //    `applies_when_json` are file-level fields stored on every chunk
+    //    row, so expanding propagates predicate state without a join
+    //    (whole-file semantics).
     let expanded = expand_to_siblings(db, &seeds);
     lore_debug!(
         "expand: {} seeds -> {} after sibling expansion ({} universal seeds)",
@@ -177,18 +217,34 @@ fn handle_pre_tool_use(
         seed_universal,
     );
 
-    // Route the full set through dedup. `dedup_filter_and_record` bypasses
-    // the `seen.contains` check for universal chunks (read-side filter) and
-    // still appends every surfaced chunk to the dedup file (write side).
-    // The dedup file therefore remains a faithful "what was injected this
-    // session" log — defensive consistency per the session-dedup-lifecycle
-    // learning.
+    // 6. Predicate filter (Track 1, R8). Run ONLY for universal chunks
+    //    with a `Some` `applies_when_json`. Non-universal chunks and
+    //    universals with no predicate pass through unchanged. Dropped
+    //    chunks are removed from `Vec<SearchResult>` BEFORE dedup sees the
+    //    list — the dedup file therefore never records a suppressed id
+    //    (read-side or write-side). A future predicate-passing call can
+    //    still inject the same chunk; suppression is per-call, not
+    //    per-session.
+    let after_predicate = apply_predicate_filter(expanded, &cc);
+
+    if after_predicate.is_empty() {
+        lore_debug!("nothing to inject after predicate filter");
+        return Ok(None);
+    }
+
+    // 7. Dedup. `dedup_filter_and_record` bypasses the `seen.contains`
+    //    check for universal chunks (read-side filter) and appends every
+    //    surfaced chunk to the dedup file (write side). The dedup file
+    //    therefore remains a faithful "what was injected this session"
+    //    log — defensive consistency per the session-dedup-lifecycle
+    //    learning. Suppressed chunks were removed in step 6, so they are
+    //    invisible to this stage.
     let dedup_path = session_dedup_path(input);
     let combined = if let Some(ref path) = dedup_path
         && path.exists()
     {
-        let pre_count = expanded.len();
-        match dedup_filter_and_record(path, &expanded) {
+        let pre_count = after_predicate.len();
+        match dedup_filter_and_record(path, &after_predicate) {
             Ok(filtered) => {
                 let kept_universal = filtered.iter().filter(|r| r.is_universal).count();
                 lore_debug!(
@@ -203,12 +259,12 @@ fn handle_pre_tool_use(
             Err(e) => {
                 eprintln!("lore hook: dedup filter error: {e}");
                 lore_debug!("dedup filter error (continuing without dedup): {e}");
-                expanded
+                after_predicate
             }
         }
     } else {
         lore_debug!("dedup inactive (no session file)");
-        expanded
+        after_predicate
     };
 
     if combined.is_empty() {
@@ -227,6 +283,7 @@ fn handle_pre_tool_use(
         sources.len()
     );
 
+    // 8. Format and emit.
     let context = format_imperative(&combined);
 
     Ok(Some(HookOutput::HookSpecific {
@@ -235,6 +292,84 @@ fn handle_pre_tool_use(
             additional_context: context,
         },
     }))
+}
+
+/// Apply the universal-pattern predicate filter to a list of expanded chunks.
+///
+/// For each chunk where `is_universal == true` AND `applies_when_json` is
+/// `Some`, deserialise to [`AppliesWhen`] and call
+/// [`engine::evaluate_applies_when`]. Suppressed chunks are dropped from the
+/// returned `Vec`. Universal chunks without `applies_when_json` (or whose
+/// JSON fails to deserialise — defensive R11 fallback) pass through
+/// unchanged. Non-universal chunks are NOT subject to the predicate (Track 1
+/// scope per R8).
+///
+/// Emits two `LORE_DEBUG`-gated trace shapes:
+///
+/// * Per-suppression: `predicate suppress: <pattern> tool=<tool>
+///   cmd_head="<cmd>"` — pattern source and command head are passed through
+///   [`sanitize_for_log`]; command head is byte-truncated at
+///   [`PREDICATE_LOG_CMD_HEAD_BYTES`] via [`engine::truncate_str`].
+/// * Aggregate: `predicate: N before -> M after (K suppressed)` once at the
+///   end.
+fn apply_predicate_filter(chunks: Vec<SearchResult>, cc: &CallContext) -> Vec<SearchResult> {
+    let before = chunks.len();
+    let mut suppressed: usize = 0;
+
+    let kept: Vec<SearchResult> = chunks
+        .into_iter()
+        .filter(|r| {
+            // Non-universal chunks bypass the predicate entirely (R8).
+            if !r.is_universal {
+                return true;
+            }
+            // Universal chunks with no predicate fire as today (R11).
+            let Some(json) = r.applies_when_json.as_deref() else {
+                return true;
+            };
+            // Defensive: a runtime parse failure should be impossible after
+            // U2's parser produces the JSON, but if it ever happens we
+            // treat the chunk as if no predicate were set (R11 fallback)
+            // rather than silently suppressing it.
+            let aw: AppliesWhen = match serde_json::from_str(json) {
+                Ok(aw) => aw,
+                Err(e) => {
+                    lore_debug!(
+                        "predicate parse error: {} ({}); firing unrestricted",
+                        sanitize_for_log(&r.source_file),
+                        sanitize_for_log(&e.to_string()),
+                    );
+                    return true;
+                }
+            };
+            if engine::evaluate_applies_when(&aw, cc) {
+                return true;
+            }
+            // Suppressed — emit per-suppression debug line and drop.
+            suppressed += 1;
+            let cmd_head = cc
+                .command
+                .as_deref()
+                .map(|c| engine::truncate_str(c, PREDICATE_LOG_CMD_HEAD_BYTES))
+                .unwrap_or("");
+            lore_debug!(
+                "predicate suppress: {} tool={} cmd_head=\"{}\"",
+                sanitize_for_log(&r.source_file),
+                cc.tool_name.as_deref().unwrap_or(""),
+                sanitize_for_log(cmd_head),
+            );
+            false
+        })
+        .collect();
+
+    lore_debug!(
+        "predicate: {} before -> {} after ({} suppressed)",
+        before,
+        kept.len(),
+        suppressed,
+    );
+
+    kept
 }
 
 /// Expand a result slice to include all sibling chunks from the matched
@@ -707,44 +842,52 @@ fn dedup_filter_and_record(
 /// Build an FTS5 query from a Claude Code `HookInput`.
 ///
 /// Thin shim around [`crate::engine::extract_query`]: builds a
-/// [`CallContext`] from the input (eagerly reading the transcript tail when
-/// present and `$HOME`-validated) and delegates to the engine. The engine
-/// performs no I/O; the adapter owns the filesystem access.
+/// [`CallContext`] via [`HookInput::to_call_context`] and delegates to the
+/// engine. The engine performs no I/O; the adapter owns the filesystem
+/// access (transcript-tail read happens inside `to_call_context`).
 ///
-/// **Tracking note (U4 → U5):** this shim exists so U4 can land the engine
-/// migration without forcing the wider `handle_pre_tool_use` refactor that
-/// inserts the predicate filter and reorders `skip_agent`. U5 will replace
-/// callers with `HookInput::to_call_context()` plus a single
-/// `engine::extract_query` call, retiring this shim.
+/// Retained as a `pub fn` so the `lore extract-queries` CLI subcommand
+/// (`src/main.rs`'s `cmd_extract_queries`) can keep its existing
+/// `HookInput`-flavoured interface without learning about `CallContext`.
+/// `handle_pre_tool_use` no longer routes through this shim — it builds
+/// the `CallContext` once per call and passes it to both
+/// `engine::extract_query` and the predicate filter.
 pub fn extract_query(input: &HookInput) -> Option<String> {
-    let ctx = build_call_context(input);
+    let ctx = input.to_call_context();
     engine::extract_query(&ctx)
 }
 
-/// Build a [`CallContext`] from a Claude Code `HookInput` (U4 transitional
-/// helper).
-///
-/// Eagerly reads the transcript tail when `transcript_path` is set and
-/// passes `validate_transcript_path`'s `$HOME`-rooted canonicalisation.
-/// Failures (no path, validation rejection, missing file, IO error) leave
-/// `transcript_tail = None` — silent fall-through matches the existing
-/// `extract_query` behaviour where transcript-tail terms are best-effort.
-///
-/// U5 will replace this with `HookInput::to_call_context()` proper. The
-/// behaviour is identical; only the call site changes.
-fn build_call_context(input: &HookInput) -> CallContext {
-    let transcript_tail = input
-        .transcript_path
-        .as_deref()
-        .and_then(|p| validate_transcript_path(Path::new(p)))
-        .and_then(|canonical| last_user_message(&canonical));
+impl HookInput {
+    /// Build a [`CallContext`] from this Claude Code hook event.
+    ///
+    /// Eagerly reads the transcript tail when `transcript_path` is set and
+    /// passes [`validate_transcript_path`]'s `$HOME`-rooted canonicalisation.
+    /// Failures (no path, validation rejection, missing file, IO error)
+    /// leave `transcript_tail = None` — silent fall-through preserves the
+    /// "best-effort" semantics of transcript-tail term harvesting.
+    ///
+    /// **Adapter-only filesystem boundary.** All disk I/O (transcript read,
+    /// `$HOME` validation) happens here, in the Claude Code adapter. The
+    /// engine module never reads the filesystem — see
+    /// `tests/invariants.rs::no_unsanctioned_runtime_disk_reads_in_hook_server_main`.
+    ///
+    /// Called once per `PreToolUse` for non-skip-agent paths (the
+    /// `skip_agent` short-circuit in [`handle_pre_tool_use`] runs first so
+    /// Explore / Plan subagents bypass this read entirely).
+    pub fn to_call_context(&self) -> CallContext {
+        let transcript_tail = self
+            .transcript_path
+            .as_deref()
+            .and_then(|p| validate_transcript_path(Path::new(p)))
+            .and_then(|canonical| last_user_message(&canonical));
 
-    CallContext {
-        tool_name: input.tool_name.clone(),
-        command: tool_input_str(input, "command"),
-        file_path: tool_input_str(input, "file_path"),
-        description: tool_input_str(input, "description"),
-        transcript_tail,
+        CallContext {
+            tool_name: self.tool_name.clone(),
+            command: tool_input_str(self, "command"),
+            file_path: tool_input_str(self, "file_path"),
+            description: tool_input_str(self, "description"),
+            transcript_tail,
+        }
     }
 }
 
@@ -1008,6 +1151,270 @@ mod tests {
 
         // .txt has no language anchor, and "a" is too short after cleaning.
         assert!(extract_query(&input).is_none());
+    }
+
+    // -- HookInput::to_call_context ------------------------------------------
+
+    #[test]
+    fn to_call_context_populates_all_fields_with_transcript_tail() {
+        // Write a transcript under $HOME so validate_transcript_path
+        // accepts it, then verify every CallContext field is populated.
+        let home = std::env::var("HOME").unwrap();
+        let dir = tempfile::tempdir_in(&home).unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"refactor the auth flow"}}
+"#,
+        )
+        .unwrap();
+
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: Some("sess".to_string()),
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({
+                "command": "git push",
+                "file_path": "src/lib.rs",
+                "description": "push to remote",
+            })),
+            agent_type: None,
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            tool_response: None,
+        };
+
+        let cc = input.to_call_context();
+        assert_eq!(cc.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(cc.command.as_deref(), Some("git push"));
+        assert_eq!(cc.file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(cc.description.as_deref(), Some("push to remote"));
+        assert_eq!(
+            cc.transcript_tail.as_deref(),
+            Some("refactor the auth flow"),
+            "eager transcript-tail read must populate the field",
+        );
+    }
+
+    #[test]
+    fn to_call_context_no_transcript_path_leaves_tail_none() {
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: None,
+            tool_name: Some("Edit".to_string()),
+            tool_input: Some(serde_json::json!({"file_path": "src/foo.rs"})),
+            agent_type: None,
+            transcript_path: None,
+            tool_response: None,
+        };
+
+        let cc = input.to_call_context();
+        assert!(
+            cc.transcript_tail.is_none(),
+            "no transcript_path → transcript_tail must be None",
+        );
+        assert_eq!(cc.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(cc.file_path.as_deref(), Some("src/foo.rs"));
+        assert!(cc.command.is_none());
+        assert!(cc.description.is_none());
+    }
+
+    #[test]
+    fn to_call_context_invalid_transcript_path_silently_falls_through() {
+        // Path that fails validate_transcript_path (does not exist) →
+        // transcript_tail stays None; no panic, no error surfaced.
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: None,
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": "ls"})),
+            agent_type: None,
+            transcript_path: Some("/nonexistent/path/transcript.jsonl".to_string()),
+            tool_response: None,
+        };
+
+        let cc = input.to_call_context();
+        assert!(
+            cc.transcript_tail.is_none(),
+            "invalid transcript path → transcript_tail must be None",
+        );
+        assert_eq!(cc.command.as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn skip_path_avoids_transcript_read_even_when_path_invalid() {
+        // Pin the skip_agent ordering invariant: when agent_type is
+        // Explore/Plan, handle_pre_tool_use returns Ok(None) without ever
+        // calling to_call_context. We verify by passing an invalid
+        // transcript path that would yield None on read but cannot panic
+        // in this skip path because the path is never even reached.
+        //
+        // We exercise the public surface: if `skip_agent` is true, the
+        // pre-tool-use returns None. Since we cannot construct a real
+        // KnowledgeDB / Embedder in a unit test cheaply, we assert the
+        // contract by verifying that `skip_agent` itself returns true on
+        // the input we'd otherwise pass. The integration test
+        // `hook_explore_agent_produces_no_output` covers the end-to-end
+        // skip path against a real binary.
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: None,
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": "ls"})),
+            agent_type: Some("Explore".to_string()),
+            // Even an obviously invalid path must not panic — the skip
+            // path means to_call_context is never called.
+            transcript_path: Some("/nonexistent/explore.jsonl".to_string()),
+            tool_response: None,
+        };
+        assert!(skip_agent(&input));
+    }
+
+    // -- apply_predicate_filter ----------------------------------------------
+
+    fn make_universal_chunk(
+        id: &str,
+        source: &str,
+        applies_when_json: Option<&str>,
+    ) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: "universal".to_string(),
+            source_file: source.to_string(),
+            heading_path: String::new(),
+            score: 1.0,
+            is_universal: true,
+            applies_when_json: applies_when_json.map(String::from),
+        }
+    }
+
+    fn make_non_universal_chunk(id: &str, source: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: String::new(),
+            source_file: source.to_string(),
+            heading_path: String::new(),
+            score: 1.0,
+            is_universal: false,
+            applies_when_json: None,
+        }
+    }
+
+    fn ctx_bash_predicate(command: &str) -> CallContext {
+        CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some(command.to_string()),
+            file_path: None,
+            description: None,
+            transcript_tail: None,
+        }
+    }
+
+    #[test]
+    fn predicate_filter_keeps_universal_without_applies_when() {
+        // R11: universal chunk with no applies_when fires unconditionally.
+        let chunks = vec![make_universal_chunk("u1", "git.md", None)];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "u1");
+    }
+
+    #[test]
+    fn predicate_filter_drops_universal_when_predicate_suppresses() {
+        // Universal chunk with applies_when.bash_command_starts_with: [git]
+        // and a Bash ls call → suppressed.
+        let aw_json = serde_json::to_string(&AppliesWhen {
+            tools: None,
+            bash_command_starts_with: Some(vec!["git".to_string()]),
+        })
+        .unwrap();
+        let chunks = vec![make_universal_chunk("u1", "git.md", Some(&aw_json))];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert!(kept.is_empty(), "predicate must suppress non-matching call");
+    }
+
+    #[test]
+    fn predicate_filter_keeps_universal_when_predicate_matches() {
+        let aw_json = serde_json::to_string(&AppliesWhen {
+            tools: None,
+            bash_command_starts_with: Some(vec!["git".to_string()]),
+        })
+        .unwrap();
+        let chunks = vec![make_universal_chunk("u1", "git.md", Some(&aw_json))];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("git push"));
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn predicate_filter_bypasses_non_universal_chunks() {
+        // R8: non-universal chunks are NOT subject to the predicate, even
+        // when their applies_when_json is somehow populated.
+        let aw_json = serde_json::to_string(&AppliesWhen {
+            tools: Some(vec!["NeverMatchesAnyTool".to_string()]),
+            bash_command_starts_with: None,
+        })
+        .unwrap();
+        let mut nu = make_non_universal_chunk("nu1", "rust.md");
+        nu.applies_when_json = Some(aw_json);
+        let kept = apply_predicate_filter(vec![nu], &ctx_bash_predicate("ls"));
+        assert_eq!(
+            kept.len(),
+            1,
+            "non-universal chunks must bypass the predicate filter (R8)",
+        );
+    }
+
+    #[test]
+    fn predicate_filter_mixed_universal_and_non_universal() {
+        // Mix: 1 non-universal kept, 1 universal-no-predicate kept,
+        // 1 universal-suppressed dropped, 1 universal-passing kept.
+        let aw_suppress = serde_json::to_string(&AppliesWhen {
+            tools: None,
+            bash_command_starts_with: Some(vec!["never".to_string()]),
+        })
+        .unwrap();
+        let aw_match = serde_json::to_string(&AppliesWhen {
+            tools: Some(vec!["Bash".to_string()]),
+            bash_command_starts_with: None,
+        })
+        .unwrap();
+
+        let chunks = vec![
+            make_non_universal_chunk("nu", "rust.md"),
+            make_universal_chunk("u-no-pred", "always.md", None),
+            make_universal_chunk("u-suppressed", "git.md", Some(&aw_suppress)),
+            make_universal_chunk("u-matched", "bash.md", Some(&aw_match)),
+        ];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"nu"));
+        assert!(ids.contains(&"u-no-pred"));
+        assert!(!ids.contains(&"u-suppressed"));
+        assert!(ids.contains(&"u-matched"));
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn predicate_filter_treats_malformed_json_as_unrestricted() {
+        // Defensive R11 fallback: if applies_when_json is somehow malformed
+        // at runtime, the chunk fires as if no predicate were set rather
+        // than being silently suppressed.
+        let chunks = vec![make_universal_chunk(
+            "u1",
+            "weird.md",
+            Some("not valid json {"),
+        )];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert_eq!(kept.len(), 1, "malformed JSON must fall through to fire");
+    }
+
+    #[test]
+    fn predicate_filter_empty_input_returns_empty() {
+        let kept = apply_predicate_filter(Vec::new(), &ctx_bash_predicate("ls"));
+        assert!(kept.is_empty());
     }
 
     // -- skip_agent ----------------------------------------------------------

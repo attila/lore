@@ -1496,3 +1496,522 @@ fn hook_pre_tool_use_dedup_file_records_universal_chunks() {
 
     let _ = std::fs::remove_file(dedup_path);
 }
+
+// ---------------------------------------------------------------------------
+// U5: applies_when predicate filter — integration coverage
+// ---------------------------------------------------------------------------
+
+/// Run a single `PreToolUse` event against a freshly-`SessionStart`-ed session
+/// and return the additional-context body plus the captured stderr (the
+/// `predicate ...` debug lines, gated by `LORE_DEBUG=1`).
+fn run_pre_tool_use_capturing_debug(
+    config_path: &Path,
+    session_id: &str,
+    pre_tool_input: &serde_json::Value,
+    fresh_session: bool,
+) -> (String, String) {
+    if fresh_session {
+        let session_start = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": session_id,
+        });
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(["hook", "--config", config_path.to_str().unwrap()])
+            .write_stdin(serde_json::to_string(&session_start).unwrap())
+            .assert()
+            .success();
+    }
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .env("LORE_DEBUG", "1")
+        .write_stdin(serde_json::to_string(pre_tool_input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let context = if stdout.is_empty() {
+        String::new()
+    } else {
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    (context, stderr)
+}
+
+/// Set up a knowledge directory with a single universal pattern carrying
+/// the supplied `applies_when` frontmatter block. No other patterns are
+/// seeded so the dedup-file invariant is observable: any byte that lands
+/// in the dedup file has to come from the universal chunk surfacing.
+///
+/// The pattern body is deliberately keyword-rich (`gizmo`, `widget`, etc.)
+/// so a wide range of test commands surface it via FTS without leaning on
+/// stop-listed words. The marker token `xyzzy-predicate-marker` lets
+/// callers assert presence/absence in `additionalContext` cheaply.
+///
+/// Returns the temp dir handle (must outlive the test) and the config path.
+fn setup_with_predicate_pattern(
+    applies_when_block: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    let body = "---\n\
+                tags: [universal, conventions]\n\
+                applies_when:\n\
+                {block}\n\
+                ---\n\n\
+                # Universal Predicate Pattern\n\n\
+                Run gizmo widget review before push origin HEAD. Apply rust\n\
+                typescript golang conventions across every tool call. Pattern\n\
+                marker: xyzzy-predicate-marker. Includes git push origin HEAD\n\
+                workflow guidance.\n";
+    let body = body.replace("{block}", applies_when_block);
+
+    fs::write(dir.join("predicate-test.md"), body).unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+    (tmp, config_path)
+}
+
+/// AE2 explicit + critical-correctness invariant pin.
+///
+/// Pattern tagged `universal` with `applies_when.bash_command_starts_with:
+/// [git, gh]`. Three Bash calls that DO produce query terms (so the search
+/// pipeline runs to completion and the predicate filter is exercised) but
+/// whose command heads are NOT `git` or `gh`:
+///
+/// 1. `wget always review xyzzy` (no git/gh head),
+/// 2. `curl always review xyzzy`,
+/// 3. `wc always review xyzzy`.
+///
+/// All three must:
+/// * NOT include the universal pattern in `additionalContext`.
+/// * Emit a `predicate suppress:` line on stderr (LORE_DEBUG=1).
+/// * Leave the dedup file byte-for-byte identical to its pre-sequence state
+///   — the load-bearing invariant: predicate-suppressed chunks never enter
+///   the dedup file (read-side or write-side).
+///
+/// Then a fourth `Bash git push` must pass the predicate, inject the
+/// pattern, and grow the dedup file (universal write-side semantics intact).
+#[test]
+fn hook_pre_tool_use_predicate_suppresses_unrelated_bash_commands() {
+    let (_tmp, config_path) =
+        setup_with_predicate_pattern("  bash_command_starts_with: [git, gh]\n");
+    let session_id = format!("test-predicate-suppress-{}", std::process::id());
+
+    // SessionStart creates an empty dedup file.
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let dedup_path = lore::hook::dedup_file_path(&session_id);
+    let dedup_before =
+        std::fs::read(&dedup_path).expect("dedup file should exist after SessionStart");
+
+    // Three Bash calls whose command heads are not git/gh but whose terms
+    // overlap the universal pattern body, so the FTS search pulls in the
+    // universal chunk and the predicate filter is the decision point.
+    let suppress_inputs: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "wget",
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_name": "Bash",
+                "tool_input": { "command": "wget gizmo widget review" },
+            }),
+        ),
+        (
+            "curl",
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_name": "Bash",
+                "tool_input": { "command": "curl gizmo widget review" },
+            }),
+        ),
+        (
+            "wcline",
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_name": "Bash",
+                "tool_input": { "command": "wcline gizmo widget review" },
+            }),
+        ),
+    ];
+
+    let mut suppressed_seen: usize = 0;
+    for (label, input) in &suppress_inputs {
+        let (ctx, stderr) =
+            run_pre_tool_use_capturing_debug(&config_path, &session_id, input, false);
+        assert!(
+            !ctx.contains("xyzzy-predicate-marker"),
+            "[{label}] universal pattern must NOT be injected when predicate suppresses; got context: {ctx}",
+        );
+        if stderr.contains("predicate suppress: predicate-test.md") {
+            suppressed_seen += 1;
+        }
+    }
+    assert_eq!(
+        suppressed_seen, 3,
+        "expected 3 `predicate suppress:` lines naming predicate-test.md, got stderr trace count {suppressed_seen}",
+    );
+
+    // Critical invariant: dedup file is byte-for-byte unchanged.
+    let dedup_after_suppress = std::fs::read(&dedup_path).unwrap();
+    assert_eq!(
+        dedup_before, dedup_after_suppress,
+        "dedup file must be byte-for-byte unchanged after a predicate-suppression sequence \
+         (read-side or write-side regression would break the per-call suppression contract)",
+    );
+
+    // Fourth call: predicate matches, pattern fires, dedup grows.
+    let pass_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin HEAD" },
+    });
+    let (ctx_pass, _stderr_pass) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &pass_input, false);
+    assert!(
+        ctx_pass.contains("xyzzy-predicate-marker"),
+        "predicate must fire on `git push`; expected pattern marker in: {ctx_pass}",
+    );
+
+    let dedup_after_pass = std::fs::read(&dedup_path).unwrap();
+    assert!(
+        dedup_after_pass.len() > dedup_after_suppress.len(),
+        "dedup file must grow once a predicate-passing call surfaces the chunk; \
+         before={} bytes, after={} bytes",
+        dedup_after_suppress.len(),
+        dedup_after_pass.len(),
+    );
+
+    let _ = std::fs::remove_file(dedup_path);
+}
+
+/// AE1: smart-prefix walks past `sudo`. With predicate
+/// `bash_command_starts_with: [git, gh]`, a `Bash sudo git status` call
+/// must inject the pattern (sudo is consumed; `git` is then matched).
+#[test]
+fn hook_pre_tool_use_predicate_passes_sudo_git_status() {
+    let (_tmp, config_path) =
+        setup_with_predicate_pattern("  bash_command_starts_with: [git, gh]\n");
+    let session_id = format!("test-predicate-sudo-{}", std::process::id());
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "sudo git status gizmo widget review" },
+    });
+    let (ctx, _stderr) = run_pre_tool_use_capturing_debug(&config_path, &session_id, &input, true);
+    assert!(
+        ctx.contains("xyzzy-predicate-marker"),
+        "predicate must fire on `sudo git status` (smart-prefix unwraps sudo); got: {ctx}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
+/// AE3: predicate `tools: [Bash]` only — fires on any Bash call, suppressed
+/// for Edit.
+#[test]
+fn hook_pre_tool_use_predicate_tools_only_allowlist() {
+    let (_tmp, config_path) = setup_with_predicate_pattern("  tools: [Bash]\n");
+    let session_id = format!("test-predicate-tools-only-{}", std::process::id());
+
+    // Edit foo.rs → tool not in allowlist → suppressed.
+    let edit_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/gizmo_widget.rs" },
+    });
+    let (ctx_edit, stderr_edit) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &edit_input, true);
+    assert!(
+        !ctx_edit.contains("xyzzy-predicate-marker"),
+        "tools=[Bash] must suppress Edit calls: {ctx_edit}",
+    );
+    assert!(
+        stderr_edit.contains("predicate suppress: predicate-test.md"),
+        "expected suppression debug line for Edit; got stderr: {stderr_edit}",
+    );
+
+    // Bash ls (with broad terms so the search pipeline runs) → fires.
+    let bash_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "wget gizmo widget review" },
+    });
+    let (ctx_bash, _stderr_bash) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &bash_input, false);
+    assert!(
+        ctx_bash.contains("xyzzy-predicate-marker"),
+        "tools=[Bash] must fire on Bash calls regardless of command head: {ctx_bash}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
+/// AE4: both `tools: [Bash]` AND `bash_command_starts_with: [git, gh]` set.
+/// AND across keys: only Bash + git/gh-head fires.
+#[test]
+fn hook_pre_tool_use_predicate_both_keys_combined() {
+    let (_tmp, config_path) =
+        setup_with_predicate_pattern("  tools: [Bash]\n  bash_command_starts_with: [git, gh]\n");
+    let session_id = format!("test-predicate-both-{}", std::process::id());
+
+    // Bash ls (broad terms): tool matches, command head doesn't → suppressed.
+    let bash_ls = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "wget gizmo widget review" },
+    });
+    let (ctx_ls, _) = run_pre_tool_use_capturing_debug(&config_path, &session_id, &bash_ls, true);
+    assert!(
+        !ctx_ls.contains("xyzzy-predicate-marker"),
+        "Bash with non-git head must be suppressed when both keys set: {ctx_ls}",
+    );
+
+    // Bash git push: both branches match → fires.
+    let bash_git = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin gizmo widget review" },
+    });
+    let (ctx_git, _) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &bash_git, false);
+    assert!(
+        ctx_git.contains("xyzzy-predicate-marker"),
+        "Bash + git head must fire when both keys set: {ctx_git}",
+    );
+
+    // Edit foo.rs: tool fails the [Bash] allowlist → suppressed.
+    let edit_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/gizmo_widget.rs" },
+    });
+    let (ctx_edit, _) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &edit_input, false);
+    assert!(
+        !ctx_edit.contains("xyzzy-predicate-marker"),
+        "Edit must be suppressed when tools=[Bash] is set: {ctx_edit}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
+/// AE5 (hook side): a typo'd `appliess_when:` block parses as if no
+/// predicate were set (R9: skip-with-warning at ingest, R11: pattern fires
+/// unrestricted). U7 will pin the warning emission separately; here we
+/// pin the hook-time behaviour.
+#[test]
+fn hook_pre_tool_use_predicate_typo_falls_through_to_unrestricted_firing() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("typo.md"),
+        "---\n\
+         tags: [universal, conventions]\n\
+         appliess_when:\n  bash_command_starts_with: [git]\n\
+         ---\n\n\
+         # Typo Predicate Pattern\n\n\
+         Run gizmo widget review. Pattern marker: typo-predicate-marker.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+    let session_id = format!("test-predicate-typo-{}", std::process::id());
+
+    // Bash with broad-ish terms; pattern must fire because the typo means
+    // no predicate is registered.
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "wget gizmo widget review" },
+    });
+    let (ctx, stderr) = run_pre_tool_use_capturing_debug(&config_path, &session_id, &input, true);
+    assert!(
+        ctx.contains("typo-predicate-marker"),
+        "typo'd applies_when must NOT register a predicate; pattern fires unrestricted: {ctx}",
+    );
+    assert!(
+        !stderr.contains("predicate suppress: typo.md"),
+        "no `predicate suppress:` line should fire for a pattern with a typo'd predicate: {stderr}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
+/// R11: a universal pattern WITHOUT `applies_when` continues firing on
+/// every relevant Bash call. Re-pins the existing universal-fixture
+/// (`setup_with_universal_pattern`) under the predicate-filter regime.
+#[test]
+fn hook_pre_tool_use_universal_without_applies_when_continues_firing() {
+    let (_tmp, config_path) = setup_with_universal_pattern();
+    let session_id = format!("test-no-predicate-{}", std::process::id());
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    });
+    let (ctx, stderr) = run_pre_tool_use_capturing_debug(&config_path, &session_id, &input, true);
+    assert!(
+        ctx.contains("git push origin HEAD"),
+        "universal pattern with no applies_when must fire on Bash git push: {ctx}",
+    );
+    assert!(
+        !stderr.contains("predicate suppress: workflow.md"),
+        "no suppression line should fire for a pattern with no predicate: {stderr}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
+/// R8: predicate evaluator runs ONLY for `is_universal == true` chunks.
+/// Non-universal chunks in the same database flow through unchanged even
+/// when a predicate would have suppressed them.
+#[test]
+fn hook_pre_tool_use_predicate_does_not_filter_non_universal_chunks() {
+    // Mix: one universal pattern with a predicate that suppresses Bash ls,
+    // one non-universal pattern whose body contains the same broad term so
+    // both seeds surface from FTS. Only the universal one must be
+    // suppressed; the non-universal must reach the imperative.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    fs::write(
+        dir.join("universal.md"),
+        "---\n\
+         tags: [universal, conventions]\n\
+         applies_when:\n  bash_command_starts_with: [git]\n\
+         ---\n\n\
+         # Universal With Predicate\n\n\
+         Marker: r8-univ-token. Run gizmo widget review.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("nonuniversal.md"),
+        "# Non Universal\n\n\
+         tags: conventions\n\n\
+         Marker: r8-nonuniv-token. Run gizmo widget review commands.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+    let session_id = format!("test-predicate-r8-{}", std::process::id());
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "wget gizmo widget review" },
+    });
+    let (ctx, _stderr) = run_pre_tool_use_capturing_debug(&config_path, &session_id, &input, true);
+    assert!(
+        !ctx.contains("r8-univ-token"),
+        "universal pattern with predicate that suppresses Bash ls must not appear: {ctx}",
+    );
+    assert!(
+        ctx.contains("r8-nonuniv-token"),
+        "non-universal pattern must NOT be subject to the predicate (R8): {ctx}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
+/// Subagent skip-path: `agent_type: Explore` short-circuits the entire
+/// pipeline. No transcript is read, no predicate runs, no injection
+/// happens. We pin the absence of any debug signal from the predicate
+/// stage.
+#[test]
+fn hook_pre_tool_use_explore_subagent_skips_pipeline_entirely() {
+    let (_tmp, config_path) =
+        setup_with_predicate_pattern("  bash_command_starts_with: [git, gh]\n");
+    let session_id = format!("test-predicate-skip-{}", std::process::id());
+
+    // SessionStart creates the dedup file.
+    let session_start = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&session_start).unwrap())
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin HEAD" },
+        "agent_type": "Explore",
+    });
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .env("LORE_DEBUG", "1")
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(
+        stdout.is_empty(),
+        "Explore subagent must produce no PreToolUse output: {stdout}",
+    );
+    assert!(
+        stderr.contains("skipping subagent"),
+        "expected `skipping subagent` debug line: {stderr}",
+    );
+    assert!(
+        !stderr.contains("predicate:"),
+        "predicate stage debug line must NOT fire on the skip path: {stderr}",
+    );
+    assert!(
+        !stderr.contains("predicate suppress:"),
+        "predicate suppress line must NOT fire on the skip path: {stderr}",
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
