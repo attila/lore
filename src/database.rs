@@ -499,6 +499,47 @@ impl KnowledgeDB {
         Ok(count)
     }
 
+    /// Read the `applies_when_json` column from the `patterns` row for a
+    /// specific `source_file`. Returns `Ok(None)` when no row matches and
+    /// `Ok(Some(None))` when the row exists but the column is `NULL`. Used
+    /// by U7's MCP audit tests to behaviourally verify that the three
+    /// single-file write paths round-trip the predicate through the
+    /// patterns row (mirroring chunks). Direct SQL access mirrors
+    /// [`Self::pattern_count_for_source`] — the column is not part of any
+    /// public listing struct because the value is JSON text intended for
+    /// engine consumption, not user-facing display.
+    pub fn pattern_applies_when_json_for_source(
+        &self,
+        source_file: &str,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT applies_when_json FROM patterns WHERE source_file = ?1",
+                params![source_file],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Read the `applies_when_json` column for every chunk row belonging to
+    /// `source_file`, ordered by chunk id. Used by U7's MCP audit tests to
+    /// confirm the predicate round-trips on every chunk of a multi-section
+    /// pattern (whole-file semantics). Direct SQL keeps the test surface
+    /// honest — `chunks_by_sources` returns the same column but folds the
+    /// row into a [`SearchResult`], adding noise tests do not need.
+    pub fn chunk_applies_when_json_for_source(
+        &self,
+        source_file: &str,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT applies_when_json FROM chunks WHERE source_file = ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![source_file], |row| row.get::<_, Option<String>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Read a metadata value by key.
     pub fn get_metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut stmt = self

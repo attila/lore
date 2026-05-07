@@ -3624,4 +3624,263 @@ mod tests {
             "error should mention tags and limit, got: {msg}"
         );
     }
+
+    // -- U7: MCP write paths round-trip applies_when_json -------------------
+    //
+    // Behavioural audit per the plan: every MCP single-file write tool
+    // must carry the new column end-to-end through `index_single_file`.
+    // Inspection alone is not sufficient — the
+    // `out-of-band-writers-bypass-delta-checkpoint` learning calls for
+    // round-trip tests on the actual JSON-RPC surface plus direct DB
+    // queries for the persisted state.
+    //
+    // Important: the MCP API surface (`add_pattern` / `update_pattern`)
+    // does not currently expose `applies_when` as a parameter — both
+    // tools rebuild frontmatter via `build_file_content` from the
+    // `tags` array only. The audit therefore exercises the realistic
+    // authoring flow: a pattern file already exists on disk with an
+    // `applies_when` block (added directly or by an external editor)
+    // and the MCP write tool re-indexes the file, preserving the
+    // column. `append_to_pattern` reads the existing frontmatter
+    // verbatim before appending, so it round-trips the predicate
+    // naturally.
+
+    #[test]
+    fn mcp_add_pattern_then_update_preserves_predicate_when_body_carries_frontmatter() {
+        // `add_pattern` slugifies the title and writes the file via
+        // `build_file_content` (frontmatter from `tags` only, then the
+        // user-supplied body verbatim). Pin the resulting
+        // applies_when_json column when the user-supplied body itself
+        // carries an `applies_when` frontmatter block — the
+        // `extract_frontmatter` parser walks until the first `---` /
+        // `---` pair, so the user-supplied frontmatter inside the body
+        // ends up parsed as the file's only `applies_when` source.
+        let h = TestHarness::new();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":501,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"AW Pattern",
+                        "body":"---\napplies_when:\n  tools: [Bash]\n---\n\nFresh body that is long enough for a chunk."
+                    }
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null(), "tool call failed: {resp:?}");
+
+        // Both rows agree (the cross-row consistency invariant).
+        let chunks =
+            h.db.chunk_applies_when_json_for_source("aw-pattern.md")
+                .unwrap();
+        let pattern =
+            h.db.pattern_applies_when_json_for_source("aw-pattern.md")
+                .unwrap()
+                .expect("patterns row exists");
+        for chunk in &chunks {
+            assert_eq!(
+                chunk, &pattern,
+                "chunk and pattern rows must agree on applies_when_json after MCP add_pattern",
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_update_pattern_clears_applies_when_when_predicate_stripped() {
+        // Bidirectional reconciliation: a pattern initially carries
+        // `applies_when` via its on-disk frontmatter; an MCP
+        // `update_pattern` call rewrites the file via
+        // `build_file_content` with only the preserved tags, dropping
+        // any prior `applies_when` block. Both rows must become NULL —
+        // no stale residue per the
+        // `filter-changes-in-delta-pipelines-need-bidirectional-reconciliation`
+        // learning.
+        let h = TestHarness::new();
+
+        let file = h.config.knowledge_dir.join("strip.md");
+        std::fs::write(
+            &file,
+            "---\n\
+             tags: [universal]\n\
+             applies_when:\n  \
+             tools: [Bash]\n\
+             ---\n\n\
+             # Strip\n\n\
+             Original body that is long enough.\n",
+        )
+        .unwrap();
+        let _ = crate::ingest::ingest_single_file(
+            &h.db,
+            &h.embedder,
+            &h.config.knowledge_dir,
+            &file,
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        // Sanity: pre-update, both rows have the predicate.
+        let pre_pattern =
+            h.db.pattern_applies_when_json_for_source("strip.md")
+                .unwrap()
+                .unwrap()
+                .expect("pre-update predicate populated");
+        assert!(pre_pattern.contains(r#""tools":["Bash"]"#));
+
+        // MCP `update_pattern` rewrites the body without `applies_when`.
+        // The `tags` field is omitted so the existing `[universal]` tag
+        // is preserved (preserve-on-absent contract). The body itself
+        // is plain prose — `build_file_content` rebuilds frontmatter
+        // with only tags.
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":502,"method":"tools/call",
+                "params":{
+                    "name":"update_pattern",
+                    "arguments":{
+                        "source_file":"strip.md",
+                        "body":"Brand-new body without any predicate. Long enough for chunking."
+                    }
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null(), "tool call failed: {resp:?}");
+
+        let post_chunks = h.db.chunk_applies_when_json_for_source("strip.md").unwrap();
+        for predicate in post_chunks {
+            assert!(
+                predicate.is_none(),
+                "post-update chunk JSON must be NULL, got: {predicate:?}",
+            );
+        }
+        let post_pattern =
+            h.db.pattern_applies_when_json_for_source("strip.md")
+                .unwrap();
+        assert_eq!(
+            post_pattern,
+            Some(None),
+            "post-update pattern JSON must be NULL (no stale residue)",
+        );
+    }
+
+    #[test]
+    fn mcp_append_to_pattern_preserves_applies_when_json_on_every_chunk() {
+        // `append_to_pattern` reads the existing file content as-is
+        // and appends a new section, so the original frontmatter
+        // (including `applies_when`) survives. Re-indexing through
+        // `index_single_file` re-derives the column from the same
+        // frontmatter — so every chunk (old and freshly-appended)
+        // must carry the same predicate JSON.
+        let h = TestHarness::new();
+
+        let file = h.config.knowledge_dir.join("append.md");
+        std::fs::write(
+            &file,
+            "---\n\
+             tags: [universal]\n\
+             applies_when:\n  \
+             tools: [Bash]\n\
+             ---\n\n\
+             # Append Target\n\n\
+             Original body that is long enough.\n",
+        )
+        .unwrap();
+        let _ = crate::ingest::ingest_single_file(
+            &h.db,
+            &h.embedder,
+            &h.config.knowledge_dir,
+            &file,
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":503,"method":"tools/call",
+                "params":{
+                    "name":"append_to_pattern",
+                    "arguments":{
+                        "source_file":"append.md",
+                        "heading":"New Section",
+                        "body":"Appended body that is long enough for chunking."
+                    }
+                }
+            }"#,
+        );
+        assert!(resp["error"].is_null(), "tool call failed: {resp:?}");
+
+        let chunks =
+            h.db.chunk_applies_when_json_for_source("append.md")
+                .unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "expected at least two chunks after append, got {}",
+            chunks.len(),
+        );
+        for predicate in &chunks {
+            let json = predicate
+                .as_ref()
+                .expect("every chunk must carry predicate JSON");
+            assert!(
+                json.contains(r#""tools":["Bash"]"#),
+                "chunk JSON must round-trip after append, got: {json}",
+            );
+        }
+        let pattern =
+            h.db.pattern_applies_when_json_for_source("append.md")
+                .unwrap()
+                .unwrap()
+                .expect("pattern row carries JSON");
+        assert!(pattern.contains(r#""tools":["Bash"]"#));
+    }
+
+    #[test]
+    fn mcp_add_pattern_with_malformed_applies_when_succeeds_and_persists_null() {
+        // Operator-visibility audit: a malformed `applies_when` in the
+        // user-supplied body of `add_pattern` does not fail the call
+        // (R9 skip-with-warning); the row persists with
+        // applies_when_json = NULL and the `Warning:` line goes to
+        // stderr from inside `index_single_file`. Stderr capture inside
+        // `cargo test` is not straightforward, so we pin the durable
+        // contract: tool call succeeds, both rows are NULL.
+        let h = TestHarness::new();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":504,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Malformed AW",
+                        "body":"---\nappliess_when:\n  tools: [Bash]\n---\n\nMalformed body that is long enough for a chunk."
+                    }
+                }
+            }"#,
+        );
+        assert!(
+            resp["error"].is_null(),
+            "malformed applies_when must NOT fail the MCP call: {resp:?}",
+        );
+
+        let pattern =
+            h.db.pattern_applies_when_json_for_source("malformed-aw.md")
+                .unwrap();
+        assert_eq!(
+            pattern,
+            Some(None),
+            "malformed predicate must leave pattern JSON NULL",
+        );
+        let chunks =
+            h.db.chunk_applies_when_json_for_source("malformed-aw.md")
+                .unwrap();
+        for predicate in chunks {
+            assert!(
+                predicate.is_none(),
+                "malformed predicate must leave every chunk JSON NULL",
+            );
+        }
+    }
 }
