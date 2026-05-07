@@ -1467,6 +1467,7 @@ mod tests {
             source_file: "errors.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         assert_eq!(
             embed_text(&chunk),
@@ -1484,6 +1485,7 @@ mod tests {
             source_file: "test.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         assert_eq!(embed_text(&chunk), "Title\n\nBody");
     }

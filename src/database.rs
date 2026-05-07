@@ -72,6 +72,11 @@ pub struct SearchResult {
     /// `true` when the chunk's source pattern is tagged `universal` —
     /// re-injected on every relevant `PreToolUse` call (bypasses dedup).
     pub is_universal: bool,
+    /// JSON-serialised `applies_when` predicate, or `None` when the source
+    /// pattern has no predicate. Deserialisation to the engine's
+    /// `AppliesWhen` happens at the predicate filter site (U5); the DB
+    /// layer stays JSON-naive.
+    pub applies_when_json: Option<String>,
 }
 
 /// Aggregate statistics about the database contents.
@@ -229,7 +234,8 @@ impl KnowledgeDB {
 
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
-                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score, c.is_universal
+                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score, c.is_universal,
+                    c.applies_when_json
              FROM patterns_fts f
              JOIN chunks c ON c.id = f.chunk_id
              WHERE patterns_fts MATCH ?1
@@ -249,6 +255,7 @@ impl KnowledgeDB {
                 heading_path: row.get(5)?,
                 score: row.get(6)?,
                 is_universal: row.get::<_, i64>(7)? != 0,
+                applies_when_json: row.get::<_, Option<String>>(8)?,
             })
         })?;
 
@@ -264,7 +271,7 @@ impl KnowledgeDB {
         let blob = vec_to_blob(query_embedding);
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
-                    v.distance AS score, c.is_universal
+                    v.distance AS score, c.is_universal, c.applies_when_json
              FROM patterns_vec v
              JOIN chunks c ON c.id = v.id
              WHERE v.embedding MATCH ?1
@@ -284,6 +291,7 @@ impl KnowledgeDB {
                 heading_path: row.get(5)?,
                 score: row.get(6)?,
                 is_universal: row.get::<_, i64>(7)? != 0,
+                applies_when_json: row.get::<_, Option<String>>(8)?,
             })
         })?;
 
@@ -402,7 +410,8 @@ impl KnowledgeDB {
 
         let placeholders: Vec<String> = (1..=source_files.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
-            "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score, is_universal \
+            "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score, is_universal, \
+                    applies_when_json \
              FROM chunks WHERE source_file IN ({}) ORDER BY source_file, id",
             placeholders.join(", ")
         );
@@ -423,6 +432,7 @@ impl KnowledgeDB {
                 heading_path: row.get(5)?,
                 score: row.get(6)?,
                 is_universal: row.get::<_, i64>(7)? != 0,
+                applies_when_json: row.get::<_, Option<String>>(8)?,
             })
         })?;
 
@@ -549,7 +559,16 @@ pub fn sanitize_fts_query(query: &str) -> String {
 /// Stored as `SQLite`'s `PRAGMA user_version` — a cheap integer slot that
 /// `check_schema_compatibility` reads to decide whether the database was
 /// written by a build old enough to predate the current DDL.
-const SCHEMA_VERSION: u32 = 2;
+///
+/// History:
+/// - v2: introduced `is_universal` column on `chunks` and `patterns`.
+///   v1→v2 required `lore ingest --force` because new behaviour depended
+///   on populated columns.
+/// - v3: introduced `applies_when_json TEXT NULL` column on `chunks` and
+///   `patterns`. Purely additive: `NULL` means "no predicate" which is the
+///   pre-Track-1 behaviour. `check_schema_compatibility` migrates v2→v3 in
+///   place via `ALTER TABLE` on first open — no `--force` required.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Authoritative DDL for the `chunks` table. Used by both `KnowledgeDB::init`
 /// (fresh-DB path, `CREATE TABLE IF NOT EXISTS`) and `KnowledgeDB::clear_all`
@@ -564,6 +583,7 @@ const CHUNKS_DDL: &str = "\
         source_file TEXT NOT NULL,
         heading_path TEXT DEFAULT '',
         is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
+        applies_when_json TEXT,
         ingested_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)";
@@ -594,13 +614,14 @@ const INGEST_METADATA_DDL: &str =
 /// convention — ISO-8601-ish `YYYY-MM-DD HH:MM:SS` in UTC.
 const PATTERNS_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS patterns (
-        source_file  TEXT PRIMARY KEY,
-        title        TEXT NOT NULL,
-        tags         TEXT NOT NULL,
-        is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
-        raw_body     TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        ingested_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        source_file       TEXT PRIMARY KEY,
+        title             TEXT NOT NULL,
+        tags              TEXT NOT NULL,
+        is_universal      INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
+        raw_body          TEXT NOT NULL,
+        content_hash      TEXT NOT NULL,
+        applies_when_json TEXT,
+        ingested_at       TEXT NOT NULL DEFAULT (datetime('now'))
     )";
 
 /// DDL for the dimensions-bound `patterns_vec` virtual table. Returned as a
@@ -619,8 +640,21 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
 /// Returns `Ok(())` when either the database is fresh (no `chunks` table yet
 /// — `init` will stamp the version after DDL) or the stored version is at
 /// least the current target. Returns a friendly upgrade-required error for
-/// old-schema databases (`user_version = 0` AND `chunks` exists and is
-/// non-empty).
+/// old-schema databases that cannot be migrated additively.
+///
+/// Two migration policies coexist here:
+///
+/// - **Additive bump (v2 → v3).** The `applies_when_json` column was added
+///   to `chunks` and `patterns` as nullable with no default; existing rows
+///   carry `NULL` and behave as if no predicate is set, matching the
+///   pre-Track-1 behaviour. We detect this case via the version comparison
+///   (`version == 2`) and apply two `ALTER TABLE` statements on the spot,
+///   then stamp `PRAGMA user_version = 3` and return `Ok(())`. No
+///   `lore ingest --force` is required for users on v2.
+/// - **Hard bail (anything older).** Pre-v2 databases predate the
+///   `is_universal` plumbing and would still fail subsequent SELECTs with
+///   "no such column" errors. Those users see the existing upgrade
+///   advisory naming `lore ingest --force` as the sanctioned remedy.
 ///
 /// Replaces the earlier `PRAGMA table_info(chunks)` column-parsing probe:
 /// both approaches catch the same hazard, but `user_version` is a single
@@ -642,6 +676,28 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
         )
         .unwrap_or(0);
     if chunks_exists == 0 {
+        return Ok(());
+    }
+
+    // Forward-compatible v2 → v3 migration: the `applies_when_json` column
+    // was added as nullable with no default, so existing populated DBs can
+    // be migrated in place without rebuilding the index. This branch must
+    // run before the chunk-count short-circuit below so that empty-but-v2
+    // DBs also receive the column (otherwise a re-ingest after a clean
+    // v2 install would fail to bind the new column on insert).
+    if version == 2 {
+        let patterns_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'patterns'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        conn.execute_batch("ALTER TABLE chunks ADD COLUMN applies_when_json TEXT")?;
+        if patterns_exists != 0 {
+            conn.execute_batch("ALTER TABLE patterns ADD COLUMN applies_when_json TEXT")?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
 
@@ -676,8 +732,8 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
 pub fn upsert_pattern_in_tx(tx: &Transaction<'_>, row: &PatternRow) -> anyhow::Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO patterns \
-         (source_file, title, tags, is_universal, raw_body, content_hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         (source_file, title, tags, is_universal, raw_body, content_hash, applies_when_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             row.source_file,
             row.title,
@@ -685,6 +741,7 @@ pub fn upsert_pattern_in_tx(tx: &Transaction<'_>, row: &PatternRow) -> anyhow::R
             i64::from(row.is_universal),
             row.raw_body,
             row.content_hash,
+            row.applies_when_json,
         ],
     )?;
     Ok(())
@@ -736,8 +793,9 @@ pub fn insert_chunk_in_tx(
     tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
 
     tx.execute(
-        "INSERT OR REPLACE INTO chunks (id, title, body, tags, source_file, heading_path, is_universal)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO chunks \
+         (id, title, body, tags, source_file, heading_path, is_universal, applies_when_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             chunk.id,
             chunk.title,
@@ -746,6 +804,7 @@ pub fn insert_chunk_in_tx(
             chunk.source_file,
             chunk.heading_path,
             i64::from(chunk.is_universal),
+            chunk.applies_when_json,
         ],
     )?;
 
@@ -851,6 +910,7 @@ mod tests {
             source_file: source.to_string(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         }
     }
 
@@ -864,6 +924,7 @@ mod tests {
             source_file: source.to_string(),
             heading_path: String::new(),
             is_universal: true,
+            applies_when_json: None,
         }
     }
 
@@ -879,6 +940,7 @@ mod tests {
             is_universal: chunk.is_universal,
             raw_body: chunk.body.clone(),
             content_hash: "0000000000000000".to_string(),
+            applies_when_json: chunk.applies_when_json.clone(),
         })
         .unwrap();
         db.insert_chunk(chunk, embedding).unwrap();
@@ -969,6 +1031,7 @@ mod tests {
             source_file: "patterns.md".into(),
             heading_path: "Alpha".into(),
             is_universal: false,
+            applies_when_json: None,
         };
         let c2 = Chunk {
             id: "c2".into(),
@@ -978,6 +1041,7 @@ mod tests {
             source_file: "patterns.md".into(),
             heading_path: "Beta".into(),
             is_universal: false,
+            applies_when_json: None,
         };
 
         db.insert_chunk(&c1, Some(&[1.0, 0.0, 0.0, 0.0])).unwrap();
@@ -1178,6 +1242,7 @@ mod tests {
             heading_path: String::new(),
             score: 0.0,
             is_universal: false,
+            applies_when_json: None,
         };
         let a = vec![stub("x"), stub("y")];
         let b = vec![stub("y"), stub("z")];
@@ -1256,6 +1321,7 @@ mod tests {
             source_file: "ts.md".to_string(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&tagged, None).unwrap();
 
@@ -1268,6 +1334,7 @@ mod tests {
             source_file: "rust.md".to_string(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&body_only, None).unwrap();
 
@@ -1460,6 +1527,7 @@ mod tests {
             source_file: "rust.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let c2 = Chunk {
             id: "c2".into(),
@@ -1469,6 +1537,7 @@ mod tests {
             source_file: "ts.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&c1, None).unwrap();
         db.insert_chunk(&c2, None).unwrap();
@@ -1517,6 +1586,7 @@ mod tests {
             source_file: "rust.md".into(),
             heading_path: "Naming".into(),
             is_universal: false,
+            applies_when_json: None,
         };
         seed_pattern_and_chunk(&db, &chunk, None);
 
@@ -1856,5 +1926,467 @@ mod tests {
             !results.is_empty(),
             "porter stemming should match 'test' against 'testing'"
         );
+    }
+
+    // -- applies_when_json column (U1) ---------------------------------------
+    //
+    // Cover the four scenarios the universal-pattern-predicate plan calls out
+    // for U1: fresh-DB happy path with column presence and round-trip; clear_all
+    // produces a clean v3 DB; v2 → v3 ALTER TABLE migration on first open;
+    // sibling expansion via `chunks_by_sources` returns the new column.
+
+    #[test]
+    fn fresh_db_carries_applies_when_json_column_on_both_tables() {
+        // Happy path: a freshly initialised DB has `applies_when_json` on
+        // both `chunks` and `patterns` and is stamped at v3.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "applies_when_json"),
+            "chunks must carry applies_when_json on a fresh init, got: {chunk_columns:?}"
+        );
+
+        let pattern_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(patterns)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            pattern_columns.iter().any(|c| c == "applies_when_json"),
+            "patterns must carry applies_when_json on a fresh init, got: {pattern_columns:?}"
+        );
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            user_version, SCHEMA_VERSION,
+            "fresh init must stamp PRAGMA user_version to the current target"
+        );
+    }
+
+    #[test]
+    fn applies_when_json_round_trips_some_and_none_through_chunk_writes() {
+        // Happy path: write two chunks (one with predicate JSON, one without),
+        // confirm both shapes round-trip through the FTS, vector, and
+        // `chunks_by_sources` SELECT sites.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let predicate_json =
+            r#"{"tools":["Bash"],"bash_command_starts_with":["git","gh"]}"#.to_string();
+
+        let with_predicate = Chunk {
+            id: "u1".into(),
+            title: "Git Branch Workflow".into(),
+            body: "Always git push origin HEAD on a feature branch.".into(),
+            tags: "universal, workflow".into(),
+            source_file: "wf.md".into(),
+            heading_path: String::new(),
+            is_universal: true,
+            applies_when_json: Some(predicate_json.clone()),
+        };
+        let without_predicate = Chunk {
+            id: "n1".into(),
+            title: "Plain Style".into(),
+            body: "Use anyhow for application errors".into(),
+            tags: "rust".into(),
+            source_file: "style.md".into(),
+            heading_path: String::new(),
+            is_universal: false,
+            applies_when_json: None,
+        };
+        let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+        db.insert_chunk(&with_predicate, Some(&emb)).unwrap();
+        db.insert_chunk(&without_predicate, Some(&[0.0_f32, 1.0, 0.0, 0.0]))
+            .unwrap();
+
+        // FTS round-trip.
+        let fts_results = db.search_fts("git OR anyhow", 10).unwrap();
+        let by_id: std::collections::HashMap<_, _> = fts_results
+            .iter()
+            .map(|r| (r.id.as_str(), r.applies_when_json.clone()))
+            .collect();
+        assert_eq!(
+            by_id.get("u1"),
+            Some(&Some(predicate_json.clone())),
+            "FTS must round-trip Some(predicate) for u1, got: {by_id:?}"
+        );
+        assert_eq!(
+            by_id.get("n1"),
+            Some(&None),
+            "FTS must round-trip None for n1, got: {by_id:?}"
+        );
+
+        // Vector round-trip.
+        let vec_results = db.search_vector(&[1.0_f32, 0.0, 0.0, 0.0], 10).unwrap();
+        let vec_predicate = vec_results
+            .iter()
+            .find(|r| r.id == "u1")
+            .map(|r| r.applies_when_json.clone());
+        assert_eq!(
+            vec_predicate,
+            Some(Some(predicate_json.clone())),
+            "vector search must round-trip Some(predicate)"
+        );
+
+        // `chunks_by_sources` round-trip — sibling-expansion path used by
+        // the hook pipeline. Both rows must carry their respective values.
+        let siblings = db.chunks_by_sources(&["wf.md", "style.md"]).unwrap();
+        assert_eq!(siblings.len(), 2);
+        let sib_by_id: std::collections::HashMap<_, _> = siblings
+            .iter()
+            .map(|r| (r.id.as_str(), r.applies_when_json.clone()))
+            .collect();
+        assert_eq!(sib_by_id.get("u1"), Some(&Some(predicate_json)));
+        assert_eq!(sib_by_id.get("n1"), Some(&None));
+    }
+
+    #[test]
+    fn applies_when_json_round_trips_through_pattern_row() {
+        // Happy path: the `patterns` row also carries `applies_when_json`,
+        // mirroring the chunk-side persistence so MCP write paths can update
+        // the column without re-deriving it from chunks (U7 plumbing
+        // dependency).
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let predicate_json = r#"{"tools":["Bash"]}"#.to_string();
+        db.upsert_pattern(&PatternRow {
+            source_file: "wf.md".into(),
+            title: "Workflow".into(),
+            tags: "universal".into(),
+            is_universal: true,
+            raw_body: "Body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: Some(predicate_json.clone()),
+        })
+        .unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT applies_when_json FROM patterns WHERE source_file = 'wf.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, Some(predicate_json));
+
+        // Re-upsert with None to confirm the column accepts NULL on update.
+        db.upsert_pattern(&PatternRow {
+            source_file: "wf.md".into(),
+            title: "Workflow".into(),
+            tags: "universal".into(),
+            is_universal: true,
+            raw_body: "Body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+        })
+        .unwrap();
+        let stored_after: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT applies_when_json FROM patterns WHERE source_file = 'wf.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_after, None);
+    }
+
+    #[test]
+    fn clear_all_after_v3_bump_recreates_applies_when_json_column() {
+        // Edge case: `clear_all` drops and recreates from `CHUNKS_DDL` /
+        // `PATTERNS_DDL`, which now include `applies_when_json`. Confirm the
+        // column is present after the drop+recreate (and PRAGMA user_version
+        // is stamped at the current target).
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Seed a row with a predicate so we can confirm clear_all wipes it.
+        let chunk = Chunk {
+            id: "c1".into(),
+            title: "Seed".into(),
+            body: "Body long enough to clear the 10-char minimum".into(),
+            tags: String::new(),
+            source_file: "seed.md".into(),
+            heading_path: String::new(),
+            is_universal: false,
+            applies_when_json: Some(r#"{"tools":["Bash"]}"#.into()),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        db.clear_all().unwrap();
+
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "applies_when_json"),
+            "chunks must carry applies_when_json after clear_all, got: {chunk_columns:?}"
+        );
+
+        let pattern_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(patterns)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            pattern_columns.iter().any(|c| c == "applies_when_json"),
+            "patterns must carry applies_when_json after clear_all, got: {pattern_columns:?}"
+        );
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, SCHEMA_VERSION);
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "clear_all must leave chunks empty");
+    }
+
+    #[test]
+    fn open_migrates_v2_database_to_v3_via_alter_table() {
+        // Migration regression: build a v2 DB by hand (DDL without
+        // `applies_when_json`, populated with sample chunks and a patterns
+        // row, `PRAGMA user_version = 2`) and call `KnowledgeDB::open`. The
+        // probe must apply two `ALTER TABLE` additions, stamp
+        // `PRAGMA user_version = 3`, and return successfully without bailing.
+        // Existing rows survive with `applies_when_json = NULL`. A fresh
+        // ingest after migration writes the column normally — pinning that
+        // the migrated schema is fully usable for new writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v2.db");
+
+        // Hand-build the v2 schema. Mirrors the `is_universal`-era DDL
+        // exactly, less the new column. We also create the FTS / vec virtual
+        // tables so subsequent `insert_chunk` calls have somewhere to land.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE INDEX idx_chunks_source_file ON chunks(source_file);
+                CREATE TABLE patterns (
+                    source_file  TEXT PRIMARY KEY,
+                    title        TEXT NOT NULL,
+                    tags         TEXT NOT NULL,
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    raw_body     TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    ingested_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE ingest_metadata (key TEXT PRIMARY KEY, value TEXT);
+                CREATE VIRTUAL TABLE patterns_fts USING fts5(
+                    title, body, tags, source_file, chunk_id UNINDEXED,
+                    tokenize = 'porter unicode61'
+                );",
+            )
+            .unwrap();
+            // The vec virtual table is dimensions-bound — we must register
+            // sqlite-vec for this connection before creating it.
+            super::register_sqlite_vec();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE patterns_vec USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[4]
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks \
+                 (id, title, body, source_file, heading_path, tags, is_universal) \
+                 VALUES ('legacy1', 'Legacy', 'Legacy body content', 'legacy.md', \
+                         '', 'workflow', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO patterns \
+                 (source_file, title, tags, is_universal, raw_body, content_hash) \
+                 VALUES ('legacy.md', 'Legacy', 'workflow', 0, 'Legacy body content', \
+                         'deadbeefdeadbeef')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+        }
+
+        // Open via the regular path — no `--force`. The probe must migrate
+        // in place and return successfully.
+        let db = KnowledgeDB::open(&db_path, 4)
+            .expect("v2 → v3 additive migration must apply silently on KnowledgeDB::open");
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            user_version, SCHEMA_VERSION,
+            "PRAGMA user_version must be bumped to v3 after migration"
+        );
+
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "applies_when_json"),
+            "chunks must carry applies_when_json after migration, got: {chunk_columns:?}"
+        );
+
+        let pattern_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(patterns)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            pattern_columns.iter().any(|c| c == "applies_when_json"),
+            "patterns must carry applies_when_json after migration, got: {pattern_columns:?}"
+        );
+
+        // Existing rows survive — title and body intact, new column NULL.
+        let (legacy_title, legacy_predicate): (String, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT title, applies_when_json FROM chunks WHERE id = 'legacy1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_title, "Legacy");
+        assert_eq!(
+            legacy_predicate, None,
+            "migrated row must default applies_when_json to NULL"
+        );
+
+        // The migrated patterns row likewise carries NULL.
+        let pattern_predicate: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT applies_when_json FROM patterns WHERE source_file = 'legacy.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pattern_predicate, None);
+
+        // A fresh insert against the migrated schema writes the new column
+        // normally — pinning that the migration leaves the schema fully
+        // usable for subsequent writes (no "column missing" failures).
+        let new_chunk = Chunk {
+            id: "fresh1".into(),
+            title: "Fresh".into(),
+            body: "Fresh body content for the migrated DB".into(),
+            tags: "universal".into(),
+            source_file: "fresh.md".into(),
+            heading_path: String::new(),
+            is_universal: true,
+            applies_when_json: Some(r#"{"tools":["Bash"]}"#.into()),
+        };
+        db.insert_chunk(&new_chunk, None).unwrap();
+
+        let fresh_predicate: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT applies_when_json FROM chunks WHERE id = 'fresh1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh_predicate, Some(r#"{"tools":["Bash"]}"#.to_string()));
+    }
+
+    #[test]
+    fn chunks_by_sources_returns_applies_when_json_for_every_chunk() {
+        // Integration: sibling-expansion via `chunks_by_sources` carries the
+        // new column for every chunk of a matched source. Whole-file
+        // semantics — every chunk of a single source shares the predicate
+        // (U7's invariant) — but the DB layer just round-trips whatever was
+        // written. Here we seed two chunks per source with matching JSON to
+        // confirm the SELECT site preserves the column on every row.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let predicate_json = r#"{"tools":["Bash"]}"#.to_string();
+        let chunks = vec![
+            Chunk {
+                id: "wf:Section A".into(),
+                title: "Section A".into(),
+                body: "Section A body content for chunking".into(),
+                tags: "universal".into(),
+                source_file: "wf.md".into(),
+                heading_path: "Section A".into(),
+                is_universal: true,
+                applies_when_json: Some(predicate_json.clone()),
+            },
+            Chunk {
+                id: "wf:Section B".into(),
+                title: "Section B".into(),
+                body: "Section B body content for chunking".into(),
+                tags: "universal".into(),
+                source_file: "wf.md".into(),
+                heading_path: "Section B".into(),
+                is_universal: true,
+                applies_when_json: Some(predicate_json.clone()),
+            },
+        ];
+        for c in &chunks {
+            db.insert_chunk(c, None).unwrap();
+        }
+
+        let siblings = db.chunks_by_sources(&["wf.md"]).unwrap();
+        assert_eq!(siblings.len(), 2);
+        for s in &siblings {
+            assert_eq!(
+                s.applies_when_json,
+                Some(predicate_json.clone()),
+                "chunks_by_sources must carry applies_when_json on every \
+                 row, got: {s:?}"
+            );
+        }
     }
 }

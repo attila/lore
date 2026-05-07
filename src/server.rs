@@ -1434,6 +1434,7 @@ mod tests {
             source_file: "patterns.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1467,6 +1468,7 @@ mod tests {
             source_file: "git-workflow.md".into(),
             heading_path: String::new(),
             is_universal: true,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1501,6 +1503,7 @@ mod tests {
                 source_file: "workflows/git.md".into(),
                 heading_path: String::new(),
                 is_universal: true,
+                applies_when_json: None,
             },
             crate::chunking::Chunk {
                 id: "n1".into(),
@@ -1510,6 +1513,7 @@ mod tests {
                 source_file: "rust/style.md".into(),
                 heading_path: String::new(),
                 is_universal: false,
+                applies_when_json: None,
             },
         ] {
             h.db.upsert_pattern(&crate::chunking::PatternRow {
@@ -1519,6 +1523,7 @@ mod tests {
                 is_universal: chunk.is_universal,
                 raw_body: chunk.body.clone(),
                 content_hash: "0000000000000000".into(),
+                applies_when_json: chunk.applies_when_json.clone(),
             })
             .unwrap();
             h.db.insert_chunk(&chunk, None).unwrap();
@@ -1572,6 +1577,7 @@ mod tests {
             source_file: "c.md".into(),
             heading_path: String::new(),
             is_universal: true,
+            applies_when_json: None,
         };
         h.db.upsert_pattern(&crate::chunking::PatternRow {
             source_file: chunk.source_file.clone(),
@@ -1580,6 +1586,7 @@ mod tests {
             is_universal: chunk.is_universal,
             raw_body: chunk.body.clone(),
             content_hash: "0000000000000000".into(),
+            applies_when_json: chunk.applies_when_json.clone(),
         })
         .unwrap();
         h.db.insert_chunk(&chunk, None).unwrap();
@@ -1660,6 +1667,7 @@ mod tests {
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1725,6 +1733,7 @@ mod tests {
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1819,6 +1828,7 @@ mod tests {
                 source_file: "rust/cargo-deny.md".into(),
                 heading_path: format!("section-{i}"),
                 is_universal: false,
+                applies_when_json: None,
             };
             let emb = embedder.embed(&chunk.body).unwrap();
             db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1891,6 +1901,7 @@ mod tests {
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -1958,6 +1969,7 @@ mod tests {
             source_file: "rust/cargo-deny.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2007,6 +2019,7 @@ mod tests {
                 source_file: format!("rust/pattern-{i}.md"),
                 heading_path: String::new(),
                 is_universal: false,
+                applies_when_json: None,
             };
             let emb = h.embedder.embed(&chunk.body).unwrap();
             h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2580,6 +2593,7 @@ mod tests {
             source_file: "fts-test.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3103,6 +3117,7 @@ mod tests {
             source_file: "warn.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3154,6 +3169,7 @@ mod tests {
             source_file: "nowarn.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -3192,6 +3208,7 @@ mod tests {
             source_file: "relevant.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -3229,6 +3246,7 @@ mod tests {
             source_file: "always.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -3273,6 +3291,7 @@ mod tests {
             source_file: "fts-bypass.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3324,6 +3343,7 @@ mod tests {
             source_file: "fallback.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3374,6 +3394,7 @@ mod tests {
             source_file: "limit.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         h.db.insert_chunk(&chunk, None).unwrap();
 

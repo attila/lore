@@ -13,8 +13,8 @@ use crate::hash::fnv1a;
 /// A single chunk of knowledge extracted from a markdown file.
 ///
 /// No `Default` impl by design: every chunk-construction site must explicitly
-/// set `is_universal` so that future fixtures and write paths cannot silently
-/// default it to `false`.
+/// set `is_universal` and `applies_when_json` so that future fixtures and
+/// write paths cannot silently default them.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     /// Unique identifier: `source_file:heading_path` (or `source_file` for document mode).
@@ -33,6 +33,13 @@ pub struct Chunk {
     /// which opts the pattern into the always-on injection tier (always
     /// emitted at `SessionStart`, bypasses `PreToolUse` dedup).
     pub is_universal: bool,
+    /// JSON-serialised `applies_when` predicate from the pattern's
+    /// frontmatter, or `None` when no predicate is set. When `Some`, gates
+    /// re-injection of universal chunks at the `PreToolUse` predicate filter
+    /// (see U5 in `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`).
+    /// U1 introduces the field with explicit `None` at every construction
+    /// site; U7 plumbs real values from the frontmatter parser.
+    pub applies_when_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +105,8 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
             source_file: source_file.to_string(),
             heading_path,
             is_universal,
+            // U7 will replace this with the parsed predicate JSON.
+            applies_when_json: None,
         });
     };
 
@@ -161,6 +170,8 @@ pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
         source_file: source_file.to_string(),
         heading_path: String::new(),
         is_universal,
+        // U7 will replace this with the parsed predicate JSON.
+        applies_when_json: None,
     }]
 }
 
@@ -183,6 +194,11 @@ pub struct PatternRow {
     pub is_universal: bool,
     pub raw_body: String,
     pub content_hash: String,
+    /// JSON-serialised `applies_when` predicate from the pattern's
+    /// frontmatter; mirrors `Chunk::applies_when_json`. `None` means no
+    /// predicate is set and the pattern fires as today (whole-file
+    /// semantics — the predicate is shared across every chunk).
+    pub applies_when_json: Option<String>,
 }
 
 /// Build a [`PatternRow`] from the file's raw contents and its produced
@@ -196,9 +212,11 @@ pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> P
     // All chunks from a single file share the frontmatter-derived
     // `is_universal` flag — we read it from the first chunk instead of
     // re-parsing the frontmatter, keeping the two paths in sync by
-    // construction.
+    // construction. `applies_when_json` follows the same whole-file mirror
+    // (every chunk of a pattern carries the same predicate JSON).
     let is_universal = chunks.first().is_some_and(|c| c.is_universal);
     let tags = chunks.first().map_or_else(String::new, |c| c.tags.clone());
+    let applies_when_json = chunks.first().and_then(|c| c.applies_when_json.clone());
     let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
     let raw_body = strip_frontmatter(content).trim().to_string();
     let content_hash = format!("{:016x}", fnv1a(content.as_bytes()));
@@ -209,6 +227,7 @@ pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> P
         is_universal,
         raw_body,
         content_hash,
+        applies_when_json,
     }
 }
 

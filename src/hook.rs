@@ -1310,6 +1310,7 @@ mod tests {
             heading_path: String::new(),
             score: 0.8,
             is_universal: false,
+            applies_when_json: None,
         }];
 
         let formatted = format_imperative(&results);
@@ -1330,6 +1331,7 @@ mod tests {
                 heading_path: String::new(),
                 score: 0.8,
                 is_universal: false,
+                applies_when_json: None,
             },
             SearchResult {
                 id: "c2".into(),
@@ -1340,6 +1342,7 @@ mod tests {
                 heading_path: String::new(),
                 score: 0.7,
                 is_universal: false,
+                applies_when_json: None,
             },
         ];
 
@@ -1706,6 +1709,7 @@ mod tests {
             heading_path: String::new(),
             score: 1.0,
             is_universal: false,
+            applies_when_json: None,
         }
     }
 
