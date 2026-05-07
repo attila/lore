@@ -47,11 +47,19 @@ hook:
 2. Searches the knowledge base for matching patterns and partitions the result into universal
    (uncapped, additive) and ranked (capped at `top_k`) slices
 3. Expands each slice independently to include sibling chunks from matched source files
-4. Routes the combined slice through deduplication. Universal chunks bypass the read-side
+4. **Predicate filter.** For every universal chunk that carries an `applies_when` predicate, the
+   filter evaluates the predicate against the current call. Suppressed chunks are dropped from the
+   `Vec<SearchResult>` before deduplication runs — they bypass the dedup file entirely on both the
+   read and the write side. This preserves the per-call (not per-session) suppression invariant: a
+   later call whose tool/command does match the predicate still injects the pattern. Universal
+   chunks without a predicate, and all non-universal chunks, pass through unchanged. See
+   [`applies_when`](pattern-authoring-guide.md#toolcommand-predicate-applies_when) in the pattern
+   authoring guide for the predicate's authoring surface and semantics.
+5. Routes the surviving slice through deduplication. Universal chunks bypass the read-side
    `seen.contains` check so they re-inject on every relevant tool call; non-universal chunks are
    filtered as before. Every surfaced chunk (universal or not) is appended to the dedup file so it
    remains a faithful injection log.
-5. Formats the results as imperative directives and returns them in `additionalContext`
+6. Formats the results as imperative directives and returns them in `additionalContext`
 
 The output format groups chunks by source file:
 
@@ -77,6 +85,39 @@ Fires when the agent's context window is compressed (a natural event during long
 truncates the deduplication file and re-emits the same content as SessionStart — the full pattern
 index and meta-instruction. This ensures the agent retains awareness of the knowledge base even
 after earlier injections have been compressed away.
+
+## Engine and Adapter
+
+The hook code is split between an agent-agnostic **engine** and a Claude-Code-specific **adapter**.
+The split keeps query extraction, predicate evaluation, and pure-string helpers reusable for future
+agent integrations (Cursor, opencode) without dragging Claude Code's `HookInput` shape across the
+boundary.
+
+- **`src/engine/`** — agent-agnostic engine module. Owns the `CallContext` struct (the minimal,
+  pre-extracted view of a tool call: `tool_name`, `command`, `file_path`, `description`,
+  `transcript_tail`), the `applies_when` predicate evaluator, the smart-prefix matcher,
+  `extract_query`, and the pure-string helpers (`language_from_bash`, `language_from_extension`,
+  `filename_terms`, `clean_terms`, `split_into_words`, `truncate_str`). The engine performs no
+  filesystem I/O — `tests/invariants.rs` enforces this with a static grep.
+- **`src/hook.rs`** — Claude-Code-specific adapter. Owns `HookInput` deserialisation, the
+  `HookInput::to_call_context()` conversion, the PreToolUse / SessionStart / PostCompact /
+  PostToolUse handlers, the dedup-file lifecycle, and the imperative-format output assembly.
+  Filesystem I/O lives here, including the `validate_within_dir` containment check on
+  `transcript_path` and the bounded transcript-tail read.
+
+A future agent integration writes its own adapter (mapping its native event format into
+`CallContext`), and calls the same engine functions unchanged.
+
+### Eager transcript-tail read
+
+`HookInput::to_call_context()` reads the transcript tail eagerly: when `transcript_path` is present
+and validates against `$HOME`, the adapter reads up to the documented byte cap and stores the result
+on the `CallContext`. The engine's `extract_query` then reads `cc.transcript_tail` directly without
+touching the filesystem.
+
+The `skip_agent` short-circuit for Explore and Plan subagents runs **before** `to_call_context`, so
+read-only subagents bypass the transcript read entirely. The eager read only fires on tool calls
+that would otherwise reach the search pipeline.
 
 ## The One-Tool-Call Delay
 

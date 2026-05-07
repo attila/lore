@@ -2,6 +2,11 @@
 
 ## Up Next
 
+- [ ] Universal-pattern predicate (`applies_when`) and engine/adapter split — Track 1 in flight on
+      `feat/applies-when-predicate`. Adds an optional tool/command predicate to universal-tagged
+      patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
+      into an agent-agnostic engine plus a Claude-Code adapter. See
+      `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
 - [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add

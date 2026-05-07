@@ -278,6 +278,156 @@ the same mechanism: the `tags:` value is `universal`; the section header is `## 
   the channel coverage-check measures), but the report marks them so authors do not pointlessly
   chase low coverage scores on a pattern that always re-injects.
 
+## Tool/command predicate (`applies_when`)
+
+A `universal` tag opts a pattern into always-on injection, but always-on can mean too-on. A workflow
+pattern about `git push` re-injects on every `Bash` call — including `ls`, `wc -l`, and `grep` where
+its content has no relevance. The `applies_when` predicate gates re-injection on tool class and Bash
+command prefix so a universal pattern fires only when the call is actually relevant to it.
+
+The predicate is whole-file: it lives in the pattern's frontmatter, and every chunk of the pattern
+shares it. There are no per-section predicates.
+
+### Authoring shape
+
+```yaml
+---
+title: Git Branch and PR Workflow
+tags:
+  - workflow
+  - universal
+applies_when:
+  tools: [Bash]
+  bash_command_starts_with: [git, gh]
+---
+```
+
+Both keys are optional, and `applies_when` itself is optional. A universal pattern without
+`applies_when` continues to fire on every relevant call, exactly as before — the predicate is
+opt-in.
+
+### Available keys
+
+- `applies_when.tools` — list of tool-class names (e.g. `Bash`, `Edit`, `Write`). Matches when the
+  current tool name is in the list. Case-sensitive.
+- `applies_when.bash_command_starts_with` — list of Bash command tokens (e.g. `git`, `gh`, `cargo`).
+  Matches when the call is `Bash` AND the command starts with one of the listed tokens (after the
+  smart-prefix matcher walks past common wrappers — see below).
+
+### Semantics
+
+- **OR within each list.** Any one entry matching is enough.
+- **AND across keys.** If both `tools` and `bash_command_starts_with` are set, both must match.
+- A missing key is unconstrained (does not narrow the match). A pattern with only
+  `bash_command_starts_with: [git]` and no `tools` key implicitly requires `Bash` because the
+  command-prefix check only meaningfully runs on `Bash` calls.
+
+### Smart-prefix matcher behaviour
+
+`bash_command_starts_with` does not require a literal first-token match. The matcher walks past
+common wrappers before checking the prefix, so a pattern declaring `bash_command_starts_with: [git]`
+fires on all of these:
+
+- `git status`
+- `sudo git status` — sudo with no flags
+- `sudo -E git push` — sudo with short flags (`-E`, `-H`)
+- `sudo -u user git push` — sudo with `-u USER` (two-token form)
+- `env GIT_PAGER=cat git log` — single `KEY=VAL` assignment
+- `env A=1 B=2 git status` — multiple `KEY=VAL` assignments
+- `env -u VAR git status` — env with `-u VAR` (two-token unset-var form)
+- `env -i git status` — env with `-i` (hermetic-environment flag)
+- `sudo env A=1 git pull` — one `sudo` wrapper followed by one `env` wrapper
+
+The matcher operates on the raw command string — it never passes through the FTS-cleaning that
+strips short tokens, so two-character commands like `gh` survive intact.
+
+**Documented limitations.** The matcher unwraps at most one outer `sudo` scope and one outer `env`
+scope. The following do NOT fire on `bash_command_starts_with: [git]`:
+
+- `env A=1 env B=2 git status` — nested env wrappers; only the outer env scope is consumed.
+- `bash -c "git status"` — quoted-command handling is not implemented; the matcher sees `bash` as
+  the command head, not the quoted invocation inside.
+
+In practice these forms are unusual; a single sudo and a single env wrapper covers nearly all
+realistic invocations.
+
+### Empty-list semantics
+
+`tools: []` and `bash_command_starts_with: []` are valid syntax but match nothing — they are
+zero-element allowlists. If you want a pattern to fire on every Bash call (and no other tool), set
+`tools: [Bash]`, not `tools: []`.
+
+### Indentation contract
+
+The frontmatter parser is hand-rolled and enforces a strict indentation contract:
+
+- Top-level keys (`tags:`, `applies_when:`) at column 0.
+- Nested keys under `applies_when:` (`tools:`, `bash_command_starts_with:`) at 2-space indent.
+- Block-list items under nested keys at 4-space indent (`- git`).
+- **Tabs are not accepted.** A tab-indented child triggers an ingest-time advisory and the predicate
+  is treated as absent.
+
+Inline-list values (`tools: [Bash]`) and block-list values
+
+```yaml
+applies_when:
+  tools:
+    - Bash
+  bash_command_starts_with:
+    - git
+    - gh
+```
+
+are both supported and parse identically.
+
+### Behaviour on a non-universal pattern
+
+You can attach `applies_when` to a non-universal pattern, but it is dormant in this release: the
+ingest layer parses and persists it, but the PreToolUse evaluator only consults it for chunks that
+also carry the `universal` tag. Ingest emits an info-level advisory naming the file so the
+discrepancy is visible. A future track will extend evaluation to non-universal patterns and
+introduce additional keys (`languages`, `environments`).
+
+### Worked examples
+
+**A workflow pattern restricted to `git` and `gh`** — fires on every Bash call that uses git or gh,
+suppressed on `Bash ls`, `Bash wc -l`, `Bash grep`, and on any non-Bash tool:
+
+```yaml
+---
+title: Git Branch and PR Workflow
+tags: [workflow, universal]
+applies_when:
+  bash_command_starts_with: [git, gh]
+---
+```
+
+**A shell-safety pattern that should fire on every Bash call** — and only Bash:
+
+```yaml
+---
+title: Always quote variable expansions in shell scripts
+tags: [shell, safety, universal]
+applies_when:
+  tools: [Bash]
+---
+```
+
+**A multi-tool universal** — fires on Edit, Write, and Bash but not Read:
+
+```yaml
+---
+title: Never write secrets to source files
+tags: [security, universal]
+applies_when:
+  tools: [Edit, Write, Bash]
+---
+```
+
+For tuning the relevance floor on universal patterns independently of `min_relevance`, see
+[`min_relevance_universal`](configuration.md#search-section) in the configuration reference. The
+predicate (`applies_when`) is the categorical complement to that numerical floor.
+
 ## File Structure and Grouping
 
 Lore splits each markdown file into chunks by heading and indexes them separately. However, when any
