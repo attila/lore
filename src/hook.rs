@@ -490,6 +490,30 @@ fn handle_post_tool_use(
     }))
 }
 
+/// Apply the per-class relevance floor: universal chunks are filtered against
+/// `universal_floor`, non-universal chunks against `min_relevance`. The two
+/// floors are independent, so operators can raise the universal bar without
+/// affecting ranked injections (R6).
+///
+/// Pure on `Vec<SearchResult>` so unit tests can exercise the branching logic
+/// without standing up a real `KnowledgeDB` and `Embedder`.
+fn apply_relevance_thresholds(
+    results: Vec<SearchResult>,
+    min_relevance: f64,
+    universal_floor: f64,
+) -> Vec<SearchResult> {
+    results
+        .into_iter()
+        .filter(|r| {
+            if r.is_universal {
+                r.score >= universal_floor
+            } else {
+                r.score >= min_relevance
+            }
+        })
+        .collect()
+}
+
 /// Shared search pipeline: embed, hybrid search, threshold filter,
 /// partition-and-cap, then flatten into a single `Vec<SearchResult>` with
 /// universal chunks ordered first, followed by ranked non-universal chunks
@@ -510,10 +534,12 @@ pub fn search_with_threshold(
     query: &str,
 ) -> anyhow::Result<Vec<SearchResult>> {
     lore_debug!(
-        "search: query={query:?} hybrid={} top_k={} min_relevance={:.4}",
+        "search: query={query:?} hybrid={} top_k={} min_relevance={:.4} \
+         min_relevance_universal={:.4}",
         config.search.hybrid,
         config.search.top_k,
         config.search.min_relevance,
+        config.search.effective_min_relevance_universal(),
     );
 
     let mut embed_failed = false;
@@ -542,17 +568,25 @@ pub fn search_with_threshold(
     let results = db.search_hybrid(query, query_embedding.as_deref(), overfetch_limit)?;
     lore_debug!("search: {} raw results", results.len());
 
+    // Threshold is only meaningful for hybrid search with a successful
+    // embedding; pure FTS or fallback paths bypass filtering entirely. The
+    // gate-on-`min_relevance > 0.0` predicate continues to govern whether ANY
+    // floor is applied — when both knobs would be zero, we skip the work and
+    // log raw scores. Universal results consult `min_relevance_universal`
+    // (with inherit-from-`min_relevance` semantics); non-universal results
+    // continue to use `min_relevance`.
+    let universal_floor = config.search.effective_min_relevance_universal();
     let apply_threshold =
         config.search.hybrid && !embed_failed && config.search.min_relevance > 0.0;
     let results: Vec<_> = if apply_threshold {
         let before = results.len();
-        let filtered: Vec<_> = results
-            .into_iter()
-            .filter(|r| r.score >= config.search.min_relevance)
-            .collect();
+        let filtered =
+            apply_relevance_thresholds(results, config.search.min_relevance, universal_floor);
         lore_debug!(
-            "search: threshold={:.4} filtered {} -> {}",
+            "search: threshold min_relevance={:.4} universal_floor={:.4} \
+             filtered {} -> {}",
             config.search.min_relevance,
+            universal_floor,
             before,
             filtered.len(),
         );
@@ -1415,6 +1449,99 @@ mod tests {
     fn predicate_filter_empty_input_returns_empty() {
         let kept = apply_predicate_filter(Vec::new(), &ctx_bash_predicate("ls"));
         assert!(kept.is_empty());
+    }
+
+    // -- apply_relevance_thresholds (U6) -------------------------------------
+
+    /// Build a `SearchResult` with the given score and universal flag for
+    /// per-class threshold testing. Title/body/tags are immaterial; only
+    /// `score` and `is_universal` drive the filter branch.
+    fn make_scored_result(id: &str, score: f64, is_universal: bool) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: if is_universal { "universal" } else { "" }.to_string(),
+            source_file: format!("{id}.md"),
+            heading_path: String::new(),
+            score,
+            is_universal,
+            applies_when_json: None,
+        }
+    }
+
+    #[test]
+    fn thresholds_default_universal_floor_keeps_score_above_min_relevance() {
+        // Default config: universal_floor == min_relevance. A 0.65-scored
+        // universal result is retained at the 0.6 default floor.
+        let results = vec![make_scored_result("u1", 0.65, true)];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.6);
+        assert_eq!(kept.len(), 1, "0.65 >= default 0.6 floor → keep");
+    }
+
+    #[test]
+    fn thresholds_raised_universal_floor_drops_universal_below_floor() {
+        // With min_relevance_universal = 0.7, a 0.65-scored universal
+        // result is dropped even though it is still above min_relevance.
+        let results = vec![make_scored_result("u1", 0.65, true)];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        assert!(
+            kept.is_empty(),
+            "raised universal floor must drop 0.65 universal result"
+        );
+    }
+
+    #[test]
+    fn thresholds_raised_universal_floor_keeps_non_universal_above_min_relevance() {
+        // The universal floor must NOT affect non-universal results.
+        // A 0.65-scored non-universal still fires when min_relevance = 0.6,
+        // regardless of how high the universal floor is set.
+        let results = vec![make_scored_result("nu1", 0.65, false)];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        assert_eq!(
+            kept.len(),
+            1,
+            "non-universal result must use min_relevance, not universal floor"
+        );
+    }
+
+    #[test]
+    fn thresholds_mixed_results_apply_per_class_floors() {
+        // Mixed batch: independent floors must filter per-class.
+        // min_relevance = 0.6, universal_floor = 0.7 →
+        //   * universal 0.65 dropped, universal 0.75 kept
+        //   * non-universal 0.55 dropped, non-universal 0.65 kept
+        let results = vec![
+            make_scored_result("u-low", 0.65, true),
+            make_scored_result("u-high", 0.75, true),
+            make_scored_result("nu-low", 0.55, false),
+            make_scored_result("nu-high", 0.65, false),
+        ];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains(&"u-low"), "0.65 universal below 0.7 floor");
+        assert!(ids.contains(&"u-high"), "0.75 universal above 0.7 floor");
+        assert!(
+            !ids.contains(&"nu-low"),
+            "0.55 non-universal below 0.6 floor"
+        );
+        assert!(
+            ids.contains(&"nu-high"),
+            "0.65 non-universal above 0.6 floor"
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn thresholds_score_at_floor_is_inclusive() {
+        // `>=` semantics: a score exactly at the floor is retained for both
+        // classes, matching the existing (pre-U6) min_relevance behaviour.
+        let results = vec![
+            make_scored_result("u-eq", 0.7, true),
+            make_scored_result("nu-eq", 0.6, false),
+        ];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        assert_eq!(kept.len(), 2, "scores at the floor are inclusive");
     }
 
     // -- skip_agent ----------------------------------------------------------
