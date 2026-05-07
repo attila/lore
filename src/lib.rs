@@ -3,6 +3,7 @@ pub mod config;
 pub mod database;
 pub mod debug;
 pub mod embeddings;
+pub mod engine;
 pub mod git;
 pub(crate) mod hash;
 pub mod hook;
