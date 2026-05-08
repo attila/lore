@@ -701,6 +701,24 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
 /// both approaches catch the same hazard, but `user_version` is a single
 /// integer read and scales to future schema bumps without another column
 /// name to cross-reference.
+///
+/// Returns `true` when the named column exists on the named table. Used by
+/// the v2 → v3 idempotency check so a re-entered migration (after a partial
+/// crash or concurrent open) skips an already-added column rather than
+/// erroring with "duplicate column". Table and column names are crate
+/// constants — no SQL injection surface.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
     let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
@@ -726,7 +744,16 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
     // run before the chunk-count short-circuit below so that empty-but-v2
     // DBs also receive the column (otherwise a re-ingest after a clean
     // v2 install would fail to bind the new column on insert).
+    //
+    // The migration is wrapped in a single transaction and uses column-
+    // presence checks to stay idempotent: a partial migration that crashed
+    // (or lost a race against a concurrent open) before the user_version
+    // stamp will re-enter this branch and skip the already-added column,
+    // then commit the user_version bump. Without idempotency, the second
+    // open would error with "duplicate column" and leave the DB stuck at
+    // v2 with the column already present.
     if version == 2 {
+        let chunks_has_column = column_exists(conn, "chunks", "applies_when_json")?;
         let patterns_exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'patterns'",
@@ -734,11 +761,24 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
                 |row| row.get(0),
             )
             .unwrap_or(0);
-        conn.execute_batch("ALTER TABLE chunks ADD COLUMN applies_when_json TEXT")?;
-        if patterns_exists != 0 {
-            conn.execute_batch("ALTER TABLE patterns ADD COLUMN applies_when_json TEXT")?;
+        let patterns_has_column = if patterns_exists != 0 {
+            column_exists(conn, "patterns", "applies_when_json")?
+        } else {
+            true
+        };
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !chunks_has_column {
+            sql.push_str("ALTER TABLE chunks ADD COLUMN applies_when_json TEXT;\n");
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if patterns_exists != 0 && !patterns_has_column {
+            sql.push_str("ALTER TABLE patterns ADD COLUMN applies_when_json TEXT;\n");
+        }
+        sql.push_str("PRAGMA user_version = ");
+        sql.push_str(&SCHEMA_VERSION.to_string());
+        sql.push_str(";\n");
+        sql.push_str("COMMIT;");
+        conn.execute_batch(&sql)?;
         return Ok(());
     }
 

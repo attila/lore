@@ -346,10 +346,18 @@ fn apply_predicate_filter(chunks: Vec<SearchResult>, cc: &CallContext) -> Vec<Se
                 return true;
             }
             // Suppressed — emit per-suppression debug line and drop.
+            // Log only the first whitespace-delimited token so secrets in
+            // command args (e.g. `gh auth login --token XXX`) do not leak
+            // through `LORE_DEBUG=1`. Operators still see the command class
+            // (e.g. `gh`, `sudo`); the rest stays out of stderr.
             suppressed += 1;
-            let cmd_head = cc.command.as_deref().map_or("", |c| {
-                engine::truncate_str(c, PREDICATE_LOG_CMD_HEAD_BYTES)
-            });
+            let cmd_head = cc
+                .command
+                .as_deref()
+                .and_then(|c| c.split_whitespace().next())
+                .map_or("", |first| {
+                    engine::truncate_str(first, PREDICATE_LOG_CMD_HEAD_BYTES)
+                });
             lore_debug!(
                 "predicate suppress: {} tool={} cmd_head=\"{}\"",
                 sanitize_for_log(&r.source_file),
@@ -574,8 +582,9 @@ pub fn search_with_threshold(
     // (with inherit-from-`min_relevance` semantics); non-universal results
     // continue to use `min_relevance`.
     let universal_floor = config.search.effective_min_relevance_universal();
-    let apply_threshold =
-        config.search.hybrid && !embed_failed && config.search.min_relevance > 0.0;
+    let apply_threshold = config.search.hybrid
+        && !embed_failed
+        && (config.search.min_relevance > 0.0 || universal_floor > 0.0);
     let results: Vec<_> = if apply_threshold {
         let before = results.len();
         let filtered =
@@ -1068,7 +1077,9 @@ mod tests {
     // The full engine-side coverage lives in
     // `src/engine/query.rs::tests` (against `CallContext` directly). The
     // tests below pin the `HookInput` → `CallContext` → engine shim end to
-    // end so behaviour stays equivalent until U5 retires the shim.
+    // end. The shim is retained for `cmd_extract_queries` (in `main.rs`),
+    // which still consumes `HookInput` JSON; engine coverage handles the
+    // rest.
 
     #[test]
     fn extract_query_rs_file_path() {
