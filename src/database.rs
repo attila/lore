@@ -2213,6 +2213,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Migration test inherently long: builds full
+    // v2 schema (DDL minus the new column), populates rows, opens with the
+    // production probe, and verifies multiple post-migration invariants.
     fn open_migrates_v2_database_to_v3_via_alter_table() {
         // Migration regression: build a v2 DB by hand (DDL without
         // `applies_when_json`, populated with sample chunks and a patterns

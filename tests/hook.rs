@@ -1597,7 +1597,7 @@ fn setup_with_predicate_pattern(
 ///
 /// All three must:
 /// * NOT include the universal pattern in `additionalContext`.
-/// * Emit a `predicate suppress:` line on stderr (LORE_DEBUG=1).
+/// * Emit a `predicate suppress:` line on stderr (`LORE_DEBUG=1`).
 /// * Leave the dedup file byte-for-byte identical to its pre-sequence state
 ///   — the load-bearing invariant: predicate-suppressed chunks never enter
 ///   the dedup file (read-side or write-side).

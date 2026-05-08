@@ -347,11 +347,9 @@ fn apply_predicate_filter(chunks: Vec<SearchResult>, cc: &CallContext) -> Vec<Se
             }
             // Suppressed — emit per-suppression debug line and drop.
             suppressed += 1;
-            let cmd_head = cc
-                .command
-                .as_deref()
-                .map(|c| engine::truncate_str(c, PREDICATE_LOG_CMD_HEAD_BYTES))
-                .unwrap_or("");
+            let cmd_head = cc.command.as_deref().map_or("", |c| {
+                engine::truncate_str(c, PREDICATE_LOG_CMD_HEAD_BYTES)
+            });
             lore_debug!(
                 "predicate suppress: {} tool={} cmd_head=\"{}\"",
                 sanitize_for_log(&r.source_file),
@@ -895,7 +893,7 @@ impl HookInput {
     /// Build a [`CallContext`] from this Claude Code hook event.
     ///
     /// Eagerly reads the transcript tail when `transcript_path` is set and
-    /// passes [`validate_transcript_path`]'s `$HOME`-rooted canonicalisation.
+    /// passes `validate_transcript_path`'s `$HOME`-rooted canonicalisation.
     /// Failures (no path, validation rejection, missing file, IO error)
     /// leave `transcript_tail = None` — silent fall-through preserves the
     /// "best-effort" semantics of transcript-tail term harvesting.
@@ -906,7 +904,7 @@ impl HookInput {
     /// `tests/invariants.rs::no_unsanctioned_runtime_disk_reads_in_hook_server_main`.
     ///
     /// Called once per `PreToolUse` for non-skip-agent paths (the
-    /// `skip_agent` short-circuit in [`handle_pre_tool_use`] runs first so
+    /// `skip_agent` short-circuit in `handle_pre_tool_use` runs first so
     /// Explore / Plan subagents bypass this read entirely).
     pub fn to_call_context(&self) -> CallContext {
         let transcript_tail = self

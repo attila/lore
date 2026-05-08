@@ -145,7 +145,7 @@ pub struct IngestResult {
     /// CLI consumers can introspect the run after the fact and so the
     /// MCP tools can surface the count via `lore_status` in future work.
     /// The user-facing warning channel is `eprintln!` from inside
-    /// [`index_single_file`] — single source so CLI and MCP write paths
+    /// `index_single_file` — single source so CLI and MCP write paths
     /// see the warning regardless of authoring surface.
     pub malformed_applies_when: Vec<MalformedPredicateEntry>,
 }
