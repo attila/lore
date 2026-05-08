@@ -1750,4 +1750,40 @@ Enough body text for a chunk here.
         );
         assert_eq!(row.applies_when_json, chunks[0].applies_when_json);
     }
+
+    /// T4: empty `bash_command_starts_with: []` round-trip from frontmatter
+    /// through `chunk_by_heading` to `applies_when_json`.
+    ///
+    /// The unit test for empty-list semantics at the engine layer exists; the
+    /// missing coverage was the fully-plumbed path: parser produces
+    /// `Some(vec![])`, chunker writes the JSON to every chunk, and a
+    /// round-trip deserialise preserves the empty allowlist (rather than
+    /// collapsing to `None` somewhere along the way).
+    #[test]
+    fn applies_when_empty_bash_command_list_round_trips_through_chunk_by_heading() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  bash_command_starts_with: []
+---
+
+# Hello
+Body text long enough to chunk through heading mode.
+";
+        let chunks = chunk_by_heading(md, "empty.md");
+        assert!(!chunks.is_empty(), "expected at least one chunk");
+        let json = chunks[0]
+            .applies_when_json
+            .as_deref()
+            .expect("predicate JSON populated even for empty list");
+        let aw: AppliesWhen = serde_json::from_str(json).expect("deserialise");
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&[][..]),
+            "empty bash_command_starts_with must round-trip as Some(vec![]), \
+             not None — see U3 contract that empty allowlist never matches",
+        );
+        assert!(aw.tools.is_none());
+    }
 }

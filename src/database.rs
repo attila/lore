@@ -2473,4 +2473,227 @@ mod tests {
             );
         }
     }
+
+    /// T2: v2 → v3 migration on a populated v2 database with FTS5 + vec0
+    /// virtual tables present, populated with a real chunk on each side.
+    /// The existing `open_migrates_v2_database_to_v3_via_alter_table` builds
+    /// the FTS / vec virtuals empty; this variant pins that the additive
+    /// migration leaves both virtual tables queryable end-to-end (an FTS
+    /// `MATCH` returns the seeded row; a vec0 `SELECT` returns the seeded
+    /// row), proving the ALTER TABLE on `chunks`/`patterns` does not corrupt
+    /// the sibling indexes.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn open_migrates_populated_v2_database_with_fts5_and_vec0_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v2-populated.db");
+
+        // Register sqlite-vec as an auto-extension BEFORE opening the
+        // hand-built connection so the upcoming `CREATE VIRTUAL TABLE
+        // ... USING vec0` succeeds independent of test ordering.
+        super::register_sqlite_vec();
+
+        // Build a v2 schema that mirrors the production layout: `chunks`,
+        // `patterns`, FTS5 mirror, and vec0 mirror. Populate one chunk row
+        // and one row in each virtual so we can confirm the indexes still
+        // answer queries after the additive ALTER migrates the base tables.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE INDEX idx_chunks_source_file ON chunks(source_file);
+                CREATE TABLE patterns (
+                    source_file  TEXT PRIMARY KEY,
+                    title        TEXT NOT NULL,
+                    tags         TEXT NOT NULL,
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    raw_body     TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    ingested_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE ingest_metadata (key TEXT PRIMARY KEY, value TEXT);
+                CREATE VIRTUAL TABLE patterns_fts USING fts5(
+                    title, body, tags, source_file, chunk_id UNINDEXED,
+                    tokenize = 'porter unicode61'
+                );",
+            )
+            .unwrap();
+            super::register_sqlite_vec();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE patterns_vec USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[4]
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks \
+                 (id, title, body, source_file, heading_path, tags, is_universal) \
+                 VALUES ('legacy:Top', 'Legacy', 'Findable distinct content', \
+                         'legacy.md', 'Top', 'workflow', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO patterns \
+                 (source_file, title, tags, is_universal, raw_body, content_hash) \
+                 VALUES ('legacy.md', 'Legacy', 'workflow', 0, \
+                         'Findable distinct content', 'deadbeefdeadbeef')",
+                [],
+            )
+            .unwrap();
+            // Populate the FTS5 mirror with the same row so `MATCH` queries
+            // continue to answer after migration.
+            conn.execute(
+                "INSERT INTO patterns_fts \
+                 (title, body, tags, source_file, chunk_id) \
+                 VALUES ('Legacy', 'Findable distinct content', 'workflow', \
+                         'legacy.md', 'legacy:Top')",
+                [],
+            )
+            .unwrap();
+            // Populate the vec0 mirror with a 4-dim embedding so the vec
+            // search continues to answer after migration.
+            let embedding: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
+            let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            conn.execute(
+                "INSERT INTO patterns_vec (id, embedding) VALUES (?1, ?2)",
+                params!["legacy:Top", bytes],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+        }
+
+        // Migrate via the regular open path; FTS5 / vec0 should survive.
+        let db =
+            KnowledgeDB::open(&db_path, 4).expect("v2 → v3 additive migration must apply silently");
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, SCHEMA_VERSION);
+
+        // FTS5 still serves a MATCH query for the seeded row.
+        let fts_hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM patterns_fts WHERE patterns_fts MATCH ?1",
+                params!["distinct"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            fts_hit >= 1,
+            "FTS5 virtual must remain queryable after additive v2→v3 migration"
+        );
+
+        // vec0 returns the seeded row (we just verify the row is present and
+        // the embedding column is intact — we are not exercising distance
+        // ranking here, only that the virtual table still answers SELECTs).
+        let vec_hit: String = db
+            .conn
+            .query_row(
+                "SELECT id FROM patterns_vec WHERE id = ?1",
+                params!["legacy:Top"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_hit, "legacy:Top");
+    }
+
+    /// T3: v2 → v3 migration on a v2 chunks-only database (no `patterns`
+    /// table at all). The probe's `patterns_exists != 0` guard handles the
+    /// case but had no test coverage. We construct that pre-patterns shape,
+    /// open through the production path, and assert successful migration.
+    #[test]
+    fn open_migrates_v2_database_lacking_patterns_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v2-no-patterns.db");
+
+        // Pre-patterns v2 shape: chunks table only, no patterns table. The
+        // `is_universal` column was added in v2 so it is present; the
+        // `patterns` table was added in a different prior bump in this
+        // codebase. The probe must handle this branch without trying to
+        // ALTER a non-existent table.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE INDEX idx_chunks_source_file ON chunks(source_file);
+                CREATE TABLE ingest_metadata (key TEXT PRIMARY KEY, value TEXT);
+                CREATE VIRTUAL TABLE patterns_fts USING fts5(
+                    title, body, tags, source_file, chunk_id UNINDEXED,
+                    tokenize = 'porter unicode61'
+                );",
+            )
+            .unwrap();
+            super::register_sqlite_vec();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE patterns_vec USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[4]
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks \
+                 (id, title, body, source_file, heading_path, tags, is_universal) \
+                 VALUES ('legacy:Top', 'Legacy', 'Body content here', \
+                         'legacy.md', 'Top', '', 0)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+        }
+
+        // Open should succeed: chunks gets the new column, patterns is
+        // absent so its branch is skipped, user_version stamps to v3.
+        let db = KnowledgeDB::open(&db_path, 4)
+            .expect("v2→v3 migration must succeed even without a patterns table");
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            user_version, SCHEMA_VERSION,
+            "PRAGMA user_version must be bumped to v3 even when patterns table is absent"
+        );
+
+        // The chunks table now carries `applies_when_json`.
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "applies_when_json"),
+            "chunks must carry applies_when_json after migration without patterns table"
+        );
+    }
 }

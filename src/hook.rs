@@ -1460,6 +1460,38 @@ mod tests {
         assert!(kept.is_empty());
     }
 
+    /// T11: defensive R11 fallback — a `SearchResult` whose
+    /// `applies_when_json` is malformed at runtime must pass through the
+    /// filter unchanged (chunk fires as if no predicate were set). The
+    /// existing `predicate_filter_treats_malformed_json_as_unrestricted`
+    /// covers a syntactically-broken JSON token; this T11 variant pins the
+    /// branch with a different malformed shape (well-formed JSON of the
+    /// wrong type, e.g. a JSON array where an object is required) so that
+    /// any future tightening of the deserialiser still respects R11.
+    ///
+    /// Stderr capture for the parse-error debug line is not feasible at the
+    /// unit-test layer because `LORE_DEBUG`'s `IS_DEBUG` is a process-wide
+    /// `LazyLock` and we cannot toggle it inside a single test binary.
+    /// Subprocess coverage of the parse-error log line lives at
+    /// `tests/hook.rs::hook_pre_tool_use_predicate_parse_error_logs_and_falls_through`
+    /// where stderr is captured from a fresh process with `LORE_DEBUG=1`.
+    #[test]
+    fn predicate_filter_malformed_json_array_falls_through_to_fire() {
+        // Well-formed JSON of the wrong shape (array, not the expected
+        // object). serde rejects it; the R11 fallback must keep the chunk.
+        let chunks = vec![make_universal_chunk(
+            "u1",
+            "weird.md",
+            Some(r#"["bash_command_starts_with","tools"]"#),
+        )];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert_eq!(
+            kept.len(),
+            1,
+            "JSON array where AppliesWhen object expected must fall through to fire (R11)",
+        );
+    }
+
     // -- apply_relevance_thresholds (U6) -------------------------------------
 
     /// Build a `SearchResult` with the given score and universal flag for
