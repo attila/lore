@@ -98,6 +98,17 @@ pub struct PatternSummary {
     pub tags: String,
     /// `true` when any chunk from this source pattern is tagged `universal`.
     pub is_universal: bool,
+    /// `true` when the pattern's frontmatter declares an `applies_when`
+    /// predicate. Combined with `is_universal`, this disambiguates the four
+    /// cells of the post-Track-1B pinning matrix:
+    /// - `is_universal=true,  has_predicate=false` — pinned at `SessionStart`.
+    /// - `is_universal=true,  has_predicate=true`  — deferred from
+    ///   `SessionStart`; re-injects on matching `PreToolUse` calls.
+    /// - `is_universal=false, has_predicate=false` — non-universal,
+    ///   relevance-ranked.
+    /// - `is_universal=false, has_predicate=true`  — non-universal with a
+    ///   currently dormant predicate (Track 2-B will activate this).
+    pub has_predicate: bool,
 }
 
 /// A universal-tagged pattern with its full authorial body, returned by
@@ -326,7 +337,8 @@ impl KnowledgeDB {
     /// simple ordered scan with no `DISTINCT`/`GROUP BY` gymnastics.
     pub fn list_patterns(&self) -> anyhow::Result<Vec<PatternSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_file, title, tags, is_universal \
+            "SELECT source_file, title, tags, is_universal, \
+                    applies_when_json IS NOT NULL \
              FROM patterns \
              ORDER BY source_file",
         )?;
@@ -337,6 +349,7 @@ impl KnowledgeDB {
                 title: row.get(1)?,
                 tags: row.get(2)?,
                 is_universal: row.get::<_, i64>(3)? != 0,
+                has_predicate: row.get::<_, i64>(4)? != 0,
             })
         })?;
 
@@ -1807,6 +1820,64 @@ mod tests {
             .collect();
         assert!(by_source["wf.md"], "wf.md should be universal");
         assert!(!by_source["style.md"], "style.md should not be universal");
+    }
+
+    #[test]
+    fn list_patterns_carries_has_predicate_flag() {
+        // The has_predicate column projects `applies_when_json IS NOT NULL` so
+        // agents and the CLI can distinguish the four cells of the post-Track-1B
+        // pinning matrix without re-reading source markdown. Build three
+        // fixtures: an un-predicated universal, a predicated universal, and a
+        // plain non-universal pattern.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(
+            &db,
+            &make_universal_chunk(
+                "u_plain",
+                "Plain Universal",
+                "Genuinely universal body.",
+                "plain.md",
+            ),
+            None,
+        );
+
+        let mut predicated = make_universal_chunk(
+            "u_pred",
+            "Predicated Universal",
+            "Git workflow body.",
+            "git-wf.md",
+        );
+        predicated.applies_when_json = Some(r#"{"bash_command_starts_with":["git"]}"#.into());
+        seed_pattern_and_chunk(&db, &predicated, None);
+
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk("n_plain", "Plain Style", "Style body.", "style.md"),
+            None,
+        );
+
+        let patterns = db.list_patterns().unwrap();
+        let by_source: std::collections::HashMap<_, (bool, bool)> = patterns
+            .iter()
+            .map(|p| (p.source_file.as_str(), (p.is_universal, p.has_predicate)))
+            .collect();
+        assert_eq!(
+            by_source["plain.md"],
+            (true, false),
+            "un-predicated universal: is_universal=true, has_predicate=false"
+        );
+        assert_eq!(
+            by_source["git-wf.md"],
+            (true, true),
+            "predicated universal: is_universal=true, has_predicate=true"
+        );
+        assert_eq!(
+            by_source["style.md"],
+            (false, false),
+            "plain non-universal: is_universal=false, has_predicate=false"
+        );
     }
 
     #[test]

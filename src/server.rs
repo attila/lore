@@ -449,11 +449,15 @@ fn tool_definitions() -> Value {
             "name": "list_patterns",
             "description":
                 "List every pattern indexed in the knowledge base: title, source file, \
-                 tags, and whether the pattern is universal (always injected at SessionStart \
-                 and bypasses PreToolUse deduplication). Use when an agent needs to enumerate \
-                 available patterns without issuing a keyword search — the CLI equivalent is \
-                 `lore list`. Useful before `update_pattern` to check current tags, especially \
-                 the `universal` marker.",
+                 tags, whether the pattern is universal (always-on tier), and whether \
+                 the pattern's frontmatter declares an `applies_when` predicate. \
+                 Universal patterns without a predicate pin at every SessionStart and \
+                 bypass PreToolUse deduplication; universal patterns with a predicate \
+                 are deferred from SessionStart and re-inject only on matching \
+                 PreToolUse calls. Use when an agent needs to enumerate available \
+                 patterns without issuing a keyword search — the CLI equivalent is \
+                 `lore list`. Useful before `update_pattern` to check current tags, \
+                 universality, and predicate state.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -463,7 +467,7 @@ fn tool_definitions() -> Value {
                             "When true, appends a `lore-metadata` fenced code block to the \
                              end of the response containing machine-readable JSON with an \
                              array of patterns, each carrying `title`, `source_file`, \
-                             `tags`, and `is_universal`. Defaults to false.",
+                             `tags`, `is_universal`, and `has_predicate`. Defaults to false.",
                         "default": false
                     }
                 },
@@ -902,10 +906,31 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     }
 }
 
+/// Render the per-pattern suffix that surfaces the post-Track-1B pinning
+/// state: a universal pattern without a predicate prints `[universal]`; a
+/// universal pattern with a predicate prints `[universal, deferred]`
+/// (deferred from `SessionStart` to its `PreToolUse` predicate path); otherwise
+/// no suffix. Shared between the MCP `list_patterns` prose render and the
+/// `lore list` CLI render so the two surfaces cannot drift.
+///
+/// The non-universal-with-predicate combination is intentionally rendered
+/// without a suffix in this helper. Track 1 left the predicate dormant on
+/// non-universal patterns and emits a stderr advisory at ingest time; the
+/// catalogue listing surface stays focused on the universality axis until
+/// Track 2-B activates non-universal predicates.
+#[must_use]
+pub fn pattern_pinning_suffix(is_universal: bool, has_predicate: bool) -> &'static str {
+    match (is_universal, has_predicate) {
+        (true, true) => " [universal, deferred]",
+        (true, false) => " [universal]",
+        _ => "",
+    }
+}
+
 /// Enumerate every indexed pattern. Mirrors the `lore list` CLI for agents
 /// that need the full inventory without keyword-searching. Each row carries
-/// the universal marker so agents can reason about which patterns would
-/// re-inject on every tool call.
+/// universality and predicate-presence markers so agents can reason about
+/// which patterns pin at `SessionStart` vs defer to `PreToolUse`.
 fn handle_list_patterns(
     req: &JsonRpcRequest,
     ctx: &ServerContext<'_>,
@@ -923,11 +948,11 @@ fn handle_list_patterns(
     } else {
         let mut out = String::new();
         for p in &patterns {
-            let universal_suffix = if p.is_universal { " [universal]" } else { "" };
+            let suffix = pattern_pinning_suffix(p.is_universal, p.has_predicate);
             if p.tags.is_empty() {
-                let _ = writeln!(out, "- {}{universal_suffix}", p.title);
+                let _ = writeln!(out, "- {}{suffix}", p.title);
             } else {
-                let _ = writeln!(out, "- {} [{}]{universal_suffix}", p.title, p.tags);
+                let _ = writeln!(out, "- {} [{}]{suffix}", p.title, p.tags);
             }
         }
         out
@@ -1605,6 +1630,104 @@ mod tests {
         let patterns = meta["patterns"].as_array().unwrap();
         assert_eq!(patterns.len(), 1);
         assert_eq!(patterns[0]["is_universal"], true);
+        assert_eq!(
+            patterns[0]["has_predicate"], false,
+            "un-predicated universal must surface has_predicate=false"
+        );
+    }
+
+    #[test]
+    fn list_patterns_marks_predicated_universal_as_deferred_in_prose() {
+        // Track 1B: predicated universals defer from SessionStart and re-inject
+        // on matching PreToolUse calls. The list_patterns prose surface must
+        // distinguish them from un-predicated universals so an agent reading
+        // the catalogue can reason about pinning state without parsing
+        // frontmatter.
+        let h = TestHarness::new();
+        let predicated = crate::chunking::Chunk {
+            id: "u_pred".into(),
+            title: "Predicated Workflow".into(),
+            body: "Always git push origin HEAD.".into(),
+            tags: "universal, git".into(),
+            source_file: "predicated.md".into(),
+            heading_path: String::new(),
+            is_universal: true,
+            applies_when_json: Some(r#"{"bash_command_starts_with":["git"]}"#.into()),
+        };
+        let plain_universal = crate::chunking::Chunk {
+            id: "u_plain".into(),
+            title: "Plain Universal".into(),
+            body: "Genuinely universal body.".into(),
+            tags: "universal".into(),
+            source_file: "plain.md".into(),
+            heading_path: String::new(),
+            is_universal: true,
+            applies_when_json: None,
+        };
+        for chunk in [&predicated, &plain_universal] {
+            h.db.upsert_pattern(&crate::chunking::PatternRow {
+                source_file: chunk.source_file.clone(),
+                title: chunk.title.clone(),
+                tags: chunk.tags.clone(),
+                is_universal: chunk.is_universal,
+                raw_body: chunk.body.clone(),
+                content_hash: "0000000000000000".into(),
+                applies_when_json: chunk.applies_when_json.clone(),
+            })
+            .unwrap();
+            h.db.insert_chunk(chunk, None).unwrap();
+        }
+
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":73,"method":"tools/call",
+                "params":{"name":"list_patterns","arguments":{"include_metadata":true}}}"#,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("Predicated Workflow") && l.contains("[universal, deferred]")),
+            "predicated universal must carry the deferred suffix: {text}"
+        );
+        assert!(
+            text.lines().any(|l| l.contains("Plain Universal")
+                && l.contains("[universal]")
+                && !l.contains("deferred")),
+            "un-predicated universal must keep the bare universal suffix: {text}"
+        );
+
+        let meta = metadata_from_response(&resp);
+        let by_source: std::collections::HashMap<&str, (bool, bool)> = meta["patterns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["source_file"].as_str().unwrap(),
+                    (
+                        p["is_universal"].as_bool().unwrap(),
+                        p["has_predicate"].as_bool().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(by_source["predicated.md"], (true, true));
+        assert_eq!(by_source["plain.md"], (true, false));
+    }
+
+    #[test]
+    fn pattern_pinning_suffix_renders_four_corners() {
+        // Pure helper test — pins the four cells of the pinning matrix so a
+        // future change to suffix rendering lands a single-site update.
+        assert_eq!(super::pattern_pinning_suffix(true, false), " [universal]");
+        assert_eq!(
+            super::pattern_pinning_suffix(true, true),
+            " [universal, deferred]"
+        );
+        assert_eq!(super::pattern_pinning_suffix(false, false), "");
+        // Non-universal predicated: dormant in Track 1; ingest emits an
+        // advisory, but the catalogue surface stays focused on the
+        // universality axis.
+        assert_eq!(super::pattern_pinning_suffix(false, true), "");
     }
 
     /// Build a `TestHarness` whose embedder always fails. Used to pin the

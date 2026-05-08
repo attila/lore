@@ -691,11 +691,11 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&patterns)?);
     } else {
         for p in &patterns {
-            let universal_suffix = if p.is_universal { " [universal]" } else { "" };
+            let suffix = lore::server::pattern_pinning_suffix(p.is_universal, p.has_predicate);
             if p.tags.is_empty() {
-                println!("{}{universal_suffix}", p.title);
+                println!("{}{suffix}", p.title);
             } else {
-                println!("{} [{}]{universal_suffix}", p.title, p.tags);
+                println!("{} [{}]{suffix}", p.title, p.tags);
             }
         }
     }

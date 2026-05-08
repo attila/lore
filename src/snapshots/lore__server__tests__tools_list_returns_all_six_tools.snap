@@ -1,6 +1,6 @@
 ---
 source: src/server.rs
-assertion_line: 1391
+assertion_line: 1416
 expression: resp
 ---
 {
@@ -131,12 +131,12 @@ expression: resp
         "name": "append_to_pattern"
       },
       {
-        "description": "List every pattern indexed in the knowledge base: title, source file, tags, and whether the pattern is universal (always injected at SessionStart and bypasses PreToolUse deduplication). Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, especially the `universal` marker.",
+        "description": "List every pattern indexed in the knowledge base: title, source file, tags, whether the pattern is universal (always-on tier), and whether the pattern's frontmatter declares an `applies_when` predicate. Universal patterns without a predicate pin at every SessionStart and bypass PreToolUse deduplication; universal patterns with a predicate are deferred from SessionStart and re-inject only on matching PreToolUse calls. Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, universality, and predicate state.",
         "inputSchema": {
           "properties": {
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with an array of patterns, each carrying `title`, `source_file`, `tags`, and `is_universal`. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with an array of patterns, each carrying `title`, `source_file`, `tags`, `is_universal`, and `has_predicate`. Defaults to false.",
               "type": "boolean"
             }
           },
