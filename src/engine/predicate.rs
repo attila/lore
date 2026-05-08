@@ -8,17 +8,22 @@
 //!   never panics, never returns `Result`.
 //! * [`command_matches_with_wrappers`] — the smart-prefix matcher used by
 //!   the `bash_command_starts_with` branch. Walks past one `sudo` wrapper
-//!   (with optional `-u USER`, short flags `-E`/`-H`) and one `env` wrapper
-//!   (with `-i`, `-u VAR`, and `KEY=VAL` assignments) before checking the
-//!   first non-wrapper token against the allowlist.
+//!   (with optional `-u USER`, short flags `-E`/`-H`), repeats over any
+//!   number of `env` wrappers (each with `-i`, `-u VAR`, and `KEY=VAL`
+//!   assignments), then optionally unwraps a `bash -c "..."` /
+//!   `sh -c '...'` quoted command before checking the first non-wrapper
+//!   token against the allowlist.
 //!
 //! The matcher operates on the raw command string — never through
 //! `clean_terms` / `split_into_words` / FTS-cleaning — so short commands
 //! like `gh` survive the 3-char filter. See
 //! `docs/solutions/logic-errors/common-tool-commands-produce-zero-queryable-terms-2026-04-05.md`.
 //!
-//! Unimplemented variants (Track 1 documented limitations): nested env
-//! wrappers (`env A=1 env B=2 cmd`), quoted commands inside `bash -c`. Both
+//! Unimplemented variants (Track 1 documented limitations): nested-quote
+//! / escaped-quote handling inside `bash -c` (e.g.
+//! `bash -c "echo \"git status\""`), quoted KEY=VAL with internal spaces,
+//! and recursive wrapper-stripping inside the `bash -c` quoted body
+//! (`bash -c "sudo git status"` does not unwrap the inner `sudo`). Both
 //! are unusual in practice; the matcher returns `false` for them.
 
 use crate::chunking::AppliesWhen;
@@ -80,9 +85,14 @@ fn bash_prefix_match(allowlist: &[String], ctx: &CallContext) -> bool {
     command_matches_with_wrappers(command, allowlist)
 }
 
-/// Walks past at most one `sudo` and one `env` wrapper in `command`,
-/// returning `true` if the next non-wrapper token equals one of the
-/// allowlisted strings.
+/// Walks past at most one `sudo`, any number of nested `env` wrappers,
+/// and one optional `bash -c "..."` / `sh -c '...'` quoted-command
+/// wrapper in `command`, returning `true` if the resulting effective
+/// command head equals one of the allowlisted strings.
+///
+/// **Leading whitespace.** The command is implicitly trimmed because
+/// tokenisation goes through [`str::split_whitespace`], which discards
+/// leading and inter-token whitespace.
 ///
 /// **Sudo wrapper.** When the first token is `sudo`: advance past it, then
 /// repeatedly consume short flags. Two flag shapes are recognised:
@@ -92,52 +102,129 @@ fn bash_prefix_match(allowlist: &[String], ctx: &CallContext) -> bool {
 ///
 /// Stop on the first token that is not one of those flag shapes.
 ///
-/// **Env wrapper.** When the (now-current) token is `env`: advance past
-/// it, then repeatedly consume:
+/// **Env wrapper (repeated).** While the next token is `env`: advance
+/// past it, then repeatedly consume:
 ///
 /// * `-i` — single-token hermetic-environment flag.
 /// * `-u VAR` — two-token unset-var flag.
 /// * `KEY=VAL` — single-token assignment, where `KEY` matches
 ///   `[A-Z_][A-Z0-9_]*`.
 ///
-/// Stop on the first token that does not match any of those shapes.
+/// Stop on the first token that does not match any of those shapes; loop
+/// back to env-detection for nested forms like
+/// `env A=1 env B=2 git status`.
+///
+/// **`bash -c "..."` / `sh -c '...'` wrapper.** When the next token is
+/// `bash` or `sh` followed by `-c` followed by a quoted string, extract
+/// the first whitespace-delimited token from inside the quoted string
+/// and use that as the effective command head. Both `"..."` and `'...'`
+/// quote forms are accepted. If the `-c` argument is unquoted, the
+/// remainder of the original command is treated as the body and the
+/// first whitespace-delimited token is used. Empty or whitespace-only
+/// quoted bodies fail.
 ///
 /// Operates on the raw command string. Empty command, command consisting
 /// only of wrappers (no following token), and empty allowlist all return
 /// `false`.
 ///
-/// **Documented limitations** (Track 1): nested env wrappers
-/// (`env A=1 env B=2 cmd`) and quoted commands inside `bash -c` are not
-/// unwrapped. The matcher sees the literal token after one wrapper pass
-/// and compares it against the allowlist as-is.
+/// **Documented limitations** (Track 1): nested-quote / escaped-quote
+/// handling inside `bash -c` (e.g. `bash -c "echo \"git status\""`),
+/// quoted `KEY=VAL` with internal spaces, and recursive wrapper-stripping
+/// inside the `bash -c` quoted body (the body's first token is taken
+/// verbatim — `bash -c "sudo git status"` resolves to `sudo`, not `git`).
 pub fn command_matches_with_wrappers(command: &str, allowlist: &[String]) -> bool {
     if allowlist.is_empty() {
         return false;
     }
-    let mut tokens = command.split_whitespace();
-    let Some(first) = tokens.next() else {
+    let Some(effective) = effective_command_head(command) else {
         return false;
     };
+    allowlist.iter().any(|allowed| allowed == &effective)
+}
 
-    let mut current = first;
+/// Walks the wrapper sequence and returns the first non-wrapper token, or
+/// `None` if the command is exhausted before producing one or the
+/// `bash -c` body is empty / whitespace-only. Returns owned `String`
+/// because the `bash -c` branch may slice the body of the original
+/// command and produce a fresh substring.
+fn effective_command_head(command: &str) -> Option<String> {
+    // Use match_indices so we keep byte offsets into the original string;
+    // the bash -c handler needs to slice the unquoted-then-requoted body
+    // out of the original command.
+    let mut tokens = command.split_whitespace().peekable();
+    let mut current = tokens.next()?;
 
-    // Sudo wrapper.
+    // Sudo wrapper — at most one outer scope.
     if current == "sudo" {
-        let Some(next) = consume_sudo_flags(&mut tokens) else {
-            return false;
-        };
-        current = next;
+        current = consume_sudo_flags(&mut tokens)?;
     }
 
-    // Env wrapper.
-    if current == "env" {
-        let Some(next) = consume_env_args(&mut tokens) else {
-            return false;
-        };
-        current = next;
+    // Env wrappers — repeat for nested `env A=1 env B=2 cmd` forms.
+    while current == "env" {
+        current = consume_env_args(&mut tokens)?;
     }
 
-    allowlist.iter().any(|allowed| allowed == current)
+    // bash -c "..." / sh -c '...' — at most one wrapper. Scan the raw
+    // string for the standalone `-c` token to recover the substring
+    // after it without losing quote boundaries (split_whitespace would
+    // shred `"git status"` into two tokens).
+    if (current == "bash" || current == "sh") && tokens.peek() == Some(&"-c") {
+        let body = bash_c_body(command)?;
+        return first_token_of_quoted_body(body);
+    }
+
+    Some(current.to_string())
+}
+
+/// Returns the substring of `command` that follows the `-c` argument of
+/// the trailing `bash`/`sh` invocation. The caller has already verified
+/// (via `split_whitespace`) that a `-c` token exists; this helper walks
+/// the original string to find that token's byte position so the
+/// returned slice preserves quote boundaries.
+fn bash_c_body(command: &str) -> Option<&str> {
+    // Walk byte-by-byte looking for the standalone `-c` token. We accept
+    // any whitespace before/after, and require it not be part of a longer
+    // word like `-cd`. The first such occurrence belongs to the bash -c
+    // wrapper because the caller's tokeniser already validated it.
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'c' {
+            let before_ok = i == 0 || (bytes[i - 1] as char).is_whitespace();
+            let after_ok = i + 2 == bytes.len() || (bytes[i + 2] as char).is_whitespace();
+            if before_ok && after_ok {
+                let body = command[i + 2..].trim_start();
+                if body.is_empty() {
+                    return None;
+                }
+                return Some(body);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Given the body of a `bash -c` invocation (everything after `-c`),
+/// returns the first whitespace-delimited token of the underlying
+/// command. Handles both single- and double-quoted forms; an unquoted
+/// body falls back to plain whitespace tokenisation.
+///
+/// Empty and whitespace-only quoted bodies return `None`. Nested-quote
+/// and escaped-quote handling is out of scope (Track 1 documented
+/// limitation): the first occurrence of the matching outer quote ends
+/// the body.
+fn first_token_of_quoted_body(body: &str) -> Option<String> {
+    let body = body.trim_start();
+    let first = body.chars().next()?;
+    let inner = if first == '"' || first == '\'' {
+        let rest = &body[first.len_utf8()..];
+        let end = rest.find(first)?;
+        &rest[..end]
+    } else {
+        body
+    };
+    inner.split_whitespace().next().map(str::to_string)
 }
 
 /// Walks past sudo's flag arguments, returning the first non-flag token.
@@ -420,24 +507,125 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Documented limitations — these MUST NOT fire in Track 1
+    // Leading whitespace — split_whitespace silently discards it
     // -----------------------------------------------------------------
 
-    /// Nested env wrappers: only the outer `env` is unwrapped; the next
-    /// `env` is taken as the literal command head.
     #[test]
-    fn limitation_nested_env_does_not_fire() {
+    fn leading_whitespace_is_trimmed() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("   git status");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn leading_tabs_and_spaces_trimmed() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("\t  \tgit status");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    // -----------------------------------------------------------------
+    // Nested env wrappers — `env A=1 env B=2 git status` now fires
+    // -----------------------------------------------------------------
+
+    /// Nested env wrappers are unwrapped repeatedly; both `env` scopes
+    /// are consumed before the matcher checks the head.
+    #[test]
+    fn nested_env_wrappers_fire() {
         let predicate = aw(None, Some(&["git"]));
         let ctx = ctx_bash("env A=1 env B=2 git status");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn nested_env_wrappers_with_mixed_flags_fire() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("env A=1 env -u VAR -i KEY=val git status");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn triple_nested_env_wrappers_fire() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("env A=1 env B=2 env C=3 git status");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    // -----------------------------------------------------------------
+    // bash -c "..." / sh -c '...' — quoted-command extraction
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bash_dash_c_double_quoted_fires() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c \"git status\"");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn sh_dash_c_single_quoted_fires() {
+        let predicate = aw(None, Some(&["gh"]));
+        let ctx = ctx_bash("sh -c 'gh pr create'");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn bash_dash_c_does_not_match_unrelated_command() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c \"echo hello\"");
         assert!(!evaluate_applies_when(&predicate, &ctx));
     }
 
-    /// `bash -c "git status"`: matcher sees `bash` as the command head
-    /// because quoted-command unwrapping is not implemented.
     #[test]
-    fn limitation_bash_dash_c_does_not_fire() {
+    fn bash_dash_c_unquoted_extracts_first_token() {
+        // Track 1 fallback: when -c body is unquoted, take the first
+        // whitespace-delimited token.
         let predicate = aw(None, Some(&["git"]));
-        let ctx = ctx_bash("bash -c \"git status\"");
+        let ctx = ctx_bash("bash -c git");
+        assert!(evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn bash_dash_c_empty_double_quotes_no_match() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c \"\"");
+        assert!(!evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn bash_dash_c_whitespace_only_quoted_no_match() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c \"   \"");
+        assert!(!evaluate_applies_when(&predicate, &ctx));
+    }
+
+    #[test]
+    fn bash_dash_c_no_following_arg_no_match() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c");
+        assert!(!evaluate_applies_when(&predicate, &ctx));
+    }
+
+    /// `bash -c` body's first token is taken verbatim — wrapper-stripping
+    /// inside the quoted body is a documented limitation. The body's
+    /// first token is `sudo`, which does not match the allowlist.
+    #[test]
+    fn limitation_bash_dash_c_inner_sudo_not_unwrapped() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c \"sudo git status\"");
+        assert!(!evaluate_applies_when(&predicate, &ctx));
+    }
+
+    /// Escaped-quote / nested-quote handling inside `bash -c` is out of
+    /// scope: the simple matcher splits at the first matching outer
+    /// quote, which truncates `echo "git status"` after the inner `\"`.
+    /// Documented Track 1 limitation.
+    #[test]
+    fn limitation_bash_dash_c_escaped_quotes_undefined() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = ctx_bash("bash -c \"echo \\\"git status\\\"\"");
+        // Document current behaviour: the simple matcher does not handle
+        // backslash-escaped quotes — it just doesn't fire for this shape.
         assert!(!evaluate_applies_when(&predicate, &ctx));
     }
 

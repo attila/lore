@@ -329,6 +329,7 @@ common wrappers before checking the prefix, so a pattern declaring `bash_command
 fires on all of these:
 
 - `git status`
+- `git status` — leading whitespace is trimmed
 - `sudo git status` — sudo with no flags
 - `sudo -E git push` — sudo with short flags (`-E`, `-H`)
 - `sudo -u user git push` — sudo with `-u USER` (two-token form)
@@ -336,20 +337,30 @@ fires on all of these:
 - `env A=1 B=2 git status` — multiple `KEY=VAL` assignments
 - `env -u VAR git status` — env with `-u VAR` (two-token unset-var form)
 - `env -i git status` — env with `-i` (hermetic-environment flag)
+- `env A=1 env B=2 git status` — nested env wrappers; each `env` scope is unwrapped in turn
 - `sudo env A=1 git pull` — one `sudo` wrapper followed by one `env` wrapper
+- `bash -c "git status"` — `bash -c` quoted-command extraction; the first token inside the quoted
+  body is the effective command head
+- `sh -c 'gh pr create'` — same as above with single quotes; `sh` is treated identically to `bash`
 
 The matcher operates on the raw command string — it never passes through the FTS-cleaning that
 strips short tokens, so two-character commands like `gh` survive intact.
 
-**Documented limitations.** The matcher unwraps at most one outer `sudo` scope and one outer `env`
-scope. The following do NOT fire on `bash_command_starts_with: [git]`:
+**Documented limitations.** The matcher unwraps at most one outer `sudo` scope, any number of nested
+`env` scopes, and one outer `bash -c` / `sh -c` scope. The following do NOT fire on
+`bash_command_starts_with: [git]`:
 
-- `env A=1 env B=2 git status` — nested env wrappers; only the outer env scope is consumed.
-- `bash -c "git status"` — quoted-command handling is not implemented; the matcher sees `bash` as
-  the command head, not the quoted invocation inside.
+- `bash -c "echo \"git status\""` — nested-quote / escaped-quote handling inside `bash -c` is not
+  implemented; the matcher splits at the first matching outer quote and does not unescape inner
+  ones.
+- `bash -c "sudo git status"` — wrapper-stripping inside the quoted `bash -c` body is not recursive;
+  the matcher takes the body's first whitespace-delimited token verbatim (`sudo`), so an inner
+  wrapper is not unwrapped.
+- `env "A=value with spaces" git status` — quoted `KEY=VAL` with internal spaces is not recognised;
+  the tokeniser splits the value at the first space.
 
-In practice these forms are unusual; a single sudo and a single env wrapper covers nearly all
-realistic invocations.
+In practice these forms are unusual; a single sudo, nested env wrappers, and a single `bash -c`
+covers nearly all realistic invocations.
 
 ### Empty-list semantics
 
