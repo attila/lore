@@ -343,16 +343,25 @@ impl KnowledgeDB {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Return one entry per universal-tagged source document, including the
-    /// full authorial `raw_body` for rendering. Used by the `SessionStart`
-    /// hook to emit the `## Pinned conventions` section without re-reading
-    /// the source markdown from disk — the DB is the sole runtime read
-    /// surface for indexed content (see `docs/architecture.md`).
+    /// Return one entry per **un-predicated** universal-tagged source document,
+    /// including the full authorial `raw_body` for rendering. Used by the
+    /// `SessionStart` hook to emit the `## Pinned conventions` section without
+    /// re-reading the source markdown from disk — the DB is the sole runtime
+    /// read surface for indexed content (see `docs/architecture.md`).
+    ///
+    /// Predicated universals (`is_universal = 1` with a non-NULL
+    /// `applies_when_json`) are deliberately excluded from this set: a
+    /// predicate-bearing pattern has implicitly declared itself conditionally
+    /// applicable, so pinning it at SessionStart contradicts its own scope
+    /// declaration. Such patterns still re-inject on their first matching
+    /// `PreToolUse` call via `apply_predicate_filter` in `src/hook.rs`. See
+    /// Track 1B in `CHANGELOG.md` and the `applies_when` section of
+    /// `docs/pattern-authoring-guide.md` for the user-facing contract.
     pub fn universal_patterns(&self) -> anyhow::Result<Vec<UniversalPattern>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_file, title, tags, raw_body \
              FROM patterns \
-             WHERE is_universal = 1 \
+             WHERE is_universal = 1 AND applies_when_json IS NULL \
              ORDER BY source_file",
         )?;
 
