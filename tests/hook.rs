@@ -1265,6 +1265,53 @@ fn hook_post_compact_excludes_predicated_universal_from_pinned_section() {
 }
 
 #[test]
+fn hook_post_compact_resets_dedup_file() {
+    // Sibling to the predicated-universal hazard pin above. The R4 test
+    // covers the rendered-context filter; this one pins the orthogonal
+    // contract that PostCompact also truncates the per-session dedup file
+    // (so post-compaction tool calls re-inject patterns the agent saw before
+    // the compaction event). Without this assertion, a refactor that drops
+    // `reset_dedup` from `handle_post_compact` would not be caught by any
+    // of the existing PostCompact tests — they only inspect the system
+    // message payload.
+    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
+    let session_id = format!("test-track-1b-post-compact-truncate-{}", std::process::id());
+    let dedup_path = lore::hook::dedup_file_path(&session_id);
+
+    // Pre-create the dedup file with a sentinel id so any failure-to-truncate
+    // is observable from the file contents alone.
+    if let Some(parent) = dedup_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&dedup_path, "sentinel-pre-post-compact-id\n").unwrap();
+    assert!(
+        dedup_path.exists(),
+        "fixture should have created the dedup file at {dedup_path:?}"
+    );
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let post = std::fs::read(&dedup_path).unwrap_or_default();
+    assert!(
+        post.is_empty(),
+        "PostCompact must truncate the dedup file; got {} bytes: {:?}",
+        post.len(),
+        String::from_utf8_lossy(&post),
+    );
+
+    let _ = std::fs::remove_file(&dedup_path);
+}
+
+#[test]
 fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
