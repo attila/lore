@@ -1381,10 +1381,12 @@ fn hook_session_start_pins_universal_with_typo_applies_when_key() {
         "typo'd predicate key must be ignored — pattern should still pin at \
          SessionStart: {ctx}"
     );
-    assert!(
-        ctx.contains("Typo Predicate Pattern"),
-        "typo'd predicate pattern title should appear in pinned body: {ctx}"
-    );
+    // Note: the pattern's title also appears in the "Available patterns:"
+    // catalogue line regardless of pinning state, so a title-presence
+    // assertion would be vacuous. The marker check above is load-bearing —
+    // the marker is unique to the pinned body and never appears in the
+    // catalogue. Mirrors the assertion shape used in the tools-only test
+    // below.
 }
 
 #[test]
@@ -1427,6 +1429,54 @@ fn hook_session_start_excludes_universal_with_tools_only_predicate() {
     // catalogue index — that lists every indexed pattern. The marker check
     // above is the body-not-pinned invariant; the marker is unique to the
     // pattern's body and never appears in the catalogue line.
+}
+
+#[test]
+fn hook_pre_tool_use_edit_re_injects_tools_only_predicated_universal() {
+    // Companion to the SessionStart-defer test above. The defer test pins one
+    // half of the contract (tools-only predicate excludes the chunk from
+    // SessionStart); this test pins the other half (an Edit/Write tool call
+    // on the same predicated chunk re-injects it via `apply_predicate_filter`).
+    // Without this, a regression that wired SessionStart-side filtering to
+    // recognise tools-only predicates but missed the PreToolUse-side
+    // re-injection wiring would pass every other test in the suite.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("tools-only-fire.md"),
+        "---\n\
+         tags: [universal, edits]\n\
+         applies_when:\n  tools: [Edit, Write]\n\
+         ---\n\n\
+         # Tools-Only Edit Pattern\n\n\
+         Marker: tools-only-fire-marker. Run gizmo widget review when \
+         editing rust typescript golang source files.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let session_id = format!("test-track-1b-tools-only-fire-{}", std::process::id());
+    let pre_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/gizmo_widget.rs" },
+    });
+    let (pre_ctx, _stderr) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &pre_input, true);
+    assert!(
+        pre_ctx.contains("tools-only-fire-marker"),
+        "matching Edit tool call must re-inject the tools-only predicated \
+         universal via apply_predicate_filter: {pre_ctx}"
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
 }
 
 #[test]
