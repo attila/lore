@@ -352,7 +352,7 @@ impl KnowledgeDB {
     /// Predicated universals (`is_universal = 1` with a non-NULL
     /// `applies_when_json`) are deliberately excluded from this set: a
     /// predicate-bearing pattern has implicitly declared itself conditionally
-    /// applicable, so pinning it at SessionStart contradicts its own scope
+    /// applicable, so pinning it at `SessionStart` contradicts its own scope
     /// declaration. Such patterns still re-inject on their first matching
     /// `PreToolUse` call via `apply_predicate_filter` in `src/hook.rs`. See
     /// Track 1B in `CHANGELOG.md` and the `applies_when` section of

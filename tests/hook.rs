@@ -1077,12 +1077,12 @@ fn hook_post_compact_re_emits_pinned_section() {
 // ---------------------------------------------------------------------------
 
 /// Set up a knowledge directory with two universal patterns: one un-predicated
-/// (genuinely universal — should still pin at SessionStart) and one predicated
-/// (applies_when on git/gh — should defer to PreToolUse on matching calls).
+/// (genuinely universal — should still pin at `SessionStart`) and one predicated
+/// (`applies_when` on git/gh — should defer to `PreToolUse` on matching calls).
 ///
 /// Marker tokens in the bodies — `genuinely-universal-marker` and
 /// `predicated-git-marker` — let assertions cheaply check presence/absence in
-/// SessionStart / PostCompact / PreToolUse payloads.
+/// `SessionStart` / `PostCompact` / `PreToolUse` payloads.
 fn setup_with_predicated_and_unpredicated_universals() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
