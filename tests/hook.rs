@@ -1344,6 +1344,92 @@ fn hook_post_compact_resets_dedup_file() {
 }
 
 #[test]
+fn hook_session_start_pins_universal_with_typo_applies_when_key() {
+    // Edge case: a universal pattern that misspells the predicate key
+    // (e.g. `appliess_when:`) is NOT recognised by the frontmatter parser,
+    // so `applies_when_json` stays NULL on the row. The SQL filter
+    // (`applies_when_json IS NULL`) therefore keeps the chunk in the
+    // SessionStart pin set — the typo'd predicate is silently dropped and
+    // the pattern falls back to plain universal-pin behaviour. Pin the
+    // outcome so a future ingest-side change that normalises typo'd keys
+    // into a non-NULL JSON value (and would silently flip SessionStart
+    // visibility) surfaces here.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("typo-predicate.md"),
+        "---\n\
+         tags: [universal, conventions]\n\
+         appliess_when:\n  bash_command_starts_with: [git, gh]\n\
+         ---\n\n\
+         # Typo Predicate Pattern\n\n\
+         Marker: typo-predicate-marker. Run gizmo widget review across \
+         every tool call.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let ctx = invoke_session_start(&config_path, "test-track-1b-typo-predicate");
+    assert!(
+        ctx.contains("typo-predicate-marker"),
+        "typo'd predicate key must be ignored — pattern should still pin at \
+         SessionStart: {ctx}"
+    );
+    assert!(
+        ctx.contains("Typo Predicate Pattern"),
+        "typo'd predicate pattern title should appear in pinned body: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_excludes_universal_with_tools_only_predicate() {
+    // Edge case: a universal pattern with a `tools`-only `applies_when`
+    // (no `bash_command_starts_with`) is still excluded from SessionStart
+    // — the SQL filter is shape-agnostic and triggers on
+    // `applies_when_json IS NOT NULL`. Pins the filter's universality:
+    // any predicate shape, including one that gates only on tool class,
+    // defers from SessionStart. Not exercised by the original five Track 1B
+    // tests, which all used `bash_command_starts_with`.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("tools-only.md"),
+        "---\n\
+         tags: [universal, edits]\n\
+         applies_when:\n  tools: [Edit, Write]\n\
+         ---\n\n\
+         # Tools-Only Predicate Pattern\n\n\
+         Marker: tools-only-marker. Run gizmo widget review when editing \
+         source files.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let ctx = invoke_session_start(&config_path, "test-track-1b-tools-only");
+    assert!(
+        !ctx.contains("tools-only-marker"),
+        "tools-only predicate must defer from SessionStart same as a \
+         bash_command predicate would: {ctx}"
+    );
+    // Note: the pattern's title still appears in the "Available patterns:"
+    // catalogue index — that lists every indexed pattern. The marker check
+    // above is the body-not-pinned invariant; the marker is unique to the
+    // pattern's body and never appears in the catalogue line.
+}
+
+#[test]
 fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
