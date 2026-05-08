@@ -1,8 +1,9 @@
 ---
 title: "feat: Defer SessionStart pinning for predicated universal patterns"
 type: feat
-status: active
+status: completed
 date: 2026-05-08
+completed: 2026-05-08
 ---
 
 # feat: Defer SessionStart pinning for predicated universal patterns
