@@ -1199,16 +1199,34 @@ fn hook_session_start_skip_then_pre_tool_use_fire_couples_predicate_path() {
     // R3 / Integration: SessionStart-skip and PreToolUse-fire are coupled on
     // the same fixture and DB. The transition is the assertion target — a
     // regression where U1's SQL filter is reverted but PreToolUse still fires
-    // would still let the two halves pass independently, so this test pins
-    // them together.
+    // would still let two independent half-tests pass, so this test pins both
+    // halves AND a shared invariant (the dedup-file write history) so the
+    // SessionStart→PreToolUse transition itself is what the test guards.
     let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
     let session_id = format!("test-track-1b-transition-{}", std::process::id());
+    let dedup_path = lore::hook::dedup_file_path(&session_id);
+    // Defensive: clear any stale dedup file from a previous run with the
+    // same pid so the post-SessionStart "did not seed" assertion is honest.
+    let _ = std::fs::remove_file(&dedup_path);
 
     // Half 1: SessionStart excludes the predicated chunk.
     let session_ctx = invoke_session_start(&config_path, &session_id);
     assert!(
         !session_ctx.contains("predicated-git-marker"),
         "SessionStart must not pin the predicated universal: {session_ctx}"
+    );
+    // Shared invariant 1: SessionStart never seeds dedup — the only
+    // population path is `dedup_filter_and_record` in PreToolUse. The
+    // predicated chunk must therefore not appear in any post-SessionStart
+    // dedup file. This pins the institutional dedup-lifecycle contract
+    // explicitly so a future SessionStart-side seed write (e.g. an
+    // optimisation that pre-records pinned ids) is caught here.
+    let post_session_dedup = std::fs::read(&dedup_path).unwrap_or_default();
+    assert!(
+        post_session_dedup.is_empty(),
+        "SessionStart must not seed dedup for predicated chunks: \
+         {} bytes after SessionStart",
+        post_session_dedup.len(),
     );
 
     // Half 2: matching PreToolUse Bash call re-injects the predicated chunk
@@ -1225,9 +1243,23 @@ fn hook_session_start_skip_then_pre_tool_use_fire_couples_predicate_path() {
         pre_ctx.contains("predicated-git-marker"),
         "matching PreToolUse must re-inject the predicated chunk: {pre_ctx}"
     );
+    // Shared invariant 2: PreToolUse populated dedup as part of injecting
+    // the predicated chunk. Coupled with invariant 1 (SessionStart didn't
+    // seed) and the marker presence above, this transitions the test from
+    // "two adjacent unit tests" into a single observable property: the
+    // predicated chunk's id was first recorded into the dedup file by
+    // PreToolUse, not by SessionStart.
+    let post_pre_dedup = std::fs::read(&dedup_path).unwrap_or_default();
+    assert!(
+        post_pre_dedup.len() > post_session_dedup.len(),
+        "PreToolUse must write to dedup (SessionStart left {} bytes; \
+         PreToolUse left {} bytes)",
+        post_session_dedup.len(),
+        post_pre_dedup.len(),
+    );
 
     // Cleanup the dedup file the PreToolUse call wrote.
-    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+    let _ = std::fs::remove_file(&dedup_path);
 }
 
 #[test]
