@@ -348,8 +348,12 @@ fn tool_definitions() -> Value {
                         "description":
                             "Optional tags for categorisation. Passing `\"universal\"` opts the \
                              pattern into the always-on injection tier — its body is emitted at \
-                             every SessionStart and bypasses PreToolUse deduplication (see \
-                             docs/pattern-authoring-guide.md §\"When to use the universal tag\")."
+                             every SessionStart and bypasses PreToolUse deduplication, unless the \
+                             body's frontmatter also declares an `applies_when` predicate (in \
+                             which case the pattern is deferred from SessionStart and re-injects \
+                             on matching PreToolUse calls instead). See \
+                             docs/pattern-authoring-guide.md §\"When to use the universal tag\" \
+                             and §\"Tool/command predicate (applies_when)\"."
                     },
                     "include_metadata": {
                         "type": "boolean",
@@ -391,7 +395,8 @@ fn tool_definitions() -> Value {
                              `universal`). Pass an empty array `[]` to clear all tags. Pass a \
                              non-empty array to replace the tag list wholesale; include \
                              `\"universal\"` to keep or opt the pattern into the always-on \
-                             injection tier."
+                             injection tier (see `add_pattern`'s `tags` description for the \
+                             interaction with `applies_when` predicates)."
                     },
                     "include_metadata": {
                         "type": "boolean",
