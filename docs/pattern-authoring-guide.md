@@ -239,6 +239,12 @@ conventions` section, AND it bypasses the `PreToolUse` dedup filter so it re-inj
 every relevant tool call instead of being suppressed after the first appearance. The relevance gate
 stays intact — the pattern still has to match the agent's tool call to inject.
 
+When a universal pattern carries an `applies_when` predicate (see the next section), the
+SessionStart and PostCompact pinning step is skipped — a predicate-bearing pattern has implicitly
+declared itself conditionally relevant, and pinning it at session start would contradict its own
+scope. Such patterns still re-inject on every matching `PreToolUse` call via the predicate path;
+they are deferred until needed rather than pinned upfront.
+
 The header in the SessionStart payload reads `## Pinned conventions` rather than
 `## Universal
 patterns` because that phrasing reads better as agent-facing copy. Both names refer to
@@ -321,6 +327,25 @@ opt-in.
 - A missing key is unconstrained (does not narrow the match). A pattern with only
   `bash_command_starts_with: [git]` and no `tools` key implicitly requires `Bash` because the
   command-prefix check only meaningfully runs on `Bash` calls.
+
+### SessionStart pinning is deferred when `applies_when` is set
+
+The mere presence of an `applies_when` block — regardless of which keys it carries — opts a
+universal pattern out of the SessionStart pinned-conventions block (and out of the PostCompact
+re-emit, which shares the same code path). The reasoning is symmetrical to the predicate's own
+declaration: a pattern with a predicate is conditionally relevant, and pinning it unconditionally at
+session start would contradict that scope. Predicated universals are therefore deferred to their
+PreToolUse path and re-inject on every matching tool call, just as the predicate specifies — they do
+not also pin at session start.
+
+This carries a small first-tool-call delay: the predicated pattern is visible to the agent on the
+first tool call where the predicate matches AND the search pipeline returns at least one result, not
+earlier. With the default `min_relevance_universal` (which inherits from `min_relevance` and is
+`0.0` out of the box) and the search-overfetch / universal-no-truncate behaviour in
+`search_with_threshold`, this is the realistic case. If you raise `min_relevance_universal` high
+enough to filter weak-keyword universals out, predicated patterns can be deferred across multiple
+tool calls — that is the cost of a strict universal floor and applies to every universal, not just
+predicated ones.
 
 ### Smart-prefix matcher behaviour
 

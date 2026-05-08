@@ -1068,6 +1068,417 @@ fn hook_post_compact_re_emits_pinned_section() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Track 1B: predicated universals defer from SessionStart pinning to the
+// PreToolUse predicate path. universal_patterns() filters
+// applies_when_json IS NOT NULL out of the SessionStart pin set; predicated
+// chunks still re-inject on matching PreToolUse calls via
+// apply_predicate_filter.
+// ---------------------------------------------------------------------------
+
+/// Set up a knowledge directory with two universal patterns: one un-predicated
+/// (genuinely universal — should still pin at `SessionStart`) and one predicated
+/// (`applies_when` on git/gh — should defer to `PreToolUse` on matching calls).
+///
+/// Marker tokens in the bodies — `genuinely-universal-marker` and
+/// `predicated-git-marker` — let assertions cheaply check presence/absence in
+/// `SessionStart` / `PostCompact` / `PreToolUse` payloads.
+fn setup_with_predicated_and_unpredicated_universals() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+
+    fs::write(
+        dir.join("genuine-universal.md"),
+        "---\ntags: [universal, conventions]\n---\n\n\
+         # Genuinely Universal\n\n\
+         Marker: genuinely-universal-marker. Run gizmo widget review across \
+         every tool call regardless of command — rust typescript golang \
+         conventions, push origin HEAD when finishing.\n",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("predicated-git.md"),
+        "---\n\
+         tags: [universal, git]\n\
+         applies_when:\n  bash_command_starts_with: [git, gh]\n\
+         ---\n\n\
+         # Predicated Git Workflow\n\n\
+         Marker: predicated-git-marker. Always push with \
+         `git push --force-with-lease`, never plain `--force`. Run gizmo \
+         widget review before opening a pull request.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+    (tmp, config_path)
+}
+
+#[test]
+fn hook_session_start_excludes_predicated_universal_from_pinned_section() {
+    // R1: predicated universals must NOT pin at SessionStart.
+    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
+    let ctx = invoke_session_start(&config_path, "test-track-1b-predicated-skipped");
+
+    assert!(
+        ctx.contains("## Pinned conventions"),
+        "pinned section should still appear (un-predicated universal is present): {ctx}"
+    );
+    assert!(
+        !ctx.contains("predicated-git-marker"),
+        "predicated universal body must NOT appear in pinned body: {ctx}"
+    );
+    // Note: the predicated pattern's title still appears in the "Available
+    // patterns:" index — that is the full pattern catalogue, not the pinned
+    // section. The marker check above is the load-bearing assertion for "body
+    // not pinned"; the marker is unique to the predicated chunk's body.
+}
+
+#[test]
+fn hook_session_start_pins_unpredicated_universal_alongside_predicated_sibling() {
+    // R2: an un-predicated universal still pins when a predicated sibling
+    // exists in the same DB — the filter is per-row, not all-or-nothing.
+    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
+    let ctx = invoke_session_start(&config_path, "test-track-1b-unpredicated-still-pins");
+
+    assert!(
+        ctx.contains("Genuinely Universal"),
+        "un-predicated universal title should appear: {ctx}"
+    );
+    assert!(
+        ctx.contains("genuinely-universal-marker"),
+        "un-predicated universal body should appear: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_omits_pinned_section_when_only_universal_is_predicated() {
+    // R1+R2 boundary: when every universal-tagged pattern carries a predicate,
+    // the pinned section is empty and the header is omitted entirely
+    // (mirrors hook_session_start_omits_pinned_section_when_no_universal_patterns).
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("predicated-only.md"),
+        "---\n\
+         tags: [universal, git]\n\
+         applies_when:\n  bash_command_starts_with: [git, gh]\n\
+         ---\n\n\
+         # Predicated Only\n\n\
+         Marker: predicated-only-marker. Always push with \
+         `git push --force-with-lease`.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let ctx = invoke_session_start(&config_path, "test-track-1b-only-predicated");
+    assert!(
+        !ctx.contains("## Pinned conventions"),
+        "pinned section should be omitted when no un-predicated universals exist: {ctx}"
+    );
+    assert!(
+        !ctx.contains("predicated-only-marker"),
+        "predicated universal body must not leak into the SessionStart payload: {ctx}"
+    );
+}
+
+#[test]
+fn hook_session_start_skip_then_pre_tool_use_fire_couples_predicate_path() {
+    // R3 / Integration: SessionStart-skip and PreToolUse-fire are coupled on
+    // the same fixture and DB. The transition is the assertion target — a
+    // regression where U1's SQL filter is reverted but PreToolUse still fires
+    // would still let two independent half-tests pass, so this test pins both
+    // halves AND a shared invariant (the dedup-file write history) so the
+    // SessionStart→PreToolUse transition itself is what the test guards.
+    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
+    let session_id = format!("test-track-1b-transition-{}", std::process::id());
+    let dedup_path = lore::hook::dedup_file_path(&session_id);
+    // Defensive: clear any stale dedup file from a previous run with the
+    // same pid so the post-SessionStart "did not seed" assertion is honest.
+    let _ = std::fs::remove_file(&dedup_path);
+
+    // Half 1: SessionStart excludes the predicated chunk.
+    let session_ctx = invoke_session_start(&config_path, &session_id);
+    assert!(
+        !session_ctx.contains("predicated-git-marker"),
+        "SessionStart must not pin the predicated universal: {session_ctx}"
+    );
+    // Shared invariant 1: SessionStart never seeds dedup — the only
+    // population path is `dedup_filter_and_record` in PreToolUse. The
+    // predicated chunk must therefore not appear in any post-SessionStart
+    // dedup file. This pins the institutional dedup-lifecycle contract
+    // explicitly so a future SessionStart-side seed write (e.g. an
+    // optimisation that pre-records pinned ids) is caught here.
+    let post_session_dedup = std::fs::read(&dedup_path).unwrap_or_default();
+    assert!(
+        post_session_dedup.is_empty(),
+        "SessionStart must not seed dedup for predicated chunks: \
+         {} bytes after SessionStart",
+        post_session_dedup.len(),
+    );
+
+    // Half 2: matching PreToolUse Bash call re-injects the predicated chunk
+    // via apply_predicate_filter on the same DB and dedup state.
+    let pre_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin HEAD" },
+    });
+    let (pre_ctx, _stderr) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &pre_input, false);
+    assert!(
+        pre_ctx.contains("predicated-git-marker"),
+        "matching PreToolUse must re-inject the predicated chunk: {pre_ctx}"
+    );
+    // Shared invariant 2: PreToolUse populated dedup as part of injecting
+    // the predicated chunk. Coupled with invariant 1 (SessionStart didn't
+    // seed) and the marker presence above, this transitions the test from
+    // "two adjacent unit tests" into a single observable property: the
+    // predicated chunk's id was first recorded into the dedup file by
+    // PreToolUse, not by SessionStart.
+    let post_pre_dedup = std::fs::read(&dedup_path).unwrap_or_default();
+    assert!(
+        post_pre_dedup.len() > post_session_dedup.len(),
+        "PreToolUse must write to dedup (SessionStart left {} bytes; \
+         PreToolUse left {} bytes)",
+        post_session_dedup.len(),
+        post_pre_dedup.len(),
+    );
+
+    // Cleanup the dedup file the PreToolUse call wrote.
+    let _ = std::fs::remove_file(&dedup_path);
+}
+
+#[test]
+fn hook_post_compact_excludes_predicated_universal_from_pinned_section() {
+    // R4 / hazard pin: PostCompact shares format_session_context with
+    // SessionStart today, but pin the invariant directly so a future refactor
+    // splitting the shared path cannot silently regress predicated-chunk
+    // filtering on the PostCompact side (composition-cascade mitigation).
+    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": "test-track-1b-post-compact",
+    });
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
+
+    assert!(
+        ctx.contains("genuinely-universal-marker"),
+        "PostCompact should still re-emit the un-predicated universal body: {ctx}"
+    );
+    assert!(
+        !ctx.contains("predicated-git-marker"),
+        "PostCompact must NOT re-emit the predicated universal body: {ctx}"
+    );
+}
+
+#[test]
+fn hook_post_compact_resets_dedup_file() {
+    // Sibling to the predicated-universal hazard pin above. The R4 test
+    // covers the rendered-context filter; this one pins the orthogonal
+    // contract that PostCompact also truncates the per-session dedup file
+    // (so post-compaction tool calls re-inject patterns the agent saw before
+    // the compaction event). Without this assertion, a refactor that drops
+    // `reset_dedup` from `handle_post_compact` would not be caught by any
+    // of the existing PostCompact tests — they only inspect the system
+    // message payload.
+    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
+    let session_id = format!("test-track-1b-post-compact-truncate-{}", std::process::id());
+    let dedup_path = lore::hook::dedup_file_path(&session_id);
+
+    // Pre-create the dedup file with a sentinel id so any failure-to-truncate
+    // is observable from the file contents alone.
+    if let Some(parent) = dedup_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&dedup_path, "sentinel-pre-post-compact-id\n").unwrap();
+    assert!(
+        dedup_path.exists(),
+        "fixture should have created the dedup file at {dedup_path:?}"
+    );
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": session_id,
+    });
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success();
+
+    let post = std::fs::read(&dedup_path).unwrap_or_default();
+    assert!(
+        post.is_empty(),
+        "PostCompact must truncate the dedup file; got {} bytes: {:?}",
+        post.len(),
+        String::from_utf8_lossy(&post),
+    );
+
+    let _ = std::fs::remove_file(&dedup_path);
+}
+
+#[test]
+fn hook_session_start_pins_universal_with_typo_applies_when_key() {
+    // Edge case: a universal pattern that misspells the predicate key
+    // (e.g. `appliess_when:`) is NOT recognised by the frontmatter parser,
+    // so `applies_when_json` stays NULL on the row. The SQL filter
+    // (`applies_when_json IS NULL`) therefore keeps the chunk in the
+    // SessionStart pin set — the typo'd predicate is silently dropped and
+    // the pattern falls back to plain universal-pin behaviour. Pin the
+    // outcome so a future ingest-side change that normalises typo'd keys
+    // into a non-NULL JSON value (and would silently flip SessionStart
+    // visibility) surfaces here.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("typo-predicate.md"),
+        "---\n\
+         tags: [universal, conventions]\n\
+         appliess_when:\n  bash_command_starts_with: [git, gh]\n\
+         ---\n\n\
+         # Typo Predicate Pattern\n\n\
+         Marker: typo-predicate-marker. Run gizmo widget review across \
+         every tool call.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let ctx = invoke_session_start(&config_path, "test-track-1b-typo-predicate");
+    assert!(
+        ctx.contains("typo-predicate-marker"),
+        "typo'd predicate key must be ignored — pattern should still pin at \
+         SessionStart: {ctx}"
+    );
+    // Note: the pattern's title also appears in the "Available patterns:"
+    // catalogue line regardless of pinning state, so a title-presence
+    // assertion would be vacuous. The marker check above is load-bearing —
+    // the marker is unique to the pinned body and never appears in the
+    // catalogue. Mirrors the assertion shape used in the tools-only test
+    // below.
+}
+
+#[test]
+fn hook_session_start_excludes_universal_with_tools_only_predicate() {
+    // Edge case: a universal pattern with a `tools`-only `applies_when`
+    // (no `bash_command_starts_with`) is still excluded from SessionStart
+    // — the SQL filter is shape-agnostic and triggers on
+    // `applies_when_json IS NOT NULL`. Pins the filter's universality:
+    // any predicate shape, including one that gates only on tool class,
+    // defers from SessionStart. Not exercised by the original five Track 1B
+    // tests, which all used `bash_command_starts_with`.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("tools-only.md"),
+        "---\n\
+         tags: [universal, edits]\n\
+         applies_when:\n  tools: [Edit, Write]\n\
+         ---\n\n\
+         # Tools-Only Predicate Pattern\n\n\
+         Marker: tools-only-marker. Run gizmo widget review when editing \
+         source files.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let ctx = invoke_session_start(&config_path, "test-track-1b-tools-only");
+    assert!(
+        !ctx.contains("tools-only-marker"),
+        "tools-only predicate must defer from SessionStart same as a \
+         bash_command predicate would: {ctx}"
+    );
+    // Note: the pattern's title still appears in the "Available patterns:"
+    // catalogue index — that lists every indexed pattern. The marker check
+    // above is the body-not-pinned invariant; the marker is unique to the
+    // pattern's body and never appears in the catalogue line.
+}
+
+#[test]
+fn hook_pre_tool_use_edit_re_injects_tools_only_predicated_universal() {
+    // Companion to the SessionStart-defer test above. The defer test pins one
+    // half of the contract (tools-only predicate excludes the chunk from
+    // SessionStart); this test pins the other half (an Edit/Write tool call
+    // on the same predicated chunk re-injects it via `apply_predicate_filter`).
+    // Without this, a regression that wired SessionStart-side filtering to
+    // recognise tools-only predicates but missed the PreToolUse-side
+    // re-injection wiring would pass every other test in the suite.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    seed_patterns(dir);
+    fs::write(
+        dir.join("tools-only-fire.md"),
+        "---\n\
+         tags: [universal, edits]\n\
+         applies_when:\n  tools: [Edit, Write]\n\
+         ---\n\n\
+         # Tools-Only Edit Pattern\n\n\
+         Marker: tools-only-fire-marker. Run gizmo widget review when \
+         editing rust typescript golang source files.\n",
+    )
+    .unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db"));
+
+    let session_id = format!("test-track-1b-tools-only-fire-{}", std::process::id());
+    let pre_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/gizmo_widget.rs" },
+    });
+    let (pre_ctx, _stderr) =
+        run_pre_tool_use_capturing_debug(&config_path, &session_id, &pre_input, true);
+    assert!(
+        pre_ctx.contains("tools-only-fire-marker"),
+        "matching Edit tool call must re-inject the tools-only predicated \
+         universal via apply_predicate_filter: {pre_ctx}"
+    );
+
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+}
+
 #[test]
 fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
     let tmp = tempdir().unwrap();

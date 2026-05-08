@@ -1,5 +1,6 @@
 ---
 source: src/server.rs
+assertion_line: 1416
 expression: resp
 ---
 {
@@ -46,7 +47,7 @@ expression: resp
               "type": "boolean"
             },
             "tags": {
-              "description": "Optional tags for categorisation. Passing `\"universal\"` opts the pattern into the always-on injection tier — its body is emitted at every SessionStart and bypasses PreToolUse deduplication (see docs/pattern-authoring-guide.md §\"When to use the universal tag\").",
+              "description": "Optional tags for categorisation. Passing `\"universal\"` opts the pattern into the always-on injection tier — its body is emitted at every SessionStart and bypasses PreToolUse deduplication, unless the body's frontmatter also declares an `applies_when` predicate (in which case the pattern is deferred from SessionStart and re-injects on matching PreToolUse calls instead). See docs/pattern-authoring-guide.md §\"When to use the universal tag\" and §\"Tool/command predicate (applies_when)\".",
               "items": {
                 "type": "string"
               },
@@ -83,7 +84,7 @@ expression: resp
               "type": "string"
             },
             "tags": {
-              "description": "Optional. Omit to preserve the existing frontmatter tags (including `universal`). Pass an empty array `[]` to clear all tags. Pass a non-empty array to replace the tag list wholesale; include `\"universal\"` to keep or opt the pattern into the always-on injection tier.",
+              "description": "Optional. Omit to preserve the existing frontmatter tags (including `universal`). Pass an empty array `[]` to clear all tags. Pass a non-empty array to replace the tag list wholesale; include `\"universal\"` to keep or opt the pattern into the always-on injection tier (see `add_pattern`'s `tags` description for the interaction with `applies_when` predicates).",
               "items": {
                 "type": "string"
               },
@@ -130,12 +131,12 @@ expression: resp
         "name": "append_to_pattern"
       },
       {
-        "description": "List every pattern indexed in the knowledge base: title, source file, tags, and whether the pattern is universal (always injected at SessionStart and bypasses PreToolUse deduplication). Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, especially the `universal` marker.",
+        "description": "List every pattern indexed in the knowledge base: title, source file, tags, whether the pattern is universal (always-on tier), and whether the pattern's frontmatter declares an `applies_when` predicate. Universal patterns without a predicate pin at every SessionStart and bypass PreToolUse deduplication; universal patterns with a predicate are deferred from SessionStart and re-inject only on matching PreToolUse calls. Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, universality, and predicate state.",
         "inputSchema": {
           "properties": {
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with an array of patterns, each carrying `title`, `source_file`, `tags`, and `is_universal`. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with an array of patterns, each carrying `title`, `source_file`, `tags`, `is_universal`, and `has_predicate`. Defaults to false.",
               "type": "boolean"
             }
           },
