@@ -1,8 +1,9 @@
 ---
 title: "feat: Universal-pattern predicate (`applies_when`) and engine/adapter split"
 type: feat
-status: active
+status: completed
 date: 2026-05-07
+completed: 2026-05-08
 origin: docs/brainstorms/2026-05-07-universal-pattern-predicate-requirements.md
 ---
 
