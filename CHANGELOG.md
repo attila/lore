@@ -33,6 +33,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   against a concurrent open) re-enters the branch safely. Existing chunks have NULL in the new
   `applies_when_json` column, behaving as if no predicate were set (R11). The hard-bail schema
   advisory remains for any future non-additive bump.
+- **Predicated universal patterns are no longer pinned at SessionStart.** A pattern tagged
+  `universal` that also carries an `applies_when` predicate has implicitly declared itself
+  conditionally relevant; pinning its full body at every SessionStart contradicted that scope. Such
+  patterns are now excluded from the `## Pinned conventions` block at SessionStart and from the
+  PostCompact re-emit (shared code path), and re-inject on every matching `PreToolUse` call via the
+  existing predicate path — deferred until needed rather than pinned upfront. Un-predicated
+  universals are unaffected. The change carries a small first-tool-call delay for predicated
+  patterns; see the SessionStart-pinning subsection of
+  [`docs/pattern-authoring-guide.md`](docs/pattern-authoring-guide.md) for the precondition. Origin
+  is the post-Track-1 dogfood retrospective captured in
+  [`docs/solutions/workflow-issues/dogfood-reframes-workstream-2026-05-08.md`](docs/solutions/workflow-issues/dogfood-reframes-workstream-2026-05-08.md).
 
 ### Notes
 
