@@ -32,6 +32,19 @@ pub struct SearchConfig {
     pub top_k: usize,
     #[serde(default = "default_min_relevance")]
     pub min_relevance: f64,
+    /// Optional threshold floor applied only to universal-tagged results.
+    /// `None` (default) → inherit `min_relevance`. Lets operators raise the
+    /// universal floor without affecting ranked non-universal injections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_relevance_universal: Option<f64>,
+}
+
+impl SearchConfig {
+    /// Effective relevance floor for universal results: the explicit
+    /// `min_relevance_universal` override if set, otherwise `min_relevance`.
+    pub fn effective_min_relevance_universal(&self) -> f64 {
+        self.min_relevance_universal.unwrap_or(self.min_relevance)
+    }
 }
 
 fn default_min_relevance() -> f64 {
@@ -59,6 +72,7 @@ impl Config {
                 hybrid: true,
                 top_k: 5,
                 min_relevance: default_min_relevance(),
+                min_relevance_universal: None,
             },
             chunking: ChunkingConfig {
                 strategy: "heading".to_string(),
@@ -288,5 +302,119 @@ mod tests {
             inbox_branch_prefix: "inbox/".to_string(),
         });
         assert_eq!(config.inbox_branch_prefix(), Some("inbox/"));
+    }
+
+    // -- min_relevance_universal (U6) ----------------------------------------
+
+    #[test]
+    fn default_with_leaves_universal_floor_unset() {
+        // AE6: a fresh install must match current behaviour exactly. The
+        // override stays None and the accessor falls through to min_relevance.
+        let config = sample_config();
+        assert!(
+            config.search.min_relevance_universal.is_none(),
+            "default_with must leave min_relevance_universal unset"
+        );
+        assert!(
+            (config.search.effective_min_relevance_universal() - 0.6).abs() < f64::EPSILON,
+            "without override, accessor must return min_relevance default (0.6)"
+        );
+    }
+
+    #[test]
+    fn round_trip_without_universal_floor_inherits_min_relevance() {
+        let toml_text = "\
+            knowledge_dir = \"docs\"\n\
+            database = \"lore.db\"\n\
+            bind = \"localhost:3100\"\n\n\
+            [ollama]\n\
+            host = \"http://127.0.0.1:11434\"\n\
+            model = \"nomic-embed-text\"\n\n\
+            [search]\n\
+            hybrid = true\n\
+            top_k = 5\n\
+            min_relevance = 0.6\n\n\
+            [chunking]\n\
+            strategy = \"heading\"\n\
+            max_tokens = 1024\n";
+
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!(
+            cfg.search.min_relevance_universal.is_none(),
+            "absent key must deserialise to None"
+        );
+        assert!(
+            (cfg.search.effective_min_relevance_universal() - 0.6).abs() < f64::EPSILON,
+            "accessor must inherit min_relevance when override absent"
+        );
+    }
+
+    #[test]
+    fn round_trip_with_universal_floor_returns_override() {
+        let toml_text = "\
+            knowledge_dir = \"docs\"\n\
+            database = \"lore.db\"\n\
+            bind = \"localhost:3100\"\n\n\
+            [ollama]\n\
+            host = \"http://127.0.0.1:11434\"\n\
+            model = \"nomic-embed-text\"\n\n\
+            [search]\n\
+            hybrid = true\n\
+            top_k = 5\n\
+            min_relevance = 0.6\n\
+            min_relevance_universal = 0.7\n\n\
+            [chunking]\n\
+            strategy = \"heading\"\n\
+            max_tokens = 1024\n";
+
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.search.min_relevance_universal, Some(0.7));
+        assert!(
+            (cfg.search.effective_min_relevance_universal() - 0.7).abs() < f64::EPSILON,
+            "explicit override must take precedence over min_relevance"
+        );
+        // Non-universal floor is unchanged.
+        assert!((cfg.search.min_relevance - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn accessor_tracks_min_relevance_when_override_absent() {
+        // If only min_relevance is overridden, the universal floor follows
+        // the new value (inherit-from-`min_relevance` semantics).
+        let toml_text = "\
+            knowledge_dir = \"docs\"\n\
+            database = \"lore.db\"\n\
+            bind = \"localhost:3100\"\n\n\
+            [ollama]\n\
+            host = \"http://127.0.0.1:11434\"\n\
+            model = \"nomic-embed-text\"\n\n\
+            [search]\n\
+            hybrid = true\n\
+            top_k = 5\n\
+            min_relevance = 0.8\n\n\
+            [chunking]\n\
+            strategy = \"heading\"\n\
+            max_tokens = 1024\n";
+
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!(cfg.search.min_relevance_universal.is_none());
+        assert!(
+            (cfg.search.effective_min_relevance_universal() - 0.8).abs() < f64::EPSILON,
+            "accessor must track raised min_relevance"
+        );
+    }
+
+    #[test]
+    fn save_and_load_preserves_universal_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config.toml");
+
+        let mut config = sample_config();
+        config.search.min_relevance_universal = Some(0.75);
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.search.min_relevance_universal, Some(0.75));
+        assert_eq!(loaded, config);
     }
 }

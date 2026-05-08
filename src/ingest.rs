@@ -13,7 +13,10 @@ use std::path::PathBuf;
 
 use walkdir::WalkDir;
 
-use crate::chunking::{Chunk, chunk_as_document, chunk_by_heading, extract_title};
+use crate::chunking::{
+    Chunk, MalformedPredicateEntry, chunk_as_document_with_malformed_predicates,
+    chunk_by_heading_with_malformed_predicates, extract_title,
+};
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
 use crate::git;
@@ -134,6 +137,17 @@ pub struct IngestResult {
     /// form does not (e.g. `Universal`, `UNIVERSAL`). Each entry is
     /// `<source_file>: <tag>`. Drives the near-miss spelling advisory.
     pub near_miss_universal_tags: Vec<String>,
+    /// Per-file `applies_when` malformed-predicate advisories collected
+    /// from the U2 frontmatter parser. Each entry names the source file,
+    /// the offending key (e.g. `appliess_when`, `applies_when.tools`),
+    /// and a short human-readable reason. The pattern is ingested as if
+    /// no predicate were set (R9 skip-with-warning); the entry exists so
+    /// CLI consumers can introspect the run after the fact and so the
+    /// MCP tools can surface the count via `lore_status` in future work.
+    /// The user-facing warning channel is `eprintln!` from inside
+    /// `index_single_file` — single source so CLI and MCP write paths
+    /// see the warning regardless of authoring surface.
+    pub malformed_applies_when: Vec<MalformedPredicateEntry>,
 }
 
 impl IngestResult {
@@ -537,6 +551,7 @@ fn process_change(
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
+                    fold_malformed_applies_when(result, &indexed.malformed_applies_when);
                     on_progress(&format!("  {path} → {} chunks", indexed.chunks_indexed));
                 }
                 Err(e) => {
@@ -575,6 +590,7 @@ fn process_change(
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
+                    fold_malformed_applies_when(result, &indexed.malformed_applies_when);
                     on_progress(&format!(
                         "  {from} → {to} ({} chunks)",
                         indexed.chunks_indexed
@@ -697,6 +713,7 @@ pub fn full_ingest(
                     &indexed.rel_path,
                     &indexed.universal_metadata,
                 );
+                fold_malformed_applies_when(&mut result, &indexed.malformed_applies_when);
                 result.files_processed += 1;
                 on_progress(&format!(
                     "  {} → {} chunks",
@@ -856,6 +873,7 @@ pub fn ingest_single_file(
                 ));
             }
             fold_universal_metadata(&mut result, &indexed.rel_path, &indexed.universal_metadata);
+            fold_malformed_applies_when(&mut result, &indexed.malformed_applies_when);
             on_progress(&format!("  {rel_path} → {} chunks", indexed.chunks_indexed));
         }
         Err(e) => {
@@ -1216,6 +1234,21 @@ fn fold_universal_metadata(
     }
 }
 
+/// Fold per-file `applies_when` malformed-predicate advisories into the
+/// running `IngestResult`. Used by every ingest path (full / delta /
+/// single-file) so the run-summary surface and any future `lore_status`
+/// integration sees the same data shape regardless of which entry point
+/// processed the file. The user-facing warning is emitted once on stderr
+/// from inside [`index_single_file`]; this fold path captures the entries
+/// for introspective callers without duplicating the message.
+fn fold_malformed_applies_when(result: &mut IngestResult, entries: &[MalformedPredicateEntry]) {
+    for entry in entries {
+        if !result.malformed_applies_when.contains(entry) {
+            result.malformed_applies_when.push(entry.clone());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1228,6 +1261,13 @@ struct IndexedFile {
     embedding_failures: usize,
     rel_path: String,
     universal_metadata: UniversalMetadata,
+    /// `applies_when` advisories from the U2 frontmatter parser, with
+    /// `file_path` populated to the relative path. Already-emitted to
+    /// stderr by [`index_single_file`] before return; the calling ingest
+    /// path folds the entries into [`IngestResult::malformed_applies_when`]
+    /// so introspective callers (CLI exit summary, future `lore_status`
+    /// surface) can report them without re-parsing the file.
+    malformed_applies_when: Vec<MalformedPredicateEntry>,
 }
 
 /// Index (or re-index) a single file: delete old chunks, chunk, embed, insert.
@@ -1248,7 +1288,38 @@ fn index_single_file(
         .to_string_lossy()
         .to_string();
 
-    let chunks = dispatch_chunking(strategy, &content, &rel_path);
+    let (chunks, malformed_applies_when) = dispatch_chunking(strategy, &content, &rel_path);
+
+    // Surface malformed-predicate advisories on stderr from a single
+    // channel so CLI ingest (whose `on_progress` writes to stdout) and
+    // MCP write paths (which return `WriteResult` with no warnings field)
+    // both see the warning regardless of authoring surface. R9
+    // skip-with-warning: the pattern still ingests with
+    // `applies_when_json = NULL` because U2's parser already returned
+    // `None` for the predicate.
+    for entry in &malformed_applies_when {
+        eprintln!(
+            "Warning: pattern {}: malformed applies_when ({}): {}",
+            entry.file_path, entry.key, entry.reason
+        );
+    }
+
+    // Non-universal-pattern guard: an `applies_when` predicate on a
+    // pattern without the `universal` tag is dormant in Track 1 (the
+    // hook-side evaluator runs only for universal-tagged chunks per R8).
+    // Without this advisory the silent fail-open mode would give pattern
+    // authors no signal that their predicate does nothing. Emitted once
+    // per source file because the predicate is whole-file.
+    if let Some(first) = chunks.first()
+        && first.applies_when_json.is_some()
+        && !first.is_universal
+    {
+        eprintln!(
+            "Warning: pattern {rel_path} has applies_when but is not \
+             universal-tagged; predicate is dormant in Track 1 \
+             (see Track 2-B)."
+        );
+    }
 
     // Enforce the per-file universal body-size hard cap before touching
     // the database so a rejection leaves the existing index untouched.
@@ -1326,6 +1397,7 @@ fn index_single_file(
         embedding_failures,
         rel_path,
         universal_metadata,
+        malformed_applies_when,
     })
 }
 
@@ -1370,11 +1442,20 @@ fn validate_slug(filename: &str) -> anyhow::Result<()> {
 }
 
 /// Dispatch to the appropriate chunking function based on `strategy`.
-fn dispatch_chunking(strategy: &str, content: &str, rel_path: &str) -> Vec<Chunk> {
+///
+/// Returns the produced chunks alongside any
+/// [`MalformedPredicateEntry`] advisories raised by the U2 frontmatter
+/// parser so [`index_single_file`] can surface them to CLI and MCP write
+/// paths via a single warning channel.
+fn dispatch_chunking(
+    strategy: &str,
+    content: &str,
+    rel_path: &str,
+) -> (Vec<Chunk>, Vec<MalformedPredicateEntry>) {
     if strategy == "heading" {
-        chunk_by_heading(content, rel_path)
+        chunk_by_heading_with_malformed_predicates(content, rel_path)
     } else {
-        chunk_as_document(content, rel_path)
+        chunk_as_document_with_malformed_predicates(content, rel_path)
     }
 }
 
@@ -1467,6 +1548,7 @@ mod tests {
             source_file: "errors.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         assert_eq!(
             embed_text(&chunk),
@@ -1484,6 +1566,7 @@ mod tests {
             source_file: "test.md".into(),
             heading_path: String::new(),
             is_universal: false,
+            applies_when_json: None,
         };
         assert_eq!(embed_text(&chunk), "Title\n\nBody");
     }
@@ -3263,5 +3346,342 @@ mod tests {
 
         let stored = db.get_metadata(META_LOREIGNORE_HASH).unwrap();
         assert_eq!(stored, Some(String::new()));
+    }
+
+    // -- U7: applies_when persistence + malformed advisories ----------------
+    //
+    // The U2 frontmatter parser populates `Chunk::applies_when_json` for
+    // every chunk produced from a file with a valid `applies_when` block;
+    // U7 plumbs the column through `index_single_file` so both chunk and
+    // pattern rows persist it. Test scenarios from the plan: happy paths
+    // (with/without predicate), error path (malformed → NULL + advisory),
+    // non-universal predicate guard, multi-section whole-file invariant,
+    // and delta-ingest update.
+
+    fn write_pattern(dir: &Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content).unwrap();
+    }
+
+    #[test]
+    fn ingest_persists_applies_when_json_on_chunk_and_pattern_rows() {
+        // Happy path: a universal pattern with a valid `applies_when` block
+        // populates `applies_when_json` on every chunk and on the
+        // `patterns` row (whole-file mirror via `pattern_row_from`).
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        let body = "---\n\
+                    tags: [universal, workflow]\n\
+                    applies_when:\n  \
+                    tools: [Bash]\n  \
+                    bash_command_starts_with: [git, gh]\n\
+                    ---\n\n\
+                    # Workflow\n\n\
+                    Workflow body that is long enough for chunking.\n";
+        write_pattern(dir, "workflow.md", body);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.malformed_applies_when.is_empty());
+
+        // Direct DB access: every chunk row carries the JSON.
+        let chunk_predicates = db
+            .chunk_applies_when_json_for_source("workflow.md")
+            .unwrap();
+        assert!(!chunk_predicates.is_empty(), "expected chunks");
+        for predicate in &chunk_predicates {
+            let json = predicate.as_ref().expect("Some JSON");
+            assert!(
+                json.contains(r#""tools":["Bash"]"#),
+                "chunk JSON should serialise tools, got: {json}"
+            );
+            assert!(
+                json.contains(r#""bash_command_starts_with":["git","gh"]"#),
+                "chunk JSON should serialise bash prefix list, got: {json}"
+            );
+        }
+
+        // Pattern row also carries the JSON (mirrored via `pattern_row_from`).
+        let pattern_predicate = db
+            .pattern_applies_when_json_for_source("workflow.md")
+            .unwrap();
+        let pattern_json = pattern_predicate
+            .expect("patterns row exists")
+            .expect("predicate JSON populated on pattern row");
+        assert_eq!(
+            &pattern_json,
+            chunk_predicates[0].as_ref().unwrap(),
+            "pattern row's applies_when_json must match chunk row's verbatim",
+        );
+    }
+
+    #[test]
+    fn ingest_leaves_applies_when_json_null_when_block_absent() {
+        // Happy path: a pattern without an `applies_when` block ingests
+        // with `applies_when_json = NULL` on both chunk and pattern rows.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_pattern(
+            dir,
+            "plain.md",
+            "---\ntags: [conventions]\n---\n\n# Plain\n\nPlain body long enough.\n",
+        );
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let chunk_predicates = db.chunk_applies_when_json_for_source("plain.md").unwrap();
+        assert!(!chunk_predicates.is_empty());
+        for predicate in chunk_predicates {
+            assert!(predicate.is_none(), "expected NULL applies_when_json");
+        }
+
+        let pattern_predicate = db.pattern_applies_when_json_for_source("plain.md").unwrap();
+        assert_eq!(pattern_predicate, Some(None));
+    }
+
+    #[test]
+    fn ingest_records_malformed_applies_when_advisory_with_null_column() {
+        // Error path (AE5): a typo'd top-level key (`appliess_when`) leaves
+        // the column NULL on both rows AND surfaces a
+        // `MalformedPredicateEntry` in `IngestResult.malformed_applies_when`
+        // so introspective callers can report the warning even though the
+        // user-facing channel is stderr. Pattern fires as if no predicate
+        // were set (R9 skip-with-warning).
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let body = "---\n\
+                    tags: [universal]\n\
+                    appliess_when:\n  \
+                    tools: [Bash]\n\
+                    ---\n\n\
+                    # Typo\n\n\
+                    Typo body that is long enough for a chunk.\n";
+        write_pattern(dir, "typo.md", body);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        // Both rows have NULL — pattern fires unrestricted.
+        let chunk_predicates = db.chunk_applies_when_json_for_source("typo.md").unwrap();
+        assert!(!chunk_predicates.is_empty());
+        for predicate in chunk_predicates {
+            assert!(predicate.is_none(), "typo'd predicate must leave NULL");
+        }
+        let pattern_predicate = db.pattern_applies_when_json_for_source("typo.md").unwrap();
+        assert_eq!(pattern_predicate, Some(None));
+
+        // The advisory IS captured in IngestResult so callers can introspect.
+        assert_eq!(
+            result.malformed_applies_when.len(),
+            1,
+            "expected exactly one malformed entry, got: {:?}",
+            result.malformed_applies_when
+        );
+        let entry = &result.malformed_applies_when[0];
+        assert_eq!(entry.file_path, "typo.md");
+        assert!(
+            entry.key.contains("appliess_when") || entry.key == "applies_when",
+            "advisory should mention the offending key, got: {}",
+            entry.key
+        );
+    }
+
+    #[test]
+    fn ingest_persists_applies_when_when_pattern_is_not_universal() {
+        // R8 invariant: the predicate parses on any pattern (the namespace
+        // is reserved for Track 2-B), so the column persists even when
+        // the pattern is not universal-tagged. The hook-side evaluator
+        // (U5) gates predicate evaluation on `is_universal`. U7's
+        // ingest-side guard surfaces a stderr advisory naming the file
+        // so authors get a signal that nothing happens at hook time.
+        // We verify the DB column persists; the stderr emission is best
+        // observed in the MCP audit tests since the unit-test stderr is
+        // captured by the harness.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let body = "---\n\
+                    tags: [conventions]\n\
+                    applies_when:\n  \
+                    tools: [Bash]\n\
+                    ---\n\n\
+                    # Dormant\n\n\
+                    Dormant body that is long enough for a chunk.\n";
+        write_pattern(dir, "dormant.md", body);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(
+            result.malformed_applies_when.is_empty(),
+            "non-universal predicate is not malformed; should not appear in malformed list",
+        );
+
+        // Column persists — the pattern is not universal-tagged but the
+        // namespace is reserved (R7) and parses on any pattern (R8).
+        let pattern_predicate = db
+            .pattern_applies_when_json_for_source("dormant.md")
+            .unwrap();
+        let json = pattern_predicate
+            .expect("patterns row exists")
+            .expect("non-universal predicate still persists in column");
+        assert!(
+            json.contains(r#""tools":["Bash"]"#),
+            "non-universal predicate JSON must round-trip, got: {json}",
+        );
+    }
+
+    #[test]
+    fn ingest_propagates_applies_when_to_every_chunk_in_multi_section_pattern() {
+        // Whole-file invariant: every chunk of a multi-section pattern
+        // shares the same `applies_when_json`. Pinned per the
+        // composition-cascades learning — sibling expansion via
+        // `chunks_by_sources` returns all chunks from a matched source,
+        // so they must all carry the predicate consistently or
+        // suppression would behave non-uniformly.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let body = "---\n\
+                    tags: [universal]\n\
+                    applies_when:\n  \
+                    bash_command_starts_with: [git]\n\
+                    ---\n\n\
+                    # Top\n\n\
+                    Intro body that is long enough for chunking.\n\n\
+                    ## Section A\n\n\
+                    Section A body that is long enough for chunking.\n\n\
+                    ## Section B\n\n\
+                    Section B body that is long enough for chunking.\n";
+        write_pattern(dir, "multi.md", body);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        let predicates = db.chunk_applies_when_json_for_source("multi.md").unwrap();
+        assert!(
+            predicates.len() >= 2,
+            "expected at least two chunks, got {}",
+            predicates.len(),
+        );
+        let first = predicates[0]
+            .as_ref()
+            .expect("first chunk must carry predicate JSON")
+            .clone();
+        for (i, predicate) in predicates.iter().enumerate() {
+            assert_eq!(
+                predicate.as_ref(),
+                Some(&first),
+                "chunk {i} must share the same applies_when_json as the first chunk",
+            );
+        }
+    }
+
+    #[test]
+    fn delta_ingest_updates_applies_when_json_when_predicate_added() {
+        // Integration: a pattern initially has no predicate; a later
+        // commit adds `applies_when` to its frontmatter. Delta ingest
+        // unconditionally rewrites the chunks of changed files, so the
+        // updated predicate must show up on both chunk and pattern rows.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+
+        let initial_body = "---\ntags: [universal]\n---\n\n# WF\n\nWF body that is long enough.\n";
+        write_pattern(dir, "wf.md", initial_body);
+        git_commit_all(dir, "initial");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Before adding the predicate.
+        let before = db.pattern_applies_when_json_for_source("wf.md").unwrap();
+        assert_eq!(before, Some(None));
+
+        // Now amend the frontmatter to include `applies_when` and re-commit.
+        let updated_body = "---\n\
+                            tags: [universal]\n\
+                            applies_when:\n  \
+                            bash_command_starts_with: [git]\n\
+                            ---\n\n\
+                            # WF\n\n\
+                            WF body that is long enough.\n";
+        write_pattern(dir, "wf.md", updated_body);
+        git_commit_all(dir, "add applies_when");
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let after_pattern = db.pattern_applies_when_json_for_source("wf.md").unwrap();
+        let after_json = after_pattern
+            .expect("patterns row exists after delta")
+            .expect("delta-ingested row carries predicate");
+        assert!(
+            after_json.contains(r#""bash_command_starts_with":["git"]"#),
+            "delta-ingested predicate JSON missing prefix list, got: {after_json}",
+        );
+        let after_chunks = db.chunk_applies_when_json_for_source("wf.md").unwrap();
+        for predicate in after_chunks {
+            assert_eq!(
+                predicate.as_deref(),
+                Some(after_json.as_str()),
+                "every chunk row must carry the new predicate after delta",
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_single_file_records_malformed_applies_when_in_result() {
+        // Pin that the single-file CLI entry point also surfaces the
+        // advisory in its `IngestResult.malformed_applies_when`. Same
+        // contract as full ingest, exercised through the
+        // `ingest_single_file` wrapper used by `lore ingest --file`.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let body = "---\n\
+                    tags: [universal]\n\
+                    applies_when:\n  \
+                    tools: Bash\n\
+                    ---\n\n\
+                    # Scalar\n\n\
+                    Scalar body that is long enough for a chunk.\n";
+        write_pattern(dir, "scalar.md", body);
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let result = ingest_single_file(
+            &db,
+            &embedder,
+            dir,
+            &dir.join("scalar.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(
+            !result.malformed_applies_when.is_empty(),
+            "scalar-where-list should produce a malformed advisory entry",
+        );
+        assert_eq!(result.malformed_applies_when[0].file_path, "scalar.md");
+
+        // The chunk row's applies_when_json must NOT carry the scalar form;
+        // depending on parser behaviour the entry may still parse the known
+        // keys partially. The contract here is that malformed entries are
+        // reported AND ingest does not crash.
+        let chunks = db.chunk_applies_when_json_for_source("scalar.md").unwrap();
+        assert!(!chunks.is_empty(), "scalar.md should still ingest");
     }
 }

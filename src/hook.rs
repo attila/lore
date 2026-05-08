@@ -15,22 +15,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::chunking::AppliesWhen;
 use crate::config::Config;
 use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::Embedder;
+use crate::engine::{self, CallContext};
 use crate::lore_debug;
 
-// ---------------------------------------------------------------------------
-// Stop words
-// ---------------------------------------------------------------------------
-
-const STOP_WORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "into", "that", "this", "then", "when", "will", "has",
-    "have", "was", "are", "not", "but", "can", "all", "its", "our", "use", "new", "let", "set",
-    "get", "add", "run", "see", "how", "may", "per", "via", "yet", "also", "just", "some", "been",
-    "were", "what", "they", "each", "which", "their", "there", "about", "would", "could", "should",
-    "these", "those", "other", "than", "them", "your", "does", "here",
-];
+/// Maximum bytes of a Bash command echoed in `predicate suppress:` debug
+/// lines. Predicate-suppression logs name the offending pattern source plus
+/// the first ~60 bytes of the command so operators can correlate without
+/// flooding the terminal with long pipelines.
+const PREDICATE_LOG_CMD_HEAD_BYTES: usize = 60;
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -148,25 +144,58 @@ fn handle_session_start(
     }))
 }
 
-/// Handle `PreToolUse`: extract query, search, dedup-filter, format imperatives.
+/// Handle `PreToolUse`: extract query, search, predicate-filter, dedup-filter,
+/// format imperatives.
+///
+/// Ordering matters and is load-bearing for invariants tested elsewhere:
+///
+/// 1. **`skip_agent` runs FIRST** — Explore / Plan subagents short-circuit
+///    before the eager transcript-tail read in `to_call_context`. Preserves
+///    the existing zero-I/O guarantee for read-only subagent calls.
+/// 2. Build the [`CallContext`] once via [`HookInput::to_call_context`]
+///    (eager transcript-tail read happens here for non-skip paths).
+/// 3. Engine [`engine::extract_query`] for the FTS query string.
+/// 4. [`search_with_threshold`] for seeds. (U6 will branch on
+///    `min_relevance_universal` for universal results.)
+/// 5. [`expand_to_siblings`] to pull every chunk of each matched source.
+/// 6. **Predicate filter** (Track 1, R8): for each universal chunk with a
+///    non-`None` `applies_when_json`, deserialise to [`AppliesWhen`] and
+///    call [`engine::evaluate_applies_when`]. Suppressed chunks are dropped
+///    from the local `Vec<SearchResult>` BEFORE the dedup call, so the
+///    dedup file never records their ids — neither read-side nor write-side
+///    (per the dedup-bypass-on-suppression invariant; pinned by the
+///    `predicate_filter_byte_for_byte_dedup_file_unchanged_on_suppression`
+///    integration test).
+/// 7. [`dedup_filter_and_record`] on the surviving chunks.
+/// 8. [`format_imperative`] + emit `additionalContext`.
 fn handle_pre_tool_use(
     input: &HookInput,
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
+    // 1. skip_agent FIRST — before the eager transcript-tail read so
+    //    Explore/Plan subagents never trigger filesystem I/O.
     if skip_agent(input) {
         lore_debug!("skipping subagent");
         return Ok(None);
     }
 
-    let Some(query) = extract_query(input) else {
+    // 2. Build the CallContext once. The eager transcript-tail read with
+    //    `$HOME` validation happens inside `to_call_context` — adapter-only
+    //    filesystem responsibility (engine remains disk-I/O-free, see
+    //    `tests/invariants.rs`).
+    let cc = input.to_call_context();
+
+    // 3. Engine query extraction.
+    let Some(query) = engine::extract_query(&cc) else {
         lore_debug!("no query extracted from tool input");
         return Ok(None);
     };
 
     lore_debug!("extracted query: {query}");
 
+    // 4. Hybrid / FTS search with the configured relevance floor.
     let seeds = search_with_threshold(db, embedder, config, &query)?;
 
     if seeds.is_empty() {
@@ -176,10 +205,10 @@ fn handle_pre_tool_use(
 
     let seed_universal = seeds.iter().filter(|r| r.is_universal).count();
 
-    // Sibling expansion is a single DB call — `is_universal` is a file-level
-    // tag stored on every chunk row, so expanding the combined seed list
-    // still yields universal-only siblings for universal seeds and
-    // non-universal siblings for non-universal seeds.
+    // 5. Sibling expansion — single DB call. `is_universal` and
+    //    `applies_when_json` are file-level fields stored on every chunk
+    //    row, so expanding propagates predicate state without a join
+    //    (whole-file semantics).
     let expanded = expand_to_siblings(db, &seeds);
     lore_debug!(
         "expand: {} seeds -> {} after sibling expansion ({} universal seeds)",
@@ -188,18 +217,34 @@ fn handle_pre_tool_use(
         seed_universal,
     );
 
-    // Route the full set through dedup. `dedup_filter_and_record` bypasses
-    // the `seen.contains` check for universal chunks (read-side filter) and
-    // still appends every surfaced chunk to the dedup file (write side).
-    // The dedup file therefore remains a faithful "what was injected this
-    // session" log — defensive consistency per the session-dedup-lifecycle
-    // learning.
+    // 6. Predicate filter (Track 1, R8). Run ONLY for universal chunks
+    //    with a `Some` `applies_when_json`. Non-universal chunks and
+    //    universals with no predicate pass through unchanged. Dropped
+    //    chunks are removed from `Vec<SearchResult>` BEFORE dedup sees the
+    //    list — the dedup file therefore never records a suppressed id
+    //    (read-side or write-side). A future predicate-passing call can
+    //    still inject the same chunk; suppression is per-call, not
+    //    per-session.
+    let after_predicate = apply_predicate_filter(expanded, &cc);
+
+    if after_predicate.is_empty() {
+        lore_debug!("nothing to inject after predicate filter");
+        return Ok(None);
+    }
+
+    // 7. Dedup. `dedup_filter_and_record` bypasses the `seen.contains`
+    //    check for universal chunks (read-side filter) and appends every
+    //    surfaced chunk to the dedup file (write side). The dedup file
+    //    therefore remains a faithful "what was injected this session"
+    //    log — defensive consistency per the session-dedup-lifecycle
+    //    learning. Suppressed chunks were removed in step 6, so they are
+    //    invisible to this stage.
     let dedup_path = session_dedup_path(input);
     let combined = if let Some(ref path) = dedup_path
         && path.exists()
     {
-        let pre_count = expanded.len();
-        match dedup_filter_and_record(path, &expanded) {
+        let pre_count = after_predicate.len();
+        match dedup_filter_and_record(path, &after_predicate) {
             Ok(filtered) => {
                 let kept_universal = filtered.iter().filter(|r| r.is_universal).count();
                 lore_debug!(
@@ -214,12 +259,12 @@ fn handle_pre_tool_use(
             Err(e) => {
                 eprintln!("lore hook: dedup filter error: {e}");
                 lore_debug!("dedup filter error (continuing without dedup): {e}");
-                expanded
+                after_predicate
             }
         }
     } else {
         lore_debug!("dedup inactive (no session file)");
-        expanded
+        after_predicate
     };
 
     if combined.is_empty() {
@@ -238,6 +283,7 @@ fn handle_pre_tool_use(
         sources.len()
     );
 
+    // 8. Format and emit.
     let context = format_imperative(&combined);
 
     Ok(Some(HookOutput::HookSpecific {
@@ -246,6 +292,90 @@ fn handle_pre_tool_use(
             additional_context: context,
         },
     }))
+}
+
+/// Apply the universal-pattern predicate filter to a list of expanded chunks.
+///
+/// For each chunk where `is_universal == true` AND `applies_when_json` is
+/// `Some`, deserialise to [`AppliesWhen`] and call
+/// [`engine::evaluate_applies_when`]. Suppressed chunks are dropped from the
+/// returned `Vec`. Universal chunks without `applies_when_json` (or whose
+/// JSON fails to deserialise — defensive R11 fallback) pass through
+/// unchanged. Non-universal chunks are NOT subject to the predicate (Track 1
+/// scope per R8).
+///
+/// Emits two `LORE_DEBUG`-gated trace shapes:
+///
+/// * Per-suppression: `predicate suppress: <pattern> tool=<tool>
+///   cmd_head="<cmd>"` — pattern source and command head are passed through
+///   [`sanitize_for_log`]; command head is byte-truncated at
+///   [`PREDICATE_LOG_CMD_HEAD_BYTES`] via [`engine::truncate_str`].
+/// * Aggregate: `predicate: N before -> M after (K suppressed)` once at the
+///   end.
+fn apply_predicate_filter(chunks: Vec<SearchResult>, cc: &CallContext) -> Vec<SearchResult> {
+    let before = chunks.len();
+    let mut suppressed: usize = 0;
+
+    let kept: Vec<SearchResult> = chunks
+        .into_iter()
+        .filter(|r| {
+            // Non-universal chunks bypass the predicate entirely (R8).
+            if !r.is_universal {
+                return true;
+            }
+            // Universal chunks with no predicate fire as today (R11).
+            let Some(json) = r.applies_when_json.as_deref() else {
+                return true;
+            };
+            // Defensive: a runtime parse failure should be impossible after
+            // U2's parser produces the JSON, but if it ever happens we
+            // treat the chunk as if no predicate were set (R11 fallback)
+            // rather than silently suppressing it.
+            let aw: AppliesWhen = match serde_json::from_str(json) {
+                Ok(aw) => aw,
+                Err(e) => {
+                    lore_debug!(
+                        "predicate parse error: {} ({}); firing unrestricted",
+                        sanitize_for_log(&r.source_file),
+                        sanitize_for_log(&e.to_string()),
+                    );
+                    return true;
+                }
+            };
+            if engine::evaluate_applies_when(&aw, cc) {
+                return true;
+            }
+            // Suppressed — emit per-suppression debug line and drop.
+            // Log only the first whitespace-delimited token so secrets in
+            // command args (e.g. `gh auth login --token XXX`) do not leak
+            // through `LORE_DEBUG=1`. Operators still see the command class
+            // (e.g. `gh`, `sudo`); the rest stays out of stderr.
+            suppressed += 1;
+            let cmd_head = cc
+                .command
+                .as_deref()
+                .and_then(|c| c.split_whitespace().next())
+                .map_or("", |first| {
+                    engine::truncate_str(first, PREDICATE_LOG_CMD_HEAD_BYTES)
+                });
+            lore_debug!(
+                "predicate suppress: {} tool={} cmd_head=\"{}\"",
+                sanitize_for_log(&r.source_file),
+                cc.tool_name.as_deref().unwrap_or(""),
+                sanitize_for_log(cmd_head),
+            );
+            false
+        })
+        .collect();
+
+    lore_debug!(
+        "predicate: {} before -> {} after ({} suppressed)",
+        before,
+        kept.len(),
+        suppressed,
+    );
+
+    kept
 }
 
 /// Expand a result slice to include all sibling chunks from the matched
@@ -338,8 +468,8 @@ fn handle_post_tool_use(
     }
 
     // Use stderr as a search query (clean it into terms).
-    let terms = split_into_words(stderr);
-    let cleaned = clean_terms(&terms);
+    let terms = engine::split_into_words(stderr);
+    let cleaned = engine::clean_terms(&terms);
     if cleaned.is_empty() {
         return Ok(None);
     }
@@ -366,6 +496,30 @@ fn handle_post_tool_use(
     }))
 }
 
+/// Apply the per-class relevance floor: universal chunks are filtered against
+/// `universal_floor`, non-universal chunks against `min_relevance`. The two
+/// floors are independent, so operators can raise the universal bar without
+/// affecting ranked injections (R6).
+///
+/// Pure on `Vec<SearchResult>` so unit tests can exercise the branching logic
+/// without standing up a real `KnowledgeDB` and `Embedder`.
+fn apply_relevance_thresholds(
+    results: Vec<SearchResult>,
+    min_relevance: f64,
+    universal_floor: f64,
+) -> Vec<SearchResult> {
+    results
+        .into_iter()
+        .filter(|r| {
+            if r.is_universal {
+                r.score >= universal_floor
+            } else {
+                r.score >= min_relevance
+            }
+        })
+        .collect()
+}
+
 /// Shared search pipeline: embed, hybrid search, threshold filter,
 /// partition-and-cap, then flatten into a single `Vec<SearchResult>` with
 /// universal chunks ordered first, followed by ranked non-universal chunks
@@ -386,10 +540,12 @@ pub fn search_with_threshold(
     query: &str,
 ) -> anyhow::Result<Vec<SearchResult>> {
     lore_debug!(
-        "search: query={query:?} hybrid={} top_k={} min_relevance={:.4}",
+        "search: query={query:?} hybrid={} top_k={} min_relevance={:.4} \
+         min_relevance_universal={:.4}",
         config.search.hybrid,
         config.search.top_k,
         config.search.min_relevance,
+        config.search.effective_min_relevance_universal(),
     );
 
     let mut embed_failed = false;
@@ -418,17 +574,26 @@ pub fn search_with_threshold(
     let results = db.search_hybrid(query, query_embedding.as_deref(), overfetch_limit)?;
     lore_debug!("search: {} raw results", results.len());
 
-    let apply_threshold =
-        config.search.hybrid && !embed_failed && config.search.min_relevance > 0.0;
+    // Threshold is only meaningful for hybrid search with a successful
+    // embedding; pure FTS or fallback paths bypass filtering entirely. The
+    // gate-on-`min_relevance > 0.0` predicate continues to govern whether ANY
+    // floor is applied — when both knobs would be zero, we skip the work and
+    // log raw scores. Universal results consult `min_relevance_universal`
+    // (with inherit-from-`min_relevance` semantics); non-universal results
+    // continue to use `min_relevance`.
+    let universal_floor = config.search.effective_min_relevance_universal();
+    let apply_threshold = config.search.hybrid
+        && !embed_failed
+        && (config.search.min_relevance > 0.0 || universal_floor > 0.0);
     let results: Vec<_> = if apply_threshold {
         let before = results.len();
-        let filtered: Vec<_> = results
-            .into_iter()
-            .filter(|r| r.score >= config.search.min_relevance)
-            .collect();
+        let filtered =
+            apply_relevance_thresholds(results, config.search.min_relevance, universal_floor);
         lore_debug!(
-            "search: threshold={:.4} filtered {} -> {}",
+            "search: threshold min_relevance={:.4} universal_floor={:.4} \
+             filtered {} -> {}",
             config.search.min_relevance,
+            universal_floor,
             before,
             filtered.len(),
         );
@@ -715,62 +880,55 @@ fn dedup_filter_and_record(
 // Query extraction
 // ---------------------------------------------------------------------------
 
-/// Build an FTS5 query from tool input signals.
+/// Build an FTS5 query from a Claude Code `HookInput`.
 ///
-/// Returns `None` when no meaningful terms can be extracted.
+/// Thin shim around [`crate::engine::extract_query`]: builds a
+/// [`CallContext`] via [`HookInput::to_call_context`] and delegates to the
+/// engine. The engine performs no I/O; the adapter owns the filesystem
+/// access (transcript-tail read happens inside `to_call_context`).
+///
+/// Retained as a `pub fn` so the `lore extract-queries` CLI subcommand
+/// (`src/main.rs`'s `cmd_extract_queries`) can keep its existing
+/// `HookInput`-flavoured interface without learning about `CallContext`.
+/// `handle_pre_tool_use` no longer routes through this shim — it builds
+/// the `CallContext` once per call and passes it to both
+/// `engine::extract_query` and the predicate filter.
 pub fn extract_query(input: &HookInput) -> Option<String> {
-    let mut terms: Vec<String> = Vec::new();
-    let mut language: Option<String> = None;
+    let ctx = input.to_call_context();
+    engine::extract_query(&ctx)
+}
 
-    // 1. File path signals (Edit, Write, Read, etc.)
-    if let Some(file_path) = tool_input_str(input, "file_path") {
-        if let Some(lang) = language_from_extension(&file_path) {
-            language = Some(lang);
+impl HookInput {
+    /// Build a [`CallContext`] from this Claude Code hook event.
+    ///
+    /// Eagerly reads the transcript tail when `transcript_path` is set and
+    /// passes `validate_transcript_path`'s `$HOME`-rooted canonicalisation.
+    /// Failures (no path, validation rejection, missing file, IO error)
+    /// leave `transcript_tail = None` — silent fall-through preserves the
+    /// "best-effort" semantics of transcript-tail term harvesting.
+    ///
+    /// **Adapter-only filesystem boundary.** All disk I/O (transcript read,
+    /// `$HOME` validation) happens here, in the Claude Code adapter. The
+    /// engine module never reads the filesystem — see
+    /// `tests/invariants.rs::no_unsanctioned_runtime_disk_reads_in_hook_server_main`.
+    ///
+    /// Called once per `PreToolUse` for non-skip-agent paths (the
+    /// `skip_agent` short-circuit in `handle_pre_tool_use` runs first so
+    /// Explore / Plan subagents bypass this read entirely).
+    pub fn to_call_context(&self) -> CallContext {
+        let transcript_tail = self
+            .transcript_path
+            .as_deref()
+            .and_then(|p| validate_transcript_path(Path::new(p)))
+            .and_then(|canonical| last_user_message(&canonical));
+
+        CallContext {
+            tool_name: self.tool_name.clone(),
+            command: tool_input_str(self, "command"),
+            file_path: tool_input_str(self, "file_path"),
+            description: tool_input_str(self, "description"),
+            transcript_tail,
         }
-        terms.extend(filename_terms(&file_path));
-    }
-
-    // 2. Bash signals
-    if input.tool_name.as_deref() == Some("Bash") {
-        let text = tool_input_str(input, "description")
-            .or_else(|| tool_input_str(input, "command"))
-            .unwrap_or_default();
-
-        if language.is_none() {
-            language = language_from_bash(&text);
-        }
-
-        terms.extend(split_into_words(&text));
-    }
-
-    // 3. Transcript tail (last user message).
-    // Validate that the transcript path is under $HOME before reading.
-    // Use the canonical path returned from validation to prevent symlink
-    // TOCTOU between validation and file open.
-    if let Some(ref path) = input.transcript_path
-        && let Some(canonical) = validate_transcript_path(Path::new(path))
-        && let Some(msg) = last_user_message(&canonical)
-    {
-        let truncated = truncate_str(&msg, 200);
-        terms.extend(split_into_words(truncated));
-    }
-
-    // 4. Clean terms
-    let cleaned = clean_terms(&terms);
-
-    // 5. Assemble FTS5 query
-    match (language, cleaned.is_empty()) {
-        // Language anchor + enrichment terms: `lang AND (term1 OR term2 OR ...)`
-        (Some(lang), false) => {
-            let or_clause = cleaned.join(" OR ");
-            Some(format!("{lang} AND ({or_clause})"))
-        }
-        // Language anchor only (no enrichment survived cleaning): just the language
-        (Some(lang), true) => Some(lang),
-        // No language anchor, but enrichment terms: OR-only query
-        (None, false) => Some(cleaned.join(" OR ")),
-        // Nothing useful extracted
-        (None, true) => None,
     }
 }
 
@@ -788,85 +946,6 @@ fn tool_input_str(input: &HookInput, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(String::from)
-}
-
-/// Map file extension to a language keyword for FTS anchor.
-fn language_from_extension(path: &str) -> Option<String> {
-    let ext = Path::new(path).extension()?.to_str()?;
-    match ext.to_lowercase().as_str() {
-        "ts" | "tsx" => Some("typescript".to_string()),
-        "rs" => Some("rust".to_string()),
-        "js" | "jsx" => Some("javascript".to_string()),
-        "yml" | "yaml" => Some("yaml".to_string()),
-        "py" => Some("python".to_string()),
-        "go" => Some("golang".to_string()),
-        _ => None,
-    }
-}
-
-/// Infer language from a Bash command string.
-fn language_from_bash(command: &str) -> Option<String> {
-    let lower = command.to_lowercase();
-    if lower.contains("npm")
-        || lower.contains("npx")
-        || lower.contains("yarn")
-        || lower.contains("bun")
-    {
-        return Some("typescript".to_string());
-    }
-    if lower.contains("cargo") {
-        return Some("rust".to_string());
-    }
-    if lower.contains("pip") || lower.contains("python") {
-        return Some("python".to_string());
-    }
-    None
-}
-
-/// Extract terms from a filename: take the basename (without extension),
-/// split `camelCase` and `PascalCase`, lowercase everything.
-fn filename_terms(path: &str) -> Vec<String> {
-    let basename = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-
-    split_camel_case(basename)
-        .into_iter()
-        .flat_map(|w| split_into_words(&w))
-        .collect()
-}
-
-/// Split a `camelCase` or `PascalCase` string into individual words.
-fn split_camel_case(s: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
-    for ch in s.chars() {
-        if ch.is_uppercase() && !current.is_empty() {
-            words.push(current.clone());
-            current.clear();
-        }
-        if ch.is_alphanumeric() {
-            current.push(ch.to_lowercase().next().unwrap_or(ch));
-        } else if !current.is_empty() {
-            // Non-alphanumeric boundary (hyphens, underscores, dots, etc.)
-            words.push(current.clone());
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
-/// Split a string on whitespace and non-alphabetic boundaries, lowercase.
-fn split_into_words(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphabetic())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect()
 }
 
 /// Validate that a transcript path is under `$HOME`.
@@ -944,62 +1023,6 @@ fn last_user_message(path: &Path) -> Option<String> {
     None
 }
 
-/// Truncate a string to at most `max_bytes` bytes (on a valid UTF-8 char
-/// boundary).
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the largest byte offset that is both <= max_bytes and a valid
-    // char boundary.
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Clean terms: strip non-alpha, filter short, filter hex-like, filter stop
-/// words, deduplicate while preserving order.
-fn clean_terms(raw: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-
-    for term in raw {
-        // Strip non-alphabetic characters.
-        let cleaned: String = term.chars().filter(|c| c.is_alphabetic()).collect();
-        let lower = cleaned.to_lowercase();
-
-        // Filter terms shorter than 3 chars.
-        if lower.len() < 3 {
-            continue;
-        }
-
-        // Filter hex-like strings (6+ hex characters).
-        if is_hex_like(&lower) {
-            continue;
-        }
-
-        // Filter stop words.
-        if STOP_WORDS.contains(&lower.as_str()) {
-            continue;
-        }
-
-        // Deduplicate.
-        if seen.insert(lower.clone()) {
-            result.push(lower);
-        }
-    }
-
-    result
-}
-
-/// Returns `true` if the string looks like a hex fragment (>= 6 chars,
-/// all `[0-9a-f]`).
-fn is_hex_like(s: &str) -> bool {
-    s.len() >= 6 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 // ---------------------------------------------------------------------------
 // Imperative formatting
 // ---------------------------------------------------------------------------
@@ -1049,7 +1072,14 @@ pub fn format_imperative(results: &[SearchResult]) -> String {
 mod tests {
     use super::*;
 
-    // -- extract_query -------------------------------------------------------
+    // -- extract_query (shim coverage) ---------------------------------------
+    //
+    // The full engine-side coverage lives in
+    // `src/engine/query.rs::tests` (against `CallContext` directly). The
+    // tests below pin the `HookInput` → `CallContext` → engine shim end to
+    // end. The shim is retained for `cmd_extract_queries` (in `main.rs`),
+    // which still consumes `HookInput` JSON; engine coverage handles the
+    // rest.
 
     #[test]
     fn extract_query_rs_file_path() {
@@ -1166,6 +1196,395 @@ mod tests {
         assert!(extract_query(&input).is_none());
     }
 
+    // -- HookInput::to_call_context ------------------------------------------
+
+    #[test]
+    fn to_call_context_populates_all_fields_with_transcript_tail() {
+        // Write a transcript under $HOME so validate_transcript_path
+        // accepts it, then verify every CallContext field is populated.
+        let home = std::env::var("HOME").unwrap();
+        let dir = tempfile::tempdir_in(&home).unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"refactor the auth flow"}}
+"#,
+        )
+        .unwrap();
+
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: Some("sess".to_string()),
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({
+                "command": "git push",
+                "file_path": "src/lib.rs",
+                "description": "push to remote",
+            })),
+            agent_type: None,
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            tool_response: None,
+        };
+
+        let cc = input.to_call_context();
+        assert_eq!(cc.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(cc.command.as_deref(), Some("git push"));
+        assert_eq!(cc.file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(cc.description.as_deref(), Some("push to remote"));
+        assert_eq!(
+            cc.transcript_tail.as_deref(),
+            Some("refactor the auth flow"),
+            "eager transcript-tail read must populate the field",
+        );
+    }
+
+    #[test]
+    fn to_call_context_no_transcript_path_leaves_tail_none() {
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: None,
+            tool_name: Some("Edit".to_string()),
+            tool_input: Some(serde_json::json!({"file_path": "src/foo.rs"})),
+            agent_type: None,
+            transcript_path: None,
+            tool_response: None,
+        };
+
+        let cc = input.to_call_context();
+        assert!(
+            cc.transcript_tail.is_none(),
+            "no transcript_path → transcript_tail must be None",
+        );
+        assert_eq!(cc.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(cc.file_path.as_deref(), Some("src/foo.rs"));
+        assert!(cc.command.is_none());
+        assert!(cc.description.is_none());
+    }
+
+    #[test]
+    fn to_call_context_invalid_transcript_path_silently_falls_through() {
+        // Path that fails validate_transcript_path (does not exist) →
+        // transcript_tail stays None; no panic, no error surfaced.
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: None,
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": "ls"})),
+            agent_type: None,
+            transcript_path: Some("/nonexistent/path/transcript.jsonl".to_string()),
+            tool_response: None,
+        };
+
+        let cc = input.to_call_context();
+        assert!(
+            cc.transcript_tail.is_none(),
+            "invalid transcript path → transcript_tail must be None",
+        );
+        assert_eq!(cc.command.as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn skip_path_avoids_transcript_read_even_when_path_invalid() {
+        // Pin the skip_agent ordering invariant: when agent_type is
+        // Explore/Plan, handle_pre_tool_use returns Ok(None) without ever
+        // calling to_call_context. We verify by passing an invalid
+        // transcript path that would yield None on read but cannot panic
+        // in this skip path because the path is never even reached.
+        //
+        // We exercise the public surface: if `skip_agent` is true, the
+        // pre-tool-use returns None. Since we cannot construct a real
+        // KnowledgeDB / Embedder in a unit test cheaply, we assert the
+        // contract by verifying that `skip_agent` itself returns true on
+        // the input we'd otherwise pass. The integration test
+        // `hook_explore_agent_produces_no_output` covers the end-to-end
+        // skip path against a real binary.
+        let input = HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            session_id: None,
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": "ls"})),
+            agent_type: Some("Explore".to_string()),
+            // Even an obviously invalid path must not panic — the skip
+            // path means to_call_context is never called.
+            transcript_path: Some("/nonexistent/explore.jsonl".to_string()),
+            tool_response: None,
+        };
+        assert!(skip_agent(&input));
+    }
+
+    // -- apply_predicate_filter ----------------------------------------------
+
+    fn make_universal_chunk(
+        id: &str,
+        source: &str,
+        applies_when_json: Option<&str>,
+    ) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: "universal".to_string(),
+            source_file: source.to_string(),
+            heading_path: String::new(),
+            score: 1.0,
+            is_universal: true,
+            applies_when_json: applies_when_json.map(String::from),
+        }
+    }
+
+    fn make_non_universal_chunk(id: &str, source: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: String::new(),
+            source_file: source.to_string(),
+            heading_path: String::new(),
+            score: 1.0,
+            is_universal: false,
+            applies_when_json: None,
+        }
+    }
+
+    fn ctx_bash_predicate(command: &str) -> CallContext {
+        CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some(command.to_string()),
+            file_path: None,
+            description: None,
+            transcript_tail: None,
+        }
+    }
+
+    #[test]
+    fn predicate_filter_keeps_universal_without_applies_when() {
+        // R11: universal chunk with no applies_when fires unconditionally.
+        let chunks = vec![make_universal_chunk("u1", "git.md", None)];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "u1");
+    }
+
+    #[test]
+    fn predicate_filter_drops_universal_when_predicate_suppresses() {
+        // Universal chunk with applies_when.bash_command_starts_with: [git]
+        // and a Bash ls call → suppressed.
+        let aw_json = serde_json::to_string(&AppliesWhen {
+            tools: None,
+            bash_command_starts_with: Some(vec!["git".to_string()]),
+        })
+        .unwrap();
+        let chunks = vec![make_universal_chunk("u1", "git.md", Some(&aw_json))];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert!(kept.is_empty(), "predicate must suppress non-matching call");
+    }
+
+    #[test]
+    fn predicate_filter_keeps_universal_when_predicate_matches() {
+        let aw_json = serde_json::to_string(&AppliesWhen {
+            tools: None,
+            bash_command_starts_with: Some(vec!["git".to_string()]),
+        })
+        .unwrap();
+        let chunks = vec![make_universal_chunk("u1", "git.md", Some(&aw_json))];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("git push"));
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn predicate_filter_bypasses_non_universal_chunks() {
+        // R8: non-universal chunks are NOT subject to the predicate, even
+        // when their applies_when_json is somehow populated.
+        let aw_json = serde_json::to_string(&AppliesWhen {
+            tools: Some(vec!["NeverMatchesAnyTool".to_string()]),
+            bash_command_starts_with: None,
+        })
+        .unwrap();
+        let mut nu = make_non_universal_chunk("nu1", "rust.md");
+        nu.applies_when_json = Some(aw_json);
+        let kept = apply_predicate_filter(vec![nu], &ctx_bash_predicate("ls"));
+        assert_eq!(
+            kept.len(),
+            1,
+            "non-universal chunks must bypass the predicate filter (R8)",
+        );
+    }
+
+    #[test]
+    fn predicate_filter_mixed_universal_and_non_universal() {
+        // Mix: 1 non-universal kept, 1 universal-no-predicate kept,
+        // 1 universal-suppressed dropped, 1 universal-passing kept.
+        let aw_suppress = serde_json::to_string(&AppliesWhen {
+            tools: None,
+            bash_command_starts_with: Some(vec!["never".to_string()]),
+        })
+        .unwrap();
+        let aw_match = serde_json::to_string(&AppliesWhen {
+            tools: Some(vec!["Bash".to_string()]),
+            bash_command_starts_with: None,
+        })
+        .unwrap();
+
+        let chunks = vec![
+            make_non_universal_chunk("nu", "rust.md"),
+            make_universal_chunk("u-no-pred", "always.md", None),
+            make_universal_chunk("u-suppressed", "git.md", Some(&aw_suppress)),
+            make_universal_chunk("u-matched", "bash.md", Some(&aw_match)),
+        ];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"nu"));
+        assert!(ids.contains(&"u-no-pred"));
+        assert!(!ids.contains(&"u-suppressed"));
+        assert!(ids.contains(&"u-matched"));
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn predicate_filter_treats_malformed_json_as_unrestricted() {
+        // Defensive R11 fallback: if applies_when_json is somehow malformed
+        // at runtime, the chunk fires as if no predicate were set rather
+        // than being silently suppressed.
+        let chunks = vec![make_universal_chunk(
+            "u1",
+            "weird.md",
+            Some("not valid json {"),
+        )];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert_eq!(kept.len(), 1, "malformed JSON must fall through to fire");
+    }
+
+    #[test]
+    fn predicate_filter_empty_input_returns_empty() {
+        let kept = apply_predicate_filter(Vec::new(), &ctx_bash_predicate("ls"));
+        assert!(kept.is_empty());
+    }
+
+    /// T11: defensive R11 fallback — a `SearchResult` whose
+    /// `applies_when_json` is malformed at runtime must pass through the
+    /// filter unchanged (chunk fires as if no predicate were set). The
+    /// existing `predicate_filter_treats_malformed_json_as_unrestricted`
+    /// covers a syntactically-broken JSON token; this T11 variant pins the
+    /// branch with a different malformed shape (well-formed JSON of the
+    /// wrong type, e.g. a JSON array where an object is required) so that
+    /// any future tightening of the deserialiser still respects R11.
+    ///
+    /// Stderr capture for the parse-error debug line is not feasible at the
+    /// unit-test layer because `LORE_DEBUG`'s `IS_DEBUG` is a process-wide
+    /// `LazyLock` and we cannot toggle it inside a single test binary.
+    /// Subprocess coverage of the parse-error log line lives at
+    /// `tests/hook.rs::hook_pre_tool_use_predicate_parse_error_logs_and_falls_through`
+    /// where stderr is captured from a fresh process with `LORE_DEBUG=1`.
+    #[test]
+    fn predicate_filter_malformed_json_array_falls_through_to_fire() {
+        // Well-formed JSON of the wrong shape (array, not the expected
+        // object). serde rejects it; the R11 fallback must keep the chunk.
+        let chunks = vec![make_universal_chunk(
+            "u1",
+            "weird.md",
+            Some(r#"["bash_command_starts_with","tools"]"#),
+        )];
+        let kept = apply_predicate_filter(chunks, &ctx_bash_predicate("ls"));
+        assert_eq!(
+            kept.len(),
+            1,
+            "JSON array where AppliesWhen object expected must fall through to fire (R11)",
+        );
+    }
+
+    // -- apply_relevance_thresholds (U6) -------------------------------------
+
+    /// Build a `SearchResult` with the given score and universal flag for
+    /// per-class threshold testing. Title/body/tags are immaterial; only
+    /// `score` and `is_universal` drive the filter branch.
+    fn make_scored_result(id: &str, score: f64, is_universal: bool) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: if is_universal { "universal" } else { "" }.to_string(),
+            source_file: format!("{id}.md"),
+            heading_path: String::new(),
+            score,
+            is_universal,
+            applies_when_json: None,
+        }
+    }
+
+    #[test]
+    fn thresholds_default_universal_floor_keeps_score_above_min_relevance() {
+        // Default config: universal_floor == min_relevance. A 0.65-scored
+        // universal result is retained at the 0.6 default floor.
+        let results = vec![make_scored_result("u1", 0.65, true)];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.6);
+        assert_eq!(kept.len(), 1, "0.65 >= default 0.6 floor → keep");
+    }
+
+    #[test]
+    fn thresholds_raised_universal_floor_drops_universal_below_floor() {
+        // With min_relevance_universal = 0.7, a 0.65-scored universal
+        // result is dropped even though it is still above min_relevance.
+        let results = vec![make_scored_result("u1", 0.65, true)];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        assert!(
+            kept.is_empty(),
+            "raised universal floor must drop 0.65 universal result"
+        );
+    }
+
+    #[test]
+    fn thresholds_raised_universal_floor_keeps_non_universal_above_min_relevance() {
+        // The universal floor must NOT affect non-universal results.
+        // A 0.65-scored non-universal still fires when min_relevance = 0.6,
+        // regardless of how high the universal floor is set.
+        let results = vec![make_scored_result("nu1", 0.65, false)];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        assert_eq!(
+            kept.len(),
+            1,
+            "non-universal result must use min_relevance, not universal floor"
+        );
+    }
+
+    #[test]
+    fn thresholds_mixed_results_apply_per_class_floors() {
+        // Mixed batch: independent floors must filter per-class.
+        // min_relevance = 0.6, universal_floor = 0.7 →
+        //   * universal 0.65 dropped, universal 0.75 kept
+        //   * non-universal 0.55 dropped, non-universal 0.65 kept
+        let results = vec![
+            make_scored_result("u-low", 0.65, true),
+            make_scored_result("u-high", 0.75, true),
+            make_scored_result("nu-low", 0.55, false),
+            make_scored_result("nu-high", 0.65, false),
+        ];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains(&"u-low"), "0.65 universal below 0.7 floor");
+        assert!(ids.contains(&"u-high"), "0.75 universal above 0.7 floor");
+        assert!(
+            !ids.contains(&"nu-low"),
+            "0.55 non-universal below 0.6 floor"
+        );
+        assert!(
+            ids.contains(&"nu-high"),
+            "0.65 non-universal above 0.6 floor"
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn thresholds_score_at_floor_is_inclusive() {
+        // `>=` semantics: a score exactly at the floor is retained for both
+        // classes, matching the existing (pre-U6) min_relevance behaviour.
+        let results = vec![
+            make_scored_result("u-eq", 0.7, true),
+            make_scored_result("nu-eq", 0.6, false),
+        ];
+        let kept = apply_relevance_thresholds(results, 0.6, 0.7);
+        assert_eq!(kept.len(), 2, "scores at the floor are inclusive");
+    }
+
     // -- skip_agent ----------------------------------------------------------
 
     #[test]
@@ -1224,79 +1643,6 @@ mod tests {
         assert!(!skip_agent(&input));
     }
 
-    // -- split_camel_case ----------------------------------------------------
-
-    #[test]
-    fn split_camel_validate_email() {
-        let parts = split_camel_case("validateEmail");
-        assert_eq!(parts, vec!["validate", "email"]);
-    }
-
-    #[test]
-    fn split_camel_pascal_case() {
-        let parts = split_camel_case("UserProfile");
-        assert_eq!(parts, vec!["user", "profile"]);
-    }
-
-    #[test]
-    fn split_camel_snake_case() {
-        let parts = split_camel_case("error_handling");
-        assert_eq!(parts, vec!["error", "handling"]);
-    }
-
-    // -- is_hex_like ---------------------------------------------------------
-
-    #[test]
-    fn hex_like_true() {
-        assert!(is_hex_like("abcdef"));
-        assert!(is_hex_like("1a2b3c4d"));
-        assert!(is_hex_like("deadbeef"));
-    }
-
-    #[test]
-    fn hex_like_false() {
-        assert!(!is_hex_like("abcde")); // too short
-        assert!(!is_hex_like("abcxyz")); // non-hex chars
-        assert!(!is_hex_like("rust")); // not hex
-    }
-
-    // -- clean_terms ---------------------------------------------------------
-
-    #[test]
-    fn clean_removes_stop_words_and_short() {
-        let terms: Vec<String> = vec![
-            "the".into(),
-            "a".into(),
-            "rust".into(),
-            "error".into(),
-            "handling".into(),
-        ];
-        let cleaned = clean_terms(&terms);
-        assert!(!cleaned.contains(&"the".to_string()));
-        assert!(!cleaned.contains(&"a".to_string()));
-        assert!(cleaned.contains(&"rust".to_string()));
-        assert!(cleaned.contains(&"error".to_string()));
-    }
-
-    #[test]
-    fn clean_deduplicates() {
-        let terms: Vec<String> = vec!["error".into(), "error".into(), "handling".into()];
-        let cleaned = clean_terms(&terms);
-        assert_eq!(
-            cleaned.iter().filter(|t| *t == "error").count(),
-            1,
-            "should deduplicate"
-        );
-    }
-
-    #[test]
-    fn clean_filters_hex() {
-        let terms: Vec<String> = vec!["deadbeef".into(), "rust".into()];
-        let cleaned = clean_terms(&terms);
-        assert!(!cleaned.contains(&"deadbeef".to_string()));
-        assert!(cleaned.contains(&"rust".to_string()));
-    }
-
     // -- format_imperative ---------------------------------------------------
 
     #[test]
@@ -1310,6 +1656,7 @@ mod tests {
             heading_path: String::new(),
             score: 0.8,
             is_universal: false,
+            applies_when_json: None,
         }];
 
         let formatted = format_imperative(&results);
@@ -1330,6 +1677,7 @@ mod tests {
                 heading_path: String::new(),
                 score: 0.8,
                 is_universal: false,
+                applies_when_json: None,
             },
             SearchResult {
                 id: "c2".into(),
@@ -1340,6 +1688,7 @@ mod tests {
                 heading_path: String::new(),
                 score: 0.7,
                 is_universal: false,
+                applies_when_json: None,
             },
         ];
 
@@ -1352,60 +1701,6 @@ mod tests {
     fn format_imperative_empty_results() {
         let formatted = format_imperative(&[]);
         assert!(formatted.is_empty());
-    }
-
-    // -- language_from_extension ---------------------------------------------
-
-    #[test]
-    fn language_extension_rs() {
-        assert_eq!(
-            language_from_extension("src/main.rs"),
-            Some("rust".to_string())
-        );
-    }
-
-    #[test]
-    fn language_extension_tsx() {
-        assert_eq!(
-            language_from_extension("App.tsx"),
-            Some("typescript".to_string())
-        );
-    }
-
-    #[test]
-    fn language_extension_unknown() {
-        assert_eq!(language_from_extension("notes.txt"), None);
-    }
-
-    // -- language_from_bash --------------------------------------------------
-
-    #[test]
-    fn bash_npm_is_typescript() {
-        assert_eq!(
-            language_from_bash("npm install express"),
-            Some("typescript".to_string())
-        );
-    }
-
-    #[test]
-    fn bash_cargo_is_rust() {
-        assert_eq!(
-            language_from_bash("cargo build --release"),
-            Some("rust".to_string())
-        );
-    }
-
-    #[test]
-    fn bash_pip_is_python() {
-        assert_eq!(
-            language_from_bash("pip install requests"),
-            Some("python".to_string())
-        );
-    }
-
-    #[test]
-    fn bash_unknown_is_none() {
-        assert_eq!(language_from_bash("ls -la"), None);
     }
 
     // -- transcript_path ---------------------------------------------------
@@ -1706,6 +2001,7 @@ mod tests {
             heading_path: String::new(),
             score: 1.0,
             is_universal: false,
+            applies_when_json: None,
         }
     }
 

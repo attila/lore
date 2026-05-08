@@ -8,13 +8,57 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::hash::fnv1a;
+
+/// Parsed `applies_when` predicate from a pattern's frontmatter.
+///
+/// Both fields are optional; the predicate semantics are OR within each list
+/// and AND across keys (an unset key is "don't care"). An empty list parses
+/// to `Some(vec![])` and is documented to never match (a zero-element
+/// allowlist) — the evaluator (U3) enforces that contract; this parser
+/// merely preserves the empty list verbatim.
+///
+/// Stored on each chunk and pattern row as a JSON-serialised string in
+/// `applies_when_json`; `None` there means "no predicate, fire as today".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliesWhen {
+    /// Tool-class allowlist; matches when the current call's tool name is
+    /// in the list (case-sensitive against Claude Code tool names).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Bash-command-prefix allowlist; matches when the current call is
+    /// `Bash` AND the command (after walking past one `sudo` and one
+    /// `env KEY=VAL` wrapper, see U3) starts with one of the listed tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bash_command_starts_with: Option<Vec<String>>,
+}
+
+/// A per-file ingest advisory describing a malformed `applies_when` entry.
+///
+/// Emitted by [`parse_frontmatter_applies_when`] and surfaced at ingest by
+/// U7 as a `Warning:` line via `on_progress` (CLI) or `eprintln!` (MCP write
+/// tools). The pattern is ingested as if no predicate were set (R9
+/// skip-with-warning), so authors keep the always-on visibility while the
+/// signal points them at the typo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MalformedPredicateEntry {
+    /// Source file path the malformed predicate was found in.
+    pub file_path: String,
+    /// The offending key (e.g. `appliess_when`, `applies_when.tools`,
+    /// `applies_when.foo`). Stable shape so log lines and tests can match.
+    pub key: String,
+    /// Short human-readable reason ("unknown top-level key", "expected list,
+    /// got scalar", "tabs not supported", ...).
+    pub reason: String,
+}
 
 /// A single chunk of knowledge extracted from a markdown file.
 ///
 /// No `Default` impl by design: every chunk-construction site must explicitly
-/// set `is_universal` so that future fixtures and write paths cannot silently
-/// default it to `false`.
+/// set `is_universal` and `applies_when_json` so that future fixtures and
+/// write paths cannot silently default them.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     /// Unique identifier: `source_file:heading_path` (or `source_file` for document mode).
@@ -33,6 +77,13 @@ pub struct Chunk {
     /// which opts the pattern into the always-on injection tier (always
     /// emitted at `SessionStart`, bypasses `PreToolUse` dedup).
     pub is_universal: bool,
+    /// JSON-serialised `applies_when` predicate from the pattern's
+    /// frontmatter, or `None` when no predicate is set. When `Some`, gates
+    /// re-injection of universal chunks at the `PreToolUse` predicate filter
+    /// (see U5 in `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`).
+    /// U1 introduces the field with explicit `None` at every construction
+    /// site; U7 plumbs real values from the frontmatter parser.
+    pub applies_when_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +94,27 @@ pub struct Chunk {
 ///
 /// Falls back to [`chunk_as_document`] when no heading-based chunks are
 /// produced (e.g. when the body under every heading is shorter than 10 chars).
+///
+/// Malformed `applies_when` entries are silently dropped on this entry point;
+/// callers that need the per-file ingest advisory list (U7) should use
+/// [`chunk_by_heading_with_malformed_predicates`] instead.
 pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
+    chunk_by_heading_with_malformed_predicates(content, source_file).0
+}
+
+/// Like [`chunk_by_heading`] but also returns the per-file
+/// [`MalformedPredicateEntry`] advisories produced by parsing the
+/// `applies_when` block. The advisory list is empty when the frontmatter has
+/// no `applies_when` block or when the block parses cleanly. Used by ingest
+/// (U7) to surface per-file warnings via `on_progress` (CLI) and `eprintln!`
+/// (MCP write tools).
+pub fn chunk_by_heading_with_malformed_predicates(
+    content: &str,
+    source_file: &str,
+) -> (Vec<Chunk>, Vec<MalformedPredicateEntry>) {
+    let (applies_when, malformed) = parse_frontmatter_applies_when(content, source_file);
+    let applies_when_json = serialise_applies_when(applies_when.as_ref());
+
     let stripped = strip_frontmatter(content);
     let lines: Vec<&str> = stripped.lines().collect();
     let mut chunks = Vec::new();
@@ -59,6 +130,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
                  stack: &[(usize, String)],
                  tags: &str,
                  is_universal: bool,
+                 applies_when_json: &Option<String>,
                  source_file: &str,
                  chunks: &mut Vec<Chunk>,
                  id_counts: &mut HashMap<String, usize>| {
@@ -98,6 +170,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
             source_file: source_file.to_string(),
             heading_path,
             is_universal,
+            applies_when_json: applies_when_json.clone(),
         });
     };
 
@@ -109,6 +182,7 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
                 &heading_stack,
                 &tags,
                 is_universal,
+                &applies_when_json,
                 source_file,
                 &mut chunks,
                 &mut id_counts,
@@ -130,30 +204,47 @@ pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
         &heading_stack,
         &tags,
         is_universal,
+        &applies_when_json,
         source_file,
         &mut chunks,
         &mut id_counts,
     );
 
     if chunks.is_empty() {
-        return chunk_as_document(content, source_file);
+        return chunk_as_document_with_malformed_predicates(content, source_file);
     }
 
-    chunks
+    (chunks, malformed)
 }
 
 /// Treat the entire file as a single chunk (after stripping frontmatter).
+///
+/// Malformed `applies_when` entries are silently dropped on this entry point;
+/// callers that need the per-file ingest advisory list (U7) should use
+/// [`chunk_as_document_with_malformed_predicates`] instead.
 pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
+    chunk_as_document_with_malformed_predicates(content, source_file).0
+}
+
+/// Like [`chunk_as_document`] but also returns the per-file
+/// [`MalformedPredicateEntry`] advisories from parsing `applies_when`.
+pub fn chunk_as_document_with_malformed_predicates(
+    content: &str,
+    source_file: &str,
+) -> (Vec<Chunk>, Vec<MalformedPredicateEntry>) {
+    let (applies_when, malformed) = parse_frontmatter_applies_when(content, source_file);
+    let applies_when_json = serialise_applies_when(applies_when.as_ref());
+
     let body = strip_frontmatter(content).trim().to_string();
     if body.len() < 10 {
-        return Vec::new();
+        return (Vec::new(), malformed);
     }
 
     let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
     let tags = extract_frontmatter_tags(content);
     let is_universal = frontmatter_has_tag(content, "universal");
 
-    vec![Chunk {
+    let chunks = vec![Chunk {
         id: source_file.to_string(),
         title,
         body,
@@ -161,7 +252,21 @@ pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
         source_file: source_file.to_string(),
         heading_path: String::new(),
         is_universal,
-    }]
+        applies_when_json,
+    }];
+    (chunks, malformed)
+}
+
+/// Serialise an [`AppliesWhen`] to its JSON representation, returning `None`
+/// when the predicate is absent. Centralised so chunk and pattern rows
+/// always see the same JSON shape.
+fn serialise_applies_when(aw: Option<&AppliesWhen>) -> Option<String> {
+    aw.map(|aw| {
+        // `serde_json::to_string` can only fail on non-string-keyed maps;
+        // `AppliesWhen` has only `Vec<String>` fields, so this is infallible
+        // in practice.
+        serde_json::to_string(aw).expect("AppliesWhen serialises to JSON")
+    })
 }
 
 /// One row per pattern file for the `patterns` table — the authorial view
@@ -183,6 +288,11 @@ pub struct PatternRow {
     pub is_universal: bool,
     pub raw_body: String,
     pub content_hash: String,
+    /// JSON-serialised `applies_when` predicate from the pattern's
+    /// frontmatter; mirrors `Chunk::applies_when_json`. `None` means no
+    /// predicate is set and the pattern fires as today (whole-file
+    /// semantics — the predicate is shared across every chunk).
+    pub applies_when_json: Option<String>,
 }
 
 /// Build a [`PatternRow`] from the file's raw contents and its produced
@@ -196,9 +306,11 @@ pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> P
     // All chunks from a single file share the frontmatter-derived
     // `is_universal` flag — we read it from the first chunk instead of
     // re-parsing the frontmatter, keeping the two paths in sync by
-    // construction.
+    // construction. `applies_when_json` follows the same whole-file mirror
+    // (every chunk of a pattern carries the same predicate JSON).
     let is_universal = chunks.first().is_some_and(|c| c.is_universal);
     let tags = chunks.first().map_or_else(String::new, |c| c.tags.clone());
+    let applies_when_json = chunks.first().and_then(|c| c.applies_when_json.clone());
     let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
     let raw_body = strip_frontmatter(content).trim().to_string();
     let content_hash = format!("{:016x}", fnv1a(content.as_bytes()));
@@ -209,6 +321,7 @@ pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> P
         is_universal,
         raw_body,
         content_hash,
+        applies_when_json,
     }
 }
 
@@ -311,6 +424,342 @@ pub fn parse_frontmatter_tag_list(content: &str) -> Vec<String> {
         .map(|l| strip_outer_quotes(l.trim_start_matches([' ', '-']).trim()))
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// Parse the frontmatter `applies_when:` block into an [`AppliesWhen`] plus a
+/// list of [`MalformedPredicateEntry`] advisories.
+///
+/// Return shape:
+///
+/// - `(None, vec![])` — the frontmatter has no `applies_when` block (and no
+///   near-miss top-level key). Pattern fires as if no predicate were set.
+/// - `(Some(aw), vec![])` — clean parse of all known nested keys.
+/// - `(Some(aw), vec![entry, ...])` — the block parsed but at least one
+///   nested key was malformed; known keys are still populated, the offending
+///   keys are listed in the advisory vec.
+/// - `(None, vec![entry])` — a top-level near-miss key (e.g. `appliess_when`)
+///   was detected, or the `applies_when` block is structurally unusable
+///   (e.g. tab-indented children, scalar where a mapping is expected).
+///
+/// The parser enforces the indentation contract documented in U2 and U8:
+/// top-level keys at column 0; nested keys under `applies_when:` at 2-space
+/// indent; block-list items at 4-space indent. Tabs are not accepted under
+/// `applies_when:`.
+///
+/// `source_file` is only used to populate the advisory entries' `file_path`
+/// field; it does not affect parsing.
+pub fn parse_frontmatter_applies_when(
+    content: &str,
+    source_file: &str,
+) -> (Option<AppliesWhen>, Vec<MalformedPredicateEntry>) {
+    let Some(fm) = extract_frontmatter(content) else {
+        return (None, Vec::new());
+    };
+
+    let mut malformed = Vec::new();
+
+    // Detect a typo'd top-level key whose name resembles `applies_when`. The
+    // hand-rolled parser only knows the literal `applies_when:`, so this scan
+    // has to run independently — we walk every column-0 key and flag any
+    // near-miss before falling through to the actual block locator.
+    if let Some(typo) = find_top_level_applies_when_typo(&fm) {
+        malformed.push(MalformedPredicateEntry {
+            file_path: source_file.to_string(),
+            key: typo,
+            reason: "unknown top-level key (did you mean applies_when?)".to_string(),
+        });
+        return (None, malformed);
+    }
+
+    // Locate `applies_when:` at column 0. We deliberately reject indented
+    // occurrences (e.g. mistakenly nested under `tags:`) — those parse as
+    // `None` with no advisory, structurally identical to a missing block.
+    let Some(block) = extract_applies_when_block(&fm) else {
+        return (None, Vec::new());
+    };
+
+    // Reject tab indentation up front. Tabs collide with our 2/4-space contract
+    // and would silently misparse, so we surface the unsupported indentation
+    // and bail with no predicate (R9 skip-with-warning).
+    if block_has_tab_indent(&block) {
+        malformed.push(MalformedPredicateEntry {
+            file_path: source_file.to_string(),
+            key: "applies_when".to_string(),
+            reason: "tabs not supported in applies_when block (use spaces)".to_string(),
+        });
+        return (None, malformed);
+    }
+
+    let mut applies_when = AppliesWhen {
+        tools: None,
+        bash_command_starts_with: None,
+    };
+    let mut any_known_seen = false;
+
+    for entry in iter_applies_when_children(&block) {
+        match entry.key.as_str() {
+            "tools" => match parse_applies_when_value(&entry) {
+                Ok(values) => {
+                    applies_when.tools = Some(values);
+                    any_known_seen = true;
+                }
+                Err(reason) => {
+                    malformed.push(MalformedPredicateEntry {
+                        file_path: source_file.to_string(),
+                        key: "applies_when.tools".to_string(),
+                        reason,
+                    });
+                }
+            },
+            "bash_command_starts_with" => match parse_applies_when_value(&entry) {
+                Ok(values) => {
+                    applies_when.bash_command_starts_with = Some(values);
+                    any_known_seen = true;
+                }
+                Err(reason) => {
+                    malformed.push(MalformedPredicateEntry {
+                        file_path: source_file.to_string(),
+                        key: "applies_when.bash_command_starts_with".to_string(),
+                        reason,
+                    });
+                }
+            },
+            other => {
+                malformed.push(MalformedPredicateEntry {
+                    file_path: source_file.to_string(),
+                    key: format!("applies_when.{other}"),
+                    reason: "unknown nested key (Track 1 supports tools, bash_command_starts_with)"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    if any_known_seen {
+        (Some(applies_when), malformed)
+    } else {
+        // No usable nested keys — return `None` so the pattern fires as if
+        // the block weren't there. Advisories (e.g. type-mismatch on the only
+        // key, or unknown-only nested keys) still flow up.
+        (None, malformed)
+    }
+}
+
+/// Find a column-0 frontmatter key whose name looks like a typo of
+/// `applies_when` (case-insensitive equality, edit-distance ≤ 2, or a
+/// `applies` prefix). Returns the offending key as it appears in the source.
+fn find_top_level_applies_when_typo(fm: &str) -> Option<String> {
+    const TARGET: &str = "applies_when";
+
+    for line in fm.lines() {
+        // Only column-0 keys. A leading space rules out nested children.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        let key = line[..colon].trim();
+        if key.is_empty() || key == TARGET {
+            continue;
+        }
+        let lower = key.to_lowercase();
+        if lower == TARGET {
+            // Pure case variant (`Applies_When:`). Treat as typo so the
+            // author gets a signal — the parser only matches the lowercase
+            // literal.
+            return Some(key.to_string());
+        }
+        if lower.starts_with("applies") && key != "applies" {
+            return Some(key.to_string());
+        }
+        if levenshtein_at_most_two(&lower, TARGET) {
+            return Some(key.to_string());
+        }
+    }
+    None
+}
+
+/// Return the body of the `applies_when:` block from `fm` (frontmatter text
+/// without the surrounding `---` fences). The body is the content following
+/// the `applies_when:` line up to (but not including) the next column-0 key
+/// or end of frontmatter. Inline-mapping form (`applies_when: { ... }`) is
+/// NOT accepted — the contract is line-based.
+fn extract_applies_when_block(fm: &str) -> Option<String> {
+    let mut lines = fm.lines();
+    let mut block: Vec<&str> = Vec::new();
+    let mut in_block = false;
+
+    for line in lines.by_ref() {
+        if !in_block {
+            // Strict: column-0 `applies_when:` only.
+            if let Some(rest) = line.strip_prefix("applies_when:") {
+                if !rest.trim().is_empty() {
+                    // Inline scalar/mapping after the colon — Track 1 doesn't
+                    // support inline mapping; treat as empty body so children
+                    // (none here) yield `None` upstream.
+                    return None;
+                }
+                in_block = true;
+            }
+            continue;
+        }
+        // Stop at the next column-0 key (any non-space-leading non-empty line
+        // with a colon).
+        if !line.starts_with(' ') && !line.starts_with('\t') && line.contains(':') {
+            break;
+        }
+        block.push(line);
+    }
+
+    if !in_block {
+        return None;
+    }
+    Some(block.join("\n"))
+}
+
+/// Detect tab characters in any leading-indent position of the block. We only
+/// care about indentation tabs (mid-value tabs are fine for, e.g., a quoted
+/// string with internal whitespace).
+fn block_has_tab_indent(block: &str) -> bool {
+    block.lines().any(|l| l.starts_with('\t'))
+}
+
+/// One nested entry harvested from the `applies_when` block.
+struct AppliesWhenEntry {
+    /// The nested key (`tools`, `bash_command_starts_with`, or anything else
+    /// authors typed under `applies_when:`).
+    key: String,
+    /// Inline value, if the entry was written as `key: [a, b]` or
+    /// `key: scalar`. Empty string when block-list form was used.
+    inline_value: String,
+    /// Block-list items collected from 4-space-indented `- value` lines that
+    /// follow the key line. Empty when inline form was used.
+    block_items: Vec<String>,
+}
+
+/// Walk the `applies_when:` block body and yield one entry per nested key.
+/// Skips blank lines. Lines that don't match the 2-space-indented `key:` shape
+/// are ignored — the U2 contract is intentionally narrow.
+fn iter_applies_when_children(block: &str) -> Vec<AppliesWhenEntry> {
+    let mut out = Vec::new();
+    let mut lines = block.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Nested keys must be 2-space-indented (children of `applies_when:`).
+        // Reject 0-space indent (a stray top-level key sneaked in) and >2
+        // (deeper nesting we don't support in Track 1).
+        let indent = leading_space_count(line);
+        if indent != 2 {
+            continue;
+        }
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        let key = line[indent..colon].trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let inline_value = line[colon + 1..].trim().to_string();
+
+        // Collect 4-space-indented block-list items that follow.
+        let mut block_items = Vec::new();
+        while let Some(next) = lines.peek() {
+            let next_indent = leading_space_count(next);
+            let next_trim = next.trim();
+            if next_trim.is_empty() {
+                lines.next();
+                continue;
+            }
+            if next_indent == 4 && (next_trim.starts_with("- ") || next_trim == "-") {
+                let item = next_trim[1..].trim();
+                if !item.is_empty() {
+                    block_items.push(strip_outer_quotes(item));
+                }
+                lines.next();
+                continue;
+            }
+            // Anything else terminates the current key's items.
+            break;
+        }
+
+        out.push(AppliesWhenEntry {
+            key,
+            inline_value,
+            block_items,
+        });
+    }
+
+    out
+}
+
+/// Resolve an entry's value into a `Vec<String>` (preserving empty lists)
+/// or describe the type-mismatch reason when neither inline-list nor
+/// block-list form was used cleanly.
+fn parse_applies_when_value(entry: &AppliesWhenEntry) -> Result<Vec<String>, String> {
+    if !entry.inline_value.is_empty() {
+        let v = entry.inline_value.as_str();
+        if let Some(rest) = v.strip_prefix('[') {
+            if let Some(inner) = rest.strip_suffix(']') {
+                let trimmed = inner.trim();
+                if trimmed.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return Ok(trimmed
+                    .split(',')
+                    .map(|t| strip_outer_quotes(t.trim()))
+                    .filter(|t| !t.is_empty())
+                    .collect());
+            }
+            return Err("expected closing ']' in inline list".to_string());
+        }
+        // Scalar where list expected.
+        return Err(format!(
+            "expected list, got scalar `{}` (use `{}: [{}]` or a block list)",
+            v, entry.key, v
+        ));
+    }
+
+    // No inline value: must be a block list (possibly empty).
+    Ok(entry.block_items.clone())
+}
+
+/// Count the leading ASCII spaces on a line (does not count tabs — tab
+/// detection lives in [`block_has_tab_indent`]).
+fn leading_space_count(line: &str) -> usize {
+    line.bytes().take_while(|b| *b == b' ').count()
+}
+
+/// Approximate Levenshtein distance check returning `true` when the edit
+/// distance between `a` and `b` is at most 2. Used for the `applies_when`
+/// typo near-miss heuristic; we don't need a full distance, just a yes/no.
+fn levenshtein_at_most_two(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let len_diff = a_bytes.len().abs_diff(b_bytes.len());
+    if len_diff > 2 {
+        return false;
+    }
+
+    let m = a_bytes.len();
+    let n = b_bytes.len();
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr: Vec<usize> = vec![0; n + 1];
+
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = usize::from(a_bytes[i - 1] != b_bytes[j - 1]);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n] <= 2
 }
 
 /// Strip a single matched pair of surrounding quotes from `s` (only when both
@@ -862,5 +1311,479 @@ Body text that is definitely long enough for a chunk.
 ";
         let tags = extract_frontmatter_tags(md);
         assert_eq!(tags, "rust, patterns");
+    }
+
+    // -- parse_frontmatter_applies_when ----------------------------------
+
+    #[test]
+    fn applies_when_full_block_inline_lists() {
+        let md = "\
+---
+title: Git Branch and PR Workflow
+tags:
+  - workflow
+  - universal
+applies_when:
+  tools: [Bash]
+  bash_command_starts_with: [git, gh]
+---
+
+# Hello
+Body text that is definitely long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty(), "got: {malformed:?}");
+        let aw = aw.expect("predicate parsed");
+        assert_eq!(aw.tools.as_deref(), Some(&["Bash".to_string()][..]));
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["git".to_string(), "gh".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn applies_when_block_list_form() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  bash_command_starts_with:
+    - git
+    - gh
+---
+
+# Hello
+Body text that is definitely long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty(), "got: {malformed:?}");
+        let aw = aw.expect("predicate parsed");
+        assert!(aw.tools.is_none());
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["git".to_string(), "gh".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn applies_when_only_tools_set() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  tools: [Bash, Edit]
+---
+
+# Hello
+Body text long enough to chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty());
+        let aw = aw.unwrap();
+        assert_eq!(
+            aw.tools.as_deref(),
+            Some(&["Bash".to_string(), "Edit".to_string()][..])
+        );
+        assert!(aw.bash_command_starts_with.is_none());
+    }
+
+    #[test]
+    fn applies_when_only_bash_command_starts_with_set() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  bash_command_starts_with: [cargo]
+---
+
+# Hello
+Body text long enough to chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty());
+        let aw = aw.unwrap();
+        assert!(aw.tools.is_none());
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["cargo".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn applies_when_missing_block_returns_none_no_advisory() {
+        let md = "---\ntags: [conventions]\n---\n\n# Hello\nBody long enough.\n";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(aw.is_none());
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn applies_when_universal_tag_without_block_returns_none() {
+        let md = "---\ntags: [universal]\n---\n\n# Hello\nBody long enough here.\n";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(aw.is_none());
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn applies_when_empty_inline_list_parses_to_empty_vec() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  tools: []
+---
+
+# Hello
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty(), "got: {malformed:?}");
+        let aw = aw.expect("predicate parsed");
+        assert_eq!(aw.tools.as_deref(), Some(&[][..]));
+        assert!(aw.bash_command_starts_with.is_none());
+    }
+
+    #[test]
+    fn applies_when_unicode_value_parses() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  bash_command_starts_with: [gît]
+---
+
+# Hello
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty());
+        let aw = aw.unwrap();
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["gît".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn applies_when_typoed_top_level_key_returns_none_with_advisory() {
+        // AE5: typo'd key -> skip-with-warning, pattern fires as if no
+        // predicate. The parser surfaces the typo'd key for the operator.
+        let md = "\
+---
+tags: [universal]
+appliess_when:
+  tools: [Bash]
+---
+
+# Hello
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "patterns/foo.md");
+        assert!(aw.is_none(), "predicate must be inert on typo");
+        assert_eq!(malformed.len(), 1, "got: {malformed:?}");
+        assert_eq!(malformed[0].file_path, "patterns/foo.md");
+        assert_eq!(malformed[0].key, "appliess_when");
+        assert!(
+            malformed[0].reason.contains("did you mean applies_when"),
+            "reason: {}",
+            malformed[0].reason
+        );
+    }
+
+    #[test]
+    fn applies_when_scalar_where_list_expected_emits_advisory() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  tools: Bash
+---
+
+# Hello
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        // No usable known keys parsed cleanly => predicate is None.
+        assert!(aw.is_none());
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].key, "applies_when.tools");
+        assert!(
+            malformed[0].reason.contains("expected list"),
+            "reason: {}",
+            malformed[0].reason
+        );
+    }
+
+    #[test]
+    fn applies_when_unknown_nested_key_keeps_known_keys_and_warns() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  tools: [Bash]
+  foo: bar
+---
+
+# Hello
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        let aw = aw.expect("predicate parsed (known keys retained)");
+        assert_eq!(aw.tools.as_deref(), Some(&["Bash".to_string()][..]));
+        assert!(aw.bash_command_starts_with.is_none());
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].key, "applies_when.foo");
+        assert!(
+            malformed[0].reason.contains("unknown nested key"),
+            "reason: {}",
+            malformed[0].reason
+        );
+    }
+
+    #[test]
+    fn applies_when_two_space_indent_with_inline_lists() {
+        let md = "\
+---
+applies_when:
+  tools: [Bash]
+  bash_command_starts_with: [git]
+---
+
+# H
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty(), "got: {malformed:?}");
+        let aw = aw.unwrap();
+        assert_eq!(aw.tools.as_deref(), Some(&["Bash".to_string()][..]));
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["git".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn applies_when_two_space_indent_with_four_space_block_items() {
+        let md = "\
+---
+applies_when:
+  tools:
+    - Bash
+    - Edit
+  bash_command_starts_with:
+    - cargo
+---
+
+# H
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(malformed.is_empty(), "got: {malformed:?}");
+        let aw = aw.unwrap();
+        assert_eq!(
+            aw.tools.as_deref(),
+            Some(&["Bash".to_string(), "Edit".to_string()][..])
+        );
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["cargo".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn applies_when_tab_indented_children_emit_advisory_no_predicate() {
+        let md = "---\ntags: [universal]\napplies_when:\n\ttools: [Bash]\n---\n\n# H\nBody long enough for a chunk.\n";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(aw.is_none(), "tabs must inert the predicate");
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].key, "applies_when");
+        assert!(
+            malformed[0].reason.contains("tabs not supported"),
+            "reason: {}",
+            malformed[0].reason
+        );
+    }
+
+    #[test]
+    fn applies_when_indented_top_level_key_is_not_detected() {
+        // `applies_when:` mistakenly indented under another key (column != 0)
+        // is structurally identical to a missing block — no advisory fires.
+        let md = "\
+---
+tags:
+  - universal
+  applies_when:
+    tools: [Bash]
+---
+
+# H
+Body long enough for a chunk.
+";
+        let (aw, malformed) = parse_frontmatter_applies_when(md, "p.md");
+        assert!(aw.is_none());
+        assert!(malformed.is_empty(), "got: {malformed:?}");
+    }
+
+    // -- chunk-time integration ------------------------------------------
+
+    #[test]
+    fn chunk_by_heading_propagates_applies_when_json_to_every_chunk() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  tools: [Bash]
+  bash_command_starts_with: [git]
+---
+
+# Top
+Enough body text for a real chunk here.
+
+## Sub
+Another section with enough body text.
+
+## Other
+Yet another section with enough body text.
+";
+        let chunks = chunk_by_heading(md, "uni.md");
+        assert!(chunks.len() >= 3, "got {} chunks", chunks.len());
+        let first = chunks[0]
+            .applies_when_json
+            .as_deref()
+            .expect("predicate JSON populated");
+        // Every chunk shares the same value (whole-file semantics).
+        for c in &chunks {
+            assert_eq!(
+                c.applies_when_json.as_deref(),
+                Some(first),
+                "chunk {:?} drifted",
+                c.id
+            );
+        }
+        // Round-trip: the JSON deserialises back to the parsed predicate.
+        let aw: AppliesWhen = serde_json::from_str(first).expect("deserialise");
+        assert_eq!(aw.tools.as_deref(), Some(&["Bash".to_string()][..]));
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&["git".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn chunk_by_heading_no_applies_when_means_none_on_chunks() {
+        let md = "---\ntags: [universal]\n---\n\n# Top\nEnough body text here.\n";
+        let chunks = chunk_by_heading(md, "uni.md");
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(
+                c.applies_when_json.is_none(),
+                "chunk {:?} unexpectedly had predicate JSON",
+                c.id
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_by_heading_with_malformed_predicates_surfaces_advisory() {
+        let md = "\
+---
+tags: [universal]
+appliess_when:
+  tools: [Bash]
+---
+
+# Top
+Enough body text for a real chunk.
+";
+        let (chunks, malformed) = chunk_by_heading_with_malformed_predicates(md, "patterns/foo.md");
+        assert!(!chunks.is_empty());
+        // Advisory survives the chunk wiring.
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].key, "appliess_when");
+        // No predicate JSON written when the typo inerted the block.
+        for c in &chunks {
+            assert!(c.applies_when_json.is_none());
+        }
+    }
+
+    #[test]
+    fn chunk_as_document_propagates_applies_when_json() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  tools: [Bash]
+---
+
+No headings here, just a long enough paragraph for a single document chunk.
+";
+        let chunks = chunk_as_document(md, "uni.md");
+        assert_eq!(chunks.len(), 1);
+        let json = chunks[0]
+            .applies_when_json
+            .as_deref()
+            .expect("predicate JSON populated");
+        let aw: AppliesWhen = serde_json::from_str(json).unwrap();
+        assert_eq!(aw.tools.as_deref(), Some(&["Bash".to_string()][..]));
+    }
+
+    #[test]
+    fn pattern_row_from_mirrors_applies_when_json_from_chunks() {
+        // U7 will plumb pattern_row_from end-to-end, but the mirror added in
+        // U1 should already see the populated value once chunks carry it.
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  bash_command_starts_with: [git]
+---
+
+# Top
+Enough body text for a chunk here.
+";
+        let chunks = chunk_by_heading(md, "uni.md");
+        let row = pattern_row_from(md, "uni.md", &chunks);
+        assert!(
+            row.applies_when_json.is_some(),
+            "pattern row should mirror chunks' applies_when_json"
+        );
+        assert_eq!(row.applies_when_json, chunks[0].applies_when_json);
+    }
+
+    /// T4: empty `bash_command_starts_with: []` round-trip from frontmatter
+    /// through `chunk_by_heading` to `applies_when_json`.
+    ///
+    /// The unit test for empty-list semantics at the engine layer exists; the
+    /// missing coverage was the fully-plumbed path: parser produces
+    /// `Some(vec![])`, chunker writes the JSON to every chunk, and a
+    /// round-trip deserialise preserves the empty allowlist (rather than
+    /// collapsing to `None` somewhere along the way).
+    #[test]
+    fn applies_when_empty_bash_command_list_round_trips_through_chunk_by_heading() {
+        let md = "\
+---
+tags: [universal]
+applies_when:
+  bash_command_starts_with: []
+---
+
+# Hello
+Body text long enough to chunk through heading mode.
+";
+        let chunks = chunk_by_heading(md, "empty.md");
+        assert!(!chunks.is_empty(), "expected at least one chunk");
+        let json = chunks[0]
+            .applies_when_json
+            .as_deref()
+            .expect("predicate JSON populated even for empty list");
+        let aw: AppliesWhen = serde_json::from_str(json).expect("deserialise");
+        assert_eq!(
+            aw.bash_command_starts_with.as_deref(),
+            Some(&[][..]),
+            "empty bash_command_starts_with must round-trip as Some(vec![]), \
+             not None — see U3 contract that empty allowlist never matches",
+        );
+        assert!(aw.tools.is_none());
     }
 }

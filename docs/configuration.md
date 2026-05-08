@@ -59,11 +59,20 @@ the extension boundary (e.g. `.md` → `.txt`) is treated as a deletion.
 
 #### `[search]` Section
 
-| Field           | Type  | Default | Description                                                                                                                                 |
-| --------------- | ----- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `hybrid`        | bool  | `true`  | Enable hybrid search (FTS5 + vector via Ollama). Set to `false` for FTS5-only search, which is faster but lacks semantic matching.          |
-| `top_k`         | usize | `5`     | Number of top results to consider before sibling expansion and deduplication. Higher values inject more context per tool call.              |
-| `min_relevance` | float | `0.6`   | Minimum normalised score for a result to be injected. Applied only during hybrid search with successful embedding. Set to `0.0` to disable. |
+| Field                     | Type           | Default | Description                                                                                                                                                                                                                                                           |
+| ------------------------- | -------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hybrid`                  | bool           | `true`  | Enable hybrid search (FTS5 + vector via Ollama). Set to `false` for FTS5-only search, which is faster but lacks semantic matching.                                                                                                                                    |
+| `top_k`                   | usize          | `5`     | Number of top results to consider before sibling expansion and deduplication. Higher values inject more context per tool call.                                                                                                                                        |
+| `min_relevance`           | float          | `0.6`   | Minimum normalised score for a result to be injected. Applied only during hybrid search with successful embedding. Set to `0.0` to disable.                                                                                                                           |
+| `min_relevance_universal` | optional float | unset   | Per-tier score floor applied to universal-tagged patterns at PreToolUse search time. When unset, the effective universal floor inherits from `min_relevance`. Non-universal results continue to be filtered against `min_relevance` regardless of this field's value. |
+
+The `min_relevance_universal` knob exists for tuning universal-pattern relevance independently when
+dogfooding shows over-firing on weakly-related queries. It is the numerical complement to the
+[`applies_when`](pattern-authoring-guide.md#toolcommand-predicate-applies_when) predicate, which
+gates universal injection categorically by tool class and Bash command prefix. Reach for the
+predicate when the over-firing is on a structural axis (the pattern fires on Bash calls it has no
+business addressing); reach for `min_relevance_universal` when the over-firing is on a relevance
+axis (the pattern fires on calls in its tool class but with weak topical overlap).
 
 #### `[chunking]` Section
 

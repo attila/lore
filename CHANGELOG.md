@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Universal-pattern predicate (`applies_when`)** — universal-tagged patterns may now declare an
+  optional frontmatter block gating their re-injection by tool class and Bash command prefix. Two
+  keys (`tools`, `bash_command_starts_with`) compose with OR semantics within each list and AND
+  semantics across keys. The Bash command-prefix matcher walks past `sudo`, `sudo -u USER`, `env`,
+  `env -i`, `env -u VAR`, and `env KEY=VAL` wrapper tokens before checking the prefix. Documented
+  limitations: nested env wrappers and quoted-command (`bash -c "..."`) extraction. See
+  [`docs/pattern-authoring-guide.md`](docs/pattern-authoring-guide.md).
+- **`min_relevance_universal` config knob** — optional per-tier score floor under `[search]`.
+  Defaults to inheriting from `min_relevance` so an upgrade introduces no behaviour change without
+  explicit config. Numerical complement to `applies_when`'s categorical gate.
+- **Engine/adapter split** — predicate evaluator, smart-prefix matcher, query extraction, and
+  pure-string helpers now live in a new agent-agnostic `src/engine/` module operating on a minimal
+  `CallContext`. `src/hook.rs` becomes a Claude-Code-specific adapter that owns `HookInput`
+  deserialisation, the `HookInput → CallContext` conversion, and the eager transcript-tail read.
+  Future agent integrations (Cursor, opencode, etc.) build their own adapter and reuse the same
+  engine.
+
+### Changed
+
+- **Knowledge database schema bumped to v3** with a forward-compatible ALTER TABLE migration on
+  first open — no `lore ingest --force` required. The migration is wrapped in a transaction and uses
+  column-presence checks for idempotency, so a partial migration that crashed (or lost a race
+  against a concurrent open) re-enters the branch safely. Existing chunks have NULL in the new
+  `applies_when_json` column, behaving as if no predicate were set (R11). The hard-bail schema
+  advisory remains for any future non-additive bump.
+
+### Notes
+
+- This release is additive at every user-facing surface (CLI, MCP tool params, config). The schema
+  bump is one-way: a v3 database cannot be opened by a v0.1.x lore binary, which would see a
+  higher-than-expected `user_version` and bail with the existing schema-mismatch error.
+  Re-installing a v0.1.x binary against a v3 database requires a manual rebuild via
+  `lore ingest --force`.
+
 ## [0.1.0] - 2026-05-01
 
 First stable release. No user-facing changes since `0.1.0-alpha.1`; promoting after end-to-end
