@@ -17,8 +17,13 @@ original dogfooding loop did not exercise, and a binary release that crashes or 
 The four bullets span a wide severity range. A code scan against today's `src/ingest.rs` and
 `src/git.rs` (commit `6037cf1`, branch `main`) shows:
 
-- **Empty knowledge dir** — already works. `ingest_empty_directory_returns_zero` in `src/ingest.rs`
-  covers it; `full_ingest` returns zero results with no errors.
+- **Empty knowledge dir** — _pivoted to a separate branch._ Originally classified as "already works"
+  (silent zero-result via `ingest_empty_directory_returns_zero`). Superseded by
+  `feat/empty-knowledge-dir-validation`, which replaces silent-zero-result with fail-fast plus an
+  opt-in `--allow-empty-knowledge` flag. See
+  `docs/brainstorms/2026-05-04-empty-knowledge-dir-validation-requirements.md` and
+  `docs/plans/2026-05-04-001-feat-empty-knowledge-dir-validation-plan.md` on that branch. Out of
+  scope here.
 - **Non-git dir** — mostly handled by PR #30. `ingest` falls back to full mode via
   `git::is_git_repo`, write ops return `CommitStatus::NotCommitted`, and inbox-prefix writes
   correctly error. `is_git_repo` also returns `false` when the `git` binary itself is missing
@@ -48,10 +53,10 @@ The four bullets span a wide severity range. A code scan against today's `src/in
 
 This brainstorm scopes a **pre-release robustness pass** focused on user-visible correctness. It
 fixes the two real bugs (slug collisions, Unicode normalisation), replaces the misleading no-HEAD
-progress line with one that explains the state, and adds regression tests for all four roadmap
-bullets plus the two sub-cases (no-HEAD, missing git binary) so release artefacts cannot regress
-them. Speculative hardening and UX polish beyond the single no-HEAD line are out of scope; they can
-be addressed opportunistically later.
+progress line with one that explains the state, and adds regression tests for the three remaining
+roadmap bullets plus the two sub-cases (no-HEAD, missing git binary) so release artefacts cannot
+regress them. Speculative hardening and UX polish beyond the single no-HEAD line are out of scope;
+they can be addressed opportunistically later.
 
 ## Requirements
 
@@ -104,7 +109,7 @@ be addressed opportunistically later.
   propagate warnings back to the caller: either add a `&mut Vec<String>` errors accumulator
   parameter, or change the return type to include a `Vec<String>` of warnings alongside the paths.
   The latter is the cleaner choice given `walk_md_files` is already a pure helper returning a tuple;
-  planning should pick one explicitly. The test in R11.10 is `#[cfg(unix)]`-gated because
+  planning should pick one explicitly. The test in R11.9 is `#[cfg(unix)]`-gated because
   `OsStr::from_bytes` is a Unix-only extension; Windows builds will compile but not exercise the
   assertion. R8 is acknowledged as Linux-dominant in practice because APFS and HFS+ enforce UTF-8 at
   the filesystem layer — on macOS the code path can compile and run but is unlikely to fire in
@@ -133,39 +138,39 @@ be addressed opportunistically later.
 **Regression tests**
 
 - R11. Add or confirm regression tests for each of the following cases in `src/ingest.rs` tests or a
-  new `tests/edge_cases.rs` integration file:
-  1. **Empty knowledge directory** returns zero results with no errors (**already covered** by
-     `ingest_empty_directory_returns_zero`; confirm it still runs under the new code paths).
-  2. **Non-git knowledge directory** ingests successfully and `try_commit` returns `NotCommitted`
+  new `tests/edge_cases.rs` integration file. (The empty-knowledge-directory test that originally
+  appeared first in this list has been moved to `feat/empty-knowledge-dir-validation`; remaining
+  items renumbered accordingly.)
+  1. **Non-git knowledge directory** ingests successfully and `try_commit` returns `NotCommitted`
      (**already covered** by existing `add_pattern` tests; confirm).
-  3. **Fresh `git init` with no commits** (R9): ingest succeeds, the no-HEAD progress line fires
+  2. **Fresh `git init` with no commits** (R9): ingest succeeds, the no-HEAD progress line fires
      exactly once, and `META_LAST_COMMIT` is not yet written.
-  4. **No-HEAD → commit → re-ingest transition** (R10): sequence is (a) `git init`, (b) write
+  3. **No-HEAD → commit → re-ingest transition** (R10): sequence is (a) `git init`, (b) write
      markdown, (c) `ingest()`, (d) `git add` + `git commit`, (e) `ingest()` again, (f) assert the
      second call recorded HEAD and the third call enters delta mode. This must exercise the
      top-level `ingest()` entry point, not `full_ingest()` directly, because the transition is the
      load-bearing behaviour.
-  5. **Missing `git` binary on PATH**: simulated via `assert_cmd` spawning the `lore` binary as a
+  4. **Missing `git` binary on PATH**: simulated via `assert_cmd` spawning the `lore` binary as a
      subprocess with `.env_clear().env("PATH", "")` — not via in-process `set_var`, which would race
      with every other test that invokes git. `is_git_repo` must return false, ingest must fall
      through to full mode, write ops must return `NotCommitted`.
-  6. **Slug collision** — two distinct titles colliding into the same slug: the second `add_pattern`
+  5. **Slug collision** — two distinct titles colliding into the same slug: the second `add_pattern`
      returns a collision-specific error naming the existing file and its title.
-  7. **Slug collision with no-heading existing file**: the conflicting file has only frontmatter and
+  6. **Slug collision with no-heading existing file**: the conflicting file has only frontmatter and
      body (no `# Heading`), so `extract_title` returns `None`; the error message uses
      `(no title heading)` rather than repeating the filename stem.
-  8. **NFC/NFD slug convergence**: the title `café` typed with a combining acute (NFD)
+  7. **NFC/NFD slug convergence**: the title `café` typed with a combining acute (NFD)
      post-normalisation produces slug `café` (the four-codepoint NFC form), not `cafe`. This test
      specifically guards against the pre-fix behaviour where the combining mark was stripped by
      `is_alphanumeric`.
-  9. **Empty-after-normalisation slug**: a title composed solely of combining marks or
+  8. **Empty-after-normalisation slug**: a title composed solely of combining marks or
      non-alphanumeric codepoints still triggers the existing
      `Title must contain at least one
      alphanumeric character` error after normalisation. Guards
      against NFC unexpectedly turning a previously-valid title into an empty slug (or vice versa).
-  10. **Non-UTF-8 filename on disk** (R8): constructed via `OsStr::from_bytes` inside a
-      `#[cfg(unix)]`-gated test, surfaces in `IngestResult::errors` as a lossy-conversion warning
-      rather than being silently indexed.
+  9. **Non-UTF-8 filename on disk** (R8): constructed via `OsStr::from_bytes` inside a
+     `#[cfg(unix)]`-gated test, surfaces in `IngestResult::errors` as a lossy-conversion warning
+     rather than being silently indexed.
 
 ## Success Criteria
 
@@ -294,8 +299,24 @@ _(none)_
   a new `tests/edge_cases.rs` integration file. Either is acceptable; planning should pick based on
   which path is cheaper to keep green under the delta-ingest helper surface.
 
+## Implementation Slices
+
+After the empty-knowledge-dir pivot, what remains lands as five granular slices rather than a single
+pre-release pass. Slice A must precede Slice B per the sequencing decision in _Key Decisions_; the
+other three are mutually independent and can ship in any order.
+
+| Slice                          | Requirements              | Notes                          |
+| ------------------------------ | ------------------------- | ------------------------------ |
+| A. Unicode NFC normalisation   | R5, R6, R7 + R11.7, R11.8 | Lands first; B is gated on it. |
+| B. Slug collision detection    | R1–R4 + R11.5, R11.6      | Depends on A.                  |
+| C. No-HEAD progress line       | R9, R10 + R11.2, R11.3    | Independent.                   |
+| D. Lossy-path warning          | R8 + R11.9                | Independent, Unix-only.        |
+| E. Missing-git regression test | R11.1, R11.4              | Independent, test-only.        |
+
+A and B may be combined in a single PR or split with B gated on A; the brainstorm's _Key Decisions_
+warns against shipping B without A.
+
 ## Next Steps
 
-→ `/ce:plan` for structured implementation planning. This work is independent of every other open
-roadmap item, so planning can proceed directly and the resulting pull request can ship ahead of the
-release process work.
+→ `/ce:plan` per slice (see _Implementation Slices_). Slice A unblocks Slice B; the other three are
+mutually independent. Each plan can target its own branch and PR.
