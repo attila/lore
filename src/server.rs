@@ -68,6 +68,15 @@ struct JsonRpcResponse {
 /// advisory to the agent as a tool-call result rather than dying at handshake
 /// time with the message trapped on stderr that most MCP hosts discard.
 pub fn start_mcp_server(config: &Config, embedder: &dyn Embedder) -> anyhow::Result<()> {
+    // Tier-2 effective-empty warning, mirrored from `lore ingest`. Fires once
+    // at boot regardless of healthy/degraded mode. The server proceeds either
+    // way — refusing to start on an empty knowledge dir would block agents
+    // that legitimately want to introspect or `lore_status` the state. See
+    // project memory `project_cli_behaviour_ladder.md`.
+    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+        eprintln!("{msg}");
+    }
+
     match KnowledgeDB::open(&config.database, embedder.dimensions()) {
         Ok(db) => {
             db.init()?;
