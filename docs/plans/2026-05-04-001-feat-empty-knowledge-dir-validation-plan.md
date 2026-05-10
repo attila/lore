@@ -12,10 +12,13 @@ origin: docs/brainstorms/2026-05-04-empty-knowledge-dir-validation-requirements.
 ## Overview
 
 Surface a tier-2 warning when the effective scan set in the knowledge directory is empty — either
-because no `.md` files exist or because `.loreignore` excludes every candidate. Replace today's
-silent-zero-result on filesystem-empty and unify with the existing partial warning at
-`src/ingest.rs:691-693`. Mirror the warning at MCP server startup (`cmd_serve`) and surface the disk
-state on the `lore_status` MCP tool. No flag, no error, exit 0.
+because no `.md` files exist or because `.loreignore` excludes every candidate. The warning fires at
+the top-level `ingest()` entry point (`src/ingest.rs:199`), so both the `delta_ingest`
+(`src/ingest.rs:471`) and `full_ingest` (`src/ingest.rs:678`) paths are covered in one place; the
+existing partial warning at `src/ingest.rs:691-693` is removed and folded into the unified path.
+Mirror the warning at MCP server startup (`cmd_serve`) and surface the disk state on the
+`lore_status` MCP tool plus the `lore status` CLI command. Two distinct messages, one for each cause
+(filesystem-empty vs all-ignored). No flag, no error, exit 0.
 
 > **Refined 2026-05-10.** This plan supersedes a fail-fast framing with an opt-in
 > `--allow-empty-knowledge` flag. After applying the project's CLI behaviour ladder, the case is
@@ -31,57 +34,79 @@ See the brainstorm — `Problem Frame` section is anchored against `src/ingest.r
 
 ## Requirements (summary)
 
-- **R1**: Unified effective-empty warning in `full_ingest`, replacing the partial warning at
-  `src/ingest.rs:691-693`.
+- **R1**: Unified effective-empty warning at the top of `ingest()` (`src/ingest.rs:199`); covers
+  `delta_ingest` and `full_ingest` automatically. Removes the partial warning at
+  `src/ingest.rs:691-693`. Two distinct messages — one per cause.
 - **R2**: Same warning at `cmd_serve` startup (`src/main.rs:511`).
-- **R3**: `lore_status` MCP tool (`src/server.rs:973`) and `lore status` CLI output gain
-  `empty_knowledge_dir: bool` and `knowledge_dir_status: "empty" | "populated"`.
+- **R3**: Both status surfaces report the state, via independent code paths. MCP `lore_status`
+  (`handle_lore_status` at `src/server.rs:973-1014`) gains `empty_knowledge_dir: bool` and
+  `knowledge_dir_status: "empty" | "populated"` in its JSON metadata; CLI `lore status`
+  (`cmd_status` at `src/main.rs:707-761`) gains a corresponding `eprintln!` line. Detail in U3.
 - **R4**: README + clap doc-comments describe the warning. No new doc file.
-- **R5**: Inline unit tests, one integration test, one `lore_status` test.
+- **R5**: Inline unit tests via `ingest()` (not `full_ingest()` directly), one integration test, one
+  `lore_status` test.
 
 ## Implementation Units
 
-| Unit   | Goal                                           | Files touched                                | Dependencies | Verification                                                                          |
-| ------ | ---------------------------------------------- | -------------------------------------------- | ------------ | ------------------------------------------------------------------------------------- |
-| **U1** | Unify effective-empty warning in `full_ingest` | `src/ingest.rs`                              | None         | New inline tests (filesystem-empty, all-ignored, populated control) pass              |
-| **U2** | Mirror warning at MCP server startup           | `src/main.rs`, `src/server.rs` (or `lib.rs`) | U1           | Manual smoke: `lore serve` on empty dir prints warning once and stays running         |
-| **U3** | Add `empty_knowledge_dir` fields to status     | `src/server.rs`                              | U1           | New inline test in `src/server.rs` asserts both fields for empty and populated states |
-| **U4** | Tests: integration + status fields             | `tests/edge_cases.rs`, `src/server.rs`       | U1, U3       | `assert_cmd` integration test asserts exit 0 + stderr warning; status test passes     |
-| **U5** | Documentation                                  | `README.md`, `src/main.rs` (clap doc)        | U1, U2, U3   | `dprint check` passes; `cargo run -- --help` shows updated text                       |
+| Unit   | Goal                                                     | Files touched                                | Dependencies | Verification                                                                                   |
+| ------ | -------------------------------------------------------- | -------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------- |
+| **U1** | Unify warning at top of `ingest()` (covers delta + full) | `src/ingest.rs`                              | None         | Inline tests via `ingest()` (filesystem-empty, all-ignored, populated, delta-after-empty) pass |
+| **U2** | Mirror warning at MCP server startup                     | `src/main.rs`, `src/server.rs` (or `lib.rs`) | U1           | Manual smoke: `lore serve` on empty dir prints warning once and stays running                  |
+| **U3** | Add `empty_knowledge_dir` to MCP and CLI status          | `src/server.rs`, `src/main.rs`               | U1           | Inline test in `src/server.rs` asserts both JSON fields; manual smoke verifies CLI line        |
+| **U4** | Integration test                                         | `tests/edge_cases.rs`                        | U1           | `assert_cmd` runs `lore ingest` on empty dir; asserts exit 0 + stderr warning                  |
+| **U5** | Documentation                                            | `README.md`, `src/main.rs` (clap doc)        | U1, U2, U3   | `dprint check` passes; `cargo run -- --help` shows updated text                                |
 
 ## Implementation Details
 
-### U1 — Unify effective-empty warning
+### U1 — Unify effective-empty warning at top of `ingest()`
 
 **File edits**: `src/ingest.rs`
 
-- Replace the conditional warning at `src/ingest.rs:691-693`. The current branch fires only when
-  `.loreignore` is the cause; the new shape fires whenever `md_files.is_empty()` after
-  `discover_md_files` returns, branching on whether `.loreignore` filtering was responsible.
-- Extract a helper, e.g.
-  `fn empty_warning_message(walked_count: usize, has_loreignore: bool) -> &'static str`, that
-  returns one of two messages (per the brainstorm's deferred question; default: two distinct
-  messages):
-  - filesystem-empty (`walked_count == 0`):
-    `Warning: knowledge directory is empty — add at least one .md file`
-  - all-ignored (`walked_count > 0 && md_files.is_empty()`):
-    `Warning: .loreignore matched every markdown file; nothing will be indexed` (preserved verbatim
-    from today for diff minimisation).
-- Expose `pub fn is_effective_empty(knowledge_dir: &Path) -> bool` from `lore::ingest` so
-  `cmd_serve` (U2) and `handle_lore_status` (U3) can reuse the check without re-walking from
-  scratch. The helper internally calls `loreignore::load` and `walk_md_files` and returns `true`
-  when the filtered list is empty.
+- Add a small helper: `pub fn effective_scan_state(knowledge_dir: &Path) -> EffectiveScanState`,
+  where `EffectiveScanState` is an enum with three variants:
+  - `Populated` — at least one markdown file survives `.loreignore` filtering.
+  - `FilesystemEmpty` — no `.md` files exist at all.
+  - `AllIgnored` — files exist but `.loreignore` excludes every candidate.
+
+  The helper internally calls `loreignore::load` and `walk_md_files`. A second helper
+  `pub fn is_effective_empty(knowledge_dir: &Path) -> bool` wraps it for callers (U2, U3) that only
+  need a bool.
+
+- At the top of `ingest()` (after the `is_git_repo` check at line 207 but before the `last_commit`
+  branching at line 213, so the warning fires regardless of git state and regardless of
+  delta-vs-full path), call `effective_scan_state` and emit the matching message via `on_progress`:
+
+  - `FilesystemEmpty`:
+    `Warning: knowledge directory is empty — add at least one .md file under <path>`
+  - `AllIgnored`: `Warning: .loreignore matched every markdown file; nothing will be indexed`
+    (preserved verbatim from today's wording for diff minimisation and to keep the
+    `full_ingest_with_all_files_excluded_indexes_nothing` test at `src/ingest.rs:2799` passing
+    without rewording.)
+  - `Populated`: no warning.
+
+  This single call site covers `delta_ingest`, all four `full_ingest` short-circuit branches in
+  `ingest()`, and the standalone "Not a git repository" / "No previous ingest recorded" / "Previous
+  commit not found" / "Failed to resolve HEAD" / "git diff failed" paths uniformly.
+
+- **Remove** the existing conditional warning at `src/ingest.rs:691-693`. The unified path in
+  `ingest()` now fires it once, before either `full_ingest` or `delta_ingest` runs. Direct callers
+  of `full_ingest` outside `ingest()` (today: tests only; verify with `git grep "full_ingest("`)
+  lose the warning, which is acceptable because tests exercise the contract through `ingest()` per
+  R5.
 
 **Tests** (inline `#[cfg(test)] mod tests`, alongside `ingest_empty_directory_returns_zero` at line
 1652):
 
-- `ingest_empty_directory_warns`: empty `tempdir`, capture `on_progress` calls into a `Vec<String>`
-  via a closure, assert one entry contains the filesystem-empty substring.
-- `ingest_all_ignored_warns`: write `.md` files plus `.loreignore` excluding them all, assert the
-  all-ignored substring fires. Confirms the existing partial warning still works through the new
-  path.
-- `ingest_populated_directory_does_not_warn`: positive control — write a `.md` file, assert no
-  warning substring fires.
+- `ingest_empty_directory_warns`: empty `tempdir`, drive through `ingest()` (not `full_ingest()`
+  directly), capture `on_progress` calls into a `Vec<String>` via a closure, assert one entry
+  contains the filesystem-empty substring.
+- `ingest_all_ignored_warns`: write `.md` files plus `.loreignore` excluding them all, drive through
+  `ingest()`, assert the all-ignored substring fires.
+- `ingest_populated_directory_does_not_warn`: positive control — write a `.md` file, drive through
+  `ingest()`, assert no warning substring fires.
+- `delta_ingest_after_emptying_warns`: write a `.md` file, run `ingest()` to record a commit; delete
+  the file (`.loreignore` untouched), commit; run `ingest()` again; assert the filesystem-empty
+  warning fires this time. Exercises the delta path explicitly.
 - Keep `ingest_empty_directory_returns_zero` (line 1652) — it asserts the zero-result contract that
   the warning does not change.
 
@@ -89,6 +114,10 @@ See the brainstorm — `Problem Frame` section is anchored against `src/ingest.r
 
 - `cargo test --features test-support`
 - `cargo clippy --all-targets -- -D warnings`
+- Confirm none of the existing tests at `src/ingest.rs:2667`
+  (`delta_ingest_no_changes_returns_early`), `:2799`
+  (`full_ingest_with_all_files_excluded_indexes_nothing`), or `:1652`
+  (`ingest_empty_directory_returns_zero`) regress.
 
 ### U2 — Mirror warning at MCP server startup
 
@@ -106,7 +135,12 @@ line 70)
 stays running. (The in-process MCP server tests in `src/server.rs` already exercise startup; one of
 them can assert the warning is captured.)
 
-### U3 — Add `empty_knowledge_dir` to `lore_status`
+### U3 — Add `empty_knowledge_dir` to MCP and CLI status
+
+The MCP tool (`handle_lore_status`) and the CLI command (`cmd_status`) render independently — the
+CLI does not consume the MCP JSON. Both surfaces need separate edits.
+
+#### U3.a — MCP `lore_status`
 
 **File edits**: `src/server.rs`, `handle_lore_status` (line 973-1014)
 
@@ -136,15 +170,50 @@ them can assert the warning is captured.)
 - `lore_status_reports_populated_knowledge_dir`: tempdir with one `.md` file, assert `false` /
   `"populated"`.
 
-### U4 — Integration test
+#### U3.b — CLI `lore status`
 
-**File creation** (or extend if it exists): `tests/edge_cases.rs`
+**File edits**: `src/main.rs`, `cmd_status` (line 707-761)
 
-- Use `assert_cmd` to spawn `lore ingest --config <path>` against a tempdir holding nothing, with a
-  config pointing at the tempdir.
-- Assert exit code 0 and stderr contains the filesystem-empty warning substring.
-- Test placement matches project convention (`rust/testing-strategy.md`): flat `tests/*.rs`, not
-  `tests/integration/`.
+- After the existing block that prints `Chunks` and `Sources` (around line 749-751), add a line
+  printing the effective-empty state:
+
+  ```rust
+  let knowledge_state =
+      if lore::ingest::is_effective_empty(&config.knowledge_dir) {
+          "✗ empty"
+      } else {
+          "✓ populated"
+      };
+  eprintln!("  Knowledge:    {knowledge_state}");
+  ```
+
+  (The existing line 717 already prints the knowledge-dir _path_ as `Knowledge:`. Either rename the
+  existing line to `Path:` and use `Knowledge:` for the state, or pick a different label such as
+  `Scan set:` for the new line. Implementation may choose; the test asserts the substring, not the
+  label.)
+
+- The CLI output stays human-formatted (`✓` / `✗` decoration matches the existing Ollama / Model /
+  sqlite-vec lines). No JSON output here — the CLI is human-only; agents use the MCP tool.
+
+**Tests**: a CLI integration assertion in U4 covers this; no separate unit test, because
+`cmd_status` is mostly composition of helpers that already have coverage.
+
+### U4 — Integration tests
+
+**File creation**: `tests/edge_cases.rs`. (Confirmed not present in `tests/` today — sibling files
+are flat `tests/*.rs` and the directory has no `integration/` or `unit/` sub-tree. If
+`feat/edge-case-handling` lands a `tests/edge_cases.rs` first, share the file rather than fork.)
+
+Two `assert_cmd` tests:
+
+- `ingest_empty_directory_warns_via_cli`: spawn `lore ingest --config <path>` against a tempdir
+  holding nothing, with a config pointing at the tempdir. Assert exit code 0 and stderr contains the
+  filesystem-empty warning substring.
+- `status_reports_empty_knowledge_dir_via_cli`: spawn `lore status --config <path>` against the same
+  tempdir setup. Assert stderr contains the empty-state substring written by `cmd_status` in U3.b.
+
+Test placement matches project convention (`rust/testing-strategy.md`): flat `tests/*.rs`, not
+`tests/integration/`.
 
 **Verification**: `cargo test --features test-support --test edge_cases`.
 
@@ -158,9 +227,10 @@ them can assert the warning is captured.)
   `Commands::Serve` (around line 89) to mention the warning and that exit status stays 0. The
   `lore --help` rendering picks this up automatically.
 
-**Verification**: `dprint check` passes (markdown formatting); `cargo run --
---help` shows the
-updated text.
+**Verification**:
+
+- `dprint check` passes (markdown formatting).
+- `cargo run -- --help` shows the updated text.
 
 ## Verifying downstream safety (no separate unit)
 
