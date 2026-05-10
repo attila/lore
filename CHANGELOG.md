@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Unicode NFC normalisation in slugify and slug-collision detection** — `add_pattern` now
+  distinguishes a slug collision (two distinct titles that slugify to the same filename, e.g.
+  `"API: Notes"` and `"API/Notes"` both → `api-notes.md`) from an intentional re-use (the same title
+  written twice). The collision case is tier-1 per the CLI behaviour ladder and returns a distinct
+  error naming the colliding slug, the existing file, and its title (or `(no title heading)` when
+  the existing file lacks a `#` heading); the re-use case keeps the pre-existing
+  `update_pattern`-hint error. `slugify` also NFC-normalises its input first, so `café` typed
+  precomposed (NFC, U+00E9) and `café` typed with a combining acute (NFD, `e` + U+0301) now produce
+  identical slugs instead of diverging silently. Adds the `unicode-normalization` crate. Slices A
+  and B of the edge-case-handling brainstorm.
 - **Effective-empty knowledge directory warning** — `lore ingest`, `lore serve`, and the per-request
   `lore_status` path now surface when the knowledge directory's effective scan set is empty. Three
   causes are distinguished:

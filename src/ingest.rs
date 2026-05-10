@@ -1068,7 +1068,32 @@ pub fn add_pattern(
     let file_path = knowledge_dir.join(&filename);
 
     if file_path.exists() {
-        anyhow::bail!("File already exists: {filename}. Use update_pattern instead.");
+        // Discriminate a slug collision (two distinct titles sharing a slug)
+        // from an intentional re-use (the same title written twice). Both
+        // hit the same path on disk, but the user-visible recovery differs:
+        // re-use → use `update_pattern`; collision → choose a different
+        // title. Compares titles after NFC normalisation so an NFC/NFD pair
+        // of the same visual title classifies as re-use.
+        let existing = std::fs::read_to_string(&file_path)?;
+        let existing_title_raw = extract_title(&existing);
+        let incoming_nfc: String = title.nfc().collect();
+        let existing_nfc: Option<String> = existing_title_raw.as_deref().map(|t| t.nfc().collect());
+
+        if existing_nfc.as_deref() == Some(incoming_nfc.as_str()) {
+            anyhow::bail!(
+                "Pattern \"{title}\" already exists at {filename}. \
+                 Use update_pattern to modify it."
+            );
+        }
+
+        let existing_label = existing_title_raw
+            .as_deref()
+            .map(|t| format!("title: \"{t}\""))
+            .unwrap_or_else(|| "no title heading".to_string());
+        anyhow::bail!(
+            "Slug \"{slug}\" already used by {filename} ({existing_label}). \
+             Choose a different title or call update_pattern to modify the existing file."
+        );
     }
 
     std::fs::write(&file_path, &content)?;
@@ -2102,7 +2127,9 @@ mod tests {
     }
 
     #[test]
-    fn add_pattern_rejects_existing_file() {
+    fn add_pattern_rejects_re_use_with_update_pattern_hint() {
+        // Re-use case: incoming title matches the existing file's heading.
+        // The error names the pattern and points at update_pattern.
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
         let db = memory_db();
@@ -2114,6 +2141,112 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("already exists"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("update_pattern"),
+            "should hint update_pattern: {msg}"
+        );
+        assert!(
+            !msg.contains("Slug "),
+            "should not use collision wording for re-use: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_distinct_titles_colliding_slug_returns_collision_error() {
+        // R11.5. Two distinct titles slugifying to the same name produce a
+        // collision-specific error naming the existing file and its title.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(dir.join("api-notes.md"), "# API Notes\n").unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "API: Notes", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Slug \"api-notes\""), "missing slug: {msg}");
+        assert!(msg.contains("api-notes.md"), "missing filename: {msg}");
+        assert!(
+            msg.contains("title: \"API Notes\""),
+            "missing existing title: {msg}"
+        );
+        assert!(
+            msg.contains("Choose a different title"),
+            "missing recovery hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_collision_with_no_heading_existing_file_uses_no_title_heading_label() {
+        // R11.6. When the conflicting file has no `# ` line at any position,
+        // extract_title returns None and the error uses `(no title heading)`
+        // rather than echoing the filename stem as if it were a title.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Frontmatter plus plain prose body — no `# ` line anywhere.
+        fs::write(
+            dir.join("api-notes.md"),
+            "---\ntags: [legacy]\n---\n\nPlain prose with no heading whatsoever.\n",
+        )
+        .unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "API Notes", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("(no title heading)"),
+            "missing fallback: {msg}"
+        );
+        assert!(
+            !msg.contains("title: \""),
+            "should not synthesise a title: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_nfc_nfd_round_trip_classifies_as_re_use() {
+        // Existing file written with NFC `café` heading; incoming NFD
+        // (`cafe` + combining acute) slugs identically and — after NFC
+        // normalisation of both titles — compares equal, so the
+        // discriminator classifies as re-use, not collision.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(dir.join("café.md"), "# café\n").unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "cafe\u{0301}", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("update_pattern"),
+            "expected re-use path: {msg}"
+        );
+        assert!(!msg.contains("Slug "), "should not be a collision: {msg}");
+    }
+
+    #[test]
+    fn add_pattern_rejects_combining_marks_only_title() {
+        // Guards U1 + U2 together: a title that NFC-normalises to a slug
+        // composed solely of combining marks still hits the existing
+        // alphanumeric-required error before any collision check fires.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(&db, &embedder, dir, "\u{0301}\u{0301}", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("at least one alphanumeric character"),
+            "unexpected error: {msg}"
+        );
     }
 
     // -- update_pattern ----------------------------------------------------
