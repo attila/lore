@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Effective-empty knowledge directory warning** — `lore ingest`, `lore serve`, and the per-request
+  `lore_status` path now surface when the knowledge directory's effective scan set is empty. Three
+  causes are distinguished:
+  - **Filesystem-empty** — the configured directory has no `.md` files;
+  - **All-ignored** — files exist but every candidate is excluded by `.loreignore`;
+  - **Missing** — the configured `knowledge_dir` does not exist on disk or is not a directory.
+
+  Behaviour is tier-2 per the project's CLI behaviour ladder
+  ([`docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md`](docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md)):
+  a warning to stderr, no error, exit `0`. The `lore_status` MCP tool gains `empty_knowledge_dir`
+  (bool) and `knowledge_dir_status` (`"populated" | "empty" | "missing"`) fields in its JSON
+  metadata; `lore status` prints a `Scan set:` line decorated `✓ populated`, `✗ empty (…)`, or
+  `✗ missing (…)`. There is deliberately no `--allow-empty-knowledge` opt-out flag — silencer flags
+  would train users to mask the same signal the warning was designed to surface.
 - **Universal-pattern predicate (`applies_when`)** — universal-tagged patterns may now declare an
   optional frontmatter block gating their re-injection by tool class and Bash command prefix. Two
   keys (`tools`, `bash_command_starts_with`) compose with OR semantics within each list and AND

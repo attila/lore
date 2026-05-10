@@ -181,6 +181,16 @@ repository root.
   a warning to stderr, and no filtering is applied.
 - **Malformed patterns:** Invalid glob syntax in a single line emits a warning to stderr; other
   valid patterns continue to apply.
+- **All files excluded:** When every `.md` file under `knowledge_dir` matches a `.loreignore`
+  pattern, `lore ingest` and `lore serve` print a warning to stderr and exit `0` with an empty
+  index. The same effective-empty signal fires when `knowledge_dir` is itself empty or does not
+  exist on disk; in those cases the warning names the missing or empty path so the recovery action
+  is unambiguous. `lore status` surfaces the same state on its `Scan set:` line, and the MCP
+  `lore_status` tool reports `empty_knowledge_dir` and `knowledge_dir_status`
+  (`"populated" |
+  "empty" | "missing"`). See
+  [`docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md`](solutions/conventions/cli-behaviour-ladder-2026-05-10.md)
+  for the rationale.
 
 ### Debug output
 
