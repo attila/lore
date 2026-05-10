@@ -1,191 +1,205 @@
 ---
-title: "feat: Empty Knowledge‑Directory Validation"
+title: "feat: Empty Knowledge-Directory Detection"
 type: feat
 status: in-progress
 date: 2026-05-04
-deepened: 2026-05-04
+deepened: 2026-05-10
 origin: docs/brainstorms/2026-05-04-empty-knowledge-dir-validation-requirements.md
 ---
 
-# Empty Knowledge‑Directory Validation
+# Empty Knowledge-Directory Detection
 
 ## Overview
 
-Implement a robust validation for an empty knowledge directory whilst providing an explicit flag
-(`--allow-empty-knowledge`) that permits a no‑op ingest. The default behaviour remains fail‑fast.
-The implementation must update the CLI, ingest pipeline, health endpoint, documentation and tests,
-ensuring full TDD compliance.
+Surface a tier-2 warning when the effective scan set in the knowledge directory is empty — either
+because no `.md` files exist or because `.loreignore` excludes every candidate. Replace today's
+silent-zero-result on filesystem-empty and unify with the existing partial warning at
+`src/ingest.rs:691-693`. Mirror the warning at MCP server startup (`cmd_serve`) and surface the disk
+state on the `lore_status` MCP tool. No flag, no error, exit 0.
+
+> **Refined 2026-05-10.** This plan supersedes a fail-fast framing with an opt-in
+> `--allow-empty-knowledge` flag. After applying the project's CLI behaviour ladder, the case is
+> tier-2 (warn), not tier-1 (fail). The flag, the bespoke `tests/unit/` and `tests/integration/`
+> paths, the speculative `/health` HTTP endpoint, the speculative `--auto-heal-empty-knowledge`
+> alias, and the speculative `docs/usage.md` references have all been dropped. See the brainstorm
+> preamble for the rationale.
 
 ## Problem Frame
 
-Lore expects a knowledge directory containing markdown files that are indexed into `knowledge.db`.
-When the directory is empty the ingest pipeline proceeds as if the database were fully indexed,
-leading to a silent failure: the tool reports success but provides no patterns. This situation can
-arise in freshly‑initialised sandboxes, CI pipelines that create a temporary knowledge directory, or
-when a user inadvertently deletes the contents. A robust defence is required to detect the condition
-early, inform the user, and optionally allow an explicit empty‑directory allowance mode.
+See the brainstorm — `Problem Frame` section is anchored against `src/ingest.rs` at commit
+`f78d061`.
 
-## Requirements
+## Requirements (summary)
 
-- **R1 – Empty‑Directory Detection (Fail‑Fast)**: Abort with a clear error if no markdown files are
-  present.
-- **R2 – Explicit Empty‑Directory Allowance Flag**: `--allow-empty-knowledge` (or equivalent
-  configuration key) shall be introduced. When supplied the programme treats an empty knowledge
-  directory as a valid state, skips indexing, and returns a successful ingest result with zero files
-  processed. No placeholder file is created.
-- **R3 – Health Endpoint Reporting**: The HTTP health endpoint (`/health`) shall expose
+- **R1**: Unified effective-empty warning in `full_ingest`, replacing the partial warning at
+  `src/ingest.rs:691-693`.
+- **R2**: Same warning at `cmd_serve` startup (`src/main.rs:511`).
+- **R3**: `lore_status` MCP tool (`src/server.rs:973`) and `lore status` CLI output gain
   `empty_knowledge_dir: bool` and `knowledge_dir_status: "empty" | "populated"`.
-- **R4 – Documentation**: Update README, CLI help and `just` help output to describe the new
-  validation step and flag.
-- **R5 – Test Coverage**: Unit tests for validation logic, integration test verifying the flag’s
-  behaviour, and health‑endpoint tests.
+- **R4**: README + clap doc-comments describe the warning. No new doc file.
+- **R5**: Inline unit tests, one integration test, one `lore_status` test.
 
 ## Implementation Units
 
-| Unit   | Goal                                                                              | Files touched                                                                                           | Dependencies | Verification                                                                                                                                                          |
-| ------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **U1** | Add CLI flag `--allow-empty-knowledge`                                            | `src/main.rs`, `src/config.rs` (if flag stored in config)                                               | None         | New unit test `cli::allow_empty_flag_parses` passes; `cargo clippy` shows no regressions                                                                              |
-| **U2** | Update `src/ingest.rs` to detect empty knowledge directory and honour the flag    | `src/ingest.rs`                                                                                         | U1           | Unit tests `validation::detect_empty_dir` (RED) and `validation::allow_empty_success` (GREEN) pass; integration test (see U5) confirms no placeholder file is created |
-| **U3** | Extend health endpoint JSON with `empty_knowledge_dir` and `knowledge_dir_status` | `src/server.rs` (or appropriate health module)                                                          | U2           | Health‑endpoint unit test asserts correct fields for both empty and populated states                                                                                  |
-| **U4** | Update documentation (README, CLI help, `just` help)                              | `README.md`, `docs/usage.md`, `justfile` (help description)                                             | U1, U2, U3   | `just fmt` succeeds; documentation builds without lint warnings                                                                                                       |
-| **U5** | Integration test: ingest on an empty knowledge directory with flag                | `tests/integration/empty_knowledge.rs`                                                                  | U1, U2       | Test runs `lore ingest --allow-empty-knowledge` on a temporary empty directory, exits 0, and asserts no `README.md` placeholder exists                                |
-| **U6** | Unit test for failure path (empty directory without flag)                         | `tests/unit/validation.rs`                                                                              | U2           | Test asserts error message matches specification and exit status is non‑zero                                                                                          |
-| **U7** | Verify downstream components do not assume at least one markdown file             | Review of modules that consume ingest results (e.g., search, pattern matching) – add guards if required | U2           | All downstream unit tests run with an empty‑state fixture and pass                                                                                                    |
+| Unit   | Goal                                           | Files touched                                | Dependencies | Verification                                                                          |
+| ------ | ---------------------------------------------- | -------------------------------------------- | ------------ | ------------------------------------------------------------------------------------- |
+| **U1** | Unify effective-empty warning in `full_ingest` | `src/ingest.rs`                              | None         | New inline tests (filesystem-empty, all-ignored, populated control) pass              |
+| **U2** | Mirror warning at MCP server startup           | `src/main.rs`, `src/server.rs` (or `lib.rs`) | U1           | Manual smoke: `lore serve` on empty dir prints warning once and stays running         |
+| **U3** | Add `empty_knowledge_dir` fields to status     | `src/server.rs`                              | U1           | New inline test in `src/server.rs` asserts both fields for empty and populated states |
+| **U4** | Tests: integration + status fields             | `tests/edge_cases.rs`, `src/server.rs`       | U1, U3       | `assert_cmd` integration test asserts exit 0 + stderr warning; status test passes     |
+| **U5** | Documentation                                  | `README.md`, `src/main.rs` (clap doc)        | U1, U2, U3   | `dprint check` passes; `cargo run -- --help` shows updated text                       |
 
-## Proof of Assumptions / Dependencies
+## Implementation Details
 
-### Implementation Unit Details
+### U1 — Unify effective-empty warning
 
-#### U1 – Add CLI flag `--allow-empty-knowledge`
+**File edits**: `src/ingest.rs`
 
-- **File edits**:
-  - `src/main.rs`: Extend Clap `App` definition with
-    `.arg(Arg::new("allow-empty-knowledge").long("allow-empty-knowledge").action(ArgAction::SetTrue).help("Permit ingestion when knowledge directory is empty"))`.
-  - `src/config.rs`: Add `pub allow_empty_knowledge: bool` to the configuration struct, default
-    `false`.
-- **Tests**:
-  - Add unit test `cli::allow_empty_flag_parses` in `tests/cli.rs` verifying the flag sets the
-    configuration.
-- **Verification**:
-  - Run `cargo fmt` and `cargo clippy` to ensure style compliance.
+- Replace the conditional warning at `src/ingest.rs:691-693`. The current branch fires only when
+  `.loreignore` is the cause; the new shape fires whenever `md_files.is_empty()` after
+  `discover_md_files` returns, branching on whether `.loreignore` filtering was responsible.
+- Extract a helper, e.g.
+  `fn empty_warning_message(walked_count: usize, has_loreignore: bool) -> &'static str`, that
+  returns one of two messages (per the brainstorm's deferred question; default: two distinct
+  messages):
+  - filesystem-empty (`walked_count == 0`):
+    `Warning: knowledge directory is empty — add at least one .md file`
+  - all-ignored (`walked_count > 0 && md_files.is_empty()`):
+    `Warning: .loreignore matched every markdown file; nothing will be indexed` (preserved verbatim
+    from today for diff minimisation).
+- Expose `pub fn is_effective_empty(knowledge_dir: &Path) -> bool` from `lore::ingest` so
+  `cmd_serve` (U2) and `handle_lore_status` (U3) can reuse the check without re-walking from
+  scratch. The helper internally calls `loreignore::load` and `walk_md_files` and returns `true`
+  when the filtered list is empty.
 
-#### U2 – Update ingest logic to honour the flag
+**Tests** (inline `#[cfg(test)] mod tests`, alongside `ingest_empty_directory_returns_zero` at line
+1652):
 
-- **File edits**:
-  - `src/ingest.rs`: Detect emptiness via `std::fs::read_dir`. If empty and flag is false, return
-    `anyhow::Error` with message "Knowledge directory is empty; aborting ingestion.". If flag is
-    true, return an `IngestResult` with `files_processed: 0`.
-- **Tests**:
-  - RED test `validation::detect_empty_dir` expecting an error.
-  - GREEN test `validation::allow_empty_success` expecting a successful result with zero files.
-- **Verification**:
-  - Ensure integration test U5 confirms no placeholder file is created.
+- `ingest_empty_directory_warns`: empty `tempdir`, capture `on_progress` calls into a `Vec<String>`
+  via a closure, assert one entry contains the filesystem-empty substring.
+- `ingest_all_ignored_warns`: write `.md` files plus `.loreignore` excluding them all, assert the
+  all-ignored substring fires. Confirms the existing partial warning still works through the new
+  path.
+- `ingest_populated_directory_does_not_warn`: positive control — write a `.md` file, assert no
+  warning substring fires.
+- Keep `ingest_empty_directory_returns_zero` (line 1652) — it asserts the zero-result contract that
+  the warning does not change.
 
-#### U3 – Extend health endpoint JSON
+**Verification**:
 
-- **File edits**:
-  - `src/server.rs`: Add fields `empty_knowledge_dir: bool` and `knowledge_dir_status: &'static str`
-    to health response struct.
-- **Tests**:
-  - Add unit test `health::empty_knowledge_status` asserting the new fields (see evidence below).
-- **Verification**:
-  - Confirm existing health checks remain passing.
+- `cargo test --features test-support`
+- `cargo clippy --all-targets -- -D warnings`
 
-#### U4 – Documentation updates
+### U2 — Mirror warning at MCP server startup
 
-- **Files touched**:
-  - `README.md`: Add a new “Empty Knowledge Directory” section describing the behaviour and flag.
-  - `docs/usage.md`: Include an example invocation with `--allow-empty-knowledge`.
-  - `justfile`: Extend the `ingest` task description with the new flag.
-- **Verification**:
-  - Run `just fmt` and ensure documentation builds without lint warnings.
+**File edits**: `src/main.rs` (`cmd_serve`, line 511) and / or `src/server.rs` (`start_mcp_server`,
+line 70)
 
-#### U5 – Integration test for flag behaviour
+- At server boot, after config load and before entering the read-loop, call
+  `ingest::is_effective_empty(&config.knowledge_dir)` and emit the same warning to stderr via
+  `eprintln!` if true. The exact call site (main vs server module) is up to implementation; placing
+  it inside `start_mcp_server` keeps the `cmd_serve` wrapper thin and allows the in-process MCP
+  server tests to exercise the path if useful.
+- The warning fires once at boot. No per-request re-check.
 
-- **File creation**:
-  - `tests/integration/empty_knowledge.rs`: Creates a temporary empty directory, runs the binary
-    with `--allow-empty-knowledge`, asserts exit status `0` and that no placeholder file is
-    generated.
-- **Verification**:
-  - Mark the test with `#[ignore]` if it depends on external resources.
+**Verification**: manual `lore serve` against an empty `tempdir`; warning appears on stderr, server
+stays running. (The in-process MCP server tests in `src/server.rs` already exercise startup; one of
+them can assert the warning is captured.)
 
-#### U6 – Unit test for failure path
+### U3 — Add `empty_knowledge_dir` to `lore_status`
 
-- **File creation**:
-  - `tests/unit/validation.rs`: Adds test `empty_dir_without_flag_errors` that runs ingest on an
-    empty directory without the flag and checks the error message matches "Knowledge directory is
-    empty; aborting ingestion.".
-- **Verification**:
-  - Confirm the error propagates a non‑zero exit code.
+**File edits**: `src/server.rs`, `handle_lore_status` (line 973-1014)
 
-#### U7 – Safeguard downstream components
+- After the existing `loreignore_active` computation (line 993-995), add:
 
-- **File edits**:
-  - Review `src/search.rs` and `src/pattern.rs`; insert guard clauses returning empty result sets
-    when `files_processed == 0`.
-- **Tests**:
-  - Add unit tests exercising the guards to ensure no panics occur with an empty ingest result.
+  ```rust
+  let empty_knowledge_dir =
+      crate::ingest::is_effective_empty(&ctx.config.knowledge_dir);
+  let knowledge_dir_status = if empty_knowledge_dir {
+      "empty"
+  } else {
+      "populated"
+  };
+  ```
 
-### Evidence of Assumptions
+- Add both fields to the `metadata` JSON object alongside `loreignore_active`,
+  `inbox_workflow_configured`, etc.
+- Update the tool description string at `src/server.rs:480` to mention the new fields. Update the
+  corresponding insta snapshot
+  (`src/snapshots/lore__server__tests__tools_list_returns_all_six_tools.snap`) via
+  `cargo insta accept` after the change.
 
-- **CLI parsing**: A unit test verifies the flag parsing without side‑effects:
+**Tests** (inline in `src/server.rs`):
 
-```rust
-// tests/cli.rs
-#[test]
-fn allow_empty_flag_parses() {
-    let args = vec!["lore", "ingest", "--allow-empty-knowledge"];
-    let cfg = Config::from_args(&args).expect("Failed to parse CLI");
-    assert!(cfg.allow_empty_knowledge);
-}
-```
+- `lore_status_reports_empty_knowledge_dir`: tempdir with no `.md` files, call the handler, assert
+  `empty_knowledge_dir == true` and `knowledge_dir_status == "empty"` in the JSON metadata.
+- `lore_status_reports_populated_knowledge_dir`: tempdir with one `.md` file, assert `false` /
+  `"populated"`.
 
-- **Health endpoint**: The health endpoint returns the new fields:
+### U4 — Integration test
 
-```rust
-#[tokio::test]
-async fn health_endpoint_shows_empty_knowledge() {
-    let address = start_server().await;
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&format!("http://{}/health", address))
-        .send()
-        .await
-        .expect("Health request failed");
-    let json: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    assert_eq!(json["empty_knowledge_dir"], true);
-    assert_eq!(json["knowledge_dir_status"], "empty");
-}
-```
+**File creation** (or extend if it exists): `tests/edge_cases.rs`
 
-- **Downstream safety**: Guard clauses were added to `src/search.rs` and `src/pattern.rs` to return
-  empty result sets when `files_processed == 0`. Unit tests confirm the guards behave correctly.
+- Use `assert_cmd` to spawn `lore ingest --config <path>` against a tempdir holding nothing, with a
+  config pointing at the tempdir.
+- Assert exit code 0 and stderr contains the filesystem-empty warning substring.
+- Test placement matches project convention (`rust/testing-strategy.md`): flat `tests/*.rs`, not
+  `tests/integration/`.
 
-- **Documentation generation**: After updating the markdown files, `just fmt` succeeds, proving the
-  formatting passes.
+**Verification**: `cargo test --features test-support --test edge_cases`.
+
+### U5 — Documentation
+
+**File edits**:
+
+- `README.md`: a short paragraph in the existing usage section describing the warning behaviour. No
+  new section unless one is already topical.
+- `src/main.rs`: update the clap doc-comment on `Commands::Ingest` (around line 76-83) and
+  `Commands::Serve` (around line 89) to mention the warning and that exit status stays 0. The
+  `lore --help` rendering picks this up automatically.
+
+**Verification**: `dprint check` passes (markdown formatting); `cargo run --
+--help` shows the
+updated text.
+
+## Verifying downstream safety (no separate unit)
+
+The original plan included U7, "Verify downstream components do not assume at least one markdown
+file", with proposed defensive guards in `src/search.rs` and `src/pattern.rs`. A code read of
+`full_ingest` (`src/ingest.rs:678-734`) confirms zero files iterates an empty vector cleanly with a
+zero-result `IngestResult`; search against a zero-pattern index returns zero results without panic.
+**No guards needed; no separate unit.** If implementation surfaces a panic during U1 testing, scope
+a guard to the specific call site rather than do a sweeping pass.
 
 ## Risks & Mitigation
 
-- **Risk**: Some downstream components may implicitly assume at least one markdown file (e.g.,
-  pattern generation).
-  - _Mitigation_: Guard those components with an early‑exit when the ingest result is empty, as
-    demonstrated in U7. Insert defensive checks in `src/search.rs` and `src/pattern.rs`. Include
-    unit tests with empty result sets to verify.
+- **Risk**: The unified warning fires twice — once via the new path, once via leftover code at
+  `src/ingest.rs:691-693`. _Mitigation_: U1 explicitly _replaces_ the existing branch; the
+  `ingest_all_ignored_warns` test asserts the new helper output, which catches any leftover
+  fragment.
 
-- **Risk**: Flag naming confusion could lead to misuse.
-  - _Mitigation_: The CLI help text clearly states the purpose and short name; an alias
-    `--auto-heal-empty-knowledge` is provided for legacy scripts (implemented in U1). Documentation
-    examples demonstrate correct usage.
+- **Risk**: `is_effective_empty` walks the directory a second time when called from `cmd_serve` and
+  `handle_lore_status`, doubling I/O on every status call. _Mitigation_: the walk is cheap on
+  realistic sizes (markdown files only, bounded by `walkdir`); status calls are agent-driven and
+  infrequent. If benchmarks later show a hotspot, cache via a `Once` or move the result into the
+  `ServerContext`.
 
-- **Risk**: Forgetting to run `just fmt` after editing markdown files.
-  - _Mitigation_: `AGENTS.md` enforces a post‑edit formatting rule; CI runs `dprint check` to catch
-    omissions. A pre‑commit hook invoking `just fmt‑fix` has been added to the repository.
+- **Risk**: `cargo insta` snapshot drift on the MCP `tools/list` snapshot
+  (`src/snapshots/lore__server__tests__tools_list_returns_all_six_tools.snap`) blocks CI when the
+  description string for `lore_status` updates. _Mitigation_: U3 explicitly calls out running
+  `cargo insta accept`. Treat the snapshot update as part of the same commit so reviewers see the
+  diff intentionally.
+
+- **Risk**: Integration test flakes on shared tempdir helpers under parallel test execution.
+  _Mitigation_: each test creates its own `tempfile::tempdir()` — the pattern already used
+  throughout `src/ingest.rs` tests.
 
 ## Next Steps
 
-1. Execute `03‑work` to implement the units above, adhering to RED‑GREEN‑REFACTOR TDD gates.
-2. After each unit, record a checkpoint via `session_checkpoint`.
-3. Once all units pass, run `just ci` to ensure the full quality gate succeeds.
-4. Hand off to the reviewer for final verification before merging.
-
----
+1. Implement U1 first (unifying warning + helper + inline tests). Run
+   `cargo test --features test-support`.
+2. Implement U2 and U3 in either order — they are independent.
+3. Implement U4 (integration test) once U1 + U3 are stable.
+4. Implement U5 (documentation) last, so the copy reflects final wording.
+5. Run `just ci` before opening the PR.
+6. Open a draft PR; the existing `feat/empty-knowledge-dir-validation` branch is the target.
