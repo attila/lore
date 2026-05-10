@@ -264,12 +264,51 @@ a guard to the specific call site rather than do a sweeping pass.
   _Mitigation_: each test creates its own `tempfile::tempdir()` — the pattern already used
   throughout `src/ingest.rs` tests.
 
+## As shipped
+
+All five units landed on `feat/empty-knowledge-dir-validation`:
+
+| Unit | Commit    | Subject                                                            |
+| ---- | --------- | ------------------------------------------------------------------ |
+| U1   | `0176fef` | feat: warn on effective-empty knowledge dir from top of `ingest()` |
+| U2   | `e4f52a0` | feat: mirror effective-empty warning at MCP server startup         |
+| U3.a | `84357a2` | feat: report `empty_knowledge_dir` on `lore_status` MCP tool       |
+| U3.b | `187bc98` | feat: surface effective-empty state in `lore status` CLI           |
+| U4   | `e459558` | test: add CLI integration tests for empty-dir warning              |
+| U5   | `247fe9d` | doc: document empty-knowledge-dir warning in README + `--help`     |
+
+The implementation matches the spec above with two minor clarifications worth recording:
+
+- **CLI `Scan set:` line uses one unified message**, while the ingest path emits two distinct
+  warnings. The CLI status is a single line per state so a unified message reads cleaner; ingest has
+  more room to spell out the recovery action.
+- **The `delta_ingest_after_emptying_warns` test** explicitly drives through `ingest()` rather than
+  `full_ingest()` so the delta path is exercised. Direct callers of `full_ingest()` no longer fire
+  the warning; the existing `tests/loreignore.rs` integration test was updated to route through
+  `ingest()` accordingly.
+
+## Smoke verification
+
+Verified locally on 2026-05-10 against four scenarios using a release build and a tempdir config:
+
+- **Filesystem-empty** → `lore ingest` emits
+  `Warning: knowledge directory is empty — add at least one .md file under <path>`, exit 0.
+- **All-ignored** (single `.md` plus `.loreignore` of `*.md`) → `lore ingest` emits
+  `Warning: .loreignore matched every markdown file; nothing will be indexed`, exit 0. The message
+  is distinct from the filesystem-empty one.
+- **Populated** (one `.md`) → `lore ingest` emits no warning; `lore status` shows
+  `Scan set:     ✓ populated`.
+- **Server startup** on the empty dir → `lore serve` prints the warning before the
+  `[lore] MCP server started` banner.
+
+`just ci` is green locally apart from a small set of pre-existing sandbox-bound test failures
+unrelated to this feature (two `hook::tests::*` requiring `$HOME` write, two git-push tests
+inheriting `GIT_CONFIG_*` env pollution, and `cargo deny` fetching the RustSec advisory database
+over SSH). All four are tracked separately for refactor after this PR merges.
+
 ## Next Steps
 
-1. Implement U1 first (unifying warning + helper + inline tests). Run
-   `cargo test --features test-support`.
-2. Implement U2 and U3 in either order — they are independent.
-3. Implement U4 (integration test) once U1 + U3 are stable.
-4. Implement U5 (documentation) last, so the copy reflects final wording.
-5. Run `just ci` before opening the PR.
-6. Open a draft PR; the existing `feat/empty-knowledge-dir-validation` branch is the target.
+1. Open a draft PR from `feat/empty-knowledge-dir-validation` → `main`.
+2. Self-review the diff in the GitHub UI; capture any wording tweaks.
+3. Mark ready for review, merge once green, flip this plan's frontmatter `status` to `completed`
+   with `completed: <merge-date>`.
