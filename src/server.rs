@@ -503,8 +503,8 @@ fn tool_definitions() -> Value {
                         "description":
                             "When true, appends a `lore-metadata` fenced code block to the \
                              end of the response containing machine-readable JSON with \
-                             knowledge_dir, knowledge_dir_status (\"empty\" or \"populated\"), \
-                             empty_knowledge_dir (bool), git_repository, \
+                             knowledge_dir, knowledge_dir_status (\"populated\", \"empty\", \
+                             or \"missing\"), empty_knowledge_dir (bool), git_repository, \
                              last_ingested_commit, chunks_indexed, sources_indexed, \
                              inbox_workflow_configured, delta_ingest_available, \
                              loreignore_active, and universal_advisories (count, \
@@ -513,8 +513,10 @@ fn tool_definitions() -> Value {
                              on-disk state, distinct from sources_indexed (database state): \
                              when sources_indexed is 0 and empty_knowledge_dir is false, \
                              files exist but have not been ingested — run `lore ingest`. \
-                             When empty_knowledge_dir is true, add `.md` files or relax \
-                             `.loreignore` first. Defaults to false.",
+                             When empty_knowledge_dir is true, knowledge_dir_status \
+                             discriminates further: \"empty\" calls for adding `.md` files \
+                             or relaxing `.loreignore`; \"missing\" means the configured \
+                             path doesn't exist or isn't a directory. Defaults to false.",
                         "default": false
                     }
                 },
@@ -1004,23 +1006,25 @@ fn handle_lore_status(
     let sources = stats.as_ref().map(|s| s.sources);
     let inbox_workflow_configured = ctx.config.inbox_branch_prefix().is_some();
     let delta_ingest_available = is_git_repo && last_commit.is_some();
-    // Reflect whether a .loreignore file is currently active so agents
-    // inspecting knowledge base health know that what they see in search is
-    // a filtered view of the underlying directory.
-    let loreignore_active = crate::loreignore::load(&ctx.config.knowledge_dir)
-        .matcher
-        .is_some();
-
-    // Report the on-disk effective scan state so agents can distinguish
-    // "the directory has files but the index is stale" (sources_indexed=0,
-    // empty_knowledge_dir=false) from "the directory itself is effectively
-    // empty" (empty_knowledge_dir=true). The latter calls for adding files
-    // or relaxing .loreignore, not for running ingest.
-    let empty_knowledge_dir = crate::ingest::is_effective_empty(&ctx.config.knowledge_dir);
-    let knowledge_dir_status = if empty_knowledge_dir {
-        "empty"
-    } else {
-        "populated"
+    // Compute the effective scan state in a single pass. `effective_scan_state`
+    // does one `.loreignore` load + one `walk_md_files`, and the `ScanInfo`
+    // it returns carries `loreignore_active` derived from the same load —
+    // avoiding the prior pattern of reading `.loreignore` once for the
+    // `loreignore_active` field and again inside `is_effective_empty`.
+    //
+    // The reported state distinguishes `populated`, `empty` (no .md files
+    // OR all-ignored), and `missing` (path doesn't exist or isn't a directory).
+    // Agents can pair `empty_knowledge_dir` with `sources_indexed` to choose
+    // a recovery action: stale index (run ingest), genuinely empty dir
+    // (add files / relax .loreignore), or wrong path (fix config).
+    let scan = crate::ingest::effective_scan_state(&ctx.config.knowledge_dir);
+    let loreignore_active = scan.loreignore_active;
+    let empty_knowledge_dir = !matches!(scan.state, crate::ingest::EffectiveScanState::Populated);
+    let knowledge_dir_status = match scan.state {
+        crate::ingest::EffectiveScanState::Populated => "populated",
+        crate::ingest::EffectiveScanState::Missing => "missing",
+        crate::ingest::EffectiveScanState::FilesystemEmpty
+        | crate::ingest::EffectiveScanState::AllIgnored => "empty",
     };
 
     // Surface the last-ingest universal-pattern advisories so agents can
@@ -2528,6 +2532,37 @@ mod tests {
             text.contains("(empty)"),
             "summary should mention the empty state, got: {text}"
         );
+    }
+
+    #[test]
+    fn lore_status_reports_missing_knowledge_dir() {
+        // Configured path doesn't exist. The MCP tool must report
+        // knowledge_dir_status="missing" so agents distinguish typos from
+        // genuinely empty directories. empty_knowledge_dir remains true
+        // because the effective scan set is empty in either case.
+        let h = TestHarness::new();
+        let nonexistent = h.config.knowledge_dir.join("does-not-exist");
+        let mut config = h.config.clone();
+        config.knowledge_dir = nonexistent;
+        let ctx = ServerContext {
+            db: &h.db,
+            embedder: &h.embedder,
+            config: &config,
+        };
+
+        let req: JsonRpcRequest = serde_json::from_str(
+            r#"{
+                "jsonrpc":"2.0","id":63,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        )
+        .unwrap();
+        let resp_value: Value = serde_json::to_value(handle_request(&req, &ctx).unwrap()).unwrap();
+
+        assert!(resp_value["error"].is_null());
+        let metadata = metadata_from_response(&resp_value);
+        assert_eq!(metadata["empty_knowledge_dir"], true);
+        assert_eq!(metadata["knowledge_dir_status"], "missing");
     }
 
     #[test]

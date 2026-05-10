@@ -63,3 +63,42 @@ fn status_reports_empty_knowledge_dir_via_cli() {
         .success()
         .stderr(predicate::str::contains("Scan set:").and(predicate::str::contains("empty")));
 }
+
+#[test]
+fn serve_startup_warns_on_empty_dir_via_cli() {
+    // Spawn `lore serve` with closed stdin so the read-loop exits on EOF
+    // immediately after boot. The startup warning fires before the loop is
+    // entered, so it must appear on stderr regardless.
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_empty_knowledge(tmp.path());
+
+    let assert = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["serve", "--config", config_path.to_str().unwrap()])
+        .write_stdin("")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert();
+
+    assert
+        .success()
+        .stderr(predicate::str::contains("knowledge directory is empty"));
+}
+
+#[test]
+fn list_does_not_warn_on_empty_knowledge_dir_via_cli() {
+    // Negative control: read-only commands that do not run ingest must not
+    // fire the empty-dir warning. A regression that broadens the check to
+    // every CLI entry point would be caught here. `lore list` is the
+    // simplest read-only path that touches the database without ingesting.
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = setup_empty_knowledge(tmp.path());
+
+    let assert = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["list", "--config", config_path.to_str().unwrap()])
+        .assert();
+
+    assert
+        .success()
+        .stderr(predicate::str::contains("knowledge directory is empty").not());
+}

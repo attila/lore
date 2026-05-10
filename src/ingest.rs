@@ -683,10 +683,10 @@ fn discover_md_files(
 /// Result of evaluating the effective scan set of a knowledge directory —
 /// the markdown files that survive `.loreignore` filtering.
 ///
-/// Used by [`ingest`] to discriminate the cause of an empty effective scan
-/// set so the user-visible warning can name the right recovery action.
-/// Surfaces that only need to know "is anything indexable?" can call
-/// [`is_effective_empty`] for a bool.
+/// Used to discriminate the cause of an empty effective scan set so the
+/// user-visible warning can name the right recovery action. Surfaces that
+/// only need to know "is anything indexable?" can call [`is_effective_empty`]
+/// for a bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EffectiveScanState {
     /// At least one markdown file survives `.loreignore` filtering.
@@ -695,49 +695,100 @@ pub(crate) enum EffectiveScanState {
     FilesystemEmpty,
     /// Markdown files exist on disk, but `.loreignore` excludes every one.
     AllIgnored,
+    /// `knowledge_dir` does not exist on disk or is not a directory (regular
+    /// file, broken symlink, missing parent). The user almost certainly has
+    /// a typo or a stale path in the config — running ingest is the wrong
+    /// recovery action.
+    Missing,
+}
+
+/// Effective scan-set state plus auxiliary flags derived from the same
+/// `.loreignore` load + `walk_md_files` pass.
+///
+/// Centralising both fields here lets `handle_lore_status` and the ingest
+/// entry point compute the full picture from a single filesystem walk
+/// rather than re-reading `.loreignore` and re-walking the directory per
+/// caller.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScanInfo {
+    pub state: EffectiveScanState,
+    pub loreignore_active: bool,
 }
 
 /// Compute the effective scan state of a knowledge directory.
 ///
 /// Walks `knowledge_dir` for markdown files and applies `.loreignore`
-/// filtering. The walk cost is the same one [`full_ingest`] pays via
-/// [`discover_md_files`] — this helper exists so callers outside the
-/// ingest pipeline ([`ingest`] itself, `cmd_serve` startup, the
-/// `lore_status` MCP tool, and the `lore status` CLI) can ask the
-/// question without reaching into ingest internals.
-pub(crate) fn effective_scan_state(knowledge_dir: &Path) -> EffectiveScanState {
+/// filtering. Returns both the discriminated state and a `loreignore_active`
+/// flag derived from the same single load, so callers that need both (like
+/// `handle_lore_status`) avoid a second `.loreignore` read.
+///
+/// When `knowledge_dir` does not exist or is not a directory, the function
+/// short-circuits with [`EffectiveScanState::Missing`] — no walk, no
+/// `.loreignore` load, and `loreignore_active` is reported as `false`.
+pub(crate) fn effective_scan_state(knowledge_dir: &Path) -> ScanInfo {
+    if !knowledge_dir.is_dir() {
+        return ScanInfo {
+            state: EffectiveScanState::Missing,
+            loreignore_active: false,
+        };
+    }
     let loaded_ignore = loreignore::load(knowledge_dir);
+    let loreignore_active = loaded_ignore.matcher.is_some();
     let (kept, walked_count) = walk_md_files(knowledge_dir, loaded_ignore.matcher.as_ref());
-    if !kept.is_empty() {
+    let state = if !kept.is_empty() {
         EffectiveScanState::Populated
     } else if walked_count == 0 {
         EffectiveScanState::FilesystemEmpty
     } else {
         EffectiveScanState::AllIgnored
+    };
+    ScanInfo {
+        state,
+        loreignore_active,
     }
 }
 
 /// Returns `true` when the effective scan set is empty — either because no
-/// markdown files exist or because `.loreignore` excludes every candidate.
+/// markdown files exist, `.loreignore` excludes every candidate, or the
+/// directory does not exist on disk.
 ///
-/// Convenience wrapper for callers that only need a bool. See
-/// [`effective_scan_state`] when the cause matters.
+/// Convenience wrapper for callers that only need a bool.
 pub fn is_effective_empty(knowledge_dir: &Path) -> bool {
     !matches!(
-        effective_scan_state(knowledge_dir),
+        effective_scan_state(knowledge_dir).state,
         EffectiveScanState::Populated
     )
+}
+
+/// Returns a stable label describing the knowledge directory's effective
+/// scan-set state: `"populated"`, `"empty"`, or `"missing"`.
+///
+/// Used by the `lore_status` MCP tool's `knowledge_dir_status` field and the
+/// `lore status` CLI's `Scan set:` line so both surfaces report the same
+/// discrimination without exposing the internal enum across the binary/library
+/// boundary.
+pub fn knowledge_dir_status_label(knowledge_dir: &Path) -> &'static str {
+    match effective_scan_state(knowledge_dir).state {
+        EffectiveScanState::Populated => "populated",
+        EffectiveScanState::Missing => "missing",
+        EffectiveScanState::FilesystemEmpty | EffectiveScanState::AllIgnored => "empty",
+    }
 }
 
 /// Compose the user-facing tier-2 warning for an effective-empty knowledge
 /// directory, or `None` when the directory is populated.
 ///
-/// Distinct messages per cause so the recovery action (add a `.md` file vs
-/// relax `.loreignore`) is unambiguous. Used by [`ingest`] (emitted via
-/// `on_progress`) and by `cmd_serve` startup (emitted via `eprintln!`).
+/// Distinct messages per cause so the recovery action (add a `.md` file,
+/// relax `.loreignore`, or fix the `knowledge_dir` path) is unambiguous.
+/// Used by [`ingest`] (emitted via `on_progress`) and by `cmd_serve` startup
+/// (emitted via `eprintln!`).
 pub fn empty_warning_message(knowledge_dir: &Path) -> Option<String> {
-    match effective_scan_state(knowledge_dir) {
+    match effective_scan_state(knowledge_dir).state {
         EffectiveScanState::Populated => None,
+        EffectiveScanState::Missing => Some(format!(
+            "Warning: knowledge directory not found at {} — check `knowledge_dir` in your config",
+            knowledge_dir.display()
+        )),
         EffectiveScanState::FilesystemEmpty => Some(format!(
             "Warning: knowledge directory is empty — add at least one .md file under {}",
             knowledge_dir.display()
@@ -1800,6 +1851,95 @@ mod tests {
         assert!(
             !captured.iter().any(|m| m.contains("Warning:")),
             "expected no warning, got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_missing_directory_warns_and_does_not_crash() {
+        // Configured path doesn't exist on disk. The warning must say so
+        // explicitly rather than the misleading "add at least one .md file"
+        // (which is the wrong recovery for a typo).
+        let tmp = tempdir().unwrap();
+        let nonexistent = tmp.path().join("does-not-exist");
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let messages = std::cell::RefCell::new(Vec::<String>::new());
+        ingest(&db, &embedder, &nonexistent, "heading", &|m| {
+            messages.borrow_mut().push(m.to_string());
+        });
+
+        let captured = messages.borrow();
+        assert!(
+            captured
+                .iter()
+                .any(|m| m.contains("not found") && m.contains("knowledge_dir")),
+            "expected missing-directory warning, got: {captured:?}"
+        );
+        assert!(
+            !captured.iter().any(|m| m.contains("add at least one")),
+            "missing-dir warning must not suggest adding a file, got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_knowledge_dir_is_regular_file_warns() {
+        // Configured path is a regular file, not a directory. Same recovery
+        // path as Missing (fix the config).
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let path = dir.join("not-a-dir");
+        fs::write(&path, "I am not a directory").unwrap();
+
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let messages = std::cell::RefCell::new(Vec::<String>::new());
+        ingest(&db, &embedder, &path, "heading", &|m| {
+            messages.borrow_mut().push(m.to_string());
+        });
+
+        let captured = messages.borrow();
+        assert!(
+            captured
+                .iter()
+                .any(|m| m.contains("not found") && m.contains("knowledge_dir")),
+            "expected missing-directory warning for regular file, got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn empty_warning_clears_after_adding_a_file() {
+        // Remedy-completion test: warn fires on empty -> user adds a .md
+        // file -> next ingest must not fire the warning. Pins the contract
+        // that the warning is reachable AND the documented remedy actually
+        // clears it.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let first = std::cell::RefCell::new(Vec::<String>::new());
+        ingest(&db, &embedder, dir, "heading", &|m| {
+            first.borrow_mut().push(m.to_string());
+        });
+        assert!(
+            first
+                .borrow()
+                .iter()
+                .any(|m| m.contains("knowledge directory is empty")),
+            "first ingest on empty dir must warn"
+        );
+
+        fs::write(dir.join("only.md"), "# Only\n\nBody text long enough.\n").unwrap();
+
+        let second = std::cell::RefCell::new(Vec::<String>::new());
+        ingest(&db, &embedder, dir, "heading", &|m| {
+            second.borrow_mut().push(m.to_string());
+        });
+        assert!(
+            !second.borrow().iter().any(|m| m.contains("Warning:")),
+            "warning must be cleared after adding a file, got: {:?}",
+            second.borrow()
         );
     }
 
