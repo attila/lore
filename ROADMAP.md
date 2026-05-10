@@ -7,7 +7,13 @@
       patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
       into an agent-agnostic engine plus a Claude-Code adapter. See
       `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-- [ ] Edge case handling (empty knowledge dir, non-git dir, duplicate titles, unicode filenames)
+- [ ] Edge case handling — remaining slices on `feat/edge-case-handling`: slug-collision detection
+      with distinct error wording (R1–R4), Unicode NFC normalisation in `slugify` (R5–R7), no-HEAD
+      progress line on a fresh `git init` (R9–R10), lossy-path warning during directory walk (R8),
+      and a missing-`git` binary regression test. See
+      `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md` for the brainstorm and the
+      _Implementation Slices_ table for the per-slice mapping. The empty-knowledge-dir slice was
+      pivoted to its own branch and shipped (see Completed below).
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -97,6 +103,16 @@
       and iterating on edit suggestions until the surfaced-query set stabilises. Ships alongside the
       fenced `lore-metadata` content-block pivot for MCP tool responses. See
       `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+- [x] Effective-empty knowledge directory warning — `lore ingest`, `lore serve`, and `lore_status`
+      surface when the knowledge directory's effective scan set is empty (filesystem-empty,
+      all-ignored, or missing). Tier-2 per the project's CLI behaviour ladder: warning to stderr,
+      exit 0, no opt-out flag. The MCP `lore_status` tool reports `empty_knowledge_dir` and
+      `knowledge_dir_status` (`"populated" | "empty" | "missing"`); the `lore status` CLI prints a
+      `Scan set:` line with the same discrimination. Originated as one bullet of the
+      edge-case-handling roadmap line; pivoted to a dedicated branch when the design crystallised
+      the CLI behaviour ladder convention. See
+      `docs/plans/2026-05-04-001-feat-empty-knowledge-dir-validation-plan.md` and
+      `docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md`.
 - [x] Universal patterns via tag-based SessionStart injection — patterns whose `tags:` frontmatter
       list contains `universal` get full body emitted in a `## Pinned conventions` section at every
       SessionStart and PostCompact, AND bypass the PreToolUse dedup filter so they re-inject on
