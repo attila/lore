@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use crate::chunking::{
@@ -1034,6 +1035,17 @@ pub fn add_pattern(
     tags: &[&str],
     inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
+    // Sanitise the title at the canonical write boundary: trim surrounding
+    // whitespace and reject embedded newlines. Without this, surrounding
+    // whitespace would round-trip as a misclassified collision (extract_title
+    // trims; build_file_content writes verbatim) and embedded newlines would
+    // truncate the on-disk heading at the first `\n`, defeating the
+    // collision discriminator forever and corrupting the indexed pattern.
+    let title = title.trim();
+    if title.contains('\n') || title.contains('\r') {
+        anyhow::bail!("Title must not contain newline characters");
+    }
+
     let slug = slugify(title);
     if slug.is_empty() {
         anyhow::bail!("Title must contain at least one alphanumeric character");
@@ -1067,7 +1079,40 @@ pub fn add_pattern(
     let file_path = knowledge_dir.join(&filename);
 
     if file_path.exists() {
-        anyhow::bail!("File already exists: {filename}. Use update_pattern instead.");
+        // Discriminate a slug collision (two distinct titles sharing a slug)
+        // from an intentional re-use (the same title written twice). Both
+        // hit the same path on disk, but the user-visible recovery differs:
+        // re-use → use `update_pattern`; collision → choose a different
+        // title. Compares titles after NFC normalisation so an NFC/NFD pair
+        // of the same visual title classifies as re-use.
+        // Read the existing file to extract its title for the discriminator.
+        // On read failure (directory at `file_path`, permission denied, or
+        // non-UTF-8 content), fall back to empty contents so the collision
+        // branch fires with the curated `(no title heading)` label rather
+        // than propagating a raw OS error and bypassing the tier-1 wording.
+        let existing = std::fs::read_to_string(&file_path).unwrap_or_default();
+        // `extract_title` can return `Some("")` for a bare `# ` heading with
+        // no text. Treat that as no extractable title so the collision label
+        // reads `(no title heading)` rather than `title: ""`.
+        let existing_title_raw = extract_title(&existing).filter(|t| !t.trim().is_empty());
+        let incoming_nfc: String = title.nfc().collect();
+        let existing_nfc: Option<String> = existing_title_raw.as_deref().map(|t| t.nfc().collect());
+
+        if existing_nfc.as_deref() == Some(incoming_nfc.as_str()) {
+            anyhow::bail!(
+                "Pattern \"{title}\" already exists at {filename}. \
+                 Use update_pattern to modify it."
+            );
+        }
+
+        let existing_label = existing_title_raw.as_deref().map_or_else(
+            || "no title heading".to_string(),
+            |t| format!("title: \"{t}\""),
+        );
+        anyhow::bail!(
+            "Slug \"{slug}\" already used by {filename} ({existing_label}). \
+             Choose a different title or call update_pattern to modify the existing file."
+        );
     }
 
     std::fs::write(&file_path, &content)?;
@@ -1615,8 +1660,16 @@ fn try_commit(knowledge_dir: &Path, file_path: &Path, message: &str) -> CommitSt
 }
 
 /// Turn a title into a filename-safe slug.
+///
+/// Input is NFC-normalised first so visually identical titles in different
+/// normalisation forms (e.g. precomposed `é` vs. `e` + combining acute)
+/// produce identical slugs. Without this, NFD combining marks would be
+/// stripped by the `is_alphanumeric` filter and `café` (NFD) would slug to
+/// `cafe`, diverging from `café` (NFC) which slugs to `café`.
 fn slugify(title: &str) -> String {
     title
+        .nfc()
+        .collect::<String>()
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -1740,6 +1793,35 @@ mod tests {
     #[test]
     fn slugify_leading_trailing_dashes() {
         assert_eq!(slugify("  --Title-- "), "title");
+    }
+
+    #[test]
+    fn slugify_nfd_combining_acute_normalises_to_nfc() {
+        // R11.7. `café` typed with a combining acute (NFD: `e` + U+0301)
+        // post-normalisation slugs to the precomposed NFC form, not `cafe`.
+        // Pre-fix the combining mark was stripped by `is_alphanumeric`.
+        let nfd = "cafe\u{0301}";
+        let nfc = "café";
+        assert_eq!(slugify(nfd), slugify(nfc));
+        assert_eq!(slugify(nfd), "café");
+    }
+
+    #[test]
+    fn slugify_combining_marks_only_yields_empty_slug() {
+        // R11.8. A title made solely of combining marks slugs to empty;
+        // callers (add_pattern) surface the existing
+        // `Title must contain at least one alphanumeric character` error.
+        assert_eq!(slugify("\u{0301}\u{0301}"), "");
+    }
+
+    #[test]
+    fn slugify_preserves_full_unicode() {
+        // R7. NFC neither folds nor transliterates — non-Latin scripts
+        // survive intact and produce a slug equal to their lowercased,
+        // alphanumeric form (CJK has no cased form, so it round-trips
+        // unchanged).
+        assert_eq!(slugify("Café Tip"), "café-tip");
+        assert_eq!(slugify("日本語"), "日本語");
     }
 
     // -- ingest (full directory) -------------------------------------------
@@ -2066,7 +2148,9 @@ mod tests {
     }
 
     #[test]
-    fn add_pattern_rejects_existing_file() {
+    fn add_pattern_rejects_re_use_with_update_pattern_hint() {
+        // Re-use case: incoming title matches the existing file's heading.
+        // The error names the pattern and points at update_pattern.
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
         let db = memory_db();
@@ -2078,6 +2162,254 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("already exists"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("update_pattern"),
+            "should hint update_pattern: {msg}"
+        );
+        assert!(
+            !msg.contains("Slug "),
+            "should not use collision wording for re-use: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_distinct_titles_colliding_slug_returns_collision_error() {
+        // R11.5. Two distinct titles slugifying to the same name produce a
+        // collision-specific error naming the existing file and its title.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(dir.join("api-notes.md"), "# API Notes\n").unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "API: Notes", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Slug \"api-notes\""), "missing slug: {msg}");
+        assert!(msg.contains("api-notes.md"), "missing filename: {msg}");
+        assert!(
+            msg.contains("title: \"API Notes\""),
+            "missing existing title: {msg}"
+        );
+        assert!(
+            msg.contains("Choose a different title"),
+            "missing recovery hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_collision_with_no_heading_existing_file_uses_no_title_heading_label() {
+        // R11.6. When the conflicting file has no `# ` line at any position,
+        // extract_title returns None and the error uses `(no title heading)`
+        // rather than echoing the filename stem as if it were a title.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Frontmatter plus plain prose body — no `# ` line anywhere.
+        fs::write(
+            dir.join("api-notes.md"),
+            "---\ntags: [legacy]\n---\n\nPlain prose with no heading whatsoever.\n",
+        )
+        .unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "API Notes", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("(no title heading)"),
+            "missing fallback: {msg}"
+        );
+        assert!(
+            !msg.contains("title: \""),
+            "should not synthesise a title: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_nfc_nfd_round_trip_classifies_as_re_use() {
+        // Existing file written with NFC `café` heading; incoming NFD
+        // (`cafe` + combining acute) slugs identically and — after NFC
+        // normalisation of both titles — compares equal, so the
+        // discriminator classifies as re-use, not collision.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(dir.join("café.md"), "# café\n").unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "cafe\u{0301}", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("update_pattern"),
+            "expected re-use path: {msg}"
+        );
+        assert!(!msg.contains("Slug "), "should not be a collision: {msg}");
+    }
+
+    #[test]
+    fn add_pattern_rejects_combining_marks_only_title() {
+        // Guards U1 + U2 together: a title that NFC-normalises to a slug
+        // composed solely of combining marks still hits the existing
+        // alphanumeric-required error before any collision check fires.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(&db, &embedder, dir, "\u{0301}\u{0301}", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("at least one alphanumeric character"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_rejects_empty_title() {
+        // Plan-listed regression guard: empty title still hits the
+        // alphanumeric-required error after U1's NFC normalisation.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(&db, &embedder, dir, "", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("at least one alphanumeric character"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_trims_title_whitespace_so_round_trip_classifies_as_re_use() {
+        // R1. A title with leading/trailing whitespace round-trips correctly:
+        // the trimmed form is used for slugify, the on-disk heading, and the
+        // discriminator NFC compare. A second call with the trimmed form
+        // classifies as re-use, not collision.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "  My Pattern  ",
+            "body text",
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "My Pattern", "other body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("update_pattern"),
+            "expected re-use path: {msg}"
+        );
+        assert!(
+            !msg.contains("Choose a different title"),
+            "should not be a collision: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_rejects_newline_in_title() {
+        // R2. Newlines in a title would truncate the on-disk `# heading` line
+        // and corrupt the indexed pattern. Reject at the write boundary.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(&db, &embedder, dir, "Hello\nWorld", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must not contain newline"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_rejects_carriage_return_in_title() {
+        // R2 sibling. CRLF artefacts from copy-paste are rejected by the
+        // same guard.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(&db, &embedder, dir, "Hello\rWorld", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must not contain newline"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_directory_at_file_path_falls_back_to_no_heading_collision() {
+        // R3. A directory at the slug path makes `read_to_string` fail; the
+        // discriminator must still surface the curated tier-1 message with
+        // the `(no title heading)` label rather than propagating a raw
+        // `IsADirectory` error.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Create a directory at the path `add_pattern` would target.
+        fs::create_dir_all(dir.join("blocked.md")).unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "Blocked", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        // The fs::write that follows the discriminator may also fail with an
+        // OS error if the directory survives, but the discriminator runs
+        // first and bails with the curated message.
+        assert!(
+            msg.contains("Slug \"blocked\"") && msg.contains("(no title heading)"),
+            "expected curated collision message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_existing_file_with_nfd_heading_classifies_nfc_incoming_as_re_use() {
+        // Symmetric companion to add_pattern_nfc_nfd_round_trip_classifies_as_re_use:
+        // existing file's heading is NFD on disk, incoming title is NFC.
+        // The discriminator NFC-normalises both sides before comparison, so
+        // either direction should classify as re-use.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Existing file's heading is NFD (`e` + combining acute).
+        fs::write(dir.join("café.md"), "# cafe\u{0301}\n").unwrap();
+
+        let result = add_pattern(&db, &embedder, dir, "café", "body", &[], None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("update_pattern"),
+            "expected re-use path: {msg}"
+        );
+        assert!(
+            !msg.contains("Choose a different title"),
+            "should not be a collision: {msg}"
+        );
     }
 
     // -- update_pattern ----------------------------------------------------
