@@ -1075,7 +1075,10 @@ pub fn add_pattern(
         // title. Compares titles after NFC normalisation so an NFC/NFD pair
         // of the same visual title classifies as re-use.
         let existing = std::fs::read_to_string(&file_path)?;
-        let existing_title_raw = extract_title(&existing);
+        // `extract_title` can return `Some("")` for a bare `# ` heading with
+        // no text. Treat that as no extractable title so the collision label
+        // reads `(no title heading)` rather than `title: ""`.
+        let existing_title_raw = extract_title(&existing).filter(|t| !t.trim().is_empty());
         let incoming_nfc: String = title.nfc().collect();
         let existing_nfc: Option<String> = existing_title_raw.as_deref().map(|t| t.nfc().collect());
 
