@@ -7,13 +7,14 @@
       patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
       into an agent-agnostic engine plus a Claude-Code adapter. See
       `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-- [ ] Edge case handling — remaining slices on `feat/edge-case-handling`: slug-collision detection
-      with distinct error wording (R1–R4), Unicode NFC normalisation in `slugify` (R5–R7), no-HEAD
-      progress line on a fresh `git init` (R9–R10), lossy-path warning during directory walk (R8),
-      and a missing-`git` binary regression test. See
+- [ ] Edge case handling — three remaining slices: no-HEAD progress line on a fresh `git init`
+      (Slice C, R9–R10 + R11.2, R11.3), lossy-path warning during directory walk (Slice D, R8 +
+      R11.9, Unix-only test gating), missing-`git` binary regression test (Slice E, R11.1, R11.4,
+      test-only). All three are mutually independent. See
       `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md` for the brainstorm and the
-      _Implementation Slices_ table for the per-slice mapping. The empty-knowledge-dir slice was
-      pivoted to its own branch and shipped (see Completed below).
+      _Implementation Slices_ table for the per-slice mapping. Slices A (Unicode NFC normalisation)
+      and B (slug-collision detection) shipped together (see Completed below); the
+      empty-knowledge-dir slice shipped earlier on its own branch.
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -103,6 +104,18 @@
       and iterating on edit suggestions until the surfaced-query set stabilises. Ships alongside the
       fenced `lore-metadata` content-block pivot for MCP tool responses. See
       `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
+- [x] Edge case handling — Slices A + B (Unicode NFC normalisation in `slugify` and slug-collision
+      detection in `add_pattern`). NFC normalisation makes `café` (NFC) and `café` (NFD) produce
+      identical slugs. The collision discriminator distinguishes a real slug collision (two distinct
+      titles sharing a slug, tier-1 hard-fail) from intentional re-use (same title, pointed at
+      `update_pattern`); error names slug, filename, and existing title (or
+      `(no title
+      heading)`). Multi-reviewer pass added title sanitisation at the write
+      boundary (trim whitespace, reject embedded newlines) and graceful read fallback for
+      non-regular files at the slug path. R5 (NFD-on-disk vs NFC-incoming filename mismatch on
+      Mac→Linux sync) is documented as a deferred limitation. See
+      `docs/plans/2026-05-10-001-feat-unicode-nfc-slug-collisions-plan.md` and
+      `docs/solutions/design-patterns/round-trip-discriminator-canonicalise-both-sides-2026-05-10.md`.
 - [x] Effective-empty knowledge directory warning — `lore ingest`, `lore serve`, and `lore_status`
       surface when the knowledge directory's effective scan set is empty (filesystem-empty,
       all-ignored, or missing). Tier-2 per the project's CLI behaviour ladder: warning to stderr,
