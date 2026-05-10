@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use crate::chunking::{
@@ -1615,8 +1616,16 @@ fn try_commit(knowledge_dir: &Path, file_path: &Path, message: &str) -> CommitSt
 }
 
 /// Turn a title into a filename-safe slug.
+///
+/// Input is NFC-normalised first so visually identical titles in different
+/// normalisation forms (e.g. precomposed `é` vs. `e` + combining acute)
+/// produce identical slugs. Without this, NFD combining marks would be
+/// stripped by the `is_alphanumeric` filter and `café` (NFD) would slug to
+/// `cafe`, diverging from `café` (NFC) which slugs to `café`.
 fn slugify(title: &str) -> String {
     title
+        .nfc()
+        .collect::<String>()
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -1740,6 +1749,33 @@ mod tests {
     #[test]
     fn slugify_leading_trailing_dashes() {
         assert_eq!(slugify("  --Title-- "), "title");
+    }
+
+    #[test]
+    fn slugify_nfd_combining_acute_normalises_to_nfc() {
+        // R11.7. `café` typed with a combining acute (NFD: `e` + U+0301)
+        // post-normalisation slugs to the precomposed NFC form, not `cafe`.
+        // Pre-fix the combining mark was stripped by `is_alphanumeric`.
+        let nfd = "cafe\u{0301}";
+        let nfc = "café";
+        assert_eq!(slugify(nfd), slugify(nfc));
+        assert_eq!(slugify(nfd), "café");
+    }
+
+    #[test]
+    fn slugify_combining_marks_only_yields_empty_slug() {
+        // R11.8. A title made solely of combining marks slugs to empty;
+        // callers (add_pattern) surface the existing
+        // `Title must contain at least one alphanumeric character` error.
+        assert_eq!(slugify("\u{0301}\u{0301}"), "");
+    }
+
+    #[test]
+    fn slugify_preserves_full_unicode() {
+        // R7. NFC neither folds nor transliterates — non-Latin scripts
+        // survive intact.
+        assert_eq!(slugify("Café Tip"), "café-tip");
+        assert!(!slugify("日本語").is_empty());
     }
 
     // -- ingest (full directory) -------------------------------------------
