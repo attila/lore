@@ -136,6 +136,13 @@ reinforcement (see the "When to use the universal tag" section in the pattern au
 | `lore extract-queries`      | Simulate the hook's FTS5 query extraction for a tool call |
 | `lore status`               | Check health of all components                            |
 
+> **What if the knowledge directory is empty?** `lore ingest` and `lore serve` print a warning to
+> stderr ("Warning: knowledge directory is empty …") and continue — an empty directory is a legal
+> state, not an error, so the exit status stays `0`. Add a `.md` file or relax `.loreignore` to
+> populate the index. `lore status` reports the same state via its `Scan set:` line, and the MCP
+> `lore_status` tool exposes `empty_knowledge_dir: true` plus `knowledge_dir_status: "empty"` for
+> monitoring callers.
+
 ## MCP Tools
 
 The server exposes five tools:

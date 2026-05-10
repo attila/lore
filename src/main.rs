@@ -63,6 +63,8 @@ enum Commands {
 
 EXIT CODES:
   0  Success. Delta and full ingest may list per-file errors on stderr and still exit 0.
+     An effectively empty knowledge directory (no .md files, or every file excluded by
+     .loreignore) prints a warning to stderr and still exits 0 — the empty state is legal.
   1  Single-file ingest failed (atomic), or an unrecoverable error (config, database,
      embedding service). Relative paths are resolved against the current working directory,
      not the knowledge directory.
@@ -86,7 +88,13 @@ NOTES:
         file: Option<PathBuf>,
     },
 
-    /// Start the MCP server (stdio transport for Claude Code)
+    /// Start the MCP server (stdio transport for Claude Code).
+    ///
+    /// On startup, prints a one-shot warning to stderr if the knowledge
+    /// directory is effectively empty (no `.md` files, or every file
+    /// excluded by `.loreignore`). The server proceeds to serve regardless
+    /// — the empty state is legal so agents can still introspect via
+    /// `lore_status`.
     Serve,
 
     /// Search the knowledge base from the command line
@@ -256,6 +264,14 @@ fn cmd_init(
     let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
     let _lock_guard = write_lock.acquire()?;
 
+    // Mirror the tier-2 effective-empty warning that `ingest()` emits at its
+    // entry point. `cmd_init` calls `full_ingest` directly to avoid the
+    // delta/full state probe (the DB is fresh), so the warning would not fire
+    // otherwise. See project memory `project_cli_behaviour_ladder.md`.
+    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+        eprintln!("{msg}");
+    }
+
     let ingest_result = ingest::full_ingest(
         &db,
         &ollama,
@@ -399,6 +415,12 @@ fn dispatch_ingest(
 
     if force {
         eprintln!("Full ingest (--force)...\n");
+        // Mirror the tier-2 warning that `ingest()` emits — `--force`
+        // bypasses `ingest()` to skip the delta/full state probe, so the
+        // warning would not fire otherwise.
+        if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+            on_progress(&msg);
+        }
         Ok(ingest::full_ingest(
             db,
             ollama,
@@ -715,6 +737,12 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
     eprintln!("  Knowledge:    {}", config.knowledge_dir.display());
+    let scan_state = match ingest::knowledge_dir_status_label(&config.knowledge_dir) {
+        "missing" => "✗ missing (path not found or not a directory)",
+        "empty" => "✗ empty (no .md files, or .loreignore excludes them all)",
+        _ => "✓ populated",
+    };
+    eprintln!("  Scan set:     {scan_state}");
     eprintln!("  Database:     {}", config.database.display());
     eprintln!("  Bind:         {}", config.bind);
     eprintln!();

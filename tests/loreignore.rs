@@ -195,7 +195,10 @@ fn loreignore_excluding_all_markdown_yields_empty_index() {
     let db = memory_db();
     let embedder = FakeEmbedder::new();
     let messages = std::cell::RefCell::new(Vec::<String>::new());
-    let result = ingest::full_ingest(&db, &embedder, dir, "heading", &|m| {
+    // Route through `ingest::ingest` rather than `ingest::full_ingest` directly:
+    // the effective-empty warning lives on the top-level entry point, so any
+    // direct full_ingest caller would miss it.
+    let result = ingest::ingest(&db, &embedder, dir, "heading", &|m| {
         messages.borrow_mut().push(m.to_string());
     });
 
