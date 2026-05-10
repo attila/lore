@@ -488,11 +488,13 @@ fn tool_definitions() -> Value {
             "description":
                 "Report knowledge base health: whether it is a git repository, the indexed \
                  chunk and source counts, the last ingested commit (if any), whether the \
-                 inbox branch workflow is configured, and whether a .loreignore file is \
-                 active (filtering files out of the index). Use this before write operations \
-                 to verify the knowledge base is in the expected state, especially when the \
-                 agent needs to know whether changes will be committed to git or whether \
-                 files in a particular path are excluded from search.",
+                 inbox branch workflow is configured, whether a .loreignore file is active \
+                 (filtering files out of the index), and whether the knowledge directory \
+                 is effectively empty (no markdown files, or every file excluded by \
+                 .loreignore). Use this before write operations to verify the knowledge \
+                 base is in the expected state, especially when the agent needs to know \
+                 whether changes will be committed to git or whether files in a particular \
+                 path are excluded from search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -501,12 +503,13 @@ fn tool_definitions() -> Value {
                         "description":
                             "When true, appends a `lore-metadata` fenced code block to the \
                              end of the response containing machine-readable JSON with \
-                             knowledge_dir, git_repository, last_ingested_commit, \
-                             chunks_indexed, sources_indexed, inbox_workflow_configured, \
-                             delta_ingest_available, loreignore_active, and \
-                             universal_advisories (count, oversized bodies, near-miss tags \
-                             from the most recent full or single-file ingest). \
-                             Defaults to false.",
+                             knowledge_dir, knowledge_dir_status (\"empty\" or \"populated\"), \
+                             empty_knowledge_dir (bool), git_repository, \
+                             last_ingested_commit, chunks_indexed, sources_indexed, \
+                             inbox_workflow_configured, delta_ingest_available, \
+                             loreignore_active, and universal_advisories (count, \
+                             oversized bodies, near-miss tags from the most recent full or \
+                             single-file ingest). Defaults to false.",
                         "default": false
                     }
                 },
@@ -1003,6 +1006,18 @@ fn handle_lore_status(
         .matcher
         .is_some();
 
+    // Report the on-disk effective scan state so agents can distinguish
+    // "the directory has files but the index is stale" (sources_indexed=0,
+    // empty_knowledge_dir=false) from "the directory itself is effectively
+    // empty" (empty_knowledge_dir=true). The latter calls for adding files
+    // or relaxing .loreignore, not for running ingest.
+    let empty_knowledge_dir = crate::ingest::is_effective_empty(&ctx.config.knowledge_dir);
+    let knowledge_dir_status = if empty_knowledge_dir {
+        "empty"
+    } else {
+        "populated"
+    };
+
     // Surface the last-ingest universal-pattern advisories so agents can
     // see the >3 warning, per-pattern body-size warnings, and near-miss
     // typo flags without needing access to the stderr of the operator's
@@ -1016,6 +1031,8 @@ fn handle_lore_status(
 
     let metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
+        "knowledge_dir_status": knowledge_dir_status,
+        "empty_knowledge_dir": empty_knowledge_dir,
         "git_repository": is_git_repo,
         "last_ingested_commit": last_commit,
         "chunks_indexed": chunks,
@@ -1027,9 +1044,10 @@ fn handle_lore_status(
     });
 
     let summary = format!(
-        "Knowledge base: {} — {} {} across {} {}. Git repository: {}. \
+        "Knowledge base: {} ({}) — {} {} across {} {}. Git repository: {}. \
          Delta ingest: {}. Inbox workflow: {}. .loreignore: {}.",
         ctx.config.knowledge_dir.display(),
+        knowledge_dir_status,
         chunks.map_or_else(|| "?".into(), |c| c.to_string()),
         if chunks == Some(1) { "chunk" } else { "chunks" },
         sources.map_or_else(|| "?".into(), |s| s.to_string()),
@@ -2475,6 +2493,69 @@ mod tests {
         assert!(
             text.contains("Git repository: yes"),
             "summary should reflect git state, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_empty_knowledge_dir() {
+        // Arrange
+        // TestHarness's tempdir starts with no markdown files, so the
+        // effective scan set is empty (filesystem-empty). The new fields
+        // must report this without ingest having run.
+        let h = TestHarness::new();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":60,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["empty_knowledge_dir"], true);
+        assert_eq!(metadata["knowledge_dir_status"], "empty");
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("(empty)"),
+            "summary should mention the empty state, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_reports_populated_knowledge_dir() {
+        // Arrange
+        // Add a markdown file to the harness's knowledge_dir so the
+        // effective scan set is non-empty. This is independent of whether
+        // the file has been ingested; lore_status reports disk state.
+        let h = TestHarness::new();
+        std::fs::write(
+            h.config.knowledge_dir.join("alpha.md"),
+            "# Alpha\n\nBody text long enough.\n",
+        )
+        .unwrap();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":61,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["empty_knowledge_dir"], false);
+        assert_eq!(metadata["knowledge_dir_status"], "populated");
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("(populated)"),
+            "summary should mention the populated state, got: {text}"
         );
     }
 
