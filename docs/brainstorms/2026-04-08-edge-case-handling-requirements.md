@@ -19,8 +19,9 @@ The four bullets span a wide severity range. A code scan against today's `src/in
 
 - **Empty knowledge dir** — _pivoted to a separate branch._ Originally classified as "already works"
   (silent zero-result via `ingest_empty_directory_returns_zero`). Superseded by
-  `feat/empty-knowledge-dir-validation`, which replaces silent-zero-result with fail-fast plus an
-  opt-in `--allow-empty-knowledge` flag. See
+  `feat/empty-knowledge-dir-validation`, which adds a tier-2 stderr warning (per the project's CLI
+  behaviour ladder) when the _effective_ scan set is empty — filesystem-empty or fully
+  `.loreignore`-excluded. Exit status stays 0; no flag. See
   `docs/brainstorms/2026-05-04-empty-knowledge-dir-validation-requirements.md` and
   `docs/plans/2026-05-04-001-feat-empty-knowledge-dir-validation-plan.md` on that branch. Out of
   scope here.
@@ -229,9 +230,13 @@ they can be addressed opportunistically later.
 - **Distinct error for slug collisions, not auto-suffix.** Auto-suffixing (`api-notes-2.md`,
   `-3.md`, etc. modelled on `generate_branch_name` in `src/git.rs`) is ergonomic but encourages
   silent divergence: users don't notice the suffix and end up with two near-identical patterns. The
-  distinct-error path forces an intentional choice and matches the "loud failures over silent
-  recovery" tone the rest of the CLI already takes. The error message explicitly names
-  `update_pattern` as the escape hatch so the user is not left stuck.
+  distinct-error path forces an intentional choice. This is a **tier-1 (hard-fail) decision** per
+  the project's CLI behaviour ladder: continuing silently would destroy information by overwriting
+  an unrelated file, which is the test for tier 1. Tier 1 does not generalise — sibling features
+  classify differently; e.g. the empty-knowledge-dir feature on
+  `feat/empty-knowledge-dir-validation` lands at tier 2 (warn) because continuing produces a
+  coherent recoverable result. The error message explicitly names `update_pattern` as the escape
+  hatch so the user is not left stuck.
 - **NFC normalisation, keep full Unicode.** NFC is the Unicode standard's canonical composition form
   and is the cheapest way to make visually identical strings produce deterministic slugs. Stripping
   to ASCII would punish non-English pattern authors and lose information from titles in non-Latin
