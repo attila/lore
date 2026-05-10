@@ -63,6 +63,8 @@ enum Commands {
 
 EXIT CODES:
   0  Success. Delta and full ingest may list per-file errors on stderr and still exit 0.
+     An effectively empty knowledge directory (no .md files, or every file excluded by
+     .loreignore) prints a warning to stderr and still exits 0 — the empty state is legal.
   1  Single-file ingest failed (atomic), or an unrecoverable error (config, database,
      embedding service). Relative paths are resolved against the current working directory,
      not the knowledge directory.
@@ -86,7 +88,13 @@ NOTES:
         file: Option<PathBuf>,
     },
 
-    /// Start the MCP server (stdio transport for Claude Code)
+    /// Start the MCP server (stdio transport for Claude Code).
+    ///
+    /// On startup, prints a one-shot warning to stderr if the knowledge
+    /// directory is effectively empty (no `.md` files, or every file
+    /// excluded by `.loreignore`). The server proceeds to serve regardless
+    /// — the empty state is legal so agents can still introspect via
+    /// `lore_status`.
     Serve,
 
     /// Search the knowledge base from the command line
