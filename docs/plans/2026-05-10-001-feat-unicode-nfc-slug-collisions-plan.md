@@ -77,6 +77,15 @@ scoped to Slices A and B only.
 - **No case-folding edge handling.** NFC alone does not cover case-insensitive APFS collisions or
   locale-sensitive case-folding (Turkish dotted/dotless i, German sharp s, certain Greek letters);
   origin lists these as known limitations.
+- **No NFD-on-disk vs NFC-incoming directory scan.** A knowledge directory synced from a Mac
+  filesystem that stores filenames as NFD onto a Linux byte-comparing filesystem ends up with
+  `cafe\u{0301}.md` on disk; an `add_pattern(title = "café")` call on Linux slugs to NFC and writes
+  to a different inode (`café.md`), creating two parallel files for the same logical pattern.
+  Surfaced by adversarial review (R5, code-review run `20260510-194040-rev1`). Same family as the
+  case-folding limitation above — Unicode-encoding-vs-filesystem mismatch — and out of scope for
+  this slice. Fixing it requires enumerating the knowledge directory on every `add_pattern` to look
+  for NFC-equivalent existing filenames; cost is non-trivial and benefit is marginal until a real
+  user reports the case. Deferred until a concrete report justifies it.
 - **No collision detection on the inbox-branch write path.** Origin scopes the fix to direct-write
   `add_pattern`; the inbox-prefix branch in `add_pattern` (`src/ingest.rs:1048-1065`) is unchanged.
 - **No MCP server-level changes.** `src/server.rs::handle_add` wraps errors with the prefix

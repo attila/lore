@@ -16,8 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the existing file lacks a `#` heading); the re-use case keeps the pre-existing
   `update_pattern`-hint error. `slugify` also NFC-normalises its input first, so `café` typed
   precomposed (NFC, U+00E9) and `café` typed with a combining acute (NFD, `e` + U+0301) now produce
-  identical slugs instead of diverging silently. Adds the `unicode-normalization` crate. Slices A
-  and B of the edge-case-handling brainstorm.
+  identical slugs instead of diverging silently. `add_pattern` additionally trims surrounding
+  whitespace from titles and rejects embedded newlines, closing two round-trip cases where
+  legitimate re-use writes would have been misclassified as collisions or silently corrupted the
+  on-disk heading. Adds the `unicode-normalization` crate. Slices A and B of the edge-case-handling
+  brainstorm.
 - **Effective-empty knowledge directory warning** — `lore ingest`, `lore serve`, and the per-request
   `lore_status` path now surface when the knowledge directory's effective scan set is empty. Three
   causes are distinguished:
