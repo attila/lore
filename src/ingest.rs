@@ -688,7 +688,7 @@ fn discover_md_files(
 /// Surfaces that only need to know "is anything indexable?" can call
 /// [`is_effective_empty`] for a bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectiveScanState {
+pub(crate) enum EffectiveScanState {
     /// At least one markdown file survives `.loreignore` filtering.
     Populated,
     /// No markdown files exist at all in the knowledge directory.
@@ -705,7 +705,7 @@ pub enum EffectiveScanState {
 /// ingest pipeline ([`ingest`] itself, `cmd_serve` startup, the
 /// `lore_status` MCP tool, and the `lore status` CLI) can ask the
 /// question without reaching into ingest internals.
-pub fn effective_scan_state(knowledge_dir: &Path) -> EffectiveScanState {
+pub(crate) fn effective_scan_state(knowledge_dir: &Path) -> EffectiveScanState {
     let loaded_ignore = loreignore::load(knowledge_dir);
     let (kept, walked_count) = walk_md_files(knowledge_dir, loaded_ignore.matcher.as_ref());
     if !kept.is_empty() {
@@ -1849,9 +1849,19 @@ mod tests {
             .unwrap();
 
         let second = std::cell::RefCell::new(Vec::<String>::new());
-        ingest(&db, &embedder, dir, "heading", &|m| {
+        let second_result = ingest(&db, &embedder, dir, "heading", &|m| {
             second.borrow_mut().push(m.to_string());
         });
+
+        // Pin that the second run actually entered delta mode — the warning
+        // fires from `ingest()` before the delta/full split, so without this
+        // assertion a silent fall-through to `full_ingest` would still pass
+        // the substring check below.
+        assert!(
+            matches!(second_result.mode, IngestMode::Delta { .. }),
+            "expected delta mode on second ingest, got: {:?}",
+            second_result.mode
+        );
 
         let captured = second.borrow();
         assert!(

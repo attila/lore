@@ -264,6 +264,14 @@ fn cmd_init(
     let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
     let _lock_guard = write_lock.acquire()?;
 
+    // Mirror the tier-2 effective-empty warning that `ingest()` emits at its
+    // entry point. `cmd_init` calls `full_ingest` directly to avoid the
+    // delta/full state probe (the DB is fresh), so the warning would not fire
+    // otherwise. See project memory `project_cli_behaviour_ladder.md`.
+    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+        eprintln!("{msg}");
+    }
+
     let ingest_result = ingest::full_ingest(
         &db,
         &ollama,
@@ -407,6 +415,12 @@ fn dispatch_ingest(
 
     if force {
         eprintln!("Full ingest (--force)...\n");
+        // Mirror the tier-2 warning that `ingest()` emits — `--force`
+        // bypasses `ingest()` to skip the delta/full state probe, so the
+        // warning would not fire otherwise.
+        if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+            on_progress(&msg);
+        }
         Ok(ingest::full_ingest(
             db,
             ollama,

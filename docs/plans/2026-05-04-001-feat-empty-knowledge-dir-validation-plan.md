@@ -1,9 +1,8 @@
 ---
 title: "feat: Empty Knowledge-Directory Detection"
 type: feat
-status: in-progress
+status: active
 date: 2026-05-04
-deepened: 2026-05-10
 origin: docs/brainstorms/2026-05-04-empty-knowledge-dir-validation-requirements.md
 ---
 

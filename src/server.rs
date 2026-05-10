@@ -509,7 +509,12 @@ fn tool_definitions() -> Value {
                              inbox_workflow_configured, delta_ingest_available, \
                              loreignore_active, and universal_advisories (count, \
                              oversized bodies, near-miss tags from the most recent full or \
-                             single-file ingest). Defaults to false.",
+                             single-file ingest). The empty_knowledge_dir field reports \
+                             on-disk state, distinct from sources_indexed (database state): \
+                             when sources_indexed is 0 and empty_knowledge_dir is false, \
+                             files exist but have not been ingested — run `lore ingest`. \
+                             When empty_knowledge_dir is true, add `.md` files or relax \
+                             `.loreignore` first. Defaults to false.",
                         "default": false
                     }
                 },
@@ -2523,6 +2528,37 @@ mod tests {
             text.contains("(empty)"),
             "summary should mention the empty state, got: {text}"
         );
+    }
+
+    #[test]
+    fn lore_status_reports_all_ignored_knowledge_dir() {
+        // Arrange
+        // Files exist on disk but `.loreignore` excludes every one. The
+        // effective scan set is empty (AllIgnored variant) and lore_status
+        // must report the same empty/empty pair as a literally empty dir,
+        // alongside loreignore_active=true.
+        let h = TestHarness::new();
+        std::fs::write(
+            h.config.knowledge_dir.join("alpha.md"),
+            "# Alpha\n\nBody text long enough.\n",
+        )
+        .unwrap();
+        std::fs::write(h.config.knowledge_dir.join(".loreignore"), "*.md\n").unwrap();
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":62,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        );
+
+        // Assert
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["empty_knowledge_dir"], true);
+        assert_eq!(metadata["knowledge_dir_status"], "empty");
+        assert_eq!(metadata["loreignore_active"], true);
     }
 
     #[test]
