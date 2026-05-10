@@ -1086,10 +1086,10 @@ pub fn add_pattern(
             );
         }
 
-        let existing_label = existing_title_raw
-            .as_deref()
-            .map(|t| format!("title: \"{t}\""))
-            .unwrap_or_else(|| "no title heading".to_string());
+        let existing_label = existing_title_raw.as_deref().map_or_else(
+            || "no title heading".to_string(),
+            |t| format!("title: \"{t}\""),
+        );
         anyhow::bail!(
             "Slug \"{slug}\" already used by {filename} ({existing_label}). \
              Choose a different title or call update_pattern to modify the existing file."
