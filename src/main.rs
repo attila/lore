@@ -715,6 +715,12 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
     eprintln!("  Knowledge:    {}", config.knowledge_dir.display());
+    let scan_state = if ingest::is_effective_empty(&config.knowledge_dir) {
+        "✗ empty (no .md files, or .loreignore excludes them all)"
+    } else {
+        "✓ populated"
+    };
+    eprintln!("  Scan set:     {scan_state}");
     eprintln!("  Database:     {}", config.database.display());
     eprintln!("  Bind:         {}", config.bind);
     eprintln!();
