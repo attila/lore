@@ -1,12 +1,23 @@
 ---
 title: "feat: Unicode NFC normalisation and slug collision detection"
 type: feat
-status: active
+status: completed
 date: 2026-05-10
+deepened: 2026-05-10
 origin: docs/brainstorms/2026-04-08-edge-case-handling-requirements.md
 ---
 
 # Unicode NFC Normalisation and Slug Collision Detection
+
+> **Refined 2026-05-10.** Multi-reviewer code-review pass on the implementation surfaced three
+> input-sanitisation gaps not in the brainstorm: titles with leading/trailing whitespace
+> round-tripped as misclassified collisions; titles with embedded `\n` / `\r` truncated the on-disk
+> heading and corrupted the indexed pattern; non-regular files at the slug path propagated raw OS
+> errors instead of the curated tier-1 wording. All three landed in `091afed`. The general principle
+> was extracted into
+> [`docs/solutions/design-patterns/round-trip-discriminator-canonicalise-both-sides-2026-05-10.md`](../solutions/design-patterns/round-trip-discriminator-canonicalise-both-sides-2026-05-10.md).
+> R5 (NFD-on-disk vs NFC-incoming filename mismatch on a Mac→Linux sync) is documented as a deferred
+> limitation in Scope Boundaries below.
 
 ## Summary
 
@@ -272,12 +283,16 @@ for unambiguous distinction.
 
 **Approach:**
 
+- At the entry to `add_pattern`, sanitise the incoming title at the canonical write boundary: trim
+  leading/trailing whitespace and reject embedded `\n` / `\r`. Addresses round-trip failures
+  surfaced by the implementation-time multi-reviewer pass (R1, R2, R4 from code-review run
+  `20260510-194040-rev1`). See the round-trip-discriminator design pattern doc for the principle.
 - At the existing `file_path.exists()` branch, replace the unconditional `bail!` with a
   discriminator:
-  1. Read the existing file at `file_path` via `std::fs::read_to_string` and propagate any read
-     error verbatim with `?` (e.g. permission denied). The case is rare — `exists()` returned true
-     so the path is real — and a generic IO error is more honest than misclassifying as
-     no-heading-collision.
+  1. Read the existing file at `file_path` via `std::fs::read_to_string`, falling back to empty
+     contents on read failure (directory at the slug path, permission denied, non-UTF-8 file — R3).
+     This routes such cases to the curated `(no title heading)` collision branch rather than
+     propagating a raw OS error, preserving tier-1 wording across the surface.
   2. Call `extract_title` on the contents.
   3. If `Some(existing_title)` and the **NFC-normalised** existing title equals the incoming title
      (also NFC-normalised), this is a re-use: keep current behaviour with wording adjusted to make
