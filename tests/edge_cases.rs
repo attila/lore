@@ -102,3 +102,66 @@ fn list_does_not_warn_on_empty_knowledge_dir_via_cli() {
         .success()
         .stderr(predicate::str::contains("knowledge directory is empty").not());
 }
+
+#[test]
+fn ingest_without_git_binary_falls_back_to_full_mode() {
+    // R11.4 regression test for Slice E of the edge-case-handling brainstorm.
+    //
+    // `is_git_repo` returns false on both "this directory isn't a git repo"
+    // and "the git binary isn't reachable via PATH" because the underlying
+    // `Command::new("git").output()` returns `Err` in the latter case. The
+    // non-repo branch is exercised by `src/ingest.rs::tests::add_pattern_*`
+    // (non-`git_init`-ed tempdir → `CommitStatus::NotCommitted`, R11.1). The
+    // missing-binary branch had no regression test before this slice — a
+    // refactor that swaps `Command::new("git")` for `git2`/`gix`/etc. could
+    // silently regress binary-less environments without CI catching it.
+    //
+    // The brainstorm's recipe is `.env_clear().env("PATH", "")` on the child
+    // only. Mutating the parent test process's `PATH` via `std::env::set_var`
+    // would race with every concurrent test that shells out to `git` (and
+    // many do, via `git_init` helpers). `assert_cmd` sets the child's env in
+    // isolation, so the parent is unaffected.
+    //
+    // The load-bearing assertion is the unique fallback marker
+    // `"Not a git repository — running full ingest"` from
+    // `src/ingest.rs::ingest`. Other full-mode fallbacks emit different copy
+    // (`"No previous ingest recorded — running full ingest"`, etc.), so this
+    // string uniquely pins the missing-git path. Embedding via Ollama may
+    // fail in CI without a running embedder, but `cmd_ingest` only bails on
+    // single-file mode — full-mode ingest collects per-file failures into
+    // `result.errors` and still exits 0, so the assertion holds regardless
+    // of embedder availability.
+
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+    std::fs::write(
+        knowledge_dir.join("rust.md"),
+        "# Rust Patterns\n\nA pattern body long enough to chunk during full ingest.\n",
+    )
+    .unwrap();
+    let db_path = tmp.path().join("knowledge.db");
+    let config = Config::default_with(knowledge_dir, db_path, "nomic-embed-text");
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    // Act: spawn `lore ingest` with PATH cleared on the child only.
+    // `assert_cmd::Command::cargo_bin` resolves the binary path from
+    // `CARGO_BIN_EXE_lore` before `.env_clear()` runs, so the child still
+    // finds the executable.
+    let assert = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["ingest", "--config", config_path.to_str().unwrap()])
+        .env_clear()
+        .env("PATH", "")
+        .assert();
+
+    // Assert: exit 0, missing-git fallback marker fires on stderr.
+    assert
+        .success()
+        .stderr(predicate::str::contains(
+            "Not a git repository — running full ingest",
+        ))
+        .stderr(predicate::str::contains("Found 1 markdown files"));
+}
