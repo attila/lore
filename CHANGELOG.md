@@ -54,6 +54,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **No-HEAD progress line on fresh `git init`.** When `lore ingest` runs against a knowledge
+  directory that's a freshly initialised git repository with zero commits, the progress line on
+  stderr now reads `No commits yet — HEAD will be recorded after your first commit.` instead of the
+  misleading `No previous ingest recorded — running full ingest`. The latter wording still fires for
+  the other case it always covered — a real repo with commits but no recorded ingest metadata (first
+  ingest after `lore ingest --force`, cleared database) — and the other three full-mode fallback
+  wordings (non-git, prev-commit-missing, head-resolve-failed) are unchanged. Tier-2 per the CLI
+  behaviour ladder; no exit-status change. Slice C of the edge-case-handling brainstorm.
 - **Knowledge database schema bumped to v3** with a forward-compatible ALTER TABLE migration on
   first open — no `lore ingest --force` required. The migration is wrapped in a transaction and uses
   column-presence checks for idempotency, so a partial migration that crashed (or lost a race

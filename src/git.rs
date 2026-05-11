@@ -38,6 +38,43 @@ pub fn is_git_repo(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Return `true` iff `HEAD` is a symbolic ref to a branch that does not yet
+/// have any commits (the unborn-branch state after `git init` with no commits).
+///
+/// Distinguishes the unborn-branch state from other `head_commit` failure modes:
+/// detached HEAD (symbolic-ref fails), corrupted refs (symbolic-ref fails), and
+/// missing git binary (both commands fail). Returns `false` in all of those
+/// cases so callers route them through existing failure-mode wording rather
+/// than the no-HEAD-specific path.
+pub(crate) fn is_unborn_head(dir: &Path) -> bool {
+    // `git symbolic-ref --quiet HEAD` exits 0 with stdout=target ref name
+    // (e.g. `refs/heads/main`) when HEAD is symbolic, and non-zero on detached
+    // HEAD or missing/corrupted HEAD.
+    let Ok(output) = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(dir)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if target.is_empty() {
+        return false;
+    }
+
+    // `git rev-parse --verify <ref>` exits non-zero when the target ref does
+    // not yet resolve to an object — exactly the unborn-branch case.
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &target])
+        .current_dir(dir)
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false)
+}
+
 /// Guard that removes a file on drop, ensuring cleanup on all code paths.
 struct TempFileGuard<'a>(&'a Path);
 
@@ -415,6 +452,55 @@ mod tests {
     fn is_git_repo_false_for_plain_dir() {
         let tmp = tempdir().unwrap();
         assert!(!is_git_repo(tmp.path()));
+    }
+
+    #[test]
+    fn is_unborn_head_true_after_init_with_no_commits() {
+        // git_init runs `git init` + config only — no post-init commit, so
+        // HEAD is a symbolic ref pointing at an unborn branch.
+        let tmp = tempdir().unwrap();
+        git_init(tmp.path());
+        assert!(is_unborn_head(tmp.path()));
+    }
+
+    #[test]
+    fn is_unborn_head_false_after_first_commit() {
+        let tmp = tempdir().unwrap();
+        git_init(tmp.path());
+        let file = tmp.path().join("rust.md");
+        fs::write(&file, "# Rust\n\nBody.\n").unwrap();
+        add_and_commit(tmp.path(), &file, "initial").unwrap();
+        assert!(!is_unborn_head(tmp.path()));
+    }
+
+    #[test]
+    fn is_unborn_head_false_for_plain_dir() {
+        // Not a git repo at all: both git commands fail; helper returns false
+        // so callers route through `is_git_repo` instead.
+        let tmp = tempdir().unwrap();
+        assert!(!is_unborn_head(tmp.path()));
+    }
+
+    #[test]
+    fn is_unborn_head_false_when_head_is_detached() {
+        // Detached HEAD pointing at a real commit: `symbolic-ref` exits
+        // non-zero, helper short-circuits to false. The normal `head_commit`
+        // happy path covers this state — the no-HEAD discriminator should
+        // not fire.
+        let tmp = tempdir().unwrap();
+        git_init(tmp.path());
+        let file = tmp.path().join("rust.md");
+        fs::write(&file, "# Rust\n\nBody.\n").unwrap();
+        add_and_commit(tmp.path(), &file, "initial").unwrap();
+        // Detach HEAD by checking out the commit SHA directly.
+        let sha = head_commit(tmp.path()).unwrap();
+        let output = Command::new("git")
+            .args(["checkout", "--detach", &sha])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git checkout --detach failed");
+        assert!(!is_unborn_head(tmp.path()));
     }
 
     #[test]
