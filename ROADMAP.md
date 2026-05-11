@@ -7,9 +7,9 @@
       patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
       into an agent-agnostic engine plus a Claude-Code adapter. See
       `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-- [ ] Edge case handling — two remaining slices: no-HEAD progress line on a fresh `git init`
-      (Slice C, R9–R10 + R11.2, R11.3) and lossy-path warning during directory walk (Slice D, R8 +
-      R11.9, Unix-only test gating). Both are mutually independent. See
+- [ ] Edge case handling — two remaining slices: no-HEAD progress line on a fresh `git init` (Slice
+      C, R9–R10 + R11.2, R11.3) and lossy-path warning during directory walk (Slice D, R8 + R11.9,
+      Unix-only test gating). Both are mutually independent. See
       `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md` for the brainstorm and the
       _Implementation Slices_ table for the per-slice mapping. Slices A (Unicode NFC normalisation)
       and B (slug-collision detection) shipped together (see Completed below); the
