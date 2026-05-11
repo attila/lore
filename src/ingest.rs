@@ -219,9 +219,18 @@ pub fn ingest(
         return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
     }
 
-    // No stored commit — first ingest or metadata was cleared.
+    // No stored commit — first ingest, metadata cleared, or a fresh `git init`
+    // with no commits yet. Discriminate the unborn-branch case so the user
+    // gets a wording that explains what's actually happening (R9 of the
+    // edge-case-handling brainstorm). Other reasons for landing in this
+    // branch — first ingest after `lore ingest --force`, cleared database —
+    // keep the original wording.
     let Ok(Some(last_commit)) = db.get_metadata(META_LAST_COMMIT) else {
-        on_progress("No previous ingest recorded — running full ingest");
+        if git::is_unborn_head(knowledge_dir) {
+            on_progress("No commits yet — HEAD will be recorded after your first commit.");
+        } else {
+            on_progress("No previous ingest recorded — running full ingest");
+        }
         return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
     };
 
@@ -3190,6 +3199,103 @@ mod tests {
         let stored = db.get_metadata(META_LAST_COMMIT).unwrap();
         assert!(stored.is_some(), "should have stored a commit SHA");
         assert_eq!(stored.unwrap().len(), 40);
+    }
+
+    #[test]
+    fn ingest_emits_no_head_progress_line_on_fresh_git_init() {
+        // R11.2: fresh `git init` with no commits → ingest() emits the
+        // no-HEAD-specific progress line exactly once and does NOT write
+        // META_LAST_COMMIT (full_ingest's HEAD-recording let-chain
+        // short-circuits when head_commit fails on an unborn branch).
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir); // init + config only; no commit, HEAD is unborn.
+        fs::write(
+            dir.join("rust.md"),
+            "# Rust\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let progress = std::cell::RefCell::new(Vec::<String>::new());
+
+        // Act
+        let result = ingest(&db, &embedder, dir, "heading", &|m| {
+            progress.borrow_mut().push(m.to_string());
+        });
+
+        // Assert
+        assert!(
+            result.errors.is_empty(),
+            "ingest errors: {:?}",
+            result.errors
+        );
+        let lines = progress.borrow();
+        let no_head = "No commits yet — HEAD will be recorded after your first commit.";
+        let no_previous = "No previous ingest recorded — running full ingest";
+        let no_head_hits = lines.iter().filter(|l| l.as_str() == no_head).count();
+        assert_eq!(
+            no_head_hits, 1,
+            "expected the no-HEAD progress line exactly once, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| l != no_previous),
+            "old wording must not fire on the unborn-branch path, got: {lines:?}"
+        );
+        let stored = db.get_metadata(META_LAST_COMMIT).unwrap();
+        assert!(
+            stored.is_none(),
+            "META_LAST_COMMIT must not be written before the first commit lands, got: {stored:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_uses_existing_wording_on_committed_repo_with_empty_metadata() {
+        // Negative control for R11.2: a real repo with commits but a fresh
+        // DB (no prior META_LAST_COMMIT) must keep the existing
+        // "No previous ingest recorded" wording. Pins discriminator
+        // specificity — a regression that broadens the new wording to all
+        // None cases would surface here.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        let file = dir.join("rust.md");
+        fs::write(
+            &file,
+            "# Rust\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &file, "initial").unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let progress = std::cell::RefCell::new(Vec::<String>::new());
+
+        // Act
+        let result = ingest(&db, &embedder, dir, "heading", &|m| {
+            progress.borrow_mut().push(m.to_string());
+        });
+
+        // Assert
+        assert!(
+            result.errors.is_empty(),
+            "ingest errors: {:?}",
+            result.errors
+        );
+        let lines = progress.borrow();
+        let no_head = "No commits yet — HEAD will be recorded after your first commit.";
+        let no_previous = "No previous ingest recorded — running full ingest";
+        assert!(
+            lines.iter().any(|l| l == no_previous),
+            "expected existing wording on committed-repo-with-empty-metadata path, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| l != no_head),
+            "no-HEAD wording must not fire when HEAD already exists, got: {lines:?}"
+        );
     }
 
     // -- delta ingest tests ------------------------------------------------
