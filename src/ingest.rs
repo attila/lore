@@ -197,6 +197,7 @@ pub struct WriteResult {
 /// - The stored commit no longer exists in the repository history
 ///
 /// Use [`full_ingest`] directly to force a complete re-index.
+#[allow(clippy::too_many_lines)]
 pub fn ingest(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
