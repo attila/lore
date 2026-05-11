@@ -7,14 +7,14 @@
       patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
       into an agent-agnostic engine plus a Claude-Code adapter. See
       `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-- [ ] Edge case handling — three remaining slices: no-HEAD progress line on a fresh `git init`
-      (Slice C, R9–R10 + R11.2, R11.3), lossy-path warning during directory walk (Slice D, R8 +
-      R11.9, Unix-only test gating), missing-`git` binary regression test (Slice E, R11.1, R11.4,
-      test-only). All three are mutually independent. See
+- [ ] Edge case handling — two remaining slices: no-HEAD progress line on a fresh `git init`
+      (Slice C, R9–R10 + R11.2, R11.3) and lossy-path warning during directory walk (Slice D, R8 +
+      R11.9, Unix-only test gating). Both are mutually independent. See
       `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md` for the brainstorm and the
       _Implementation Slices_ table for the per-slice mapping. Slices A (Unicode NFC normalisation)
       and B (slug-collision detection) shipped together (see Completed below); the
-      empty-knowledge-dir slice shipped earlier on its own branch.
+      empty-knowledge-dir slice shipped earlier on its own branch; the missing-`git` binary
+      regression test (Slice E) also shipped (see Completed below).
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -116,6 +116,13 @@
       Mac→Linux sync) is documented as a deferred limitation. See
       `docs/plans/2026-05-10-001-feat-unicode-nfc-slug-collisions-plan.md` and
       `docs/solutions/design-patterns/round-trip-discriminator-canonicalise-both-sides-2026-05-10.md`.
+- [x] Edge case handling — Slice E (missing-`git` binary regression test). Integration test in
+      `tests/edge_cases.rs` spawns `lore ingest` with `PATH` cleared on the child process only and
+      asserts the missing-binary fallback fires the unique progress marker
+      `Not a git repository —
+      running full ingest` and exits 0. Codifies tier-3 silent
+      fallback behaviour per the CLI behaviour ladder; no user-visible behaviour change. See
+      `docs/plans/2026-05-11-001-feat-missing-git-regression-test-plan.md`.
 - [x] Effective-empty knowledge directory warning — `lore ingest`, `lore serve`, and `lore_status`
       surface when the knowledge directory's effective scan set is empty (filesystem-empty,
       all-ignored, or missing). Tier-2 per the project's CLI behaviour ladder: warning to stderr,
