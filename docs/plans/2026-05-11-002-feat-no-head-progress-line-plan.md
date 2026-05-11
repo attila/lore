@@ -1,7 +1,7 @@
 ---
 title: "feat: No-HEAD progress line on fresh git init"
 type: feat
-status: active
+status: completed
 date: 2026-05-11
 origin: docs/brainstorms/2026-04-08-edge-case-handling-requirements.md
 ---

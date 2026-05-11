@@ -7,14 +7,13 @@
       patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
       into an agent-agnostic engine plus a Claude-Code adapter. See
       `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-- [ ] Edge case handling — two remaining slices: no-HEAD progress line on a fresh `git init` (Slice
-      C, R9–R10 + R11.2, R11.3) and lossy-path warning during directory walk (Slice D, R8 + R11.9,
-      Unix-only test gating). Both are mutually independent. See
+- [ ] Edge case handling — one remaining slice: lossy-path warning during directory walk (Slice D,
+      R8 + R11.9, Unix-only test gating). See
       `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md` for the brainstorm and the
-      _Implementation Slices_ table for the per-slice mapping. Slices A (Unicode NFC normalisation)
-      and B (slug-collision detection) shipped together (see Completed below); the
-      empty-knowledge-dir slice shipped earlier on its own branch; the missing-`git` binary
-      regression test (Slice E) also shipped (see Completed below).
+      _Implementation Slices_ table for the per-slice mapping. Slices A (Unicode NFC normalisation),
+      B (slug-collision detection), C (no-HEAD progress line), and E (missing-`git` regression test)
+      all shipped (see Completed below); the empty-knowledge-dir slice shipped earlier on its own
+      branch.
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -116,6 +115,15 @@
       Mac→Linux sync) is documented as a deferred limitation. See
       `docs/plans/2026-05-10-001-feat-unicode-nfc-slug-collisions-plan.md` and
       `docs/solutions/design-patterns/round-trip-discriminator-canonicalise-both-sides-2026-05-10.md`.
+- [x] Edge case handling — Slice C (no-HEAD progress line on fresh `git init`). `ingest()` now emits
+      `No commits yet — HEAD will be recorded after your first commit.` when the knowledge directory
+      is a `git init` with zero commits, replacing the misleading
+      `No previous ingest recorded — running full ingest` wording for that case only. The other four
+      full-mode fallback wordings (non-git, prev-commit-missing, head-resolve-failed,
+      git-diff-failed) are unchanged. Discrimination uses `git symbolic-ref --quiet HEAD` plus
+      `git rev-parse --verify` on the target via a new `is_unborn_head` helper in `src/git.rs`, so
+      other `head_commit` failure modes keep surfacing as warnings. Tier-2 per the CLI behaviour
+      ladder. See `docs/plans/2026-05-11-002-feat-no-head-progress-line-plan.md`.
 - [x] Edge case handling — Slice E (missing-`git` binary regression test). Integration test in
       `tests/edge_cases.rs` spawns `lore ingest` with `PATH` cleared on the child process only and
       asserts the missing-binary fallback fires the unique progress marker
