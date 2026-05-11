@@ -8,13 +8,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Missing-`git`-binary regression test** — integration test in `tests/edge_cases.rs` spawns
-  `lore ingest` with `PATH` cleared on the child process only and asserts the existing
-  missing-binary fallback continues to fire the unique progress marker
-  (`Not a git repository —
-  running full ingest`) and exit 0. Codifies tier-3 silent fallback
-  behaviour per the CLI behaviour ladder. Slice E of the edge-case-handling brainstorm; no
-  user-visible behaviour change.
 - **Unicode NFC normalisation in slugify and slug-collision detection** — `add_pattern` now
   distinguishes a slug collision (two distinct titles that slugify to the same filename, e.g.
   `"API: Notes"` and `"API/Notes"` both → `api-notes.md`) from an intentional re-use (the same title
