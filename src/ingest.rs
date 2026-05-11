@@ -3298,6 +3298,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ingest_no_head_to_commit_to_delta_transition() {
+        // R11.3: the no-HEAD → first-commit → delta-mode lifecycle, exercised
+        // through the top-level `ingest()` entry point.
+        //
+        // Step 1: fresh `git init`, write markdown, ingest. Expect the
+        //   no-HEAD wording; META_LAST_COMMIT remains None (full_ingest's
+        //   HEAD-recording let-chain short-circuits because head_commit
+        //   fails on an unborn branch).
+        // Step 2: commit the markdown, ingest again. Expect the existing
+        //   "No previous ingest recorded" wording (HEAD now exists, but
+        //   no recorded metadata); full_ingest writes META_LAST_COMMIT.
+        // Step 3: ingest a third time. Expect the delta path — none of the
+        //   five full-fallback wordings should fire.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        let file = dir.join("rust.md");
+        fs::write(
+            &file,
+            "# Rust\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        let progress = std::cell::RefCell::new(Vec::<String>::new());
+        let collect = |m: &str| progress.borrow_mut().push(m.to_string());
+
+        let no_head = "No commits yet — HEAD will be recorded after your first commit.";
+        let no_previous = "No previous ingest recorded — running full ingest";
+        let other_fallbacks = [
+            "Not a git repository — running full ingest",
+            "Previous commit not found in history — running full ingest",
+        ];
+
+        // Act + Assert — step 1: unborn HEAD
+        let r1 = ingest(&db, &embedder, dir, "heading", &collect);
+        assert!(r1.errors.is_empty(), "step 1 errors: {:?}", r1.errors);
+        assert!(
+            progress.borrow().iter().any(|l| l == no_head),
+            "step 1 should emit no-HEAD wording, got: {:?}",
+            progress.borrow()
+        );
+        assert!(
+            db.get_metadata(META_LAST_COMMIT).unwrap().is_none(),
+            "step 1 must not record HEAD on an unborn branch"
+        );
+        progress.borrow_mut().clear();
+
+        // Arrange — land the first real commit
+        git::add_and_commit(dir, &file, "initial").unwrap();
+
+        // Act + Assert — step 2: HEAD exists but no recorded metadata
+        let r2 = ingest(&db, &embedder, dir, "heading", &collect);
+        assert!(r2.errors.is_empty(), "step 2 errors: {:?}", r2.errors);
+        assert!(
+            progress.borrow().iter().any(|l| l == no_previous),
+            "step 2 should emit the existing No-previous-ingest wording, got: {:?}",
+            progress.borrow()
+        );
+        assert!(
+            progress.borrow().iter().all(|l| l != no_head),
+            "step 2 must not emit no-HEAD wording once HEAD exists, got: {:?}",
+            progress.borrow()
+        );
+        let stored = db.get_metadata(META_LAST_COMMIT).unwrap();
+        assert!(
+            stored.is_some(),
+            "step 2 must record HEAD via full_ingest, got: {stored:?}"
+        );
+        assert_eq!(stored.unwrap().len(), 40, "step 2 should record a real SHA");
+        progress.borrow_mut().clear();
+
+        // Act + Assert — step 3: delta path
+        let r3 = ingest(&db, &embedder, dir, "heading", &collect);
+        assert!(r3.errors.is_empty(), "step 3 errors: {:?}", r3.errors);
+        let lines = progress.borrow();
+        assert!(
+            lines.iter().all(|l| l != no_head && l != no_previous),
+            "step 3 should take the delta path with no full-fallback wording, got: {lines:?}"
+        );
+        for fb in &other_fallbacks {
+            assert!(
+                lines.iter().all(|l| l != fb),
+                "step 3 should not emit fallback '{fb}', got: {lines:?}"
+            );
+        }
+    }
+
     // -- delta ingest tests ------------------------------------------------
 
     #[test]
