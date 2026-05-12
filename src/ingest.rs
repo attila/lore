@@ -360,14 +360,15 @@ fn run_reconciliation(
     on_progress: &dyn Fn(&str),
 ) -> (ReconcileStats, Vec<String>) {
     let mut errors: Vec<String> = Vec::new();
-    let mut stats = match reconcile_ignored(
+    let (result, lossy_warnings) = reconcile_ignored(
         db,
         embedder,
         knowledge_dir,
         strategy,
         loaded.matcher.as_ref(),
         on_progress,
-    ) {
+    );
+    let stats = match result {
         Ok(stats) => {
             // Only update the stored hash on successful reconciliation.
             // If reconciliation failed partway through, the database is in
@@ -384,10 +385,10 @@ fn run_reconciliation(
             ReconcileStats::default()
         }
     };
-    // Surface lossy-path warnings collected by the reconciliation walk on
-    // the same channel as the rest of the reconcile errors so they reach
-    // `IngestResult::errors` via the existing caller plumbing.
-    errors.append(&mut stats.lossy_warnings);
+    // Surface lossy-path warnings on the same channel regardless of the
+    // result above. Out-of-band return guarantees a re-index failure does
+    // not silently swallow a non-UTF-8 filename observed during the walk.
+    errors.extend(lossy_warnings);
     (stats, errors)
 }
 
@@ -403,11 +404,6 @@ struct ReconcileStats {
     added: usize,
     /// Total chunks inserted by the re-index pass.
     chunks_added: usize,
-    /// Lossy-path warnings collected by the reconciliation walk. Surfaced
-    /// onto `IngestResult::errors` by the caller so a non-UTF-8 filename
-    /// encountered during reconciliation is reported with the same
-    /// severity as one encountered during `full_ingest`.
-    lossy_warnings: Vec<String>,
 }
 
 /// Reconcile the database against the current `.loreignore` matcher.
@@ -422,6 +418,10 @@ struct ReconcileStats {
 /// When `ignore_matcher` is `None` (no `.loreignore` file), the removal
 /// pass is a no-op but the re-index pass still runs — picking up files
 /// that were previously excluded.
+/// Lossy-path warnings are returned out-of-band alongside the `Result`
+/// because they're collected from a non-fallible filesystem walk; routing
+/// them via the `Result` payload would lose them whenever the re-index pass
+/// returns `Err` partway through (the partial `ReconcileStats` is dropped).
 fn reconcile_ignored(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -429,16 +429,26 @@ fn reconcile_ignored(
     strategy: &str,
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
     on_progress: &dyn Fn(&str),
-) -> anyhow::Result<ReconcileStats> {
+) -> (anyhow::Result<ReconcileStats>, Vec<String>) {
     use std::collections::HashSet;
 
     let mut stats = ReconcileStats::default();
+
+    // Walk filesystem first. The walk itself is infallible and produces
+    // `lossy_warnings`; doing it before any fallible step guarantees the
+    // warnings survive every Err return below, where the partial
+    // `ReconcileStats` is dropped. The walk uses the matcher, not the DB
+    // snapshot, so reordering relative to pass 1 is safe.
+    let (disk_files, _, lossy_warnings) = walk_md_files(knowledge_dir, ignore_matcher);
 
     // Snapshot the indexed source list once. We use it for both the removal
     // pass and the re-index pass; the snapshot is taken before any deletions
     // so the re-index pass can correctly identify "files we just removed"
     // and avoid re-indexing them.
-    let db_sources_vec = db.source_files()?;
+    let db_sources_vec = match db.source_files() {
+        Ok(v) => v,
+        Err(e) => return (Err(e), lossy_warnings),
+    };
     lore_debug!(
         "loreignore: reconcile scanning {} indexed sources",
         db_sources_vec.len()
@@ -451,7 +461,9 @@ fn reconcile_ignored(
             let ignored = loreignore::is_ignored(matcher, Path::new(source), false);
             lore_debug!("loreignore: reconcile check {source} → ignored={ignored}");
             if ignored {
-                db.delete_by_source(source)?;
+                if let Err(e) = db.delete_by_source(source) {
+                    return (Err(e), lossy_warnings);
+                }
                 stats.removed += 1;
                 lore_debug!("loreignore: reconciled {source} (removed from index)");
                 on_progress(&format!("  {source} (reconciled — removed)"));
@@ -461,12 +473,10 @@ fn reconcile_ignored(
         lore_debug!("loreignore: reconcile removal pass skipped (no matcher)");
     }
 
-    // Pass 2: walk the filesystem and re-index any markdown file that is
-    // not currently in the database (using the pre-pass-1 snapshot, so
-    // files we just removed are correctly excluded). walk_md_files already
-    // applies the ignore matcher, so this loop only sees allowed files.
-    let (disk_files, _, lossy_warnings) = walk_md_files(knowledge_dir, ignore_matcher);
-    stats.lossy_warnings = lossy_warnings;
+    // Pass 2: re-index any markdown file that is not currently in the
+    // database (using the pre-pass-1 snapshot, so files we just removed
+    // are correctly excluded). The walk above already applied the ignore
+    // matcher, so this loop only sees allowed files.
     for (rel_path, full_path) in disk_files {
         if db_sources.contains(&rel_path) {
             continue;
@@ -483,12 +493,12 @@ fn reconcile_ignored(
             }
             Err(e) => {
                 lore_debug!("loreignore: failed to re-index {rel_path}: {e}");
-                return Err(e);
+                return (Err(e), lossy_warnings);
             }
         }
     }
 
-    Ok(stats)
+    (Ok(stats), lossy_warnings)
 }
 
 /// Return `true` when the path is matched by the `.loreignore` matcher.
@@ -636,12 +646,6 @@ fn process_change(
     }
 }
 
-/// Walk a knowledge directory for markdown files, optionally filtering
-/// through a `.loreignore` matcher.
-///
-/// Returns the kept files as `(rel_path, full_path)` tuples sorted by
-/// relative path, plus the total number of markdown files seen before
-/// filtering. Silent — callers attach progress messages themselves.
 /// Walk `knowledge_dir` for markdown files and split the result into three
 /// buckets:
 ///
@@ -871,9 +875,7 @@ pub fn full_ingest(
     // Surface non-UTF-8 filenames on the same per-file error channel
     // `index_single_file` failures use. The corresponding files are not in
     // `md_files`, so the index never sees a U+FFFD-substituted source key.
-    for warning in lossy_warnings {
-        result.errors.push(warning);
-    }
+    result.errors.extend(lossy_warnings);
 
     // The effective-empty warning fires from `ingest()` at the entry point
     // (see `empty_warning_message`); both filesystem-empty and all-ignored

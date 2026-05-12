@@ -59,8 +59,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is an error-channel entry, it suppresses `META_LAST_COMMIT` recording on that run — `lore ingest`
   stays in full-ingest mode until the bad filename is renamed to UTF-8. The warning fires loudly on
   every run while the bad name persists, so the recovery signal is unmistakable. Two related
-  accounting fixes ride along: the `Found N markdown files (M
-  excluded by .loreignore)` progress
+  accounting fixes ride along: the `Found N markdown files (M excluded by .loreignore)` progress
   line no longer counts lossy files as `.loreignore` exclusions, and a directory whose only `.md`
   files are lossy-named now routes through the `knowledge directory is empty` warning rather than
   `.loreignore matched every markdown file`. Linux-dominant in practice — APFS and HFS+ enforce
