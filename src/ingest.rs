@@ -3438,6 +3438,232 @@ mod tests {
         }
     }
 
+    // -- lossy-path warning (R8 / R11.9) ----------------------------------
+
+    /// Plant a `.md` file whose on-disk name is not valid UTF-8 by
+    /// concatenating an invalid lead byte (0xFF) with a literal `.md`
+    /// suffix. Returns the constructed full path. Linux tmpfs accepts
+    /// arbitrary byte sequences as filenames; the cfg(unix) gate is the
+    /// safety boundary against Windows builds invoking
+    /// `OsStr::from_bytes`.
+    #[cfg(unix)]
+    fn plant_non_utf8_md(dir: &Path) -> std::path::PathBuf {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = [0xFFu8, b'.', b'm', b'd'];
+        let name = OsStr::from_bytes(&bytes);
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            "# Body\n\nlossy filename body text that is long enough.\n",
+        )
+        .expect("tmpfs should accept non-UTF-8 filenames; if this fails, gate the test");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_ingest_warns_and_skips_non_utf8_filename() {
+        // R11.9. Plant one valid-UTF-8 `.md` and one non-UTF-8 `.md` in
+        // the same dir; full_ingest must index only the valid one, and
+        // emit a lossy-path warning on `result.errors` naming the bad
+        // file.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("good.md");
+        fs::write(
+            &good,
+            "# Good\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let _lossy = plant_non_utf8_md(dir);
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Act
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Assert
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "expected exactly one lossy warning, got: {:?}",
+            result.errors
+        );
+        let warning = &result.errors[0];
+        assert!(
+            warning.contains("not valid UTF-8"),
+            "warning must name the cause, got: {warning}"
+        );
+        assert!(
+            warning.contains("file not indexed"),
+            "warning must name the consequence, got: {warning}"
+        );
+        assert_eq!(
+            result.files_processed, 1,
+            "only the valid-UTF-8 file should be indexed"
+        );
+        assert!(
+            result.chunks_created >= 1,
+            "valid sibling should still produce chunks, got: {}",
+            result.chunks_created
+        );
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.sources, 1, "DB must contain exactly one source row");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_ingest_with_only_non_utf8_files_routes_to_empty_warning() {
+        // Shadow path. If every .md file in the dir is lossy-named, the
+        // empty-warning probe must route to `FilesystemEmpty`, not
+        // `AllIgnored`. The `.loreignore` wording would name the wrong
+        // cause and recovery action.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let _lossy = plant_non_utf8_md(dir);
+
+        // Act
+        let message = empty_warning_message(dir).expect("empty-dir warning must fire");
+
+        // Assert
+        assert!(
+            message.contains("knowledge directory is empty"),
+            "all-lossy dir must classify as FilesystemEmpty, got: {message}"
+        );
+        assert!(
+            !message.contains(".loreignore"),
+            "all-lossy dir must not blame .loreignore, got: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_md_files_progress_line_does_not_misattribute_lossy_to_loreignore() {
+        // Shadow path. Without the `walked_count - kept.len() -
+        // lossy_warnings.len()` accounting fix, the progress line would
+        // print "1 excluded by .loreignore" for an all-lossy directory
+        // with no .loreignore file present. Guard against that
+        // regression.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("good.md"),
+            "# Good\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let _lossy = plant_non_utf8_md(dir);
+        let progress = std::cell::RefCell::new(Vec::<String>::new());
+
+        // Act
+        let _ = discover_md_files(dir, None, &|m| progress.borrow_mut().push(m.to_string()));
+
+        // Assert
+        let lines = progress.borrow();
+        assert!(
+            lines.iter().any(|l| l.contains("Found 1 markdown files")),
+            "progress should count only the valid-UTF-8 file, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("excluded by .loreignore")),
+            "lossy must not be blamed on .loreignore, got: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delta_reconcile_surfaces_lossy_warning_from_walk() {
+        // Shadow path. A non-UTF-8 filename encountered during the
+        // `.loreignore` reconciliation walk must surface on
+        // `IngestResult::errors`, not just on a `lore_debug!` log line.
+        // Reproduce via: ingest twice with the lossy file present, with
+        // `.loreignore` changing between runs to force the
+        // reconciliation pass.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        let good = dir.join("good.md");
+        fs::write(
+            &good,
+            "# Good\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &good, "seed").unwrap();
+        // Seed `.loreignore` so the first ingest records its hash.
+        let loreignore = dir.join(".loreignore");
+        fs::write(&loreignore, "# placeholder\n").unwrap();
+        git::add_and_commit(dir, &loreignore, "loreignore v1").unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        // First ingest: no lossy file yet — establishes META_LAST_COMMIT
+        // and stores the .loreignore hash.
+        let first = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(
+            first.errors.is_empty(),
+            "seed ingest errors: {:?}",
+            first.errors
+        );
+        // Now plant the lossy file and bump `.loreignore` so the second
+        // ingest takes the reconciliation pass (which calls
+        // `walk_md_files`).
+        let _lossy = plant_non_utf8_md(dir);
+        fs::write(&loreignore, "# placeholder v2\n").unwrap();
+
+        // Act
+        let second = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Assert
+        assert!(
+            second
+                .errors
+                .iter()
+                .any(|e| e.contains("not valid UTF-8") && e.contains("file not indexed")),
+            "reconcile pass must propagate lossy warning, got: {:?}",
+            second.errors
+        );
+    }
+
+    #[test]
+    fn full_ingest_passes_valid_utf8_unicode_paths_unchanged() {
+        // Negative control. `to_string_lossy()` returns `Cow::Borrowed`
+        // for any valid-UTF-8 path including non-ASCII. The lossy check
+        // must not be mistakenly tightened to ASCII-only.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let cafe = dir.join("café.md");
+        fs::write(
+            &cafe,
+            "# Café\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Act
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Assert
+        assert!(
+            result.errors.is_empty(),
+            "non-ASCII UTF-8 path must index cleanly, got: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.files_processed, 1,
+            "café.md should be indexed normally"
+        );
+    }
+
     // -- delta ingest tests ------------------------------------------------
 
     #[test]
