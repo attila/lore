@@ -7,6 +7,7 @@
 //! `update_pattern`, `append_to_pattern`) create or modify markdown files
 //! on disk, re-index them, and optionally commit via git.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -359,14 +360,15 @@ fn run_reconciliation(
     on_progress: &dyn Fn(&str),
 ) -> (ReconcileStats, Vec<String>) {
     let mut errors: Vec<String> = Vec::new();
-    let stats = match reconcile_ignored(
+    let (result, lossy_warnings) = reconcile_ignored(
         db,
         embedder,
         knowledge_dir,
         strategy,
         loaded.matcher.as_ref(),
         on_progress,
-    ) {
+    );
+    let stats = match result {
         Ok(stats) => {
             // Only update the stored hash on successful reconciliation.
             // If reconciliation failed partway through, the database is in
@@ -383,6 +385,10 @@ fn run_reconciliation(
             ReconcileStats::default()
         }
     };
+    // Surface lossy-path warnings on the same channel regardless of the
+    // result above. Out-of-band return guarantees a re-index failure does
+    // not silently swallow a non-UTF-8 filename observed during the walk.
+    errors.extend(lossy_warnings);
     (stats, errors)
 }
 
@@ -412,6 +418,10 @@ struct ReconcileStats {
 /// When `ignore_matcher` is `None` (no `.loreignore` file), the removal
 /// pass is a no-op but the re-index pass still runs — picking up files
 /// that were previously excluded.
+/// Lossy-path warnings are returned out-of-band alongside the `Result`
+/// because they're collected from a non-fallible filesystem walk; routing
+/// them via the `Result` payload would lose them whenever the re-index pass
+/// returns `Err` partway through (the partial `ReconcileStats` is dropped).
 fn reconcile_ignored(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -419,16 +429,26 @@ fn reconcile_ignored(
     strategy: &str,
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
     on_progress: &dyn Fn(&str),
-) -> anyhow::Result<ReconcileStats> {
+) -> (anyhow::Result<ReconcileStats>, Vec<String>) {
     use std::collections::HashSet;
 
     let mut stats = ReconcileStats::default();
+
+    // Walk filesystem first. The walk itself is infallible and produces
+    // `lossy_warnings`; doing it before any fallible step guarantees the
+    // warnings survive every Err return below, where the partial
+    // `ReconcileStats` is dropped. The walk uses the matcher, not the DB
+    // snapshot, so reordering relative to pass 1 is safe.
+    let (disk_files, _, lossy_warnings) = walk_md_files(knowledge_dir, ignore_matcher);
 
     // Snapshot the indexed source list once. We use it for both the removal
     // pass and the re-index pass; the snapshot is taken before any deletions
     // so the re-index pass can correctly identify "files we just removed"
     // and avoid re-indexing them.
-    let db_sources_vec = db.source_files()?;
+    let db_sources_vec = match db.source_files() {
+        Ok(v) => v,
+        Err(e) => return (Err(e), lossy_warnings),
+    };
     lore_debug!(
         "loreignore: reconcile scanning {} indexed sources",
         db_sources_vec.len()
@@ -441,7 +461,9 @@ fn reconcile_ignored(
             let ignored = loreignore::is_ignored(matcher, Path::new(source), false);
             lore_debug!("loreignore: reconcile check {source} → ignored={ignored}");
             if ignored {
-                db.delete_by_source(source)?;
+                if let Err(e) = db.delete_by_source(source) {
+                    return (Err(e), lossy_warnings);
+                }
                 stats.removed += 1;
                 lore_debug!("loreignore: reconciled {source} (removed from index)");
                 on_progress(&format!("  {source} (reconciled — removed)"));
@@ -451,11 +473,10 @@ fn reconcile_ignored(
         lore_debug!("loreignore: reconcile removal pass skipped (no matcher)");
     }
 
-    // Pass 2: walk the filesystem and re-index any markdown file that is
-    // not currently in the database (using the pre-pass-1 snapshot, so
-    // files we just removed are correctly excluded). walk_md_files already
-    // applies the ignore matcher, so this loop only sees allowed files.
-    let (disk_files, _) = walk_md_files(knowledge_dir, ignore_matcher);
+    // Pass 2: re-index any markdown file that is not currently in the
+    // database (using the pre-pass-1 snapshot, so files we just removed
+    // are correctly excluded). The walk above already applied the ignore
+    // matcher, so this loop only sees allowed files.
     for (rel_path, full_path) in disk_files {
         if db_sources.contains(&rel_path) {
             continue;
@@ -472,12 +493,12 @@ fn reconcile_ignored(
             }
             Err(e) => {
                 lore_debug!("loreignore: failed to re-index {rel_path}: {e}");
-                return Err(e);
+                return (Err(e), lossy_warnings);
             }
         }
     }
 
-    Ok(stats)
+    (Ok(stats), lossy_warnings)
 }
 
 /// Return `true` when the path is matched by the `.loreignore` matcher.
@@ -625,16 +646,24 @@ fn process_change(
     }
 }
 
-/// Walk a knowledge directory for markdown files, optionally filtering
-/// through a `.loreignore` matcher.
+/// Walk `knowledge_dir` for markdown files and split the result into three
+/// buckets:
 ///
-/// Returns the kept files as `(rel_path, full_path)` tuples sorted by
-/// relative path, plus the total number of markdown files seen before
-/// filtering. Silent — callers attach progress messages themselves.
+/// - `kept`: files with valid-UTF-8 relative paths that survive
+///   `.loreignore` filtering — the indexable set.
+/// - `walked_count`: total number of `.md` / `.markdown` files encountered
+///   on the walk, before any filtering. Used by callers to derive the
+///   number excluded by `.loreignore` (`walked_count - kept.len() -
+///   lossy_warnings.len()`).
+/// - `lossy_warnings`: one entry per file whose on-disk filename is not
+///   valid UTF-8, formatted for surfacing on `IngestResult::errors`. These
+///   files are deliberately not added to `kept` — indexing them would
+///   store the chunk under a U+FFFD-substituted source-file key, masking
+///   the underlying problem.
 fn walk_md_files(
     knowledge_dir: &Path,
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
-) -> (Vec<(String, PathBuf)>, usize) {
+) -> (Vec<(String, PathBuf)>, usize, Vec<String>) {
     let walked: Vec<PathBuf> = WalkDir::new(knowledge_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -649,46 +678,54 @@ fn walk_md_files(
         .collect();
 
     let walked_count = walked.len();
-    let mut kept: Vec<(String, PathBuf)> = walked
-        .into_iter()
-        .filter_map(|path| {
-            let rel = path
-                .strip_prefix(knowledge_dir)
-                .ok()?
-                .to_string_lossy()
-                .to_string();
-            if let Some(matcher) = ignore_matcher
-                && loreignore::is_ignored(matcher, Path::new(&rel), false)
-            {
-                lore_debug!("loreignore: skipping {rel} (walk)");
-                return None;
-            }
-            Some((rel, path))
-        })
-        .collect();
+    let mut kept: Vec<(String, PathBuf)> = Vec::new();
+    let mut lossy_warnings: Vec<String> = Vec::new();
+    for path in walked {
+        let Ok(rel_path) = path.strip_prefix(knowledge_dir) else {
+            continue;
+        };
+        let rel_cow = rel_path.to_string_lossy();
+        if matches!(rel_cow, Cow::Owned(_)) {
+            lossy_warnings.push(format!(
+                "Skipped {rel_cow}: filename is not valid UTF-8 (file not indexed)"
+            ));
+            continue;
+        }
+        let rel = rel_cow.into_owned();
+        if let Some(matcher) = ignore_matcher
+            && loreignore::is_ignored(matcher, Path::new(&rel), false)
+        {
+            lore_debug!("loreignore: skipping {rel} (walk)");
+            continue;
+        }
+        kept.push((rel, path));
+    }
     kept.sort_by(|a, b| a.0.cmp(&b.0));
-    (kept, walked_count)
+    (kept, walked_count, lossy_warnings)
 }
 
-/// Walk + report for full ingest. Returns full paths for compatibility with
-/// the existing `full_ingest` loop.
+/// Walk + report for full ingest. Returns the kept full paths plus any
+/// lossy-path warnings collected by [`walk_md_files`] so the caller can
+/// fold them onto `IngestResult::errors`.
 fn discover_md_files(
     knowledge_dir: &Path,
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
     on_progress: &dyn Fn(&str),
-) -> Vec<PathBuf> {
-    let (kept, walked_count) = walk_md_files(knowledge_dir, ignore_matcher);
-    let skipped = walked_count - kept.len();
-    if skipped > 0 {
+) -> (Vec<PathBuf>, Vec<String>) {
+    let (kept, walked_count, lossy_warnings) = walk_md_files(knowledge_dir, ignore_matcher);
+    // Files excluded by `.loreignore` only — lossy paths are surfaced via
+    // `IngestResult::errors`, not on this progress line.
+    let ignored = walked_count - kept.len() - lossy_warnings.len();
+    if ignored > 0 {
         on_progress(&format!(
             "Found {} markdown files ({} excluded by .loreignore)",
             kept.len(),
-            skipped
+            ignored
         ));
     } else {
         on_progress(&format!("Found {} markdown files", kept.len()));
     }
-    kept.into_iter().map(|(_, p)| p).collect()
+    (kept.into_iter().map(|(_, p)| p).collect(), lossy_warnings)
 }
 
 /// Result of evaluating the effective scan set of a knowledge directory —
@@ -745,10 +782,18 @@ pub(crate) fn effective_scan_state(knowledge_dir: &Path) -> ScanInfo {
     }
     let loaded_ignore = loreignore::load(knowledge_dir);
     let loreignore_active = loaded_ignore.matcher.is_some();
-    let (kept, walked_count) = walk_md_files(knowledge_dir, loaded_ignore.matcher.as_ref());
+    let (kept, walked_count, lossy_warnings) =
+        walk_md_files(knowledge_dir, loaded_ignore.matcher.as_ref());
+    // Subtract lossy-named files from the walk count so an all-lossy
+    // directory routes to `FilesystemEmpty` rather than `AllIgnored` — the
+    // .loreignore-blamed wording would name the wrong cause and recovery
+    // action. The per-file lossy warnings travel separately via
+    // `walk_md_files` → `discover_md_files` → `IngestResult::errors`; this
+    // probe is a synchronous bool/state surface and discards them.
+    let effective_walked = walked_count - lossy_warnings.len();
     let state = if !kept.is_empty() {
         EffectiveScanState::Populated
-    } else if walked_count == 0 {
+    } else if effective_walked == 0 {
         EffectiveScanState::FilesystemEmpty
     } else {
         EffectiveScanState::AllIgnored
@@ -825,7 +870,12 @@ pub fn full_ingest(
 
     // Single read of .loreignore: matcher and hash come from the same bytes.
     let loaded_ignore = loreignore::load(knowledge_dir);
-    let md_files = discover_md_files(knowledge_dir, loaded_ignore.matcher.as_ref(), on_progress);
+    let (md_files, lossy_warnings) =
+        discover_md_files(knowledge_dir, loaded_ignore.matcher.as_ref(), on_progress);
+    // Surface non-UTF-8 filenames on the same per-file error channel
+    // `index_single_file` failures use. The corresponding files are not in
+    // `md_files`, so the index never sees a U+FFFD-substituted source key.
+    result.errors.extend(lossy_warnings);
 
     // The effective-empty warning fires from `ingest()` at the entry point
     // (see `empty_warning_message`); both filesystem-empty and all-ignored
@@ -3388,6 +3438,232 @@ mod tests {
                 "step 3 should not emit fallback '{fb}', got: {lines:?}"
             );
         }
+    }
+
+    // -- lossy-path warning (R8 / R11.9) ----------------------------------
+
+    /// Plant a `.md` file whose on-disk name is not valid UTF-8 by
+    /// concatenating an invalid lead byte (0xFF) with a literal `.md`
+    /// suffix. Returns the constructed full path. Linux tmpfs accepts
+    /// arbitrary byte sequences as filenames; the cfg(unix) gate is the
+    /// safety boundary against Windows builds invoking
+    /// `OsStr::from_bytes`.
+    #[cfg(unix)]
+    fn plant_non_utf8_md(dir: &Path) -> std::path::PathBuf {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = [0xFFu8, b'.', b'm', b'd'];
+        let name = OsStr::from_bytes(&bytes);
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            "# Body\n\nlossy filename body text that is long enough.\n",
+        )
+        .expect("tmpfs should accept non-UTF-8 filenames; if this fails, gate the test");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_ingest_warns_and_skips_non_utf8_filename() {
+        // R11.9. Plant one valid-UTF-8 `.md` and one non-UTF-8 `.md` in
+        // the same dir; full_ingest must index only the valid one, and
+        // emit a lossy-path warning on `result.errors` naming the bad
+        // file.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("good.md");
+        fs::write(
+            &good,
+            "# Good\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let _lossy = plant_non_utf8_md(dir);
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Act
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Assert
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "expected exactly one lossy warning, got: {:?}",
+            result.errors
+        );
+        let warning = &result.errors[0];
+        assert!(
+            warning.contains("not valid UTF-8"),
+            "warning must name the cause, got: {warning}"
+        );
+        assert!(
+            warning.contains("file not indexed"),
+            "warning must name the consequence, got: {warning}"
+        );
+        assert_eq!(
+            result.files_processed, 1,
+            "only the valid-UTF-8 file should be indexed"
+        );
+        assert!(
+            result.chunks_created >= 1,
+            "valid sibling should still produce chunks, got: {}",
+            result.chunks_created
+        );
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.sources, 1, "DB must contain exactly one source row");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_ingest_with_only_non_utf8_files_routes_to_empty_warning() {
+        // Shadow path. If every .md file in the dir is lossy-named, the
+        // empty-warning probe must route to `FilesystemEmpty`, not
+        // `AllIgnored`. The `.loreignore` wording would name the wrong
+        // cause and recovery action.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let _lossy = plant_non_utf8_md(dir);
+
+        // Act
+        let message = empty_warning_message(dir).expect("empty-dir warning must fire");
+
+        // Assert
+        assert!(
+            message.contains("knowledge directory is empty"),
+            "all-lossy dir must classify as FilesystemEmpty, got: {message}"
+        );
+        assert!(
+            !message.contains(".loreignore"),
+            "all-lossy dir must not blame .loreignore, got: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_md_files_progress_line_does_not_misattribute_lossy_to_loreignore() {
+        // Shadow path. Without the `walked_count - kept.len() -
+        // lossy_warnings.len()` accounting fix, the progress line would
+        // print "1 excluded by .loreignore" for an all-lossy directory
+        // with no .loreignore file present. Guard against that
+        // regression.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("good.md"),
+            "# Good\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let _lossy = plant_non_utf8_md(dir);
+        let progress = std::cell::RefCell::new(Vec::<String>::new());
+
+        // Act
+        let _ = discover_md_files(dir, None, &|m| progress.borrow_mut().push(m.to_string()));
+
+        // Assert
+        let lines = progress.borrow();
+        assert!(
+            lines.iter().any(|l| l.contains("Found 1 markdown files")),
+            "progress should count only the valid-UTF-8 file, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("excluded by .loreignore")),
+            "lossy must not be blamed on .loreignore, got: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delta_reconcile_surfaces_lossy_warning_from_walk() {
+        // Shadow path. A non-UTF-8 filename encountered during the
+        // `.loreignore` reconciliation walk must surface on
+        // `IngestResult::errors`, not just on a `lore_debug!` log line.
+        // Reproduce via: ingest twice with the lossy file present, with
+        // `.loreignore` changing between runs to force the
+        // reconciliation pass.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        let good = dir.join("good.md");
+        fs::write(
+            &good,
+            "# Good\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        git::add_and_commit(dir, &good, "seed").unwrap();
+        // Seed `.loreignore` so the first ingest records its hash.
+        let loreignore = dir.join(".loreignore");
+        fs::write(&loreignore, "# placeholder\n").unwrap();
+        git::add_and_commit(dir, &loreignore, "loreignore v1").unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        // First ingest: no lossy file yet — establishes META_LAST_COMMIT
+        // and stores the .loreignore hash.
+        let first = ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert!(
+            first.errors.is_empty(),
+            "seed ingest errors: {:?}",
+            first.errors
+        );
+        // Now plant the lossy file and bump `.loreignore` so the second
+        // ingest takes the reconciliation pass (which calls
+        // `walk_md_files`).
+        let _lossy = plant_non_utf8_md(dir);
+        fs::write(&loreignore, "# placeholder v2\n").unwrap();
+
+        // Act
+        let second = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Assert
+        assert!(
+            second
+                .errors
+                .iter()
+                .any(|e| e.contains("not valid UTF-8") && e.contains("file not indexed")),
+            "reconcile pass must propagate lossy warning, got: {:?}",
+            second.errors
+        );
+    }
+
+    #[test]
+    fn full_ingest_passes_valid_utf8_unicode_paths_unchanged() {
+        // Negative control. `to_string_lossy()` returns `Cow::Borrowed`
+        // for any valid-UTF-8 path including non-ASCII. The lossy check
+        // must not be mistakenly tightened to ASCII-only.
+
+        // Arrange
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let cafe = dir.join("café.md");
+        fs::write(
+            &cafe,
+            "# Café\n\nBody text that is long enough for a chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        // Act
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        // Assert
+        assert!(
+            result.errors.is_empty(),
+            "non-ASCII UTF-8 path must index cleanly, got: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.files_processed, 1,
+            "café.md should be indexed normally"
+        );
     }
 
     // -- delta ingest tests ------------------------------------------------
