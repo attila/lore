@@ -2,11 +2,6 @@
 
 ## Up Next
 
-- [ ] Universal-pattern predicate (`applies_when`) and engine/adapter split — Track 1 in flight on
-      `feat/applies-when-predicate`. Adds an optional tool/command predicate to universal-tagged
-      patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
-      into an agent-agnostic engine plus a Claude-Code adapter. See
-      `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -16,6 +11,20 @@
 
 ## Future
 
+- [ ] Pre-release UX polish (deferred from edge-case-handling brainstorm) — friendlier
+      empty-directory copy beyond the current tier-2 warning, empty-DB search hints, and a
+      structured `SlugCollisionError` type (with `existing_path` / `existing_title` fields for
+      programmatic downcast) to replace the prose error currently returned by `add_pattern`. Parked
+      until a concrete user report or MCP-agent retry loop justifies the additional test cost; see
+      Key Decisions in `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md`.
+- [ ] Lossy-only HEAD-gate special-case — a single non-UTF-8 filename currently blocks
+      `META_LAST_COMMIT` recording, forcing every subsequent `lore ingest` into full mode until the
+      file is renamed. The loud warning is the recovery signal, but a large knowledge dir pays a
+      permanent full-walk cost. A future special-case could record HEAD when the only entries on
+      `result.errors` are lossy-path warnings (recoverable filesystem state, not DB-consistency
+      state). Surfaced in slice D code review (REL-02); kept out of slice D scope to respect the
+      brainstorm's channel-choice directive. See
+      `docs/plans/2026-05-12-001-feat-lossy-path-warning-plan.md`.
 - [ ] Evaluate transcript tail truncation limit — currently 200 bytes, which often cuts
       mid-sentence. Increasing to 400-500 bytes may improve search recall for longer user
       instructions without adding excessive noise. Use `LORE_DEBUG` traces to measure what gets
@@ -152,3 +161,21 @@
       coverage-check skill cannot address. Schema change requires `lore ingest --force` once after
       upgrading; a startup `PRAGMA table_info` probe refuses to start with a friendly advisory
       otherwise. See `docs/plans/2026-04-20-001-feat-universal-patterns-plan.md`
+- [x] Universal-pattern predicate (`applies_when`) and engine/adapter split (Track 1) —
+      universal-tagged patterns may now carry a frontmatter `applies_when` block gating re-injection
+      by tool class and Bash command prefix (OR within keys, AND across), with
+      `min_relevance_universal` as a per-tier score floor under `[search]` (defaults to inherit
+      `min_relevance`). Hook code is reorganised into an agent-agnostic `src/engine/` module
+      operating on a `CallContext` plus a Claude-Code-specific `src/hook.rs` adapter, opening the
+      door to future Cursor/opencode integrations. Ships alongside a one-way schema bump to v3 via a
+      forward-compatible ALTER TABLE migration. See
+      `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`.
+- [x] SessionStart pinning deferred for predicated universal patterns — a `universal`-tagged pattern
+      that also carries an `applies_when` predicate is conditionally relevant, so pinning its body
+      at every SessionStart contradicted that scope. Such patterns are now excluded from the
+      `## Pinned conventions` block at SessionStart and from the PostCompact re-emit (shared code
+      path), and re-inject on every matching `PreToolUse` call via the predicate path instead.
+      Un-predicated universals are unaffected. Carries a small first-tool-call delay for predicated
+      patterns. Origin is the post-Track-1 dogfood retrospective captured in
+      `docs/solutions/workflow-issues/dogfood-reframes-workstream-2026-05-08.md`. See
+      `docs/plans/2026-05-08-001-feat-sessionstart-respect-applies-when-plan.md`.
