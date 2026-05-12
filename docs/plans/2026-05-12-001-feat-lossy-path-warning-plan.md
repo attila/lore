@@ -1,7 +1,7 @@
 ---
 title: "feat: Lossy-path warning during directory walk (Slice D)"
 type: feat
-status: active
+status: completed
 created: 2026-05-12
 origin: docs/brainstorms/2026-04-08-edge-case-handling-requirements.md
 ---

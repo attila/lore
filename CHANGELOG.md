@@ -51,6 +51,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   deserialisation, the `HookInput → CallContext` conversion, and the eager transcript-tail read.
   Future agent integrations (Cursor, opencode, etc.) build their own adapter and reuse the same
   engine.
+- **Lossy-path warning during `lore ingest`** — files whose on-disk filename is not valid UTF-8 now
+  surface a warning on stderr naming the file (in its U+FFFD-substituted printable form) and are
+  skipped from indexing instead of being silently indexed under a substituted-byte path. The warning
+  lands on `IngestResult::errors` for both full and delta (`.loreignore`-reconciliation) paths.
+  Tier-2 per the CLI behaviour ladder; no exit-status change. Side effect: because the lossy warning
+  is an error-channel entry, it suppresses `META_LAST_COMMIT` recording on that run — `lore ingest`
+  stays in full-ingest mode until the bad filename is renamed to UTF-8. The warning fires loudly on
+  every run while the bad name persists, so the recovery signal is unmistakable. Two related
+  accounting fixes ride along: the `Found N markdown files (M
+  excluded by .loreignore)` progress
+  line no longer counts lossy files as `.loreignore` exclusions, and a directory whose only `.md`
+  files are lossy-named now routes through the `knowledge directory is empty` warning rather than
+  `.loreignore matched every markdown file`. Linux-dominant in practice — APFS and HFS+ enforce
+  UTF-8 at the filesystem layer, so this rarely fires on macOS. Slice D of the edge-case-handling
+  brainstorm; closes that roadmap line.
 
 ### Changed
 

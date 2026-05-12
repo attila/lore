@@ -7,13 +7,6 @@
       patterns, ships `min_relevance_universal` as a per-tier score floor, and reorganises hook code
       into an agent-agnostic engine plus a Claude-Code adapter. See
       `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-- [ ] Edge case handling — one remaining slice: lossy-path warning during directory walk (Slice D,
-      R8 + R11.9, Unix-only test gating). See
-      `docs/brainstorms/2026-04-08-edge-case-handling-requirements.md` for the brainstorm and the
-      _Implementation Slices_ table for the per-slice mapping. Slices A (Unicode NFC normalisation),
-      B (slug-collision detection), C (no-HEAD progress line), and E (missing-`git` regression test)
-      all shipped (see Completed below); the empty-knowledge-dir slice shipped earlier on its own
-      branch.
 - [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
       JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
       Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
@@ -131,6 +124,16 @@
       running full ingest` and exits 0. Codifies tier-3 silent
       fallback behaviour per the CLI behaviour ladder; no user-visible behaviour change. See
       `docs/plans/2026-05-11-001-feat-missing-git-regression-test-plan.md`.
+- [x] Edge case handling — Slice D (lossy-path warning during directory walk). `walk_md_files` now
+      detects `Cow::Owned` from `to_string_lossy()` on relative paths and surfaces non-UTF-8
+      filenames as warnings on `IngestResult::errors` rather than indexing them under a
+      U+FFFD-substituted source-file key. Wired through `discover_md_files` (full-ingest path) and
+      `ReconcileStats.lossy_warnings` (delta-reconcile path). Two accounting fixes ride along:
+      `discover_md_files` no longer blames `.loreignore` for lossy exclusions in its progress
+      message, and `effective_scan_state` routes all-lossy directories to `FilesystemEmpty` rather
+      than `AllIgnored`. R11.9's regression test plus four shadow-path tests pin the contract.
+      `cfg(unix)`-gated where `OsStr::from_bytes` is required. Closes the edge-case-handling roadmap
+      line entirely. See `docs/plans/2026-05-12-001-feat-lossy-path-warning-plan.md`.
 - [x] Effective-empty knowledge directory warning — `lore ingest`, `lore serve`, and `lore_status`
       surface when the knowledge directory's effective scan set is empty (filesystem-empty,
       all-ignored, or missing). Tier-2 per the project's CLI behaviour ladder: warning to stderr,
