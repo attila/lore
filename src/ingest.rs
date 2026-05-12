@@ -7,6 +7,7 @@
 //! `update_pattern`, `append_to_pattern`) create or modify markdown files
 //! on disk, re-index them, and optionally commit via git.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -359,7 +360,7 @@ fn run_reconciliation(
     on_progress: &dyn Fn(&str),
 ) -> (ReconcileStats, Vec<String>) {
     let mut errors: Vec<String> = Vec::new();
-    let stats = match reconcile_ignored(
+    let mut stats = match reconcile_ignored(
         db,
         embedder,
         knowledge_dir,
@@ -383,6 +384,10 @@ fn run_reconciliation(
             ReconcileStats::default()
         }
     };
+    // Surface lossy-path warnings collected by the reconciliation walk on
+    // the same channel as the rest of the reconcile errors so they reach
+    // `IngestResult::errors` via the existing caller plumbing.
+    errors.append(&mut stats.lossy_warnings);
     (stats, errors)
 }
 
@@ -398,6 +403,11 @@ struct ReconcileStats {
     added: usize,
     /// Total chunks inserted by the re-index pass.
     chunks_added: usize,
+    /// Lossy-path warnings collected by the reconciliation walk. Surfaced
+    /// onto `IngestResult::errors` by the caller so a non-UTF-8 filename
+    /// encountered during reconciliation is reported with the same
+    /// severity as one encountered during `full_ingest`.
+    lossy_warnings: Vec<String>,
 }
 
 /// Reconcile the database against the current `.loreignore` matcher.
@@ -455,7 +465,8 @@ fn reconcile_ignored(
     // not currently in the database (using the pre-pass-1 snapshot, so
     // files we just removed are correctly excluded). walk_md_files already
     // applies the ignore matcher, so this loop only sees allowed files.
-    let (disk_files, _) = walk_md_files(knowledge_dir, ignore_matcher);
+    let (disk_files, _, lossy_warnings) = walk_md_files(knowledge_dir, ignore_matcher);
+    stats.lossy_warnings = lossy_warnings;
     for (rel_path, full_path) in disk_files {
         if db_sources.contains(&rel_path) {
             continue;
@@ -631,10 +642,24 @@ fn process_change(
 /// Returns the kept files as `(rel_path, full_path)` tuples sorted by
 /// relative path, plus the total number of markdown files seen before
 /// filtering. Silent — callers attach progress messages themselves.
+/// Walk `knowledge_dir` for markdown files and split the result into three
+/// buckets:
+///
+/// - `kept`: files with valid-UTF-8 relative paths that survive
+///   `.loreignore` filtering — the indexable set.
+/// - `walked_count`: total number of `.md` / `.markdown` files encountered
+///   on the walk, before any filtering. Used by callers to derive the
+///   number excluded by `.loreignore` (`walked_count - kept.len() -
+///   lossy_warnings.len()`).
+/// - `lossy_warnings`: one entry per file whose on-disk filename is not
+///   valid UTF-8, formatted for surfacing on `IngestResult::errors`. These
+///   files are deliberately not added to `kept` — indexing them would
+///   store the chunk under a U+FFFD-substituted source-file key, masking
+///   the underlying problem.
 fn walk_md_files(
     knowledge_dir: &Path,
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
-) -> (Vec<(String, PathBuf)>, usize) {
+) -> (Vec<(String, PathBuf)>, usize, Vec<String>) {
     let walked: Vec<PathBuf> = WalkDir::new(knowledge_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -649,46 +674,54 @@ fn walk_md_files(
         .collect();
 
     let walked_count = walked.len();
-    let mut kept: Vec<(String, PathBuf)> = walked
-        .into_iter()
-        .filter_map(|path| {
-            let rel = path
-                .strip_prefix(knowledge_dir)
-                .ok()?
-                .to_string_lossy()
-                .to_string();
-            if let Some(matcher) = ignore_matcher
-                && loreignore::is_ignored(matcher, Path::new(&rel), false)
-            {
-                lore_debug!("loreignore: skipping {rel} (walk)");
-                return None;
-            }
-            Some((rel, path))
-        })
-        .collect();
+    let mut kept: Vec<(String, PathBuf)> = Vec::new();
+    let mut lossy_warnings: Vec<String> = Vec::new();
+    for path in walked {
+        let Ok(rel_path) = path.strip_prefix(knowledge_dir) else {
+            continue;
+        };
+        let rel_cow = rel_path.to_string_lossy();
+        if matches!(rel_cow, Cow::Owned(_)) {
+            lossy_warnings.push(format!(
+                "Skipped {rel_cow}: filename is not valid UTF-8 (file not indexed)"
+            ));
+            continue;
+        }
+        let rel = rel_cow.into_owned();
+        if let Some(matcher) = ignore_matcher
+            && loreignore::is_ignored(matcher, Path::new(&rel), false)
+        {
+            lore_debug!("loreignore: skipping {rel} (walk)");
+            continue;
+        }
+        kept.push((rel, path));
+    }
     kept.sort_by(|a, b| a.0.cmp(&b.0));
-    (kept, walked_count)
+    (kept, walked_count, lossy_warnings)
 }
 
-/// Walk + report for full ingest. Returns full paths for compatibility with
-/// the existing `full_ingest` loop.
+/// Walk + report for full ingest. Returns the kept full paths plus any
+/// lossy-path warnings collected by [`walk_md_files`] so the caller can
+/// fold them onto `IngestResult::errors`.
 fn discover_md_files(
     knowledge_dir: &Path,
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
     on_progress: &dyn Fn(&str),
-) -> Vec<PathBuf> {
-    let (kept, walked_count) = walk_md_files(knowledge_dir, ignore_matcher);
-    let skipped = walked_count - kept.len();
-    if skipped > 0 {
+) -> (Vec<PathBuf>, Vec<String>) {
+    let (kept, walked_count, lossy_warnings) = walk_md_files(knowledge_dir, ignore_matcher);
+    // Files excluded by `.loreignore` only — lossy paths are surfaced via
+    // `IngestResult::errors`, not on this progress line.
+    let ignored = walked_count - kept.len() - lossy_warnings.len();
+    if ignored > 0 {
         on_progress(&format!(
             "Found {} markdown files ({} excluded by .loreignore)",
             kept.len(),
-            skipped
+            ignored
         ));
     } else {
         on_progress(&format!("Found {} markdown files", kept.len()));
     }
-    kept.into_iter().map(|(_, p)| p).collect()
+    (kept.into_iter().map(|(_, p)| p).collect(), lossy_warnings)
 }
 
 /// Result of evaluating the effective scan set of a knowledge directory —
@@ -745,10 +778,18 @@ pub(crate) fn effective_scan_state(knowledge_dir: &Path) -> ScanInfo {
     }
     let loaded_ignore = loreignore::load(knowledge_dir);
     let loreignore_active = loaded_ignore.matcher.is_some();
-    let (kept, walked_count) = walk_md_files(knowledge_dir, loaded_ignore.matcher.as_ref());
+    let (kept, walked_count, lossy_warnings) =
+        walk_md_files(knowledge_dir, loaded_ignore.matcher.as_ref());
+    // Subtract lossy-named files from the walk count so an all-lossy
+    // directory routes to `FilesystemEmpty` rather than `AllIgnored` — the
+    // .loreignore-blamed wording would name the wrong cause and recovery
+    // action. The per-file lossy warnings travel separately via
+    // `walk_md_files` → `discover_md_files` → `IngestResult::errors`; this
+    // probe is a synchronous bool/state surface and discards them.
+    let effective_walked = walked_count - lossy_warnings.len();
     let state = if !kept.is_empty() {
         EffectiveScanState::Populated
-    } else if walked_count == 0 {
+    } else if effective_walked == 0 {
         EffectiveScanState::FilesystemEmpty
     } else {
         EffectiveScanState::AllIgnored
@@ -825,7 +866,14 @@ pub fn full_ingest(
 
     // Single read of .loreignore: matcher and hash come from the same bytes.
     let loaded_ignore = loreignore::load(knowledge_dir);
-    let md_files = discover_md_files(knowledge_dir, loaded_ignore.matcher.as_ref(), on_progress);
+    let (md_files, lossy_warnings) =
+        discover_md_files(knowledge_dir, loaded_ignore.matcher.as_ref(), on_progress);
+    // Surface non-UTF-8 filenames on the same per-file error channel
+    // `index_single_file` failures use. The corresponding files are not in
+    // `md_files`, so the index never sees a U+FFFD-substituted source key.
+    for warning in lossy_warnings {
+        result.errors.push(warning);
+    }
 
     // The effective-empty warning fires from `ingest()` at the entry point
     // (see `empty_warning_message`); both filesystem-empty and all-ignored
