@@ -8,99 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Unicode NFC normalisation in slugify and slug-collision detection** — `add_pattern` now
-  distinguishes a slug collision (two distinct titles that slugify to the same filename, e.g.
-  `"API: Notes"` and `"API/Notes"` both → `api-notes.md`) from an intentional re-use (the same title
-  written twice). The collision case is tier-1 per the CLI behaviour ladder and returns a distinct
-  error naming the colliding slug, the existing file, and its title (or `(no title heading)` when
-  the existing file lacks a `#` heading); the re-use case keeps the pre-existing
-  `update_pattern`-hint error. `slugify` also NFC-normalises its input first, so `café` typed
-  precomposed (NFC, U+00E9) and `café` typed with a combining acute (NFD, `e` + U+0301) now produce
-  identical slugs instead of diverging silently. `add_pattern` additionally trims surrounding
-  whitespace from titles and rejects embedded newlines, closing two round-trip cases where
-  legitimate re-use writes would have been misclassified as collisions or silently corrupted the
-  on-disk heading. Adds the `unicode-normalization` crate. Slices A and B of the edge-case-handling
-  brainstorm.
-- **Effective-empty knowledge directory warning** — `lore ingest`, `lore serve`, and the per-request
-  `lore_status` path now surface when the knowledge directory's effective scan set is empty. Three
-  causes are distinguished:
-  - **Filesystem-empty** — the configured directory has no `.md` files;
-  - **All-ignored** — files exist but every candidate is excluded by `.loreignore`;
-  - **Missing** — the configured `knowledge_dir` does not exist on disk or is not a directory.
-
-  Behaviour is tier-2 per the project's CLI behaviour ladder
-  ([`docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md`](docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md)):
-  a warning to stderr, no error, exit `0`. The `lore_status` MCP tool gains `empty_knowledge_dir`
-  (bool) and `knowledge_dir_status` (`"populated" | "empty" | "missing"`) fields in its JSON
-  metadata; `lore status` prints a `Scan set:` line decorated `✓ populated`, `✗ empty (…)`, or
-  `✗ missing (…)`. There is deliberately no `--allow-empty-knowledge` opt-out flag — silencer flags
-  would train users to mask the same signal the warning was designed to surface.
-- **Universal-pattern predicate (`applies_when`)** — universal-tagged patterns may now declare an
-  optional frontmatter block gating their re-injection by tool class and Bash command prefix. Two
-  keys (`tools`, `bash_command_starts_with`) compose with OR semantics within each list and AND
-  semantics across keys. The Bash command-prefix matcher walks past `sudo`, `sudo -u USER`, `env`,
-  `env -i`, `env -u VAR`, and `env KEY=VAL` wrapper tokens before checking the prefix. Documented
-  limitations: nested env wrappers and quoted-command (`bash -c "..."`) extraction. See
-  [`docs/pattern-authoring-guide.md`](docs/pattern-authoring-guide.md).
-- **`min_relevance_universal` config knob** — optional per-tier score floor under `[search]`.
-  Defaults to inheriting from `min_relevance` so an upgrade introduces no behaviour change without
-  explicit config. Numerical complement to `applies_when`'s categorical gate.
-- **Engine/adapter split** — predicate evaluator, smart-prefix matcher, query extraction, and
-  pure-string helpers now live in a new agent-agnostic `src/engine/` module operating on a minimal
-  `CallContext`. `src/hook.rs` becomes a Claude-Code-specific adapter that owns `HookInput`
-  deserialisation, the `HookInput → CallContext` conversion, and the eager transcript-tail read.
-  Future agent integrations (Cursor, opencode, etc.) build their own adapter and reuse the same
-  engine.
-- **Lossy-path warning during `lore ingest`** — files whose on-disk filename is not valid UTF-8 now
-  surface a warning on stderr naming the file (in its U+FFFD-substituted printable form) and are
-  skipped from indexing instead of being silently indexed under a substituted-byte path. The warning
-  lands on `IngestResult::errors` for both full and delta (`.loreignore`-reconciliation) paths.
-  Tier-2 per the CLI behaviour ladder; no exit-status change. Side effect: because the lossy warning
-  is an error-channel entry, it suppresses `META_LAST_COMMIT` recording on that run — `lore ingest`
-  stays in full-ingest mode until the bad filename is renamed to UTF-8. The warning fires loudly on
-  every run while the bad name persists, so the recovery signal is unmistakable. Two related
-  accounting fixes ride along: the `Found N markdown files (M excluded by .loreignore)` progress
-  line no longer counts lossy files as `.loreignore` exclusions, and a directory whose only `.md`
-  files are lossy-named now routes through the `knowledge directory is empty` warning rather than
-  `.loreignore matched every markdown file`. Linux-dominant in practice — APFS and HFS+ enforce
-  UTF-8 at the filesystem layer, so this rarely fires on macOS. Slice D of the edge-case-handling
-  brainstorm; closes that roadmap line.
+- `add_pattern` distinguishes real slug collisions from intentional re-use (with a
+  `(no title heading)` variant for orphan-frontmatter targets), NFC-normalises titles before
+  slugifying, and rejects whitespace/newline injection at the write boundary. (#42)
+- `lore ingest`, `lore serve`, and `lore_status` warn when the knowledge directory's effective scan
+  set is empty, distinguishing filesystem-empty, all-`.loreignore`-excluded, and missing-directory
+  cases. (#41)
+- Universal-tagged patterns may declare an `applies_when` predicate to gate re-injection by tool
+  class and Bash command prefix (OR within keys, AND across). (#39)
+- `min_relevance_universal` adds a per-tier relevance floor under `[search]`, defaulting to inherit
+  `min_relevance`. (#39)
+- Engine/adapter split moves predicate evaluation, smart-prefix matching, and query extraction into
+  agent-agnostic `src/engine/`, with `src/hook.rs` as the Claude-Code adapter. (#39)
+- `lore ingest` skips non-UTF-8 filenames during the directory walk and surfaces them on
+  `IngestResult::errors` instead of indexing them under U+FFFD-substituted keys. (#46)
 
 ### Changed
 
-- **No-HEAD progress line on fresh `git init`.** When `lore ingest` runs against a knowledge
-  directory that's a freshly initialised git repository with zero commits, the progress line on
-  stderr now reads `No commits yet — HEAD will be recorded after your first commit.` instead of the
-  misleading `No previous ingest recorded — running full ingest`. The latter wording still fires for
-  the other case it always covered — a real repo with commits but no recorded ingest metadata (first
-  ingest after `lore ingest --force`, cleared database) — and the other three full-mode fallback
-  wordings (non-git, prev-commit-missing, head-resolve-failed) are unchanged. Tier-2 per the CLI
-  behaviour ladder; no exit-status change. Slice C of the edge-case-handling brainstorm.
-- **Knowledge database schema bumped to v3** with a forward-compatible ALTER TABLE migration on
-  first open — no `lore ingest --force` required. The migration is wrapped in a transaction and uses
-  column-presence checks for idempotency, so a partial migration that crashed (or lost a race
-  against a concurrent open) re-enters the branch safely. Existing chunks have NULL in the new
-  `applies_when_json` column, behaving as if no predicate were set (R11). The hard-bail schema
-  advisory remains for any future non-additive bump.
-- **Predicated universal patterns are no longer pinned at SessionStart.** A pattern tagged
-  `universal` that also carries an `applies_when` predicate has implicitly declared itself
-  conditionally relevant; pinning its full body at every SessionStart contradicted that scope. Such
-  patterns are now excluded from the `## Pinned conventions` block at SessionStart and from the
-  PostCompact re-emit (shared code path), and re-inject on every matching `PreToolUse` call via the
-  existing predicate path — deferred until needed rather than pinned upfront. Un-predicated
-  universals are unaffected. The change carries a small first-tool-call delay for predicated
-  patterns; see the SessionStart-pinning subsection of
-  [`docs/pattern-authoring-guide.md`](docs/pattern-authoring-guide.md) for the precondition. Origin
-  is the post-Track-1 dogfood retrospective captured in
-  [`docs/solutions/workflow-issues/dogfood-reframes-workstream-2026-05-08.md`](docs/solutions/workflow-issues/dogfood-reframes-workstream-2026-05-08.md).
+- `lore ingest` on a fresh `git init` with zero commits now prints
+  `No commits yet — HEAD will be recorded after your first commit.` instead of the misleading "No
+  previous ingest recorded" wording. (#45)
+- Knowledge database schema bumped to v3 via a forward-compatible ALTER TABLE migration on first
+  open; no `lore ingest --force` required. (#39)
+- Predicated universal patterns are no longer pinned at SessionStart; they re-inject on every
+  matching `PreToolUse` call via the predicate path. (#40)
 
 ### Notes
 
-- This release is additive at every user-facing surface (CLI, MCP tool params, config). The schema
-  bump is one-way: a v3 database cannot be opened by a v0.1.x lore binary, which would see a
-  higher-than-expected `user_version` and bail with the existing schema-mismatch error.
-  Re-installing a v0.1.x binary against a v3 database requires a manual rebuild via
-  `lore ingest --force`.
+- Additive at every user-facing surface; the v3 schema bump is one-way — a v0.1.x binary against a
+  v3 database requires `lore ingest --force` after re-install.
 
 ## [0.1.0] - 2026-05-01
 
