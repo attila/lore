@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-14
+
 ### Added
 
 - An optional `language:` frontmatter field declares the languages a pattern targets, so declared
