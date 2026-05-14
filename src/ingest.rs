@@ -1635,9 +1635,15 @@ fn index_single_file(
     strategy: &str,
 ) -> anyhow::Result<IndexedFile> {
     let content = std::fs::read_to_string(file_path)?;
-    let rel_path = file_path
-        .strip_prefix(knowledge_dir)
-        .unwrap_or(file_path)
+    // Canonicalise both sides so strip_prefix succeeds regardless of which
+    // caller mix passes canonical or non-canonical paths. Without this,
+    // macOS /var → /private/var symlinks cause rel_path to fall through to
+    // an absolute path, keying DB rows inconsistently across ingest paths.
+    let canonical_dir = knowledge_dir.canonicalize()?;
+    let canonical_file = file_path.canonicalize()?;
+    let rel_path = canonical_file
+        .strip_prefix(&canonical_dir)
+        .unwrap_or(&canonical_file)
         .to_string_lossy()
         .to_string();
 
@@ -3579,25 +3585,44 @@ mod tests {
 
     // -- lossy-path warning (R8 / R11.9) ----------------------------------
 
-    /// Plant a `.md` file whose on-disk name is not valid UTF-8 by
-    /// concatenating an invalid lead byte (0xFF) with a literal `.md`
-    /// suffix. Returns the constructed full path. Linux tmpfs accepts
-    /// arbitrary byte sequences as filenames; the cfg(unix) gate is the
-    /// safety boundary against Windows builds invoking
-    /// `OsStr::from_bytes`.
+    /// Probe whether the tempdir filesystem accepts non-UTF-8 filenames.
+    /// Linux tmpfs/ext4 do; macOS APFS rejects with EILSEQ. Result is
+    /// process-stable (`$TMPDIR` doesn't change after start) so a single
+    /// probe is cached.
     #[cfg(unix)]
-    fn plant_non_utf8_md(dir: &Path) -> std::path::PathBuf {
+    fn tempdir_supports_non_utf8_filenames() -> bool {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
-        let bytes = [0xFFu8, b'.', b'm', b'd'];
-        let name = OsStr::from_bytes(&bytes);
+        use std::sync::OnceLock;
+        static SUPPORTS: OnceLock<bool> = OnceLock::new();
+        *SUPPORTS.get_or_init(|| {
+            let Ok(probe) = tempdir() else { return false };
+            let name = OsStr::from_bytes(b"\xFF.probe");
+            fs::write(probe.path().join(name), b"").is_ok()
+        })
+    }
+
+    /// Plant a `.md` file whose on-disk name is not valid UTF-8 by
+    /// concatenating an invalid lead byte (0xFF) with a literal `.md`
+    /// suffix. Returns `Some(path)` if the filesystem accepts the name,
+    /// `None` if it rejects it (macOS APFS). Tests should early-return on
+    /// `None`. The cfg(unix) gate is the safety boundary against Windows
+    /// builds invoking `OsStr::from_bytes`.
+    #[cfg(unix)]
+    fn try_plant_non_utf8_md(dir: &Path) -> Option<std::path::PathBuf> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        if !tempdir_supports_non_utf8_filenames() {
+            return None;
+        }
+        let name = OsStr::from_bytes(&[0xFFu8, b'.', b'm', b'd']);
         let path = dir.join(name);
         fs::write(
             &path,
             "# Body\n\nlossy filename body text that is long enough.\n",
         )
-        .expect("tmpfs should accept non-UTF-8 filenames; if this fails, gate the test");
-        path
+        .ok()?;
+        Some(path)
     }
 
     #[cfg(unix)]
@@ -3617,7 +3642,13 @@ mod tests {
             "# Good\n\nBody text that is long enough for a chunk.\n",
         )
         .unwrap();
-        let _lossy = plant_non_utf8_md(dir);
+        let Some(_lossy) = try_plant_non_utf8_md(dir) else {
+            eprintln!(
+                "skip: filesystem under {} rejects non-UTF-8 filenames",
+                dir.display()
+            );
+            return;
+        };
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
@@ -3664,7 +3695,13 @@ mod tests {
         // Arrange
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
-        let _lossy = plant_non_utf8_md(dir);
+        let Some(_lossy) = try_plant_non_utf8_md(dir) else {
+            eprintln!(
+                "skip: filesystem under {} rejects non-UTF-8 filenames",
+                dir.display()
+            );
+            return;
+        };
 
         // Act
         let message = empty_warning_message(dir).expect("empty-dir warning must fire");
@@ -3697,7 +3734,13 @@ mod tests {
             "# Good\n\nBody text that is long enough for a chunk.\n",
         )
         .unwrap();
-        let _lossy = plant_non_utf8_md(dir);
+        let Some(_lossy) = try_plant_non_utf8_md(dir) else {
+            eprintln!(
+                "skip: filesystem under {} rejects non-UTF-8 filenames",
+                dir.display()
+            );
+            return;
+        };
         let progress = std::cell::RefCell::new(Vec::<String>::new());
 
         // Act
@@ -3753,7 +3796,13 @@ mod tests {
         // Now plant the lossy file and bump `.loreignore` so the second
         // ingest takes the reconciliation pass (which calls
         // `walk_md_files`).
-        let _lossy = plant_non_utf8_md(dir);
+        let Some(_lossy) = try_plant_non_utf8_md(dir) else {
+            eprintln!(
+                "skip: filesystem under {} rejects non-UTF-8 filenames",
+                dir.display()
+            );
+            return;
+        };
         fs::write(&loreignore, "# placeholder v2\n").unwrap();
 
         // Act

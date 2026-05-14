@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `update_pattern` and `append_to_pattern` no longer leave stale chunks in the index when the
+  knowledge directory is reached through a symlink (typical on macOS, and on any symlinked or
+  bind-mounted setup). (#55)
+
 ## [0.3.0] - 2026-05-14
 
 ### Added
