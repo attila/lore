@@ -127,7 +127,16 @@ When an agent uses a tool, the hook extracts search terms from its input:
 | Transcript tail | Last user message (up to 200 bytes) | Additional context terms                                 |
 
 These terms are assembled into an FTS5 query. When a language is detected, the query takes the form
-`rust AND (validate OR email)`. When no language is detected, terms are joined with `OR`.
+`rust AND (validate OR email)`. When multiple languages are inferred from shared signals (e.g.
+`npm
+test` infers both JavaScript and TypeScript), they OR-join inside parentheses:
+`(javascript OR typescript) AND (terms)`. When no language is detected, terms are joined with `OR`.
+
+Patterns can also declare their applicable languages explicitly via the `language:` frontmatter
+field — see [Pattern language declaration](#pattern-language-declaration). Declared patterns reach
+retrieval through a structural gate that matches against the inferred-language set without requiring
+the canonical token to appear in the pattern body; undeclared patterns continue to rely on the
+keyword-matching path described here.
 
 ### What the Engine Cannot See
 
@@ -422,7 +431,9 @@ You can attach `applies_when` to a non-universal pattern, but it is dormant in t
 ingest layer parses and persists it, but the PreToolUse evaluator only consults it for chunks that
 also carry the `universal` tag. Ingest emits an info-level advisory naming the file so the
 discrepancy is visible. A future track will extend evaluation to non-universal patterns and
-introduce additional keys (`languages`, `environments`).
+introduce additional keys (`environments`). The `language:` key documented in
+[Pattern language declaration](#pattern-language-declaration) below is the first such addition; it
+is orthogonal to `applies_when` and gates retrieval rather than evaluation.
 
 ### Worked examples
 
@@ -463,6 +474,183 @@ applies_when:
 For tuning the relevance floor on universal patterns independently of `min_relevance`, see
 [`min_relevance_universal`](configuration.md#search-section) in the configuration reference. The
 predicate (`applies_when`) is the categorical complement to that numerical floor.
+
+## Pattern language declaration
+
+The optional `language:` frontmatter field declares which programming language(s) a pattern is
+about. Declaring it lets lore's retrieval surface the pattern on a relevant tool call even when the
+pattern body never mentions the canonical token in prose. Without a declaration, the pattern's
+discoverability depends on body keywords — it surfaces only when its body happens to contain the
+inferred-language word that lore extracts from the tool call.
+
+### Purpose
+
+Language detection runs over every tool call and produces an inferred-language set: a Rust file edit
+infers `{rust}`, an `npm test` Bash command infers `{javascript, typescript}`, a `pyproject.toml`
+edit infers `{python}`. The retrieval pipeline then admits patterns that either declare a language
+matching the inferred set (structural gate) or have no declaration and whose body coincidentally
+matches the canonical token (the fallback path).
+
+Declaring `language:` is the durable way to participate in the structural gate: a pattern about Rust
+error handling can use prose like "Use anyhow for errors" without the word "rust" anywhere in the
+body, and still surface on a Rust file edit. Authors with patterns that already mention the
+canonical token in prose can skip the declaration; lore will continue to find them through the
+fallback path.
+
+### Declaration is for eligibility, not ranking
+
+Declaring `language: rust` does one thing: it tells lore the pattern is about Rust. That makes lore
+_consider_ the pattern on every Rust tool call, even when the body never mentions "rust" in prose.
+It does not, on its own, push the pattern up the ranking.
+
+Once a pattern is eligible, lore decides which patterns are most relevant by where the query words
+land:
+
+- Words in a **heading** carry the most weight (e.g. `## Rust error handling`)
+- Words in **tags** carry the next-most weight (e.g. `tags: [rust, errors]`)
+- Words in the **body** carry the least
+
+So a pattern with `language: rust` and a generic heading like "Use anyhow for application errors"
+will surface on every Rust tool call, but might still rank below an undeclared pattern whose heading
+reads `## Rust error handling` for the same query.
+
+**Practical advice.** Treat the declaration and the heading/tags as separate levers:
+
+1. Declare `language:` so lore always considers the pattern for that language.
+2. Name the language in your heading too — the strongest ranking lever.
+3. Use the language as a tag — second-strongest.
+4. Body mentions are the weakest signal; do not rely on them alone.
+
+### Syntax
+
+Three forms are accepted, mirroring the `tags:` field:
+
+```yaml
+---
+language: rust
+---
+```
+
+```yaml
+---
+language: [javascript, typescript]
+---
+```
+
+```yaml
+---
+language:
+  - rust
+  - golang
+---
+```
+
+Tokens are case-insensitive in the source; lore normalises every token to lowercase at ingest. An
+empty list (`language: []`) and a missing field both mean "no declaration" — both leave the pattern
+on the fallback retrieval path.
+
+### Canonical tokens
+
+The initial recognised set covers the six languages lore detects today. Authors must declare the
+canonical token in the second column; the display column shows how lore refers to the language in
+prose and CLI output. The asymmetry is most visible for Go: the canonical token is `golang` because
+bare `go` collides with the English stop-word list and the FTS5 default tokeniser.
+
+| Display    | Canonical token |
+| ---------- | --------------- |
+| Rust       | `rust`          |
+| TypeScript | `typescript`    |
+| JavaScript | `javascript`    |
+| YAML       | `yaml`          |
+| Python     | `python`        |
+| Go         | `golang`        |
+
+Authors typing `language: go` will see a tier-2 warning at ingest naming the token as unknown; the
+pattern still ingests, but the structural gate will never match it.
+
+### When to declare a single token
+
+Use the scalar form when the pattern is about exactly one language. A pattern that explains Rust's
+lifetime elision rules, or one that documents Python virtual-environment conventions, declares a
+single token because applying it to any other language would be wrong.
+
+### When to declare a multi-value list
+
+Use the list form when the pattern's content genuinely applies to a small set of languages, even if
+the worked examples come from one ecosystem. A pattern that explains "validate at the boundary, not
+in the middle" applies equally to TypeScript and JavaScript; a pattern about JSON-LD framing applies
+to whichever ecosystem the consumer happens to use. The list captures applicability, not provenance
+— it is not a place to enumerate languages the pattern's examples happen to mention.
+
+### When to omit the field
+
+Omit `language:` when the pattern applies to too many languages to enumerate, or when the content is
+language-agnostic (cross-cutting concerns like git workflow, code review etiquette, accessibility
+heuristics). Retrieval falls back to body-keyword matching — if the body contains relevant
+vocabulary, lore will still surface the pattern.
+
+### Composition with `applies_when` and `universal`
+
+The three mechanisms are orthogonal:
+
+- `universal` marks a pattern as always-on at `SessionStart`; the body is pinned into context
+  regardless of retrieval.
+- `applies_when` gates whether a universal pattern fires on a given `PreToolUse` call.
+- `language:` gates retrieval ranking — independent of universality and the tool predicate.
+
+A cross-language always-inject pattern uses `universal` (and optionally `applies_when`) with no
+`language:` declaration; a language-specific reference pattern uses `language:` with no `universal`
+tag.
+
+### Validation behaviour
+
+Unknown tokens trigger a tier-2 warn-and-proceed at ingest time. The pattern still ingests with the
+offending token persisted verbatim, but the structural retrieval gate will never match it (the gate
+compares against the canonical-token list above). Lore aggregates per-token across the whole ingest
+run, so a 50-pattern repository that all share the same typo surfaces as one warning line, not
+fifty.
+
+### Worked examples
+
+**A Rust-specific pattern using prose that lacks the canonical token** — retrieval surfaces it on
+any Rust file edit even though the body never says "rust":
+
+```yaml
+---
+title: Use anyhow for application errors
+language: rust
+---
+```
+
+**A pattern that applies to both JS and TS ecosystems**:
+
+```yaml
+---
+title: Validate at the boundary, not in the middle
+language: [javascript, typescript]
+---
+```
+
+**A Python-specific pattern using the block-list form**:
+
+```yaml
+---
+title: Pin pyproject.toml dependencies with caret ranges
+language:
+  - python
+---
+```
+
+**A cross-language workflow pattern that omits the field**:
+
+```yaml
+---
+title: Squash-merge feature branches
+tags: [workflow, universal]
+applies_when:
+  bash_command_starts_with: [git, gh]
+---
+```
 
 ## File Structure and Grouping
 

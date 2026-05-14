@@ -21,14 +21,18 @@
 //! diagram.
 
 pub mod call_context;
+pub mod languages;
 pub mod predicate;
 pub mod query;
 pub mod text;
 
 pub use call_context::CallContext;
+pub use languages::{LANGUAGES, LanguageEntry, is_known_token};
 pub use predicate::{command_matches_with_wrappers, evaluate_applies_when};
 pub use query::{
-    clean_terms, extract_query, filename_terms, language_from_bash, language_from_extension,
+    assemble_fts_query, clean_terms, extract_query, filename_terms, infer_languages,
+    language_from_bash, language_from_directory_hint, language_from_extension,
+    language_from_marker_filename,
 };
 pub use text::{split_into_words, truncate_str};
 

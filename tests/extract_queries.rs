@@ -55,6 +55,52 @@ fn extract_queries_bare_bash_command_without_language_signal_emits_empty_stdout(
 }
 
 #[test]
+fn extract_queries_bash_bundle_install_does_not_match_bun_anchor() {
+    // Regression for R2 (whole-token bash matching). The pre-refactor
+    // substring matcher fired on `bundle` because it contained the
+    // `bun` keyword; the word-boundary matcher in `engine::languages`
+    // must not.
+    let out = run(r#"{"tool_name":"Bash","tool_input":{"command":"bundle install"}}"#);
+    assert!(
+        !out.contains("typescript"),
+        "bundle install must not produce typescript anchor, got: {out:?}"
+    );
+    assert!(
+        !out.contains("javascript"),
+        "bundle install must not produce javascript anchor, got: {out:?}"
+    );
+}
+
+#[test]
+fn extract_queries_bash_env_prefix_does_not_block_keyword_anchor() {
+    // Regression for R2 env-prefix handling: `env FOO=bar cargo build`
+    // still detects rust even though the leading env wrapper precedes
+    // the `cargo` token. The `KEY=VAL`-shaped tokens are filtered
+    // before keyword matching.
+    let out = run(r#"{"tool_name":"Bash","tool_input":{"command":"env FOO=bar cargo build"}}"#);
+    assert!(out.contains("rust"), "expected rust anchor, got: {out:?}");
+}
+
+#[test]
+fn extract_queries_bash_npm_test_anchors_both_javascript_and_typescript() {
+    // AE9: `npm` registers as a command keyword for both `javascript`
+    // and `typescript`; the FTS anchor wraps them as `(... OR ...)`.
+    let out = run(r#"{"tool_name":"Bash","tool_input":{"command":"npm test authentication"}}"#);
+    assert!(
+        out.contains("javascript") && out.contains("typescript"),
+        "expected both anchors, got: {out:?}"
+    );
+}
+
+#[test]
+fn extract_queries_edit_cargo_toml_marker_filename_anchors_rust() {
+    // The marker-filename signal anchors rust even though `.toml`
+    // is not a recognised extension.
+    let out = run(r#"{"tool_name":"Edit","tool_input":{"file_path":"project/Cargo.toml"}}"#);
+    assert!(out.contains("rust"), "expected rust anchor, got: {out:?}");
+}
+
+#[test]
 fn extract_queries_invalid_json_exits_nonzero_with_stderr_message() {
     Command::cargo_bin("lore")
         .expect("binary exists")

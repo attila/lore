@@ -54,6 +54,45 @@ pub struct MalformedPredicateEntry {
     pub reason: String,
 }
 
+/// A per-file ingest advisory describing an unknown `language:` token.
+///
+/// Emitted by [`parse_frontmatter_language_list`] when a token does not
+/// match any entry in `engine::languages::LANGUAGES`. The pattern still
+/// ingests with the offending token written verbatim to `language_json`
+/// (R12 warn-and-proceed); the structural retrieval gate simply never
+/// matches it because the token has no place in the shared table. The
+/// ingest layer (`ingest.rs`) aggregates entries by `token` across all
+/// patterns and emits one warning per unique token, not per offending
+/// pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MalformedLanguageEntry {
+    /// Source file path the unknown token was declared in.
+    pub file_path: String,
+    /// The unknown token verbatim (lowercased per the parser
+    /// normalisation step, so authors see a stable shape even when they
+    /// typed mixed case).
+    pub token: String,
+}
+
+/// Combined frontmatter advisories returned alongside a file's chunks.
+///
+/// Carries both the `applies_when` near-miss / shape advisories and the
+/// `language:` unknown-token advisories. Returned as a single value so
+/// adding new advisory channels in the future stays additive against
+/// existing call sites.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChunkingAdvisories {
+    /// Malformed `applies_when` advisories from the Track-1 frontmatter
+    /// parser. Empty when the frontmatter has no `applies_when` block or
+    /// when the block parses cleanly.
+    pub malformed_applies_when: Vec<MalformedPredicateEntry>,
+    /// Unknown-token `language:` advisories from
+    /// [`parse_frontmatter_language_list`]. Empty when the frontmatter has
+    /// no `language:` field, when the field is empty, or when every token
+    /// is canonical.
+    pub malformed_language: Vec<MalformedLanguageEntry>,
+}
+
 /// A single chunk of knowledge extracted from a markdown file.
 ///
 /// No `Default` impl by design: every chunk-construction site must explicitly
@@ -84,6 +123,14 @@ pub struct Chunk {
     /// U1 introduces the field with explicit `None` at every construction
     /// site; U7 plumbs real values from the frontmatter parser.
     pub applies_when_json: Option<String>,
+    /// JSON-serialised list of canonical language tokens declared via
+    /// the pattern's `language:` frontmatter field, or `None` when no
+    /// `language:` is set. Stored as a JSON array (e.g. `["rust"]`,
+    /// `["javascript","typescript"]`) so the retrieval gate can use
+    /// `json_each()` for membership checks without a separate join
+    /// table. `None` means "no declaration"; the retrieval pipeline
+    /// admits such chunks via the FTS-fallback branch per R10.
+    pub language_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,25 +142,31 @@ pub struct Chunk {
 /// Falls back to [`chunk_as_document`] when no heading-based chunks are
 /// produced (e.g. when the body under every heading is shorter than 10 chars).
 ///
-/// Malformed `applies_when` entries are silently dropped on this entry point;
-/// callers that need the per-file ingest advisory list (U7) should use
-/// [`chunk_by_heading_with_malformed_predicates`] instead.
+/// Per-file advisories are silently dropped on this entry point;
+/// callers that need the [`ChunkingAdvisories`] list should use
+/// [`chunk_by_heading_with_advisories`] instead.
 pub fn chunk_by_heading(content: &str, source_file: &str) -> Vec<Chunk> {
-    chunk_by_heading_with_malformed_predicates(content, source_file).0
+    chunk_by_heading_with_advisories(content, source_file).0
 }
 
 /// Like [`chunk_by_heading`] but also returns the per-file
-/// [`MalformedPredicateEntry`] advisories produced by parsing the
-/// `applies_when` block. The advisory list is empty when the frontmatter has
-/// no `applies_when` block or when the block parses cleanly. Used by ingest
-/// (U7) to surface per-file warnings via `on_progress` (CLI) and `eprintln!`
-/// (MCP write tools).
-pub fn chunk_by_heading_with_malformed_predicates(
+/// [`ChunkingAdvisories`] produced by parsing the `applies_when` block and
+/// the `language:` field. Each list within the bundle is empty when the
+/// corresponding frontmatter field is absent or parses cleanly. Used by
+/// ingest to surface per-file warnings via `on_progress` (CLI) and
+/// `eprintln!` (MCP write tools).
+#[allow(clippy::too_many_lines)] // Heading-walk loop with embedded flush
+// closure inherently runs long; splitting hurts readability and
+// requires either a shared mutable-state struct or a second pass.
+pub fn chunk_by_heading_with_advisories(
     content: &str,
     source_file: &str,
-) -> (Vec<Chunk>, Vec<MalformedPredicateEntry>) {
-    let (applies_when, malformed) = parse_frontmatter_applies_when(content, source_file);
+) -> (Vec<Chunk>, ChunkingAdvisories) {
+    let (applies_when, malformed_applies_when) =
+        parse_frontmatter_applies_when(content, source_file);
     let applies_when_json = serialise_applies_when(applies_when.as_ref());
+    let (language_list, malformed_language) = parse_frontmatter_language_list(content, source_file);
+    let language_json = serialise_language_list(&language_list);
 
     let stripped = strip_frontmatter(content);
     let lines: Vec<&str> = stripped.lines().collect();
@@ -131,6 +184,7 @@ pub fn chunk_by_heading_with_malformed_predicates(
                  tags: &str,
                  is_universal: bool,
                  applies_when_json: &Option<String>,
+                 language_json: &Option<String>,
                  source_file: &str,
                  chunks: &mut Vec<Chunk>,
                  id_counts: &mut HashMap<String, usize>| {
@@ -171,6 +225,7 @@ pub fn chunk_by_heading_with_malformed_predicates(
             heading_path,
             is_universal,
             applies_when_json: applies_when_json.clone(),
+            language_json: language_json.clone(),
         });
     };
 
@@ -183,6 +238,7 @@ pub fn chunk_by_heading_with_malformed_predicates(
                 &tags,
                 is_universal,
                 &applies_when_json,
+                &language_json,
                 source_file,
                 &mut chunks,
                 &mut id_counts,
@@ -205,39 +261,55 @@ pub fn chunk_by_heading_with_malformed_predicates(
         &tags,
         is_universal,
         &applies_when_json,
+        &language_json,
         source_file,
         &mut chunks,
         &mut id_counts,
     );
 
     if chunks.is_empty() {
-        return chunk_as_document_with_malformed_predicates(content, source_file);
+        return chunk_as_document_with_advisories(content, source_file);
     }
 
-    (chunks, malformed)
+    (
+        chunks,
+        ChunkingAdvisories {
+            malformed_applies_when,
+            malformed_language,
+        },
+    )
 }
 
 /// Treat the entire file as a single chunk (after stripping frontmatter).
 ///
-/// Malformed `applies_when` entries are silently dropped on this entry point;
-/// callers that need the per-file ingest advisory list (U7) should use
-/// [`chunk_as_document_with_malformed_predicates`] instead.
+/// Per-file advisories are silently dropped on this entry point; callers
+/// that need the [`ChunkingAdvisories`] list should use
+/// [`chunk_as_document_with_advisories`] instead.
 pub fn chunk_as_document(content: &str, source_file: &str) -> Vec<Chunk> {
-    chunk_as_document_with_malformed_predicates(content, source_file).0
+    chunk_as_document_with_advisories(content, source_file).0
 }
 
 /// Like [`chunk_as_document`] but also returns the per-file
-/// [`MalformedPredicateEntry`] advisories from parsing `applies_when`.
-pub fn chunk_as_document_with_malformed_predicates(
+/// [`ChunkingAdvisories`] from parsing `applies_when` and `language:`.
+pub fn chunk_as_document_with_advisories(
     content: &str,
     source_file: &str,
-) -> (Vec<Chunk>, Vec<MalformedPredicateEntry>) {
-    let (applies_when, malformed) = parse_frontmatter_applies_when(content, source_file);
+) -> (Vec<Chunk>, ChunkingAdvisories) {
+    let (applies_when, malformed_applies_when) =
+        parse_frontmatter_applies_when(content, source_file);
     let applies_when_json = serialise_applies_when(applies_when.as_ref());
+    let (language_list, malformed_language) = parse_frontmatter_language_list(content, source_file);
+    let language_json = serialise_language_list(&language_list);
 
     let body = strip_frontmatter(content).trim().to_string();
     if body.len() < 10 {
-        return (Vec::new(), malformed);
+        return (
+            Vec::new(),
+            ChunkingAdvisories {
+                malformed_applies_when,
+                malformed_language,
+            },
+        );
     }
 
     let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
@@ -253,8 +325,15 @@ pub fn chunk_as_document_with_malformed_predicates(
         heading_path: String::new(),
         is_universal,
         applies_when_json,
+        language_json,
     }];
-    (chunks, malformed)
+    (
+        chunks,
+        ChunkingAdvisories {
+            malformed_applies_when,
+            malformed_language,
+        },
+    )
 }
 
 /// Serialise an [`AppliesWhen`] to its JSON representation, returning `None`
@@ -267,6 +346,19 @@ fn serialise_applies_when(aw: Option<&AppliesWhen>) -> Option<String> {
         // in practice.
         serde_json::to_string(aw).expect("AppliesWhen serialises to JSON")
     })
+}
+
+/// Serialise a parsed `language:` token list to its JSON representation,
+/// returning `None` when the list is empty. Centralised so chunk and
+/// pattern rows always see the same JSON shape. `["rust"]`, not
+/// `"rust"` — the on-disk shape is always a JSON array so the retrieval
+/// gate's `json_each()` query has a uniform input.
+fn serialise_language_list(tokens: &[String]) -> Option<String> {
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(tokens).expect("Vec<String> serialises to JSON"))
+    }
 }
 
 /// One row per pattern file for the `patterns` table — the authorial view
@@ -293,6 +385,12 @@ pub struct PatternRow {
     /// predicate is set and the pattern fires as today (whole-file
     /// semantics — the predicate is shared across every chunk).
     pub applies_when_json: Option<String>,
+    /// JSON-serialised list of canonical language tokens declared via
+    /// the pattern's `language:` frontmatter field; mirrors
+    /// `Chunk::language_json`. `None` means no declaration and the
+    /// retrieval pipeline routes the pattern through the FTS-fallback
+    /// branch per R10.
+    pub language_json: Option<String>,
 }
 
 /// Build a [`PatternRow`] from the file's raw contents and its produced
@@ -311,6 +409,7 @@ pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> P
     let is_universal = chunks.first().is_some_and(|c| c.is_universal);
     let tags = chunks.first().map_or_else(String::new, |c| c.tags.clone());
     let applies_when_json = chunks.first().and_then(|c| c.applies_when_json.clone());
+    let language_json = chunks.first().and_then(|c| c.language_json.clone());
     let title = extract_title(content).unwrap_or_else(|| file_stem(source_file));
     let raw_body = strip_frontmatter(content).trim().to_string();
     let content_hash = format!("{:016x}", fnv1a(content.as_bytes()));
@@ -322,6 +421,7 @@ pub fn pattern_row_from(content: &str, source_file: &str, chunks: &[Chunk]) -> P
         raw_body,
         content_hash,
         applies_when_json,
+        language_json,
     }
 }
 
@@ -424,6 +524,111 @@ pub fn parse_frontmatter_tag_list(content: &str) -> Vec<String> {
         .map(|l| strip_outer_quotes(l.trim_start_matches([' ', '-']).trim()))
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// Parse the optional frontmatter `language:` field into a list of
+/// canonical tokens plus a list of [`MalformedLanguageEntry`] advisories
+/// for unknown tokens.
+///
+/// Three input shapes are accepted, mirroring `tags:`:
+///
+/// - Scalar: `language: rust` → `(vec!["rust"], vec![])`.
+/// - Flow list: `language: [javascript, typescript]` →
+///   `(vec!["javascript", "typescript"], vec![])`.
+/// - Block list: `language:\n  - rust\n  - golang` →
+///   `(vec!["rust", "golang"], vec![])`.
+///
+/// All tokens are lowercased and outer quotes stripped at parse time so
+/// `language: Rust` and `language: "rust"` both normalise to `rust`. An
+/// empty flow list (`language: []`) or a missing field both yield an
+/// empty `Vec` and no advisories — both are treated as "no declaration",
+/// which leaves the pattern on the FTS-fallback retrieval path per R10.
+///
+/// Validation is checked against
+/// [`crate::engine::is_known_token`]: tokens that do not match a
+/// canonical entry in the shared table land in the advisory vector
+/// alongside the parsed list. The unknown token still appears in the
+/// returned token list (verbatim, lowercased) so the ingest layer can
+/// write it to `language_json` for future-proofing — the structural
+/// gate simply won't match it (no entry in the table means no inferred
+/// language can equal the unknown token).
+///
+/// `source_file` is only used to populate the advisory entries'
+/// `file_path` field; it does not affect parsing.
+pub fn parse_frontmatter_language_list(
+    content: &str,
+    source_file: &str,
+) -> (Vec<String>, Vec<MalformedLanguageEntry>) {
+    let Some(fm) = extract_frontmatter(content) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(start) = find_top_level_key(&fm, "language:") else {
+        return (Vec::new(), Vec::new());
+    };
+    let rest = &fm[start + "language:".len()..];
+    let first_line = rest.lines().next().unwrap_or("").trim();
+
+    let tokens: Vec<String> = if first_line.is_empty() {
+        // Block-list form: tokens live on subsequent indented lines.
+        rest.lines()
+            .skip(1)
+            .take_while(|l| l.starts_with("  -") || l.starts_with("- "))
+            .map(|l| strip_outer_quotes(l.trim_start_matches([' ', '-']).trim()).to_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else if let Some(bracket_start) = first_line.find('[')
+        && let Some(bracket_end) = first_line.find(']')
+        && bracket_start < bracket_end
+    {
+        // Flow-list form.
+        first_line[bracket_start + 1..bracket_end]
+            .split(',')
+            .map(|t| strip_outer_quotes(t.trim()).to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    } else {
+        // Scalar form — single token on the same line as the key.
+        let token = strip_outer_quotes(first_line).to_lowercase();
+        if token.is_empty() {
+            Vec::new()
+        } else {
+            vec![token]
+        }
+    };
+
+    let mut malformed = Vec::new();
+    for token in &tokens {
+        if !crate::engine::is_known_token(token) {
+            malformed.push(MalformedLanguageEntry {
+                file_path: source_file.to_string(),
+                token: token.clone(),
+            });
+        }
+    }
+
+    (tokens, malformed)
+}
+
+/// Locate a top-level key (e.g. `"language:"`) at column 0 of the
+/// frontmatter body. Returns the byte offset where the key begins, or
+/// `None` if the key is not present at column 0.
+///
+/// Distinct from `fm.find(key)` because that would match an indented
+/// occurrence nested inside another block (e.g. an `applies_when:` sub
+/// key named `language`). The frontmatter parser enforces column-0
+/// placement for all top-level keys per the indentation contract
+/// documented under `parse_frontmatter_applies_when`.
+fn find_top_level_key(fm: &str, key: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in fm.split_inclusive('\n') {
+        let trimmed_len = line.trim_end_matches(['\n', '\r']).len();
+        let line_no_eol = &line[..trimmed_len];
+        if line_no_eol.starts_with(key) {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Parse the frontmatter `applies_when:` block into an [`AppliesWhen`] plus a
@@ -1685,7 +1890,7 @@ Yet another section with enough body text.
     }
 
     #[test]
-    fn chunk_by_heading_with_malformed_predicates_surfaces_advisory() {
+    fn chunk_by_heading_with_advisories_surfaces_applies_when_advisory() {
         let md = "\
 ---
 tags: [universal]
@@ -1696,14 +1901,87 @@ appliess_when:
 # Top
 Enough body text for a real chunk.
 ";
-        let (chunks, malformed) = chunk_by_heading_with_malformed_predicates(md, "patterns/foo.md");
+        let (chunks, advisories) = chunk_by_heading_with_advisories(md, "patterns/foo.md");
         assert!(!chunks.is_empty());
         // Advisory survives the chunk wiring.
-        assert_eq!(malformed.len(), 1);
-        assert_eq!(malformed[0].key, "appliess_when");
+        assert_eq!(advisories.malformed_applies_when.len(), 1);
+        assert_eq!(advisories.malformed_applies_when[0].key, "appliess_when");
         // No predicate JSON written when the typo inerted the block.
         for c in &chunks {
             assert!(c.applies_when_json.is_none());
+        }
+    }
+
+    #[test]
+    fn chunk_by_heading_with_advisories_surfaces_unknown_language_token() {
+        // Unknown language token lands in the advisories list while the
+        // token itself is still serialised to chunk.language_json so the
+        // ingest layer can write it through (warn-and-proceed per R12).
+        let md = "\
+---
+language: rrust
+---
+
+# Top
+Enough body text for a real chunk.
+";
+        let (chunks, advisories) = chunk_by_heading_with_advisories(md, "patterns/foo.md");
+        assert!(!chunks.is_empty());
+        assert_eq!(advisories.malformed_language.len(), 1);
+        assert_eq!(advisories.malformed_language[0].token, "rrust");
+        for c in &chunks {
+            assert_eq!(c.language_json.as_deref(), Some(r#"["rrust"]"#));
+        }
+    }
+
+    #[test]
+    fn chunk_by_heading_language_json_serialises_known_list_to_chunks() {
+        // Every chunk produced for a single file carries the same
+        // language_json — whole-file semantics mirror applies_when_json.
+        let md = "\
+---
+language: [javascript, typescript]
+---
+
+# Top
+Enough body text for a chunk.
+
+## Sub
+Another chunk under a sub-heading.
+";
+        let (chunks, advisories) = chunk_by_heading_with_advisories(md, "patterns/foo.md");
+        assert!(!chunks.is_empty());
+        assert!(advisories.malformed_language.is_empty());
+        let expected = r#"["javascript","typescript"]"#;
+        for c in &chunks {
+            assert_eq!(c.language_json.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn chunk_as_document_language_json_serialises_to_chunk() {
+        let md = "---\nlanguage: rust\n---\n\nA short pattern body here.\n";
+        let (chunks, advisories) = chunk_as_document_with_advisories(md, "p.md");
+        assert_eq!(chunks.len(), 1);
+        assert!(advisories.malformed_language.is_empty());
+        assert_eq!(chunks[0].language_json.as_deref(), Some(r#"["rust"]"#));
+    }
+
+    #[test]
+    fn pattern_row_from_inherits_language_json_from_first_chunk() {
+        let md = "---\nlanguage: rust\n---\n\n# Top\nEnough body text for a chunk.\n";
+        let chunks = chunk_by_heading(md, "p.md");
+        let row = pattern_row_from(md, "p.md", &chunks);
+        assert_eq!(row.language_json.as_deref(), Some(r#"["rust"]"#));
+    }
+
+    #[test]
+    fn chunk_no_language_field_yields_none() {
+        let md = "---\ntags: [workflow]\n---\n\n# Top\nEnough body text.\n";
+        let chunks = chunk_by_heading(md, "p.md");
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(c.language_json.is_none());
         }
     }
 
@@ -1785,5 +2063,131 @@ Body text long enough to chunk through heading mode.
              not None — see U3 contract that empty allowlist never matches",
         );
         assert!(aw.tools.is_none());
+    }
+
+    // -- parse_frontmatter_language_list -------------------------------------
+
+    #[test]
+    fn parse_language_scalar_rust() {
+        let md = "---\nlanguage: rust\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(langs, vec!["rust".to_string()]);
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_flow_list() {
+        let md = "---\nlanguage: [javascript, typescript]\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(
+            langs,
+            vec!["javascript".to_string(), "typescript".to_string()]
+        );
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_block_list() {
+        let md = "---\nlanguage:\n  - rust\n  - golang\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(langs, vec!["rust".to_string(), "golang".to_string()]);
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_capitalised_is_normalised_to_lowercase() {
+        let md = "---\nlanguage: Rust\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(langs, vec!["rust".to_string()]);
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_unknown_token_emits_malformed_entry() {
+        let md = "---\nlanguage: rrust\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        // Unknown token is preserved in the list so the ingest layer
+        // still writes it through (warn-and-proceed per R12); the
+        // advisory captures it for the per-token aggregation.
+        assert_eq!(langs, vec!["rrust".to_string()]);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].file_path, "p.md");
+        assert_eq!(malformed[0].token, "rrust");
+    }
+
+    #[test]
+    fn parse_language_mixed_known_and_unknown() {
+        let md = "---\nlanguage: [rust, kotlin]\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(langs, vec!["rust".to_string(), "kotlin".to_string()]);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].token, "kotlin");
+    }
+
+    #[test]
+    fn parse_language_empty_flow_list() {
+        let md = "---\nlanguage: []\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert!(langs.is_empty());
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_missing_field() {
+        let md = "---\ntags: [workflow]\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert!(langs.is_empty());
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_quoted_token() {
+        let md = "---\nlanguage: \"rust\"\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(langs, vec!["rust".to_string()]);
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_quoted_string_with_internal_space_treated_as_one_token() {
+        // Quoted string with internal space — we strip the outer quotes
+        // but do not split the result; "quoted rust" lands as a single
+        // unknown token, surfaced via the advisory.
+        let md = "---\nlanguage: \"quoted rust\"\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(langs, vec!["quoted rust".to_string()]);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].token, "quoted rust");
+    }
+
+    #[test]
+    fn parse_language_no_frontmatter_returns_empty() {
+        let md = "# Just a markdown document\nNo frontmatter.\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert!(langs.is_empty());
+        assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_canonical_tokens_for_all_initial_six_languages() {
+        // R16: every entry currently in LANGUAGES must validate as known
+        // through the parser. Pinned so a typo in the table's `token`
+        // field would surface a malformed entry on a known-good fixture.
+        for token in [
+            "rust",
+            "typescript",
+            "javascript",
+            "yaml",
+            "python",
+            "golang",
+        ] {
+            let md = format!("---\nlanguage: {token}\n---\n# x\n");
+            let (langs, malformed) = parse_frontmatter_language_list(&md, "p.md");
+            assert_eq!(langs, vec![token.to_string()]);
+            assert!(
+                malformed.is_empty(),
+                "{token} must validate as known, malformed: {malformed:?}"
+            );
+        }
     }
 }

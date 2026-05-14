@@ -6,16 +6,32 @@
 //! engine performs no I/O), runs them through filename-aware splitting and
 //! `clean_terms` cleanup, and assembles a small FTS5 query string of the
 //! shape `language AND (term1 OR term2 OR ...)` (with sensible fallbacks
-//! when only one of the two parts survives).
+//! when only one of the two parts survives, and `(lang1 OR lang2)` for
+//! multi-language inferences such as `npm test` matching both
+//! `javascript` and `typescript`).
+//!
+//! Language detection iterates [`crate::engine::languages::LANGUAGES`] —
+//! the shared declarative table — over four signal types: file
+//! extensions, marker filenames, directory-hint path components, and
+//! Bash command-line tokens. The four signal helpers all return
+//! `Vec<String>` because a single signal may legitimately fire for
+//! multiple languages (e.g. `package.json` belongs to both
+//! `javascript` and `typescript`). [`extract_query`] composes them with
+//! a marker > extension > directory-hint priority chain on the file
+//! path side and unions in the Bash side.
 //!
 //! All public functions here are total: any `&CallContext` / `&str` in,
 //! deterministic output, no panics, no I/O. The Claude Code adapter is the
 //! only caller that converts a `HookInput` into a `CallContext`; future
 //! adapters call this module directly with their own `CallContext`.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::engine::call_context::CallContext;
+use crate::engine::languages::{
+    languages_for_command_keyword, languages_for_directory_hint, languages_for_extension,
+    languages_for_marker_filename,
+};
 use crate::engine::text::{split_into_words, truncate_str};
 
 /// Tool-name string the Bash branch keys off.
@@ -40,107 +56,247 @@ const STOP_WORDS: &[&str] = &[
     "these", "those", "other", "than", "them", "your", "does", "here",
 ];
 
-/// Build an FTS5 query from a [`CallContext`].
+/// Decompose a [`CallContext`] into the two ingredients retrieval needs:
+/// the set of inferred languages and the list of cleaned enrichment
+/// terms. Returns `None` when neither side produced anything useful.
 ///
-/// Returns `None` when no meaningful terms can be extracted. The shape is
-/// one of:
-///
-/// * `"<lang> AND (term1 OR term2 OR ...)"` — language anchor plus
-///   enrichment terms.
-/// * `"<lang>"` — language anchor only (no enrichment terms survived
-///   cleaning).
-/// * `"term1 OR term2 OR ..."` — enrichment terms only (no language).
-/// * `None` — neither a language anchor nor any cleaned terms.
+/// The first slot is the inferred-language set (empty `Vec` when the
+/// context has no recognised file-path or bash signal, singular when
+/// one entry matches, multi-valued when shared signals fire such as
+/// `npm test` accumulating `{javascript, typescript}`). The second slot
+/// is the cleaned, deduplicated enrichment-term list produced by
+/// [`clean_terms`].
 ///
 /// Reads from the context fields directly and never touches the
 /// filesystem; the adapter is responsible for populating
 /// `transcript_tail` (eager 32 KB read with `$HOME` validation) before
 /// calling.
-pub fn extract_query(ctx: &CallContext) -> Option<String> {
-    let mut terms: Vec<String> = Vec::new();
-    let mut language: Option<String> = None;
+///
+/// Use [`assemble_fts_query`] when you need the legacy FTS5 string
+/// shape (e.g. CLI `lore extract-queries` output, hook-shim
+/// backwards compatibility); retrieval callers pass the two `Vec`s
+/// straight to `KnowledgeDB::search_hybrid` so the structural gate
+/// can apply the membership predicate on `language_json`.
+pub fn extract_query(ctx: &CallContext) -> Option<(Vec<String>, Vec<String>)> {
+    let inferred = infer_languages(ctx);
+    let terms = harvest_terms(ctx);
+    let cleaned = clean_terms(&terms);
+    if inferred.is_empty() && cleaned.is_empty() {
+        None
+    } else {
+        Some((inferred, cleaned))
+    }
+}
 
-    // 1. File path signals (Edit, Write, Read, etc.)
+/// Assemble the legacy FTS5 query string from an inferred-language set
+/// and a cleaned enrichment-term list. Useful for callers that still
+/// speak the pre-U5 query-string contract (CLI `lore extract-queries`,
+/// the public hook-shim signature).
+///
+/// Returned shape:
+///
+/// * `Some("<lang> AND (term1 OR term2 OR ...)")` — single language
+///   anchor plus enrichment terms.
+/// * `Some("(<lang1> OR <lang2>) AND (term1 OR term2 OR ...)")` —
+///   multi-language anchor (e.g. `npm test` infers both `javascript`
+///   and `typescript`).
+/// * `Some("<lang>")` / `Some("(<lang1> OR <lang2>)")` — language
+///   anchor only (no enrichment terms).
+/// * `Some("term1 OR term2 OR ...")` — enrichment terms only.
+/// * `None` — both sides are empty.
+pub fn assemble_fts_query(inferred: &[String], cleaned: &[String]) -> Option<String> {
+    assemble_query(inferred, cleaned)
+}
+
+/// Returns the set of inferred languages for a [`CallContext`].
+///
+/// File-path signals chain by priority — marker filename > extension >
+/// directory hint — taking the first signal that produces any match.
+/// Bash command signals union with the file-path result (they
+/// contribute independently when both fire). The returned `Vec` is
+/// deduplicated and ordered first-seen.
+///
+/// Empty `Vec` means no signal matched; downstream callers must treat
+/// this as the no-language case (terms-only retrieval per R11).
+pub fn infer_languages(ctx: &CallContext) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
     if let Some(file_path) = ctx.file_path.as_deref() {
-        if let Some(lang) = language_from_extension(file_path) {
-            language = Some(lang);
-        }
-        terms.extend(filename_terms(file_path));
+        // Priority chain (R7): first non-empty result wins.
+        let from_path = language_from_marker_filename(file_path);
+        let from_path = if from_path.is_empty() {
+            language_from_extension(file_path)
+        } else {
+            from_path
+        };
+        let from_path = if from_path.is_empty() {
+            language_from_directory_hint(file_path)
+        } else {
+            from_path
+        };
+        extend_unique(&mut out, from_path);
     }
 
-    // 2. Bash signals — prefer description, fall back to command.
     if ctx.tool_name.as_deref() == Some(TOOL_BASH) {
         let text = ctx
             .description
             .as_deref()
             .or(ctx.command.as_deref())
             .unwrap_or_default();
+        extend_unique(&mut out, language_from_bash(text));
+    }
 
-        if language.is_none() {
-            language = language_from_bash(text);
+    out
+}
+
+/// Push every element of `incoming` into `out` while preserving
+/// first-seen order and dropping duplicates against the existing
+/// contents of `out`.
+fn extend_unique(out: &mut Vec<String>, incoming: Vec<String>) {
+    for lang in incoming {
+        if !out.iter().any(|existing| existing == &lang) {
+            out.push(lang);
         }
+    }
+}
 
+/// Harvest raw term candidates from the context's file path, Bash
+/// description/command, and transcript-tail snippet. The result still
+/// contains stop words, hex-like fragments, and duplicates — call
+/// [`clean_terms`] before assembling a query.
+fn harvest_terms(ctx: &CallContext) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+
+    if let Some(file_path) = ctx.file_path.as_deref() {
+        terms.extend(filename_terms(file_path));
+    }
+
+    if ctx.tool_name.as_deref() == Some(TOOL_BASH) {
+        let text = ctx
+            .description
+            .as_deref()
+            .or(ctx.command.as_deref())
+            .unwrap_or_default();
         terms.extend(split_into_words(text));
     }
 
-    // 3. Transcript tail (last user message). Populated by the adapter; we
-    //    just slice the budget and harvest words.
     if let Some(transcript_tail) = ctx.transcript_tail.as_deref() {
         let truncated = truncate_str(transcript_tail, TRANSCRIPT_TERM_BUDGET);
         terms.extend(split_into_words(truncated));
     }
 
-    // 4. Clean terms.
-    let cleaned = clean_terms(&terms);
+    terms
+}
 
-    // 5. Assemble FTS5 query.
-    match (language, cleaned.is_empty()) {
-        // Language anchor + enrichment terms: `lang AND (term1 OR term2 OR ...)`
+/// Assemble the final FTS5 query string from the inferred-language set
+/// and the cleaned enrichment terms. See [`extract_query`] for the
+/// returned shapes.
+fn assemble_query(inferred: &[String], cleaned: &[String]) -> Option<String> {
+    let lang_part = if inferred.is_empty() {
+        None
+    } else if inferred.len() == 1 {
+        Some(inferred[0].clone())
+    } else {
+        Some(format!("({})", inferred.join(" OR ")))
+    };
+
+    match (lang_part, cleaned.is_empty()) {
         (Some(lang), false) => {
             let or_clause = cleaned.join(" OR ");
             Some(format!("{lang} AND ({or_clause})"))
         }
-        // Language anchor only (no enrichment survived cleaning): just the language
         (Some(lang), true) => Some(lang),
-        // No language anchor, but enrichment terms: OR-only query
         (None, false) => Some(cleaned.join(" OR ")),
-        // Nothing useful extracted
         (None, true) => None,
     }
 }
 
-/// Map file extension to a language keyword for FTS anchor.
-pub fn language_from_extension(path: &str) -> Option<String> {
-    let ext = Path::new(path).extension()?.to_str()?;
-    match ext.to_lowercase().as_str() {
-        "ts" | "tsx" => Some("typescript".to_string()),
-        "rs" => Some("rust".to_string()),
-        "js" | "jsx" => Some("javascript".to_string()),
-        "yml" | "yaml" => Some("yaml".to_string()),
-        "py" => Some("python".to_string()),
-        "go" => Some("golang".to_string()),
-        _ => None,
-    }
+/// Map a file path's extension to the set of languages whose
+/// `extensions` slice contains it. Returns an empty `Vec` when the
+/// path has no extension or the extension is not registered.
+pub fn language_from_extension(path: &str) -> Vec<String> {
+    Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(languages_for_extension)
+        .unwrap_or_default()
 }
 
-/// Infer language from a Bash command string (substring match — not a
-/// shell-aware tokeniser; happy with `cargo build` or `npm run foo`).
-pub fn language_from_bash(command: &str) -> Option<String> {
-    let lower = command.to_lowercase();
-    if lower.contains("npm")
-        || lower.contains("npx")
-        || lower.contains("yarn")
-        || lower.contains("bun")
-    {
-        return Some("typescript".to_string());
+/// Map a file path's basename to the set of languages whose
+/// `marker_filenames` slice contains it (e.g. `Cargo.toml` → `[rust]`,
+/// `package.json` → `[typescript, javascript]`). Marker matching is
+/// case-sensitive because the conventional casing is part of the marker.
+/// Returns an empty `Vec` when the basename is not a known marker.
+pub fn language_from_marker_filename(path: &str) -> Vec<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(languages_for_marker_filename)
+        .unwrap_or_default()
+}
+
+/// Map a file path's directory components to the set of languages whose
+/// `directory_hints` slice contains any of them (e.g.
+/// `node_modules/foo/bar.js` → `[typescript, javascript]`). Components
+/// are read in path order; matches across multiple components union.
+/// Returns an empty `Vec` when no component matches a known hint.
+pub fn language_from_directory_hint(path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for component in Path::new(path).components() {
+        if let Component::Normal(os) = component
+            && let Some(name) = os.to_str()
+        {
+            extend_unique(&mut out, languages_for_directory_hint(name));
+        }
     }
-    if lower.contains("cargo") {
-        return Some("rust".to_string());
+    out
+}
+
+/// Infer the set of languages implied by a Bash command string via
+/// whole-token matching. Splits `command` on whitespace, lowercases
+/// each token, filters out `KEY=VAL`-shaped env-prefix tokens, and
+/// collects the canonical tokens of every entry whose
+/// `command_keywords` slice contains any surviving token.
+///
+/// Whole-token matching (not substring) is load-bearing — `bundle
+/// install` no longer matches `bun`, and `env FOO=bar cargo build`
+/// yields `[rust]` despite the env-prefix preceding `cargo`. Multiple
+/// languages may match the same token (`npm` registers in both
+/// `javascript` and `typescript`); the returned `Vec` deduplicates
+/// while preserving first-seen order.
+pub fn language_from_bash(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in command.split_whitespace() {
+        if is_env_assignment(raw) {
+            continue;
+        }
+        let lower = raw.to_lowercase();
+        extend_unique(&mut out, languages_for_command_keyword(&lower));
     }
-    if lower.contains("pip") || lower.contains("python") {
-        return Some("python".to_string());
+    out
+}
+
+/// Returns `true` if `token` looks like a `KEY=VAL` env-prefix
+/// assignment (left-hand side matches `[A-Z_][A-Z0-9_]*`).
+///
+/// Matches POSIX env-variable naming so well-formed prefixes such as
+/// `FOO=bar` and `PATH=/usr/bin` are filtered out of the bash-token
+/// scan, while non-assignment tokens (`npm`, `cargo`, `bundle`) and
+/// malformed assignments (`1=foo`) are passed through to the keyword
+/// match.
+fn is_env_assignment(token: &str) -> bool {
+    let Some((lhs, _)) = token.split_once('=') else {
+        return false;
+    };
+    if lhs.is_empty() {
+        return false;
     }
-    None
+    let mut chars = lhs.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !(first.is_ascii_uppercase() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Extract terms from a filename: take the basename (without extension),
@@ -230,6 +386,17 @@ fn is_hex_like(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Test helper that re-assembles the legacy FTS5 query string from
+    /// [`extract_query`]'s tuple shape. Lets the bulk of the existing
+    /// assertions on the query string survive the U5 return-type
+    /// refactor without per-test rewrites; tests that need the
+    /// inferred-language set directly call `extract_query` and
+    /// destructure.
+    fn extract_query_str(ctx: &CallContext) -> Option<String> {
+        let (langs, terms) = extract_query(ctx)?;
+        assemble_fts_query(&langs, &terms)
+    }
+
     // -- extract_query -------------------------------------------------------
 
     #[test]
@@ -240,7 +407,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).unwrap();
+        let query = extract_query_str(&ctx).unwrap();
         assert!(
             query.contains("rust"),
             "should have language anchor: {query}"
@@ -263,7 +430,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).unwrap();
+        let query = extract_query_str(&ctx).unwrap();
         assert!(
             query.contains("typescript"),
             "should have language anchor: {query}"
@@ -283,7 +450,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).unwrap();
+        let query = extract_query_str(&ctx).unwrap();
         assert!(
             query.contains("rust"),
             "should infer rust from cargo: {query}"
@@ -304,7 +471,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).unwrap();
+        let query = extract_query_str(&ctx).unwrap();
         assert!(
             query.contains("typescript"),
             "should infer typescript from npm: {query}"
@@ -326,7 +493,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).unwrap();
+        let query = extract_query_str(&ctx).unwrap();
         assert!(
             query.starts_with("rust AND ("),
             "should anchor on rust with AND clause: {query}"
@@ -347,7 +514,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).unwrap();
+        let query = extract_query_str(&ctx).unwrap();
         assert!(
             query.contains("rust"),
             "should anchor rust language: {query}"
@@ -362,7 +529,7 @@ mod tests {
             file_path: Some("a.txt".to_string()),
             ..CallContext::empty()
         };
-        assert!(extract_query(&ctx).is_none());
+        assert!(extract_query_str(&ctx).is_none());
     }
 
     #[test]
@@ -370,7 +537,7 @@ mod tests {
         // Plan U4 explicit case: a CallContext with all-None fields yields
         // `None` — no language anchor, no terms.
         let ctx = CallContext::empty();
-        assert!(extract_query(&ctx).is_none());
+        assert!(extract_query_str(&ctx).is_none());
     }
 
     #[test]
@@ -383,7 +550,7 @@ mod tests {
             ..CallContext::empty()
         };
 
-        let query = extract_query(&ctx).expect("transcript-only query should not be None");
+        let query = extract_query_str(&ctx).expect("transcript-only query should not be None");
         // No language anchor — pure OR clause.
         assert!(
             !query.contains(" AND "),
@@ -476,53 +643,316 @@ mod tests {
 
     #[test]
     fn language_extension_rs() {
-        assert_eq!(
-            language_from_extension("src/main.rs"),
-            Some("rust".to_string())
-        );
+        assert_eq!(language_from_extension("src/main.rs"), vec!["rust"]);
     }
 
     #[test]
     fn language_extension_tsx() {
-        assert_eq!(
-            language_from_extension("App.tsx"),
-            Some("typescript".to_string())
-        );
+        assert_eq!(language_from_extension("App.tsx"), vec!["typescript"]);
+    }
+
+    #[test]
+    fn language_extension_jsx() {
+        assert_eq!(language_from_extension("App.jsx"), vec!["javascript"]);
+    }
+
+    #[test]
+    fn language_extension_yaml() {
+        assert_eq!(language_from_extension("ci.yml"), vec!["yaml"]);
+        assert_eq!(language_from_extension("ci.yaml"), vec!["yaml"]);
+    }
+
+    #[test]
+    fn language_extension_py() {
+        assert_eq!(language_from_extension("script.py"), vec!["python"]);
+    }
+
+    #[test]
+    fn language_extension_go() {
+        assert_eq!(language_from_extension("main.go"), vec!["golang"]);
     }
 
     #[test]
     fn language_extension_unknown() {
-        assert_eq!(language_from_extension("notes.txt"), None);
+        assert!(language_from_extension("notes.txt").is_empty());
+    }
+
+    #[test]
+    fn language_extension_no_extension_returns_empty() {
+        assert!(language_from_extension("README").is_empty());
+    }
+
+    // -- language_from_marker_filename ---------------------------------------
+
+    #[test]
+    fn marker_cargo_toml_anywhere_in_path_detects_rust() {
+        assert_eq!(
+            language_from_marker_filename("project/Cargo.toml"),
+            vec!["rust"]
+        );
+    }
+
+    #[test]
+    fn marker_package_json_detects_both_js_and_ts() {
+        let langs = language_from_marker_filename("frontend/package.json");
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn marker_unknown_filename_returns_empty() {
+        assert!(language_from_marker_filename("src/main.rs").is_empty());
+    }
+
+    // -- language_from_directory_hint ---------------------------------------
+
+    #[test]
+    fn directory_node_modules_detects_both_js_and_ts() {
+        let langs = language_from_directory_hint("node_modules/foo/anything");
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn directory_pycache_detects_python() {
+        assert_eq!(
+            language_from_directory_hint("src/__pycache__/foo.pyc"),
+            vec!["python"]
+        );
+    }
+
+    #[test]
+    fn directory_no_hint_returns_empty() {
+        assert!(language_from_directory_hint("src/lib/foo").is_empty());
     }
 
     // -- language_from_bash --------------------------------------------------
 
     #[test]
-    fn bash_npm_is_typescript() {
-        assert_eq!(
-            language_from_bash("npm install express"),
-            Some("typescript".to_string())
-        );
+    fn bash_npm_yields_javascript_and_typescript() {
+        let langs = language_from_bash("npm install express");
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"typescript".to_string()));
     }
 
     #[test]
     fn bash_cargo_is_rust() {
-        assert_eq!(
-            language_from_bash("cargo build --release"),
-            Some("rust".to_string())
-        );
+        assert_eq!(language_from_bash("cargo build --release"), vec!["rust"]);
     }
 
     #[test]
     fn bash_pip_is_python() {
+        assert_eq!(language_from_bash("pip install requests"), vec!["python"]);
+    }
+
+    #[test]
+    fn bash_python_is_python() {
+        assert_eq!(language_from_bash("python script.py"), vec!["python"]);
+    }
+
+    #[test]
+    fn bash_python3_is_python() {
+        assert_eq!(language_from_bash("python3 -m venv .venv"), vec!["python"]);
+    }
+
+    #[test]
+    fn bash_go_is_golang() {
+        assert_eq!(language_from_bash("go build ./..."), vec!["golang"]);
+    }
+
+    #[test]
+    fn bash_unknown_is_empty() {
+        assert!(language_from_bash("ls -la").is_empty());
+    }
+
+    #[test]
+    fn bash_bundle_install_does_not_match_bun() {
+        // R2 regression test: substring matcher would have matched
+        // "bun" inside "bundle". Whole-token matcher must not.
+        assert!(language_from_bash("bundle install").is_empty());
+    }
+
+    #[test]
+    fn bash_env_prefix_does_not_block_keyword() {
+        // `env FOO=bar cargo build` should still detect rust — the
+        // env-prefix tokens are filtered before keyword matching.
+        assert_eq!(language_from_bash("env FOO=bar cargo build"), vec!["rust"]);
+    }
+
+    #[test]
+    fn bash_multiple_env_assignments_filtered() {
         assert_eq!(
-            language_from_bash("pip install requests"),
-            Some("python".to_string())
+            language_from_bash("PATH=/usr/local/bin RUST_LOG=debug cargo test"),
+            vec!["rust"]
         );
     }
 
     #[test]
-    fn bash_unknown_is_none() {
-        assert_eq!(language_from_bash("ls -la"), None);
+    fn bash_yarn_yields_javascript_and_typescript() {
+        let langs = language_from_bash("yarn add react");
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn bash_pnpm_yields_javascript_and_typescript() {
+        let langs = language_from_bash("pnpm test");
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn bash_lowercases_uppercase_tokens() {
+        // Lowercasing is performed per-token before keyword match.
+        assert_eq!(language_from_bash("CARGO build"), vec!["rust"]);
+    }
+
+    // -- infer_languages priority chain --------------------------------------
+
+    #[test]
+    fn infer_marker_beats_extension() {
+        // AE2: node_modules/foo/Cargo.toml infers rust via the marker
+        // filename, NOT typescript via the directory hint. Marker
+        // outranks extension which outranks directory hint.
+        let ctx = CallContext {
+            tool_name: Some("Edit".to_string()),
+            file_path: Some("node_modules/foo/Cargo.toml".to_string()),
+            ..CallContext::empty()
+        };
+        assert_eq!(infer_languages(&ctx), vec!["rust"]);
+    }
+
+    #[test]
+    fn infer_extension_beats_directory_hint() {
+        // src/lib.rs sitting under node_modules (contrived but valid):
+        // extension wins because marker filename did not match.
+        let ctx = CallContext {
+            tool_name: Some("Edit".to_string()),
+            file_path: Some("node_modules/foo/lib.rs".to_string()),
+            ..CallContext::empty()
+        };
+        assert_eq!(infer_languages(&ctx), vec!["rust"]);
+    }
+
+    #[test]
+    fn infer_directory_hint_when_nothing_else_matches() {
+        // A file with no recognised extension or marker, sitting under
+        // node_modules — the directory hint is the only signal.
+        let ctx = CallContext {
+            tool_name: Some("Edit".to_string()),
+            file_path: Some("node_modules/foo/anything".to_string()),
+            ..CallContext::empty()
+        };
+        let langs = infer_languages(&ctx);
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn infer_file_and_bash_union() {
+        // File path infers rust, bash command infers python.
+        // The set is unioned.
+        let ctx = CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some("python -m my_module".to_string()),
+            file_path: Some("src/main.rs".to_string()),
+            ..CallContext::empty()
+        };
+        let langs = infer_languages(&ctx);
+        assert!(langs.contains(&"rust".to_string()));
+        assert!(langs.contains(&"python".to_string()));
+    }
+
+    #[test]
+    fn infer_empty_when_no_signal() {
+        // AE6: README.md edit with no language anchor and no bash
+        // signal — empty inferred set.
+        let ctx = CallContext {
+            tool_name: Some("Edit".to_string()),
+            file_path: Some("README.md".to_string()),
+            ..CallContext::empty()
+        };
+        assert!(infer_languages(&ctx).is_empty());
+    }
+
+    // -- extract_query multi-language anchor shape ---------------------------
+
+    #[test]
+    fn extract_query_multi_language_uses_or_group() {
+        // AE9: `npm test` infers {javascript, typescript}; the FTS
+        // query anchors with `(javascript OR typescript)` wrapped in
+        // parens so the AND-with-terms parse remains unambiguous.
+        let ctx = CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some("npm test authentication".to_string()),
+            ..CallContext::empty()
+        };
+
+        let query = extract_query_str(&ctx).unwrap();
+        assert!(
+            query.contains("javascript") && query.contains("typescript"),
+            "should infer both languages: {query}"
+        );
+        assert!(
+            query.contains(" OR ") && query.contains("AND"),
+            "should have OR-grouped anchor and AND-joined terms: {query}"
+        );
+    }
+
+    #[test]
+    fn extract_query_bash_bundle_install_no_typescript_anchor() {
+        // R2 / regression: `bundle install` must not pull in `bun`'s
+        // typescript anchor.
+        let ctx = CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some("bundle install".to_string()),
+            ..CallContext::empty()
+        };
+        let query = extract_query_str(&ctx);
+        // Either None (if no enrichment terms either) or an OR-only
+        // clause with no language anchor.
+        if let Some(q) = query {
+            assert!(
+                !q.starts_with("typescript ") && !q.contains("(typescript"),
+                "must not produce typescript anchor: {q}"
+            );
+            assert!(
+                !q.starts_with("javascript ") && !q.contains("(javascript"),
+                "must not produce javascript anchor: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_query_marker_filename_beats_extension() {
+        // R3 demonstration: a hypothetical hand-built file path tests
+        // the priority chain end-to-end through extract_query.
+        let ctx = CallContext {
+            tool_name: Some("Edit".to_string()),
+            file_path: Some("project/Cargo.toml".to_string()),
+            ..CallContext::empty()
+        };
+        let query = extract_query_str(&ctx).unwrap();
+        // toml extension is unknown to LANGUAGES — without the marker
+        // signal, this would have no anchor.
+        assert!(
+            query.contains("rust"),
+            "marker filename should produce rust anchor: {query}"
+        );
+    }
+
+    // -- single-tuple new-language demonstration (R3) -----------------------
+
+    #[test]
+    fn r3_table_iteration_covers_all_signal_types() {
+        // R3 spirit: adding a new entry would be a one-tuple change.
+        // We can't add entries at runtime, but we can verify the
+        // existing table fires each of the four signal helpers for at
+        // least one entry — proving the iteration covers all four
+        // shapes uniformly.
+        assert!(!language_from_extension("a.rs").is_empty());
+        assert!(!language_from_marker_filename("Cargo.toml").is_empty());
+        assert!(!language_from_directory_hint("node_modules/x").is_empty());
+        assert!(!language_from_bash("cargo build").is_empty());
     }
 }

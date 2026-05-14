@@ -187,16 +187,29 @@ fn handle_pre_tool_use(
     //    `tests/invariants.rs`).
     let cc = input.to_call_context();
 
-    // 3. Engine query extraction.
-    let Some(query) = engine::extract_query(&cc) else {
+    // 3. Engine query extraction. The components shape — (inferred
+    //    languages, cleaned enrichment terms) — feeds the U5 structural
+    //    retrieval gate directly; we still assemble a legacy FTS string
+    //    so the embedding model and the debug log see the same shape
+    //    they always have.
+    let Some((inferred_langs, cleaned_terms)) = engine::extract_query(&cc) else {
         lore_debug!("no query extracted from tool input");
         return Ok(None);
     };
+    let query = engine::assemble_fts_query(&inferred_langs, &cleaned_terms).unwrap_or_default();
 
-    lore_debug!("extracted query: {query}");
+    lore_debug!("extracted query: {query} inferred={inferred_langs:?}");
 
-    // 4. Hybrid / FTS search with the configured relevance floor.
-    let seeds = search_with_threshold(db, embedder, config, &query)?;
+    // 4. Hybrid / FTS search with the configured relevance floor and
+    //    the structural language gate.
+    let seeds = search_with_threshold_gated(
+        db,
+        embedder,
+        config,
+        &query,
+        &cleaned_terms,
+        &inferred_langs,
+    )?;
 
     if seeds.is_empty() {
         lore_debug!("search returned no results");
@@ -539,9 +552,35 @@ pub fn search_with_threshold(
     config: &Config,
     query: &str,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    search_with_threshold_gated(db, embedder, config, query, &[], &[])
+}
+
+/// U5-aware variant of [`search_with_threshold`] that passes an
+/// inferred-language set and a cleaned enrichment-term list to the
+/// structural retrieval gate. Used by `handle_pre_tool_use` and the
+/// MCP `search_patterns` tool; the bare [`search_with_threshold`]
+/// wrapper above retains the pre-U5 shape (FTS string only) for
+/// surfaces that have not yet learned about the structural gate.
+///
+/// When `inferred_langs` is empty the structural FTS branch is
+/// skipped and the vector path's filter becomes a no-op — semantics
+/// match today's unrestricted retrieval per R11. The `query` argument
+/// is the pre-assembled FTS5 query string (used for embedding and for
+/// the unrestricted hybrid path), while `cleaned_terms` is the
+/// matching term list the structural branches consume directly.
+#[allow(clippy::too_many_arguments)]
+pub fn search_with_threshold_gated(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+    query: &str,
+    cleaned_terms: &[String],
+    inferred_langs: &[String],
+) -> anyhow::Result<Vec<SearchResult>> {
     lore_debug!(
-        "search: query={query:?} hybrid={} top_k={} min_relevance={:.4} \
+        "search: query={query:?} inferred={:?} hybrid={} top_k={} min_relevance={:.4} \
          min_relevance_universal={:.4}",
+        inferred_langs,
         config.search.hybrid,
         config.search.top_k,
         config.search.min_relevance,
@@ -571,7 +610,19 @@ pub fn search_with_threshold(
     // surface — the additive promise only works if search sees the universal
     // rows. `saturating_mul` bounds the cost when `top_k` is already large.
     let overfetch_limit = config.search.top_k.saturating_mul(10);
-    let results = db.search_hybrid(query, query_embedding.as_deref(), overfetch_limit)?;
+    let results = if cleaned_terms.is_empty() && inferred_langs.is_empty() {
+        // Caller didn't supply the structured shape (CLI `lore search`
+        // path): fall back to the pre-U5 unrestricted hybrid search so
+        // user-typed natural-language queries don't lose results.
+        db.search_hybrid(query, query_embedding.as_deref(), overfetch_limit)?
+    } else {
+        db.search_hybrid_gated(
+            cleaned_terms,
+            inferred_langs,
+            query_embedding.as_deref(),
+            overfetch_limit,
+        )?
+    };
     lore_debug!("search: {} raw results", results.len());
 
     // Threshold is only meaningful for hybrid search with a successful
@@ -891,11 +942,17 @@ fn dedup_filter_and_record(
 /// (`src/main.rs`'s `cmd_extract_queries`) can keep its existing
 /// `HookInput`-flavoured interface without learning about `CallContext`.
 /// `handle_pre_tool_use` no longer routes through this shim — it builds
-/// the `CallContext` once per call and passes it to both
-/// `engine::extract_query` and the predicate filter.
+/// the `CallContext` once per call and passes the components directly
+/// to the structural retrieval gate so the `language_json` filter has
+/// the inferred-language set available.
+///
+/// Internally calls [`engine::extract_query`] for the components and
+/// [`engine::assemble_fts_query`] to recover the legacy FTS string
+/// shape this signature still returns.
 pub fn extract_query(input: &HookInput) -> Option<String> {
     let ctx = input.to_call_context();
-    engine::extract_query(&ctx)
+    let (langs, terms) = engine::extract_query(&ctx)?;
+    engine::assemble_fts_query(&langs, &terms)
 }
 
 impl HookInput {
@@ -1329,6 +1386,7 @@ mod tests {
             score: 1.0,
             is_universal: true,
             applies_when_json: applies_when_json.map(String::from),
+            language_json: None,
         }
     }
 
@@ -1343,6 +1401,7 @@ mod tests {
             score: 1.0,
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         }
     }
 
@@ -1508,6 +1567,7 @@ mod tests {
             score,
             is_universal,
             applies_when_json: None,
+            language_json: None,
         }
     }
 
@@ -1657,6 +1717,7 @@ mod tests {
             score: 0.8,
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         }];
 
         let formatted = format_imperative(&results);
@@ -1678,6 +1739,7 @@ mod tests {
                 score: 0.8,
                 is_universal: false,
                 applies_when_json: None,
+                language_json: None,
             },
             SearchResult {
                 id: "c2".into(),
@@ -1689,6 +1751,7 @@ mod tests {
                 score: 0.7,
                 is_universal: false,
                 applies_when_json: None,
+                language_json: None,
             },
         ];
 
@@ -2002,6 +2065,7 @@ mod tests {
             score: 1.0,
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         }
     }
 

@@ -2,12 +2,12 @@
 
 ## Up Next
 
-- [ ] Extend language detection dictionaries — currently six languages (Rust, TypeScript,
-      JavaScript, YAML, Python, Go) in both extension-to-language and command-to-language maps. Add
-      Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, shell scripts, and keep both maps in sync. The Bash
-      inference side is non-trivial: each language has multiple tools (`bundle`/`gem`/`rake` → Ruby,
-      `javac`/`gradle`/`mvn` → Java, `dotnet` → C#, `swift build` → Swift, etc.). Consider
-      extracting both maps into a shared data structure to prevent drift between them
+- [ ] Extend the shared language table — six entries today (Rust, TypeScript, JavaScript, YAML,
+      Python, Go). Adding Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, and shell scripts is now a
+      single struct-literal change per language thanks to the shared `LANGUAGES` slice in
+      `src/engine/languages.rs`; each entry pairs extensions, command keywords, marker filenames,
+      and directory hints. Audit FTS5-tokenisability for hyphen/`+`/`#` tokens before adding
+      `objective-c`, `c++`, `f#`, etc.
 
 ## Future
 
@@ -44,6 +44,15 @@
 
 ## Completed
 
+- [x] Language detection architecture — refactored signal detection around a single shared
+      declarative table (`src/engine/languages.rs`) covering extensions, command keywords, marker
+      filenames, and directory hints. Word-boundary bash matcher replaces the prior substring
+      contains check (no more `bundle install` matching `bun`). Added an optional `language:`
+      frontmatter field that drives a structural retrieval gate via a new `language_json` column
+      (schema v4, additive). Retrieval now composes three independently-ranked lists fed to RRF:
+      FTS-fallback for undeclared patterns, FTS-structural for declared patterns, and
+      oversample-and-filter vector. See
+      `docs/plans/2026-05-14-001-feat-language-detection-architecture-plan.md`.
 - [x] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases). Tag-triggered
       `release.yml` cross-compiles four targets from a single Linux runner, packages tarballs +
       `SHA256SUMS`, publishes via `gh release create` behind an owner-approval Environment gate.
