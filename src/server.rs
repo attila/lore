@@ -611,6 +611,78 @@ fn check_tags_limit(req: &JsonRpcRequest, args: &Value) -> Option<JsonRpcRespons
 // Tool handlers
 // ---------------------------------------------------------------------------
 
+/// Tokenise an MCP `search_patterns` query string on whitespace,
+/// lowercase each token, and return the subset that match canonical
+/// entries in [`crate::engine::LANGUAGES`]. The first-seen order is
+/// preserved and duplicates are dropped.
+///
+/// The hook adapter infers languages from a `CallContext`'s file paths
+/// and bash commands; the MCP search surface infers from the user's
+/// typed string. Both feed the same structural retrieval gate so a
+/// pattern declaring `language: rust` surfaces on a `"rust async
+/// patterns"` query even when its body lacks the canonical token.
+fn extract_languages_from_query_string(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for token in query.split_whitespace() {
+        let lower = token.to_lowercase();
+        if crate::engine::is_known_token(&lower) && !out.iter().any(|t| t == &lower) {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+/// Run the MCP `search_patterns` retrieval branch. Splits the user
+/// query into a canonical-language set (via [`extract_languages_from_query_string`])
+/// and a cleaned terms list, then routes through the U5 structural
+/// gate when any language token was recognised. Falls back to the
+/// unrestricted hybrid path otherwise so plain-text queries keep
+/// today's behaviour.
+///
+/// Returns the search result alongside a flag indicating whether the
+/// embedding step failed (the caller uses the flag to decide whether
+/// to apply the RRF-score relevance threshold).
+fn run_search(
+    ctx: &ServerContext<'_>,
+    query: &str,
+    top_k: usize,
+) -> (anyhow::Result<Vec<crate::database::SearchResult>>, bool) {
+    let inferred_langs = extract_languages_from_query_string(query);
+    let cleaned_terms: Vec<String> = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|t| !inferred_langs.contains(t))
+        .collect();
+
+    let mut embed_failed = false;
+    let results = if ctx.config.search.hybrid {
+        let query_embedding = match ctx.embedder.embed(query) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("[lore] Embedding failed, falling back to text search: {e}");
+                embed_failed = true;
+                None
+            }
+        };
+        if inferred_langs.is_empty() {
+            ctx.db
+                .search_hybrid(query, query_embedding.as_deref(), top_k)
+        } else {
+            ctx.db.search_hybrid_gated(
+                &cleaned_terms,
+                &inferred_langs,
+                query_embedding.as_deref(),
+                top_k,
+            )
+        }
+    } else {
+        ctx.db
+            .search_fts(query, top_k)
+            .map(|r| r.into_iter().take(top_k).collect())
+    };
+    (results, embed_failed)
+}
+
 fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
     let query = args.get("query").and_then(Value::as_str).unwrap_or("");
     let include_metadata = include_metadata_arg(args);
@@ -638,24 +710,7 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Search: \"{query}\" (top_k={top_k})");
 
-    let mut embed_failed = false;
-
-    let results = if ctx.config.search.hybrid {
-        let query_embedding = match ctx.embedder.embed(query) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("[lore] Embedding failed, falling back to text search: {e}");
-                embed_failed = true;
-                None
-            }
-        };
-        ctx.db
-            .search_hybrid(query, query_embedding.as_deref(), top_k)
-    } else {
-        ctx.db
-            .search_fts(query, top_k)
-            .map(|r| r.into_iter().take(top_k).collect())
-    };
+    let (results, embed_failed) = run_search(ctx, query, top_k);
 
     match results {
         Ok(results) => {
@@ -1503,6 +1558,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1537,6 +1593,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1572,6 +1629,7 @@ mod tests {
                 heading_path: String::new(),
                 is_universal: true,
                 applies_when_json: None,
+                language_json: None,
             },
             crate::chunking::Chunk {
                 id: "n1".into(),
@@ -1582,6 +1640,7 @@ mod tests {
                 heading_path: String::new(),
                 is_universal: false,
                 applies_when_json: None,
+                language_json: None,
             },
         ] {
             h.db.upsert_pattern(&crate::chunking::PatternRow {
@@ -1592,6 +1651,7 @@ mod tests {
                 raw_body: chunk.body.clone(),
                 content_hash: "0000000000000000".into(),
                 applies_when_json: chunk.applies_when_json.clone(),
+                language_json: chunk.language_json.clone(),
             })
             .unwrap();
             h.db.insert_chunk(&chunk, None).unwrap();
@@ -1646,6 +1706,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: None,
+            language_json: None,
         };
         h.db.upsert_pattern(&crate::chunking::PatternRow {
             source_file: chunk.source_file.clone(),
@@ -1655,6 +1716,7 @@ mod tests {
             raw_body: chunk.body.clone(),
             content_hash: "0000000000000000".into(),
             applies_when_json: chunk.applies_when_json.clone(),
+            language_json: chunk.language_json.clone(),
         })
         .unwrap();
         h.db.insert_chunk(&chunk, None).unwrap();
@@ -1691,6 +1753,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: Some(r#"{"bash_command_starts_with":["git"]}"#.into()),
+            language_json: None,
         };
         let plain_universal = crate::chunking::Chunk {
             id: "u_plain".into(),
@@ -1701,6 +1764,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: None,
+            language_json: None,
         };
         for chunk in [&predicated, &plain_universal] {
             h.db.upsert_pattern(&crate::chunking::PatternRow {
@@ -1711,6 +1775,7 @@ mod tests {
                 raw_body: chunk.body.clone(),
                 content_hash: "0000000000000000".into(),
                 applies_when_json: chunk.applies_when_json.clone(),
+                language_json: chunk.language_json.clone(),
             })
             .unwrap();
             h.db.insert_chunk(chunk, None).unwrap();
@@ -1834,6 +1899,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1900,6 +1966,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -1995,6 +2062,7 @@ mod tests {
                 heading_path: format!("section-{i}"),
                 is_universal: false,
                 applies_when_json: None,
+                language_json: None,
             };
             let emb = embedder.embed(&chunk.body).unwrap();
             db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2068,6 +2136,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2136,6 +2205,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2186,6 +2256,7 @@ mod tests {
                 heading_path: String::new(),
                 is_universal: false,
                 applies_when_json: None,
+                language_json: None,
             };
             let emb = h.embedder.embed(&chunk.body).unwrap();
             h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -2885,6 +2956,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3409,6 +3481,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3461,6 +3534,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -3500,6 +3574,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -3538,6 +3613,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = h.embedder.embed(&chunk.body).unwrap();
         h.db.insert_chunk(&chunk, Some(&emb)).unwrap();
@@ -3583,6 +3659,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3635,6 +3712,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -3686,6 +3764,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         h.db.insert_chunk(&chunk, None).unwrap();
 

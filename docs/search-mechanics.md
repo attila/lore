@@ -97,18 +97,62 @@ All extracted terms pass through a cleaning pipeline before query assembly:
 
 ## FTS5 Query Assembly
 
-The cleaned terms and the language anchor (if any) are assembled into one of four query shapes:
+The cleaned terms and the inferred-language set (which may be empty, singular, or multi-valued) are
+assembled into one of these query shapes:
 
-| Language     | Terms                | Query shape                              | Example                        |
-| ------------ | -------------------- | ---------------------------------------- | ------------------------------ |
-| Detected     | Present              | `{lang} AND ({term1} OR {term2} OR ...)` | `rust AND (validate OR email)` |
-| Detected     | Empty (all filtered) | `{lang}`                                 | `rust`                         |
-| Not detected | Present              | `{term1} OR {term2} OR ...`              | `create OR body OR file`       |
-| Not detected | Empty                | No query (search skipped)                | —                              |
+| Language set    | Terms                | Query shape                                            | Example                                 |
+| --------------- | -------------------- | ------------------------------------------------------ | --------------------------------------- |
+| Single inferred | Present              | `{lang} AND ({term1} OR {term2} OR ...)`               | `rust AND (validate OR email)`          |
+| Multi inferred  | Present              | `({lang1} OR {lang2}) AND ({term1} OR {term2} OR ...)` | `(javascript OR typescript) AND (test)` |
+| Inferred        | Empty (all filtered) | `{lang}` or `({lang1} OR {lang2})`                     | `rust`                                  |
+| Not inferred    | Present              | `{term1} OR {term2} OR ...`                            | `create OR body OR file`                |
+| Not inferred    | Empty                | No query (search skipped)                              | —                                       |
 
-The first case is the most common during normal agent sessions. The language anchor ensures results
-are scoped to the relevant technology, while the OR-joined terms broaden recall across matching
-patterns.
+The single-inferred case is the most common during normal agent sessions. The multi-inferred case
+arises when a signal legitimately fires for several languages — `npm test` accumulates
+`{javascript,
+typescript}` because both entries register `npm` as a command keyword. The OR-grouped
+language anchor preserves the AND-with-terms structure so retrieval ranking remains predictable.
+
+## Structural Language Gate
+
+In addition to the FTS string assembly above, retrieval composes as three independently-ranked
+candidate lists fed to RRF. Patterns may declare their applicable languages via the optional
+`language:` frontmatter field (see the
+[pattern authoring guide](pattern-authoring-guide.md#pattern-language-declaration)). The retrieval
+pipeline applies a structural gate using SQLite's `json_each()` over the persisted `language_json`
+column:
+
+1. **FTS-fallback** — `MATCH "{lang} AND ({terms})"` with `WHERE c.language_json IS NULL`. Patterns
+   without a `language:` declaration reach retrieval through this branch; the language anchor
+   appears in the FTS predicate so the body must contain the canonical token to match. When the
+   inferred-language set is empty, the MATCH collapses to terms-only and the `IS NULL` filter still
+   applies.
+2. **FTS-structural** — `MATCH "({terms})"` with
+   `WHERE EXISTS (SELECT 1 FROM json_each(c.language_json) WHERE value IN (?inferred_langs...))`.
+   Patterns with a declared `language:` that intersects the inferred set reach retrieval through
+   this branch; the body anchor is waived because the declaration itself is the structural
+   eligibility signal. Skipped entirely when the inferred set is empty (nothing to gate against).
+3. **Vector (oversample-and-filter)** — `vec0 MATCH ?embedding AND k = ?(top_k * N)`
+   `ORDER BY v.distance` fetches `N`-times-`top_k` nearest neighbours (initial multiplier `N = 3`),
+   then filters in code by the same `language_json IS NULL OR EXISTS json_each ...` predicate the
+   FTS branches use. Take the top `top_k` after filtering. This preserves the structural gate's
+   guarantee that wrong-language-labelled patterns cannot sneak in via semantic similarity. When the
+   inferred set is empty the filter degenerates to no filter — terms-only retrieval per the "no
+   declaration, FTS coincidence" fallback rule.
+
+The two FTS branches are **disjoint by predicate**: a chunk has `language_json IS NULL` xor
+`language_json` containing the inferred lang. No pattern double-counts across the two FTS branches.
+RRF sees at most one FTS rank and one vector rank per pattern; the three-list count is a
+code-organisation choice, not an arithmetic inflation. Each FTS branch carries its own internally
+consistent BM25 weighting against its own MATCH terms; RRF uses positional rank from `enumerate`,
+not raw BM25 score, so cross-branch score commensurability is not a concern.
+
+> **Why declare `language:`?** When a pattern's body uses prose that does not happen to repeat the
+> canonical language token, the FTS-fallback branch will miss it. Declaring `language: rust` lets
+> the pattern surface on every Rust tool call regardless of body vocabulary; without the declaration
+> the pattern relies on FTS coincidence — which works for patterns that already mention the
+> canonical token in prose, and fails silently for the rest.
 
 ## FTS5 Search
 
@@ -164,22 +208,25 @@ If Ollama is unreachable or embedding fails, the search falls back to FTS5 only.
 
 ## Hybrid Merge: Reciprocal Rank Fusion
 
-When both FTS5 and vector results are available, they are merged using Reciprocal Rank Fusion (RRF)
-with a constant `k = 60`:
+Retrieval composes as up to three independently-ranked candidate lists (FTS-fallback,
+FTS-structural, vector) merged using Reciprocal Rank Fusion (RRF) with a constant `k = 60`:
 
 ```
-score(item) = 1 / (k + rank_fts) + 1 / (k + rank_vec)
+score(item) = Σ 1 / (k + rank_in_list_i)
 ```
 
-Each search retrieves `top_k * 2` results independently, and the merged scores are normalised to a
-0–1 range by dividing by the theoretical maximum:
+Each candidate list retrieves `top_k * 2` results independently, and the merged scores are
+normalised to a 0–1 range by dividing by the theoretical maximum across `N` input lists:
 
 ```
-max_rrf = 2.0 / (k + 1.0)
+max_rrf = N / (k + 1.0)
 normalised_score = score / max_rrf
 ```
 
-A normalised score of 1.0 means the item ranked first in both search methods.
+A normalised score of 1.0 means the item ranked first in every list it appeared in. The three-list
+count is the typical hybrid path (FTS-fallback + FTS-structural + vector); when the embedding step
+is skipped or fails, RRF reduces to two lists; when the inferred-language set is empty, the
+structural branch is skipped and RRF reduces accordingly.
 
 ## Relevance Threshold
 

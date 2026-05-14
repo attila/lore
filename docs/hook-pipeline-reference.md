@@ -43,9 +43,16 @@ title-only awareness for everything else.
 Fires before every Edit, Write, or Bash tool invocation. This is the primary injection point. The
 hook:
 
-1. Extracts search terms from the tool input (file path, bash command, transcript context)
-2. Searches the knowledge base for matching patterns and partitions the result into universal
-   (uncapped, additive) and ranked (capped at `top_k`) slices
+1. Extracts search terms from the tool input (file path, bash command, transcript context) and
+   infers the applicable language set from file extensions, marker filenames, directory hints, and
+   bash command keywords
+2. Searches the knowledge base for matching patterns through three independently-ranked branches: an
+   FTS fallback for patterns without a `language:` declaration, an FTS structural branch for
+   patterns whose declared `language:` intersects the inferred set, and a vector branch that
+   oversample-and-filters by the same membership predicate. The three lists fuse via RRF before
+   partitioning the result into universal (uncapped, additive) and ranked (capped at `top_k`)
+   slices. See [Structural Language Gate](search-mechanics.md#structural-language-gate) for the
+   algorithmic detail.
 3. Expands each slice independently to include sibling chunks from matched source files
 4. **Predicate filter.** For every universal chunk that carries an `applies_when` predicate, the
    filter evaluates the predicate against the current call. Suppressed chunks are dropped from the

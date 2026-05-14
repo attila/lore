@@ -16,8 +16,8 @@ use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use crate::chunking::{
-    Chunk, MalformedPredicateEntry, chunk_as_document_with_malformed_predicates,
-    chunk_by_heading_with_malformed_predicates, extract_title,
+    Chunk, ChunkingAdvisories, MalformedLanguageEntry, MalformedPredicateEntry,
+    chunk_as_document_with_advisories, chunk_by_heading_with_advisories, extract_title,
 };
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
@@ -150,6 +150,24 @@ pub struct IngestResult {
     /// `index_single_file` — single source so CLI and MCP write paths
     /// see the warning regardless of authoring surface.
     pub malformed_applies_when: Vec<MalformedPredicateEntry>,
+    /// Per-file unknown `language:` token advisories collected from the
+    /// frontmatter parser. The pattern still ingests with the offending
+    /// token written verbatim to `language_json` (R12 warn-and-proceed);
+    /// the structural retrieval gate simply never matches it. The
+    /// user-facing warning channel aggregates entries by token across the
+    /// whole ingest run and emits one line per unique token from
+    /// `emit_language_warnings` (paired with the end-of-run coverage
+    /// tally from `emit_language_tally`).
+    pub malformed_language: Vec<MalformedLanguageEntry>,
+    /// Count of patterns whose `language_json` is non-NULL and non-empty
+    /// (the author declared `language:` in frontmatter). Surfaced at the
+    /// end of `lore ingest` as a one-line coverage tally so authors can
+    /// see at a glance how much of the corpus is on the structural
+    /// retrieval gate versus the FTS-fallback path.
+    pub patterns_with_language: usize,
+    /// Total pattern files ingested (declared + undeclared). Pairs with
+    /// [`Self::patterns_with_language`] for the coverage tally line.
+    pub patterns_total: usize,
 }
 
 impl IngestResult {
@@ -562,6 +580,9 @@ fn delta_ingest(
         on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
 
+    emit_language_warnings(&result, on_progress);
+    emit_language_tally(&result, on_progress);
+
     result
 }
 
@@ -593,6 +614,7 @@ fn process_change(
                     result.chunks_created += indexed.chunks_indexed;
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
                     fold_malformed_applies_when(result, &indexed.malformed_applies_when);
+                    fold_language_metadata(result, &indexed);
                     on_progress(&format!("  {path} → {} chunks", indexed.chunks_indexed));
                 }
                 Err(e) => {
@@ -632,6 +654,7 @@ fn process_change(
                     result.chunks_created += indexed.chunks_indexed;
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
                     fold_malformed_applies_when(result, &indexed.malformed_applies_when);
+                    fold_language_metadata(result, &indexed);
                     on_progress(&format!(
                         "  {from} → {to} ({} chunks)",
                         indexed.chunks_indexed
@@ -904,6 +927,7 @@ pub fn full_ingest(
                     &indexed.universal_metadata,
                 );
                 fold_malformed_applies_when(&mut result, &indexed.malformed_applies_when);
+                fold_language_metadata(&mut result, &indexed);
                 result.files_processed += 1;
                 on_progress(&format!(
                     "  {} → {} chunks",
@@ -926,6 +950,9 @@ pub fn full_ingest(
     {
         on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
+
+    emit_language_warnings(&result, on_progress);
+    emit_language_tally(&result, on_progress);
 
     result
 }
@@ -1064,6 +1091,7 @@ pub fn ingest_single_file(
             }
             fold_universal_metadata(&mut result, &indexed.rel_path, &indexed.universal_metadata);
             fold_malformed_applies_when(&mut result, &indexed.malformed_applies_when);
+            fold_language_metadata(&mut result, &indexed);
             on_progress(&format!("  {rel_path} → {} chunks", indexed.chunks_indexed));
         }
         Err(e) => {
@@ -1074,6 +1102,7 @@ pub fn ingest_single_file(
     }
 
     result.mode = IngestMode::SingleFile { path: rel_path };
+    emit_language_warnings(&result, on_progress);
     result
 }
 
@@ -1483,6 +1512,66 @@ fn fold_malformed_applies_when(result: &mut IngestResult, entries: &[MalformedPr
     }
 }
 
+/// Fold the language-related state from one [`IndexedFile`] into the
+/// accumulating [`IngestResult`]: append malformed-language entries
+/// (deduplicated by `(file_path, token)`) and bump the per-pattern
+/// tally counters used for the end-of-run coverage line. Called once
+/// per successfully indexed file by every ingest entry point so the
+/// run summary stays in sync regardless of which path produced the
+/// chunks.
+fn fold_language_metadata(result: &mut IngestResult, indexed: &IndexedFile) {
+    for entry in &indexed.malformed_language {
+        if !result.malformed_language.contains(entry) {
+            result.malformed_language.push(entry.clone());
+        }
+    }
+    result.patterns_total += 1;
+    if indexed.declares_language {
+        result.patterns_with_language += 1;
+    }
+}
+
+/// Aggregate [`IngestResult::malformed_language`] entries by token and
+/// emit one warning line per unique token via the provided
+/// `on_progress` channel. A bulk-typo'd repo with 50 patterns
+/// declaring the same unknown token surfaces as one warning, not 50.
+/// Emits nothing when no entries are present.
+fn emit_language_warnings(result: &IngestResult, on_progress: &dyn Fn(&str)) {
+    use std::collections::BTreeMap;
+
+    // BTreeMap (not HashMap) so the per-token warnings emit in a
+    // deterministic order across runs — same fixture, same order.
+    let mut by_token: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in &result.malformed_language {
+        by_token
+            .entry(entry.token.clone())
+            .or_default()
+            .push(entry.file_path.clone());
+    }
+    for (token, files) in &by_token {
+        on_progress(&format!(
+            "Warning: unknown language token `{}` declared by {} pattern(s).",
+            token,
+            files.len()
+        ));
+    }
+}
+
+/// Emit the end-of-`lore-ingest` coverage tally — one line summarising
+/// how many patterns declare `language:` versus fall back to FTS
+/// coincidence. Fires only at the directory-ingest entry points
+/// ([`full_ingest`] and [`delta_ingest`]); single-file ingest does not
+/// emit a tally because the totals would always be 0 or 1.
+fn emit_language_tally(result: &IngestResult, on_progress: &dyn Fn(&str)) {
+    let total = result.patterns_total;
+    let declared = result.patterns_with_language;
+    let fallback = total.saturating_sub(declared);
+    on_progress(&format!(
+        "Patterns: {total} ingested; {declared} declare language:, \
+         {fallback} fall back to FTS coincidence."
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1502,6 +1591,16 @@ struct IndexedFile {
     /// so introspective callers (CLI exit summary, future `lore_status`
     /// surface) can report them without re-parsing the file.
     malformed_applies_when: Vec<MalformedPredicateEntry>,
+    /// Unknown `language:` token advisories from the frontmatter parser,
+    /// with `file_path` populated to the relative path. Returned uncombined
+    /// so the calling ingest path aggregates by token across all files
+    /// before emitting one warning per unique unknown token.
+    malformed_language: Vec<MalformedLanguageEntry>,
+    /// `true` when the indexed file declared a non-empty `language:`
+    /// frontmatter list (a chunk with `language_json` set to a non-NULL,
+    /// non-empty JSON array). Drives the coverage tally line at the end
+    /// of `lore ingest`.
+    declares_language: bool,
 }
 
 /// Index (or re-index) a single file: delete old chunks, chunk, embed, insert.
@@ -1522,7 +1621,11 @@ fn index_single_file(
         .to_string_lossy()
         .to_string();
 
-    let (chunks, malformed_applies_when) = dispatch_chunking(strategy, &content, &rel_path);
+    let (chunks, advisories) = dispatch_chunking(strategy, &content, &rel_path);
+    let ChunkingAdvisories {
+        malformed_applies_when,
+        malformed_language,
+    } = advisories;
 
     // Surface malformed-predicate advisories on stderr from a single
     // channel so CLI ingest (whose `on_progress` writes to stdout) and
@@ -1537,6 +1640,16 @@ fn index_single_file(
             entry.file_path, entry.key, entry.reason
         );
     }
+    // Per-pattern warning surface for language tokens is deliberately
+    // silent here — the ingest layer aggregates per-token across the
+    // whole run and emits one line per unique unknown token in
+    // [`finalise_ingest_result`]. Single-pattern typos still produce a
+    // clear warning; bulk-typo'd repos collapse to one line per token.
+
+    let declares_language = chunks
+        .first()
+        .and_then(|c| c.language_json.as_deref())
+        .is_some_and(|json| json != "[]");
 
     // Non-universal-pattern guard: an `applies_when` predicate on a
     // pattern without the `universal` tag is dormant in Track 1 (the
@@ -1632,6 +1745,8 @@ fn index_single_file(
         rel_path,
         universal_metadata,
         malformed_applies_when,
+        malformed_language,
+        declares_language,
     })
 }
 
@@ -1685,11 +1800,11 @@ fn dispatch_chunking(
     strategy: &str,
     content: &str,
     rel_path: &str,
-) -> (Vec<Chunk>, Vec<MalformedPredicateEntry>) {
+) -> (Vec<Chunk>, ChunkingAdvisories) {
     if strategy == "heading" {
-        chunk_by_heading_with_malformed_predicates(content, rel_path)
+        chunk_by_heading_with_advisories(content, rel_path)
     } else {
-        chunk_as_document_with_malformed_predicates(content, rel_path)
+        chunk_as_document_with_advisories(content, rel_path)
     }
 }
 
@@ -1791,6 +1906,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         assert_eq!(
             embed_text(&chunk),
@@ -1809,6 +1925,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         assert_eq!(embed_text(&chunk), "Title\n\nBody");
     }
@@ -4841,5 +4958,150 @@ mod tests {
         // reported AND ingest does not crash.
         let chunks = db.chunk_applies_when_json_for_source("scalar.md").unwrap();
         assert!(!chunks.is_empty(), "scalar.md should still ingest");
+    }
+
+    // -- language_json column write (U4) --------------------------------------
+
+    #[test]
+    fn ingest_writes_language_json_for_declared_pattern() {
+        // R12 / AE3 (storage half): a pattern with `language: rust` in
+        // frontmatter ingests with `language_json = '["rust"]'` on every
+        // chunk row and on the patterns row.
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("p.md"),
+            "---\nlanguage: rust\n---\n\n# Top\nBody text long enough to chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let result = full_ingest(&db, &FakeEmbedder::new(), tmp.path(), "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let chunks = db.chunk_language_json_for_source("p.md").unwrap();
+        assert!(!chunks.is_empty(), "p.md must produce at least one chunk");
+        for c in &chunks {
+            assert_eq!(c.as_deref(), Some(r#"["rust"]"#));
+        }
+        let pattern_lang = db.pattern_language_json_for_source("p.md").unwrap();
+        assert_eq!(pattern_lang, Some(Some(r#"["rust"]"#.to_string())));
+    }
+
+    #[test]
+    fn ingest_writes_null_language_json_for_undeclared_pattern() {
+        // AE5 (storage half): a pattern with no `language:` field
+        // ingests with `language_json = NULL` on every chunk row.
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("p.md"),
+            "---\ntags: [workflow]\n---\n\n# Top\nBody text long enough to chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let result = full_ingest(&db, &FakeEmbedder::new(), tmp.path(), "heading", &|_| {});
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let chunks = db.chunk_language_json_for_source("p.md").unwrap();
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert_eq!(c.as_deref(), None);
+        }
+        let pattern_lang = db.pattern_language_json_for_source("p.md").unwrap();
+        assert_eq!(pattern_lang, Some(None));
+    }
+
+    #[test]
+    fn ingest_aggregates_unknown_language_token_warning_per_token() {
+        // AE7 / R12 (warning aggregation half): when 12 patterns all
+        // declare `language: rrust`, exactly one warning line is emitted
+        // — not 12. The aggregation collapses duplicates by token.
+        let tmp = tempdir().unwrap();
+        for i in 0..12 {
+            fs::write(
+                tmp.path().join(format!("p{i}.md")),
+                "---\nlanguage: rrust\n---\n\n# Top\nBody text long enough to chunk.\n",
+            )
+            .unwrap();
+        }
+        let db = memory_db();
+        let warnings: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let result = full_ingest(&db, &FakeEmbedder::new(), tmp.path(), "heading", &|msg| {
+            if msg.starts_with("Warning: unknown language token") {
+                warnings.borrow_mut().push(msg.to_string());
+            }
+        });
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.malformed_language.len(), 12);
+        // One warning line for the `rrust` token, not 12.
+        assert_eq!(
+            warnings.borrow().len(),
+            1,
+            "warnings: {:?}",
+            warnings.borrow()
+        );
+        assert!(
+            warnings.borrow()[0].contains("rrust"),
+            "warning must name the token: {}",
+            warnings.borrow()[0]
+        );
+        assert!(
+            warnings.borrow()[0].contains("12 pattern"),
+            "warning must report aggregate count: {}",
+            warnings.borrow()[0]
+        );
+    }
+
+    #[test]
+    fn ingest_emits_coverage_tally_for_mixed_repository() {
+        // R13: the end-of-ingest tally line names total / declared / fallback
+        // for a repository with a mix of labelled and unlabelled patterns.
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("declared.md"),
+            "---\nlanguage: rust\n---\n\n# A\nBody text long enough for a chunk.\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("undeclared.md"),
+            "---\ntags: [workflow]\n---\n\n# B\nBody text long enough for a chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        let lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        full_ingest(&db, &FakeEmbedder::new(), tmp.path(), "heading", &|msg| {
+            lines.borrow_mut().push(msg.to_string());
+        });
+        let tally = lines
+            .borrow()
+            .iter()
+            .find(|m| m.starts_with("Patterns: "))
+            .cloned()
+            .expect("coverage tally line must fire at end of full_ingest");
+        assert!(tally.contains("2 ingested"));
+        assert!(tally.contains("1 declare language:"));
+        assert!(tally.contains("1 fall back to FTS coincidence"));
+    }
+
+    #[test]
+    fn ingest_clear_all_followed_by_reingest_preserves_language_json() {
+        // Composition-cascade audit: clear_all + re-ingest produces the
+        // same language_json state — pinning that DROP+CREATE picks up
+        // the new column from DDL.
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("p.md"),
+            "---\nlanguage: rust\n---\n\n# Top\nBody text long enough to chunk.\n",
+        )
+        .unwrap();
+        let db = memory_db();
+        full_ingest(&db, &FakeEmbedder::new(), tmp.path(), "heading", &|_| {});
+        let before = db.chunk_language_json_for_source("p.md").unwrap();
+
+        full_ingest(&db, &FakeEmbedder::new(), tmp.path(), "heading", &|_| {});
+        let after = db.chunk_language_json_for_source("p.md").unwrap();
+
+        assert_eq!(before, after);
+        for c in &after {
+            assert_eq!(c.as_deref(), Some(r#"["rust"]"#));
+        }
     }
 }

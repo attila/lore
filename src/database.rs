@@ -77,6 +77,12 @@ pub struct SearchResult {
     /// `AppliesWhen` happens at the predicate filter site (U5); the DB
     /// layer stays JSON-naive.
     pub applies_when_json: Option<String>,
+    /// JSON-serialised list of canonical language tokens declared via the
+    /// pattern's `language:` frontmatter, or `None` when the pattern has
+    /// no `language:` declaration. The retrieval gate uses `SQLite`'s
+    /// `json_each()` for membership checks; the DB layer stays
+    /// JSON-naive (no deserialisation, just a round-trip).
+    pub language_json: Option<String>,
 }
 
 /// Aggregate statistics about the database contents.
@@ -246,7 +252,7 @@ impl KnowledgeDB {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
                     bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score, c.is_universal,
-                    c.applies_when_json
+                    c.applies_when_json, c.language_json
              FROM patterns_fts f
              JOIN chunks c ON c.id = f.chunk_id
              WHERE patterns_fts MATCH ?1
@@ -267,6 +273,7 @@ impl KnowledgeDB {
                 score: row.get(6)?,
                 is_universal: row.get::<_, i64>(7)? != 0,
                 applies_when_json: row.get::<_, Option<String>>(8)?,
+                language_json: row.get::<_, Option<String>>(9)?,
             })
         })?;
 
@@ -282,7 +289,8 @@ impl KnowledgeDB {
         let blob = vec_to_blob(query_embedding);
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
-                    v.distance AS score, c.is_universal, c.applies_when_json
+                    v.distance AS score, c.is_universal, c.applies_when_json,
+                    c.language_json
              FROM patterns_vec v
              JOIN chunks c ON c.id = v.id
              WHERE v.embedding MATCH ?1
@@ -303,6 +311,7 @@ impl KnowledgeDB {
                 score: row.get(6)?,
                 is_universal: row.get::<_, i64>(7)? != 0,
                 applies_when_json: row.get::<_, Option<String>>(8)?,
+                language_json: row.get::<_, Option<String>>(9)?,
             })
         })?;
 
@@ -327,6 +336,191 @@ impl KnowledgeDB {
         let vec_results = self.search_vector(emb, limit * 2)?;
 
         Ok(reciprocal_rank_fusion(&fts_results, &vec_results, limit))
+    }
+
+    /// FTS5 search restricted to patterns with no `language:` declaration
+    /// (the fallback path). Builds a MATCH expression of the shape
+    /// `"<lang> AND (term1 OR term2 ...)"` from the inferred-language set
+    /// and the cleaned enrichment terms, wrapping multi-language inferred
+    /// sets as `"(lang1 OR lang2) AND (terms)"`. Adds the
+    /// `WHERE c.language_json IS NULL` filter so only undeclared patterns
+    /// can match — declared patterns reach retrieval through the
+    /// structural branch instead, preventing double-counting.
+    ///
+    /// Empty `inferred_langs` collapses the MATCH expression to
+    /// terms-only (`"(term1 OR term2)"`); empty `cleaned_terms` returns
+    /// no results (FTS needs something to match against).
+    pub fn search_fts_fallback(
+        &self,
+        cleaned_terms: &[String],
+        inferred_langs: &[String],
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        let Some(match_expr) = build_fts_fallback_match(cleaned_terms, inferred_langs) else {
+            return Ok(Vec::new());
+        };
+        let match_expr = sanitize_fts_query(&match_expr);
+        if match_expr.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
+                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score, c.is_universal,
+                    c.applies_when_json, c.language_json
+             FROM patterns_fts f
+             JOIN chunks c ON c.id = f.chunk_id
+             WHERE patterns_fts MATCH ?1
+               AND c.language_json IS NULL
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
+        let rows = stmt.query_map(params![match_expr, limit_i64], read_search_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// FTS5 search restricted to patterns whose declared `language_json`
+    /// intersects the inferred-language set. Builds a terms-only MATCH
+    /// expression (`"(term1 OR term2 ...)"`) and adds an
+    /// `EXISTS (SELECT 1 FROM json_each(c.language_json) WHERE value IN (...))`
+    /// filter that admits a chunk when any token in its `language_json`
+    /// array equals any token in the inferred set.
+    ///
+    /// Returns no results when either `inferred_langs` or `cleaned_terms`
+    /// is empty — without an inferred set there is nothing to gate
+    /// against, and without terms there is nothing for FTS to score.
+    pub fn search_fts_structural(
+        &self,
+        cleaned_terms: &[String],
+        inferred_langs: &[String],
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        if inferred_langs.is_empty() || cleaned_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_expr = sanitize_fts_query(&format!("({})", cleaned_terms.join(" OR ")));
+        if match_expr.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
+                    bm25(patterns_fts, 10.0, 1.0, 5.0, 0.0) AS score, c.is_universal,
+                    c.applies_when_json, c.language_json
+             FROM patterns_fts f
+             JOIN chunks c ON c.id = f.chunk_id
+             WHERE patterns_fts MATCH ?1
+               AND c.language_json IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM json_each(c.language_json)
+                   WHERE value IN (",
+        );
+        // Bind each language as a separate parameter starting at ?3
+        // (?1 is the MATCH expression, ?2 is the LIMIT).
+        for i in 0..inferred_langs.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+            sql.push_str(&(i + 3).to_string());
+        }
+        sql.push_str(
+            "                  )
+               )
+             ORDER BY score
+             LIMIT ?2",
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
+        let mut binds: Vec<&dyn rusqlite::types::ToSql> =
+            vec![&match_expr as &dyn rusqlite::types::ToSql, &limit_i64];
+        for lang in inferred_langs {
+            binds.push(lang as &dyn rusqlite::types::ToSql);
+        }
+        let rows = stmt.query_map(binds.as_slice(), read_search_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Vector similarity search with the structural language gate
+    /// applied via oversample-and-filter. Fetches `limit *
+    /// OVERSAMPLE_FACTOR` nearest neighbours from `vec0`, then keeps
+    /// only chunks whose `language_json` is either NULL (undeclared) or
+    /// shares at least one token with `inferred_langs` (declared and
+    /// compatible). Truncates to `limit` after filtering.
+    ///
+    /// When `inferred_langs` is empty the filter degenerates to the
+    /// unrestricted top-`limit` (no structural mismatch to detect, per
+    /// R11). Preserves AE4: a wrong-language-labelled pattern with a
+    /// nearby embedding is excluded because the membership check
+    /// fails.
+    pub fn search_vector_gated(
+        &self,
+        query_embedding: &[f32],
+        inferred_langs: &[String],
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        let oversample = limit.saturating_mul(VECTOR_OVERSAMPLE_FACTOR);
+        let candidates = self.search_vector(query_embedding, oversample)?;
+
+        if inferred_langs.is_empty() {
+            return Ok(candidates.into_iter().take(limit).collect());
+        }
+
+        let filtered: Vec<SearchResult> = candidates
+            .into_iter()
+            .filter(|r| structural_admits(r.language_json.as_deref(), inferred_langs))
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
+    /// Hybrid search with the U5 structural language gate applied.
+    ///
+    /// Composes three independently-ranked candidate lists and merges
+    /// them via reciprocal-rank fusion (k = 60):
+    ///
+    /// 1. [`Self::search_fts_fallback`] — patterns with no `language:`
+    ///    declaration, matched via `<lang> AND (terms)` where the
+    ///    language anchor falls out when `inferred_langs` is empty.
+    /// 2. [`Self::search_fts_structural`] — patterns whose declared
+    ///    `language_json` intersects `inferred_langs`, matched on terms
+    ///    alone. Skipped entirely when `inferred_langs` is empty
+    ///    (nothing to gate against).
+    /// 3. [`Self::search_vector_gated`] — vector neighbours
+    ///    oversample-and-filtered by the same `IS NULL OR member`
+    ///    predicate. Only included when `query_embedding` is `Some`.
+    pub fn search_hybrid_gated(
+        &self,
+        cleaned_terms: &[String],
+        inferred_langs: &[String],
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        let over = limit.saturating_mul(2);
+        let fts_fallback = self.search_fts_fallback(cleaned_terms, inferred_langs, over)?;
+        let fts_structural = if inferred_langs.is_empty() {
+            Vec::new()
+        } else {
+            self.search_fts_structural(cleaned_terms, inferred_langs, over)?
+        };
+
+        match query_embedding {
+            None => Ok(reciprocal_rank_fusion_n(
+                &[&fts_fallback, &fts_structural],
+                limit,
+            )),
+            Some(emb) => {
+                let vec_results = self.search_vector_gated(emb, inferred_langs, over)?;
+                Ok(reciprocal_rank_fusion_n(
+                    &[&fts_fallback, &fts_structural, &vec_results],
+                    limit,
+                ))
+            }
+        }
     }
 
     /// Return one entry per source document.
@@ -433,7 +627,7 @@ impl KnowledgeDB {
         let placeholders: Vec<String> = (1..=source_files.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "SELECT id, title, body, tags, source_file, heading_path, 0.0 AS score, is_universal, \
-                    applies_when_json \
+                    applies_when_json, language_json \
              FROM chunks WHERE source_file IN ({}) ORDER BY source_file, id",
             placeholders.join(", ")
         );
@@ -455,6 +649,7 @@ impl KnowledgeDB {
                 score: row.get(6)?,
                 is_universal: row.get::<_, i64>(7)? != 0,
                 applies_when_json: row.get::<_, Option<String>>(8)?,
+                language_json: row.get::<_, Option<String>>(9)?,
             })
         })?;
 
@@ -562,6 +757,41 @@ impl KnowledgeDB {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Read the `language_json` column from the `patterns` row for a
+    /// given source file. Mirrors [`Self::pattern_applies_when_json_for_source`]
+    /// for the language-declaration sibling. Outer `Option` distinguishes
+    /// "no row" from "row exists with NULL language".
+    pub fn pattern_language_json_for_source(
+        &self,
+        source_file: &str,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT language_json FROM patterns WHERE source_file = ?1",
+                params![source_file],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Read the `language_json` column for every chunk row belonging to
+    /// `source_file`, ordered by chunk id. Mirrors
+    /// [`Self::chunk_applies_when_json_for_source`]. Used by ingest
+    /// regression tests to confirm the declaration round-trips onto
+    /// every chunk of a multi-section pattern (whole-file semantics).
+    pub fn chunk_language_json_for_source(
+        &self,
+        source_file: &str,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT language_json FROM chunks WHERE source_file = ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![source_file], |row| row.get::<_, Option<String>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Read a metadata value by key.
     pub fn get_metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut stmt = self
@@ -631,7 +861,14 @@ pub fn sanitize_fts_query(query: &str) -> String {
 ///   `patterns`. Purely additive: `NULL` means "no predicate" which is the
 ///   pre-Track-1 behaviour. `check_schema_compatibility` migrates v2→v3 in
 ///   place via `ALTER TABLE` on first open — no `--force` required.
-const SCHEMA_VERSION: u32 = 3;
+/// - v4: introduced `language_json TEXT NULL` column on `chunks` and
+///   `patterns`. Purely additive: `NULL` means "no `language:` declared"
+///   and the retrieval gate falls back to FTS coincidence (R10).
+///   `check_schema_compatibility` migrates v3→v4 in place via
+///   `ALTER TABLE` on first open — no `--force` required for the common
+///   path. See `docs/solutions/conventions/schema-migration-strategy-2026-05-14.md`
+///   for the additive-vs-bail decision rubric.
+const SCHEMA_VERSION: u32 = 4;
 
 /// Authoritative DDL for the `chunks` table. Used by both `KnowledgeDB::init`
 /// (fresh-DB path, `CREATE TABLE IF NOT EXISTS`) and `KnowledgeDB::clear_all`
@@ -647,6 +884,7 @@ const CHUNKS_DDL: &str = "\
         heading_path TEXT DEFAULT '',
         is_universal INTEGER NOT NULL DEFAULT 0 CHECK (is_universal IN (0, 1)),
         applies_when_json TEXT,
+        language_json TEXT,
         ingested_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)";
@@ -684,6 +922,7 @@ const PATTERNS_DDL: &str = "\
         raw_body          TEXT NOT NULL,
         content_hash      TEXT NOT NULL,
         applies_when_json TEXT,
+        language_json     TEXT,
         ingested_at       TEXT NOT NULL DEFAULT (datetime('now'))
     )";
 
@@ -707,13 +946,14 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
 ///
 /// Two migration policies coexist here:
 ///
-/// - **Additive bump (v2 → v3).** The `applies_when_json` column was added
-///   to `chunks` and `patterns` as nullable with no default; existing rows
-///   carry `NULL` and behave as if no predicate is set, matching the
-///   pre-Track-1 behaviour. We detect this case via the version comparison
-///   (`version == 2`) and apply two `ALTER TABLE` statements on the spot,
-///   then stamp `PRAGMA user_version = 3` and return `Ok(())`. No
-///   `lore ingest --force` is required for users on v2.
+/// - **Additive bump (v2 → v3, v3 → v4).** Both bumps added a single
+///   nullable `TEXT` column with no default; existing rows carry `NULL`
+///   and behave as if the new field is absent (v3: no predicate; v4: no
+///   `language:` declared). We detect each case via the version comparison
+///   and apply `ALTER TABLE` statements on the spot, stamp the new
+///   `PRAGMA user_version`, and return `Ok(())`. A binary two versions
+///   behind (v2 → v4) folds both column adds into one transaction. No
+///   `lore ingest --force` is required for users on v2 or v3.
 /// - **Hard bail (anything older).** Pre-v2 databases predate the
 ///   `is_universal` plumbing and would still fail subsequent SELECTs with
 ///   "no such column" errors. Those users see the existing upgrade
@@ -796,6 +1036,57 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
         if patterns_exists != 0 && !patterns_has_column {
             sql.push_str("ALTER TABLE patterns ADD COLUMN applies_when_json TEXT;\n");
         }
+        // Also add the v3→v4 column so we don't bounce through two
+        // upgrade passes for a binary that's two versions behind. The
+        // v3→v4 branch below uses the same column_exists idempotency
+        // guard if reached separately.
+        let chunks_has_language = column_exists(conn, "chunks", "language_json")?;
+        if !chunks_has_language {
+            sql.push_str("ALTER TABLE chunks ADD COLUMN language_json TEXT;\n");
+        }
+        let patterns_has_language = if patterns_exists != 0 {
+            column_exists(conn, "patterns", "language_json")?
+        } else {
+            true
+        };
+        if patterns_exists != 0 && !patterns_has_language {
+            sql.push_str("ALTER TABLE patterns ADD COLUMN language_json TEXT;\n");
+        }
+        sql.push_str("PRAGMA user_version = ");
+        sql.push_str(&SCHEMA_VERSION.to_string());
+        sql.push_str(";\n");
+        sql.push_str("COMMIT;");
+        conn.execute_batch(&sql)?;
+        return Ok(());
+    }
+
+    // Forward-compatible v3 → v4 migration: the `language_json` column
+    // was added as nullable with no default, so existing populated DBs
+    // can be migrated in place without rebuilding the index. Mirrors
+    // the v2→v3 shape exactly: column-presence idempotency guards,
+    // single transaction, version stamp at commit.
+    if version == 3 {
+        let chunks_has_column = column_exists(conn, "chunks", "language_json")?;
+        let patterns_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'patterns'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let patterns_has_column = if patterns_exists != 0 {
+            column_exists(conn, "patterns", "language_json")?
+        } else {
+            true
+        };
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !chunks_has_column {
+            sql.push_str("ALTER TABLE chunks ADD COLUMN language_json TEXT;\n");
+        }
+        if patterns_exists != 0 && !patterns_has_column {
+            sql.push_str("ALTER TABLE patterns ADD COLUMN language_json TEXT;\n");
+        }
         sql.push_str("PRAGMA user_version = ");
         sql.push_str(&SCHEMA_VERSION.to_string());
         sql.push_str(";\n");
@@ -835,8 +1126,9 @@ fn check_schema_compatibility(conn: &Connection) -> anyhow::Result<()> {
 pub fn upsert_pattern_in_tx(tx: &Transaction<'_>, row: &PatternRow) -> anyhow::Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO patterns \
-         (source_file, title, tags, is_universal, raw_body, content_hash, applies_when_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (source_file, title, tags, is_universal, raw_body, content_hash, \
+          applies_when_json, language_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             row.source_file,
             row.title,
@@ -845,6 +1137,7 @@ pub fn upsert_pattern_in_tx(tx: &Transaction<'_>, row: &PatternRow) -> anyhow::R
             row.raw_body,
             row.content_hash,
             row.applies_when_json,
+            row.language_json,
         ],
     )?;
     Ok(())
@@ -897,8 +1190,9 @@ pub fn insert_chunk_in_tx(
 
     tx.execute(
         "INSERT OR REPLACE INTO chunks \
-         (id, title, body, tags, source_file, heading_path, is_universal, applies_when_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, title, body, tags, source_file, heading_path, is_universal, \
+          applies_when_json, language_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             chunk.id,
             chunk.title,
@@ -908,6 +1202,7 @@ pub fn insert_chunk_in_tx(
             chunk.heading_path,
             i64::from(chunk.is_universal),
             chunk.applies_when_json,
+            chunk.language_json,
         ],
     )?;
 
@@ -947,35 +1242,118 @@ fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Multiplier for the U5 vector oversample-and-filter step. The
+/// structural gate fetches `top_k * VECTOR_OVERSAMPLE_FACTOR` nearest
+/// neighbours from `vec0`, then filters out chunks whose
+/// `language_json` declares a non-matching language. Initial value is
+/// 3 (per plan); raise if dogfooding shows the recall floor dropping
+/// below `top_k` for narrow-language corpora.
+const VECTOR_OVERSAMPLE_FACTOR: usize = 3;
+
+/// Build the FTS5 MATCH expression for the U5 FTS-fallback branch.
+/// Returns `None` when both inputs are empty (no anchor and no terms
+/// means there is nothing for FTS to score against).
+fn build_fts_fallback_match(cleaned_terms: &[String], inferred_langs: &[String]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    if !inferred_langs.is_empty() {
+        parts.push(if inferred_langs.len() == 1 {
+            inferred_langs[0].clone()
+        } else {
+            format!("({})", inferred_langs.join(" OR "))
+        });
+    }
+    if !cleaned_terms.is_empty() {
+        parts.push(format!("({})", cleaned_terms.join(" OR ")));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
+    }
+}
+
+/// Row callback for the U5 search functions — projects a `chunks` row
+/// onto [`SearchResult`]. Centralised so the four SELECT sites (two
+/// FTS branches, vector, sibling-expansion) stay in lockstep on column
+/// order.
+fn read_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResult> {
+    Ok(SearchResult {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        body: row.get(2)?,
+        tags: row.get(3)?,
+        source_file: row.get(4)?,
+        heading_path: row.get(5)?,
+        score: row.get(6)?,
+        is_universal: row.get::<_, i64>(7)? != 0,
+        applies_when_json: row.get::<_, Option<String>>(8)?,
+        language_json: row.get::<_, Option<String>>(9)?,
+    })
+}
+
+/// Returns `true` when a chunk's `language_json` value passes the
+/// structural gate against the inferred-language set: undeclared
+/// (NULL) chunks pass unconditionally, declared chunks pass iff their
+/// token list intersects `inferred_langs`. Used by the vector
+/// oversample-and-filter path; the FTS branches encode the same
+/// predicate in SQL.
+fn structural_admits(language_json: Option<&str>, inferred_langs: &[String]) -> bool {
+    let Some(json) = language_json else {
+        return true;
+    };
+    let Ok(tokens): Result<Vec<String>, _> = serde_json::from_str(json) else {
+        // Malformed JSON should never reach retrieval (parser
+        // serialises to JSON via `to_string` on `Vec<String>`), but if
+        // it somehow does, treat the chunk as declared-but-empty and
+        // exclude it from the structural branch — safer than admitting
+        // garbage.
+        return false;
+    };
+    tokens.iter().any(|t| inferred_langs.iter().any(|l| l == t))
+}
+
 /// Merge two ranked result lists using Reciprocal Rank Fusion (k = 60).
+///
+/// Thin wrapper around [`reciprocal_rank_fusion_n`] for the two-list
+/// case; preserves the pre-U5 caller shape (`search_hybrid`'s
+/// FTS-plus-vector combo) without forcing the new three-list shape on
+/// every caller.
 fn reciprocal_rank_fusion(
     list_a: &[SearchResult],
     list_b: &[SearchResult],
     limit: usize,
 ) -> Vec<SearchResult> {
+    reciprocal_rank_fusion_n(&[list_a, list_b], limit)
+}
+
+/// Merge `N` ranked result lists using Reciprocal Rank Fusion (k = 60).
+///
+/// Generalised over slice count so the U5 structural-gate caller can
+/// fuse the FTS-fallback, FTS-structural, and vector branches in one
+/// pass. Normalisation divides by `N / (k + 1)` so the highest possible
+/// score (rank 0 in every input list) maps to 1.0 — same shape the
+/// two-list normalisation produced before, scaled to the actual list
+/// count.
+fn reciprocal_rank_fusion_n(lists: &[&[SearchResult]], limit: usize) -> Vec<SearchResult> {
     let k = 60.0_f64;
     let mut scores: HashMap<String, (SearchResult, f64)> = HashMap::new();
 
-    for (i, r) in list_a.iter().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
-        let rrf = 1.0 / (k + i as f64 + 1.0);
-        scores
-            .entry(r.id.clone())
-            .and_modify(|(_, s)| *s += rrf)
-            .or_insert_with(|| (r.clone(), rrf));
+    for list in lists {
+        for (i, r) in list.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let rrf = 1.0 / (k + i as f64 + 1.0);
+            scores
+                .entry(r.id.clone())
+                .and_modify(|(_, s)| *s += rrf)
+                .or_insert_with(|| (r.clone(), rrf));
+        }
     }
 
-    for (i, r) in list_b.iter().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
-        let rrf = 1.0 / (k + i as f64 + 1.0);
-        scores
-            .entry(r.id.clone())
-            .and_modify(|(_, s)| *s += rrf)
-            .or_insert_with(|| (r.clone(), rrf));
-    }
-
-    // Normalize to 0–1 by dividing by the max possible RRF score (rank 0 in both lists).
-    let max_rrf = 2.0 / (k + 1.0);
+    // Normalise to 0–1 by dividing by the max possible RRF score
+    // (rank 0 in every input list).
+    #[allow(clippy::cast_precision_loss)]
+    let max_rrf = (lists.len() as f64) / (k + 1.0);
+    let max_rrf = if max_rrf > 0.0 { max_rrf } else { 1.0 };
 
     let mut merged: Vec<_> = scores.into_values().collect();
     merged.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -1014,6 +1392,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         }
     }
 
@@ -1028,6 +1407,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: None,
+            language_json: None,
         }
     }
 
@@ -1044,6 +1424,7 @@ mod tests {
             raw_body: chunk.body.clone(),
             content_hash: "0000000000000000".to_string(),
             applies_when_json: chunk.applies_when_json.clone(),
+            language_json: chunk.language_json.clone(),
         })
         .unwrap();
         db.insert_chunk(chunk, embedding).unwrap();
@@ -1135,6 +1516,7 @@ mod tests {
             heading_path: "Alpha".into(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let c2 = Chunk {
             id: "c2".into(),
@@ -1145,6 +1527,7 @@ mod tests {
             heading_path: "Beta".into(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
 
         db.insert_chunk(&c1, Some(&[1.0, 0.0, 0.0, 0.0])).unwrap();
@@ -1346,6 +1729,7 @@ mod tests {
             score: 0.0,
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let a = vec![stub("x"), stub("y")];
         let b = vec![stub("y"), stub("z")];
@@ -1362,6 +1746,182 @@ mod tests {
         let max_rrf = 2.0 / 61.0;
         let expected_y = raw / max_rrf;
         assert!((merged[0].score - expected_y).abs() < 1e-10);
+    }
+
+    // -- U5 helpers: build_fts_fallback_match + structural_admits -----------
+
+    #[test]
+    fn build_fts_fallback_match_single_lang_and_terms() {
+        let m = build_fts_fallback_match(
+            &["error".to_string(), "handling".to_string()],
+            &["rust".to_string()],
+        );
+        assert_eq!(m.as_deref(), Some("rust AND (error OR handling)"));
+    }
+
+    #[test]
+    fn build_fts_fallback_match_multi_lang_wraps_in_parens() {
+        let m = build_fts_fallback_match(
+            &["test".to_string()],
+            &["javascript".to_string(), "typescript".to_string()],
+        );
+        assert_eq!(m.as_deref(), Some("(javascript OR typescript) AND (test)"));
+    }
+
+    #[test]
+    fn build_fts_fallback_match_terms_only_when_no_lang() {
+        let m = build_fts_fallback_match(&["alpha".to_string()], &[]);
+        assert_eq!(m.as_deref(), Some("(alpha)"));
+    }
+
+    #[test]
+    fn build_fts_fallback_match_lang_only_when_no_terms() {
+        let m = build_fts_fallback_match(&[], &["rust".to_string()]);
+        assert_eq!(m.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn build_fts_fallback_match_empty_returns_none() {
+        let m = build_fts_fallback_match(&[], &[]);
+        assert_eq!(m, None);
+    }
+
+    #[test]
+    fn structural_admits_null_language_is_unconditional() {
+        // Undeclared chunks pass the fallback predicate unconditionally.
+        assert!(structural_admits(None, &["rust".to_string()]));
+        assert!(structural_admits(None, &[]));
+    }
+
+    #[test]
+    fn structural_admits_declared_language_intersecting_inferred() {
+        assert!(structural_admits(
+            Some(r#"["rust"]"#),
+            &["rust".to_string()]
+        ));
+        assert!(structural_admits(
+            Some(r#"["javascript","typescript"]"#),
+            &["typescript".to_string()]
+        ));
+    }
+
+    #[test]
+    fn structural_admits_rejects_disjoint_set() {
+        // AE4: a `language: rust` pattern must NOT pass a `{python}` gate.
+        assert!(!structural_admits(
+            Some(r#"["rust"]"#),
+            &["python".to_string()]
+        ));
+    }
+
+    #[test]
+    fn structural_admits_unknown_token_in_pattern_is_excluded() {
+        // R12 / AE7 retrieval half: a pattern with `language: rrust`
+        // does not pass the structural gate for `{rust}` because the
+        // membership check is by string equality.
+        assert!(!structural_admits(
+            Some(r#"["rrust"]"#),
+            &["rust".to_string()]
+        ));
+    }
+
+    // -- U5 retrieval: structural gate end-to-end ----------------------------
+
+    #[test]
+    fn search_fts_structural_admits_declared_language_with_no_body_anchor() {
+        // AE3: a pattern declaring `language: rust` with a body that
+        // does NOT contain "rust" still surfaces via the structural
+        // branch when the inferred set is `{rust}` and the terms match.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        let chunk = Chunk {
+            id: "p1:Top".into(),
+            title: "Error Handling".into(),
+            body: "Use anyhow for application errors.".into(),
+            tags: String::new(),
+            source_file: "p1.md".into(),
+            heading_path: "Top".into(),
+            is_universal: false,
+            applies_when_json: None,
+            language_json: Some(r#"["rust"]"#.into()),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let results = db
+            .search_fts_structural(&["error".to_string()], &["rust".to_string()], 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "p1:Top");
+    }
+
+    #[test]
+    fn search_fts_structural_excludes_disjoint_declared_language() {
+        // AE4 (FTS half): a `language: rust` pattern does NOT surface
+        // through the structural branch when the inferred set is
+        // `{python}`.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        let chunk = Chunk {
+            id: "p1:Top".into(),
+            title: "Rust thing".into(),
+            body: "anyhow for application errors".into(),
+            tags: String::new(),
+            source_file: "p1.md".into(),
+            heading_path: "Top".into(),
+            is_universal: false,
+            applies_when_json: None,
+            language_json: Some(r#"["rust"]"#.into()),
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let results = db
+            .search_fts_structural(&["error".to_string()], &["python".to_string()], 10)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "rust-declared pattern must not pass a python gate"
+        );
+    }
+
+    #[test]
+    fn search_fts_fallback_excludes_declared_patterns() {
+        // The FTS-fallback branch only surfaces patterns with no
+        // `language:` declaration — declared patterns reach retrieval
+        // through the structural branch, so the two FTS lists are
+        // disjoint by `language_json IS NULL`.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        let declared = Chunk {
+            id: "decl:Top".into(),
+            title: "Declared".into(),
+            body: "rust error handling content".into(),
+            tags: String::new(),
+            source_file: "decl.md".into(),
+            heading_path: "Top".into(),
+            is_universal: false,
+            applies_when_json: None,
+            language_json: Some(r#"["rust"]"#.into()),
+        };
+        let undeclared = Chunk {
+            id: "undec:Top".into(),
+            title: "Undeclared".into(),
+            body: "rust error handling content".into(),
+            tags: String::new(),
+            source_file: "undec.md".into(),
+            heading_path: "Top".into(),
+            is_universal: false,
+            applies_when_json: None,
+            language_json: None,
+        };
+        db.insert_chunk(&declared, None).unwrap();
+        db.insert_chunk(&undeclared, None).unwrap();
+
+        let results = db
+            .search_fts_fallback(&["error".to_string()], &["rust".to_string()], 10)
+            .unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"undec:Top"));
+        assert!(!ids.contains(&"decl:Top"));
     }
 
     // -- duplicate insert ---------------------------------------------------
@@ -1425,6 +1985,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&tagged, None).unwrap();
 
@@ -1438,6 +1999,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&body_only, None).unwrap();
 
@@ -1631,6 +2193,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let c2 = Chunk {
             id: "c2".into(),
@@ -1641,6 +2204,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         db.insert_chunk(&c1, None).unwrap();
         db.insert_chunk(&c2, None).unwrap();
@@ -1690,6 +2254,7 @@ mod tests {
             heading_path: "Naming".into(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         seed_pattern_and_chunk(&db, &chunk, None);
 
@@ -2159,6 +2724,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: Some(predicate_json.clone()),
+            language_json: None,
         };
         let without_predicate = Chunk {
             id: "n1".into(),
@@ -2169,6 +2735,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: None,
+            language_json: None,
         };
         let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
         db.insert_chunk(&with_predicate, Some(&emb)).unwrap();
@@ -2234,6 +2801,7 @@ mod tests {
             raw_body: "Body".into(),
             content_hash: "0000000000000000".into(),
             applies_when_json: Some(predicate_json.clone()),
+            language_json: None,
         })
         .unwrap();
 
@@ -2256,6 +2824,7 @@ mod tests {
             raw_body: "Body".into(),
             content_hash: "0000000000000000".into(),
             applies_when_json: None,
+            language_json: None,
         })
         .unwrap();
         let stored_after: Option<String> = db
@@ -2288,6 +2857,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: false,
             applies_when_json: Some(r#"{"tools":["Bash"]}"#.into()),
+            language_json: None,
         };
         db.insert_chunk(&chunk, None).unwrap();
 
@@ -2490,6 +3060,7 @@ mod tests {
             heading_path: String::new(),
             is_universal: true,
             applies_when_json: Some(r#"{"tools":["Bash"]}"#.into()),
+            language_json: None,
         };
         db.insert_chunk(&new_chunk, None).unwrap();
 
@@ -2502,6 +3073,361 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fresh_predicate, Some(r#"{"tools":["Bash"]}"#.to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Migration test inherently long: builds full
+    // v3 schema (DDL minus the new column), populates rows, opens with the
+    // production probe, and verifies multiple post-migration invariants.
+    fn open_migrates_v3_database_to_v4_via_alter_table() {
+        // Migration regression: build a v3 DB by hand (DDL with
+        // `applies_when_json` but without `language_json`, populated with
+        // sample chunks and a patterns row, `PRAGMA user_version = 3`) and
+        // call `KnowledgeDB::open`. The probe must apply two `ALTER TABLE`
+        // additions, stamp `PRAGMA user_version = 4`, and return
+        // successfully without bailing. Existing rows survive with
+        // `language_json = NULL`.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v3.db");
+
+        // Hand-build the v3 schema. Mirrors the post-Track-1 DDL exactly,
+        // less the new `language_json` column. We also create the FTS / vec
+        // virtual tables so subsequent reads have somewhere to attach.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    applies_when_json TEXT,
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE INDEX idx_chunks_source_file ON chunks(source_file);
+                CREATE TABLE patterns (
+                    source_file       TEXT PRIMARY KEY,
+                    title             TEXT NOT NULL,
+                    tags              TEXT NOT NULL,
+                    is_universal      INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    raw_body          TEXT NOT NULL,
+                    content_hash      TEXT NOT NULL,
+                    applies_when_json TEXT,
+                    ingested_at       TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE ingest_metadata (key TEXT PRIMARY KEY, value TEXT);
+                CREATE VIRTUAL TABLE patterns_fts USING fts5(
+                    title, body, tags, source_file, chunk_id UNINDEXED,
+                    tokenize = 'porter unicode61'
+                );",
+            )
+            .unwrap();
+            super::register_sqlite_vec();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE patterns_vec USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[4]
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks \
+                 (id, title, body, source_file, heading_path, tags, is_universal, \
+                  applies_when_json) \
+                 VALUES ('legacy1', 'Legacy', 'Legacy body content', 'legacy.md', \
+                         '', 'workflow', 0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO patterns \
+                 (source_file, title, tags, is_universal, raw_body, content_hash, \
+                  applies_when_json) \
+                 VALUES ('legacy.md', 'Legacy', 'workflow', 0, 'Legacy body content', \
+                         'deadbeefdeadbeef', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3u32).unwrap();
+        }
+
+        // Open via the regular path — no `--force`. The probe must migrate
+        // in place and return successfully.
+        let db = KnowledgeDB::open(&db_path, 4)
+            .expect("v3 → v4 additive migration must apply silently on KnowledgeDB::open");
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            user_version, SCHEMA_VERSION,
+            "PRAGMA user_version must be bumped to v4 after migration"
+        );
+
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "language_json"),
+            "chunks must carry language_json after migration, got: {chunk_columns:?}"
+        );
+
+        let pattern_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(patterns)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            pattern_columns.iter().any(|c| c == "language_json"),
+            "patterns must carry language_json after migration, got: {pattern_columns:?}"
+        );
+
+        // Existing rows survive — title and body intact, new column NULL.
+        let (legacy_title, legacy_language): (String, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT title, language_json FROM chunks WHERE id = 'legacy1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_title, "Legacy");
+        assert_eq!(
+            legacy_language, None,
+            "migrated row must default language_json to NULL"
+        );
+
+        // The migrated patterns row likewise carries NULL.
+        let pattern_language: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT language_json FROM patterns WHERE source_file = 'legacy.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pattern_language, None);
+    }
+
+    #[test]
+    fn open_v4_database_is_no_op_idempotent() {
+        // After a clean migration, re-opening the same DB must not
+        // re-apply ALTER TABLE (the `column_exists` guard short-circuits).
+        // Pinned because rusqlite would error with "duplicate column" if
+        // the idempotency guard regressed.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v4.db");
+        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        db.init().unwrap();
+        drop(db);
+
+        // Re-open — no migration runs because version is already at target,
+        // but if the guard were absent and someone manually dropped
+        // user_version back to 3 we'd want column_exists to still no-op.
+        // Simulate that exact case.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", 3u32).unwrap();
+        }
+        let _db = KnowledgeDB::open(&db_path, 4)
+            .expect("re-running v3 → v4 migration on an already-v4 schema must be idempotent");
+    }
+
+    #[test]
+    fn open_migrates_v2_database_straight_to_v4_in_one_pass() {
+        // A binary two versions behind (v2) must reach v4 in a single
+        // open: the v2 → v3 branch folds the language_json adds into the
+        // same transaction. Validates the binary-skipping-version
+        // path so we don't bounce through two upgrade passes.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v2.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE patterns (
+                    source_file  TEXT PRIMARY KEY,
+                    title        TEXT NOT NULL,
+                    tags         TEXT NOT NULL,
+                    is_universal INTEGER NOT NULL DEFAULT 0 \
+                        CHECK (is_universal IN (0, 1)),
+                    raw_body     TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    ingested_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE ingest_metadata (key TEXT PRIMARY KEY, value TEXT);
+                CREATE VIRTUAL TABLE patterns_fts USING fts5(
+                    title, body, tags, source_file, chunk_id UNINDEXED,
+                    tokenize = 'porter unicode61'
+                );",
+            )
+            .unwrap();
+            super::register_sqlite_vec();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE patterns_vec USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[4]
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks \
+                 (id, title, body, source_file, heading_path, tags, is_universal) \
+                 VALUES ('legacy1', 'Legacy', 'Legacy body content', 'legacy.md', \
+                         '', 'workflow', 0)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+        }
+
+        let db = KnowledgeDB::open(&db_path, 4)
+            .expect("v2 → v4 single-pass migration must apply on KnowledgeDB::open");
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, SCHEMA_VERSION);
+
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "applies_when_json"),
+            "v2 → v4 must add applies_when_json: {chunk_columns:?}"
+        );
+        assert!(
+            chunk_columns.iter().any(|c| c == "language_json"),
+            "v2 → v4 must add language_json: {chunk_columns:?}"
+        );
+    }
+
+    #[test]
+    fn clear_all_after_v4_bump_recreates_language_json_column() {
+        // Edge case mirror of `clear_all_after_v3_bump_*`: `clear_all`
+        // drops and recreates from `CHUNKS_DDL` / `PATTERNS_DDL`, which
+        // now include `language_json`. Confirm the column is present
+        // after the drop+recreate and PRAGMA user_version is stamped at
+        // the current target.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        db.clear_all().unwrap();
+
+        let chunk_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chunk_columns.iter().any(|c| c == "language_json"),
+            "chunks must carry language_json after clear_all, got: {chunk_columns:?}"
+        );
+
+        let pattern_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(patterns)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            pattern_columns.iter().any(|c| c == "language_json"),
+            "patterns must carry language_json after clear_all, got: {pattern_columns:?}"
+        );
+
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn fresh_init_stamps_v4_user_version() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+        let user_version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 4);
+    }
+
+    #[test]
+    fn open_v1_database_hard_bails_with_advisory() {
+        // Pre-v2 databases predate the is_universal plumbing and cannot
+        // be migrated additively. Regression test for the hard-bail
+        // branch — must continue to fire after the v3 → v4 branch was
+        // added.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v1.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    tags TEXT DEFAULT '',
+                    source_file TEXT NOT NULL,
+                    heading_path TEXT DEFAULT '',
+                    ingested_at TEXT DEFAULT (datetime('now'))
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks \
+                 (id, title, body, source_file, heading_path, tags) \
+                 VALUES ('legacy1', 'Legacy', 'Legacy body', 'legacy.md', '', 'workflow')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1u32).unwrap();
+        }
+
+        let Err(err) = KnowledgeDB::open(&db_path, 4) else {
+            panic!("pre-v2 schema must hard-bail");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lore ingest --force"),
+            "advisory must name `lore ingest --force` as the remedy: {msg}"
+        );
     }
 
     #[test]
@@ -2526,6 +3452,7 @@ mod tests {
                 heading_path: "Section A".into(),
                 is_universal: true,
                 applies_when_json: Some(predicate_json.clone()),
+                language_json: None,
             },
             Chunk {
                 id: "wf:Section B".into(),
@@ -2536,6 +3463,7 @@ mod tests {
                 heading_path: "Section B".into(),
                 is_universal: true,
                 applies_when_json: Some(predicate_json.clone()),
+                language_json: None,
             },
         ];
         for c in &chunks {
