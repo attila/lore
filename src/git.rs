@@ -34,8 +34,7 @@ pub fn is_git_repo(dir: &Path) -> bool {
         .args(["rev-parse", "--git-dir"])
         .current_dir(dir)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Return `true` iff `HEAD` is a symbolic ref to a branch that does not yet
@@ -71,8 +70,7 @@ pub(crate) fn is_unborn_head(dir: &Path) -> bool {
         .args(["rev-parse", "--verify", "--quiet", &target])
         .current_dir(dir)
         .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| !o.status.success())
 }
 
 /// Guard that removes a file on drop, ensuring cleanup on all code paths.
@@ -297,8 +295,7 @@ pub fn commit_exists(repo_dir: &Path, sha: &str) -> bool {
         .args(["cat-file", "-t", sha])
         .current_dir(repo_dir)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Run `git diff --name-status` between `from_commit` and HEAD, returning
