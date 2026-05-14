@@ -9,19 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - An optional `language:` frontmatter field declares the languages a pattern targets, so declared
-  patterns surface on relevant tool calls even when their bodies omit the canonical token. (#N)
+  patterns surface on relevant tool calls even when their bodies omit the canonical token. (#50)
 - `lore ingest` reports a coverage tally distinguishing patterns that declare `language:` from those
   that fall back to FTS coincidence, and aggregates unknown-token warnings per token across the run.
-  (#N)
+  (#50)
 
 ### Changed
 
 - Bash command language inference matches on whole tokens, so `bundle install` no longer falsely
-  infers TypeScript via the `bun` substring. (#N)
+  infers TypeScript via the `bun` substring. (#50)
 - Shared signals across languages (e.g. `npm test`) now infer the full applicable set
-  (`{javascript, typescript}`) rather than collapsing to a single arbitrary winner. (#N)
+  (`{javascript, typescript}`) rather than collapsing to a single arbitrary winner. (#50)
 - Knowledge database schema bumped to v4 via a forward-compatible `ALTER TABLE` migration on first
-  open; no `lore ingest --force` required. (#N)
+  open; no `lore ingest --force` required. (#50)
 
 ## [0.2.0] - 2026-05-12
 
