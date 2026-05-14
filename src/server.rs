@@ -3428,18 +3428,29 @@ mod tests {
     #[test]
     fn add_pattern_with_inbox_returns_pending_review() {
         let h = harness_with_inbox();
-        let resp = h.request_value(
-            r#"{
-                "jsonrpc":"2.0","id":200,"method":"tools/call",
-                "params":{
-                    "name":"add_pattern",
-                    "arguments":{
-                        "title":"Inbox Test",
-                        "body":"Body for inbox testing.",
-                        "tags":["test"]
-                    }
-                }
-            }"#,
+        // Neutralise inherited GIT_CONFIG_* env vars before the inbox
+        // path's internal `git push`. See `git::tests::push_branch_to_bare_remote`
+        // for the same trap in detail.
+        let resp = temp_env::with_vars(
+            [
+                ("GIT_CONFIG_COUNT", Some("0")),
+                ("GIT_CONFIG_GLOBAL", Some("/dev/null")),
+            ],
+            || {
+                h.request_value(
+                    r#"{
+                        "jsonrpc":"2.0","id":200,"method":"tools/call",
+                        "params":{
+                            "name":"add_pattern",
+                            "arguments":{
+                                "title":"Inbox Test",
+                                "body":"Body for inbox testing.",
+                                "tags":["test"]
+                            }
+                        }
+                    }"#,
+                )
+            },
         );
         assert!(
             resp["error"].is_null(),

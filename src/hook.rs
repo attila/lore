@@ -1257,11 +1257,15 @@ mod tests {
 
     #[test]
     fn to_call_context_populates_all_fields_with_transcript_tail() {
-        // Write a transcript under $HOME so validate_transcript_path
-        // accepts it, then verify every CallContext field is populated.
-        let home = std::env::var("HOME").unwrap();
-        let dir = tempfile::tempdir_in(&home).unwrap();
-        let transcript = dir.path().join("transcript.jsonl");
+        // Override $HOME to a tempdir for the duration of the test so
+        // validate_transcript_path accepts a transcript written inside it,
+        // without depending on the real $HOME being writable (sandbox
+        // environments often refuse $HOME writes). See
+        // docs/solutions/best-practices/testing-env-var-reading-code-rust-edition-2024-2026-05-14.md
+        // for the temp-env pattern rationale.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let transcript = home.join("transcript.jsonl");
         std::fs::write(
             &transcript,
             r#"{"type":"user","message":{"content":"refactor the auth flow"}}
@@ -1283,16 +1287,19 @@ mod tests {
             tool_response: None,
         };
 
-        let cc = input.to_call_context();
-        assert_eq!(cc.tool_name.as_deref(), Some("Bash"));
-        assert_eq!(cc.command.as_deref(), Some("git push"));
-        assert_eq!(cc.file_path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(cc.description.as_deref(), Some("push to remote"));
-        assert_eq!(
-            cc.transcript_tail.as_deref(),
-            Some("refactor the auth flow"),
-            "eager transcript-tail read must populate the field",
-        );
+        let home_str = home.to_string_lossy();
+        temp_env::with_vars([("HOME", Some(home_str.as_ref()))], || {
+            let cc = input.to_call_context();
+            assert_eq!(cc.tool_name.as_deref(), Some("Bash"));
+            assert_eq!(cc.command.as_deref(), Some("git push"));
+            assert_eq!(cc.file_path.as_deref(), Some("src/lib.rs"));
+            assert_eq!(cc.description.as_deref(), Some("push to remote"));
+            assert_eq!(
+                cc.transcript_tail.as_deref(),
+                Some("refactor the auth flow"),
+                "eager transcript-tail read must populate the field",
+            );
+        });
     }
 
     #[test]
@@ -1875,16 +1882,21 @@ mod tests {
 
     #[test]
     fn validate_transcript_path_under_home() {
-        // A file under $HOME should pass validation.
-        let home = std::env::var("HOME").unwrap();
-        let dir = tempfile::tempdir_in(&home).unwrap();
-        let path = dir.path().join("transcript.jsonl");
+        // Override $HOME to a tempdir so the transcript created inside it
+        // canonicalises under the configured home prefix, without
+        // depending on the real $HOME being writable.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let path = home.join("transcript.jsonl");
         std::fs::write(&path, "").unwrap();
 
-        assert!(
-            validate_transcript_path(&path).is_some(),
-            "path under $HOME should be valid"
-        );
+        let home_str = home.to_string_lossy();
+        temp_env::with_vars([("HOME", Some(home_str.as_ref()))], || {
+            assert!(
+                validate_transcript_path(&path).is_some(),
+                "path under $HOME should be valid"
+            );
+        });
     }
 
     #[test]
