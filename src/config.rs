@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use etcetera::base_strategy::{BaseStrategy, Xdg};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,6 +146,40 @@ pub fn default_database_path() -> anyhow::Result<PathBuf> {
         "data",
     )?;
     Ok(dir.join("lore").join("knowledge.db"))
+}
+
+/// Default trace directory: `$XDG_STATE_HOME/lore/traces` or `~/.local/state/lore/traces`.
+///
+/// Returns the directory that holds Track 2 Observability trace files. Individual
+/// trace filenames are determined by the writer (per-session id); this helper
+/// returns only the parent directory, with no trailing separator.
+pub fn default_trace_dir() -> anyhow::Result<PathBuf> {
+    let xdg = xdg_strategy("state")?;
+    // `BaseStrategy::state_dir` returns `Option<PathBuf>` for trait
+    // compatibility with non-XDG strategies; the `Xdg` implementation
+    // always returns `Some`.
+    let state = xdg.state_dir().expect("Xdg::state_dir always returns Some");
+    Ok(state.join("lore").join("traces"))
+}
+
+/// Construct an `Xdg` strategy, mapping the missing-`$HOME` case onto the
+/// existing operator-facing wording. We pre-check `$HOME` ourselves because
+/// `etcetera` (via `std::env::home_dir`) falls back to `/etc/passwd` when
+/// `$HOME` is unset, which would silently produce a path instead of the
+/// explicit `--config` recovery hint.
+fn xdg_strategy(purpose: &str) -> anyhow::Result<Xdg> {
+    if std::env::var_os("HOME").is_none_or(|v| v.is_empty()) {
+        return Err(anyhow::anyhow!(
+            "Cannot determine {purpose} directory: $HOME is not set. \
+             Use --config to specify a path."
+        ));
+    }
+    Xdg::new().map_err(|_| {
+        anyhow::anyhow!(
+            "Cannot determine {purpose} directory: $HOME is not set. \
+             Use --config to specify a path."
+        )
+    })
 }
 
 #[cfg(test)]
@@ -416,5 +451,77 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.search.min_relevance_universal, Some(0.75));
         assert_eq!(loaded, config);
+    }
+
+    // -- default_trace_dir (U1: etcetera path resolution) -------------------
+    //
+    // These tests mutate the process environment via `temp_env`, which
+    // serialises env access through a reentrant mutex so concurrent test
+    // threads don't observe each other's overrides.
+
+    #[test]
+    fn default_trace_dir_uses_xdg_state_home_when_set() {
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some("/custom/state")),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_trace_dir().unwrap();
+                assert_eq!(path, PathBuf::from("/custom/state/lore/traces"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_trace_dir_falls_back_to_home_when_xdg_unset() {
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", None::<&str>),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_trace_dir().unwrap();
+                assert_eq!(path, PathBuf::from("/home/user/.local/state/lore/traces"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_trace_dir_falls_back_to_home_when_xdg_empty() {
+        // R-PR3: empty XDG_*_HOME must fall back to the $HOME-based default.
+        // etcetera honours this via an `is_absolute()` check on the env value
+        // — an empty string is not absolute, so the default applies.
+        temp_env::with_vars(
+            [("XDG_STATE_HOME", Some("")), ("HOME", Some("/home/user"))],
+            || {
+                let path = default_trace_dir().unwrap();
+                assert_eq!(path, PathBuf::from("/home/user/.local/state/lore/traces"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_trace_dir_home_unset_returns_error_mentioning_config() {
+        temp_env::with_vars(
+            [("XDG_STATE_HOME", None::<&str>), ("HOME", None::<&str>)],
+            || {
+                let result = default_trace_dir();
+                let err = result.unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("state"),
+                    "error should mention state purpose, got: {msg}"
+                );
+                assert!(
+                    msg.contains("$HOME is not set"),
+                    "error should mention $HOME, got: {msg}"
+                );
+                assert!(
+                    msg.contains("--config"),
+                    "error should mention --config, got: {msg}"
+                );
+            },
+        );
     }
 }
