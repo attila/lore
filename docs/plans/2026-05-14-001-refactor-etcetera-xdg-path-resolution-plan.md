@@ -1,7 +1,7 @@
 ---
 title: "refactor: Replace hand-rolled XDG resolution with etcetera"
 type: refactor
-status: active
+status: completed
 date: 2026-05-14
 origin: docs/brainstorms/2026-05-14-track-2-observability-requirements.md
 ---

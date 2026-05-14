@@ -22,6 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`{javascript, typescript}`) rather than collapsing to a single arbitrary winner. (#50)
 - Knowledge database schema bumped to v4 via a forward-compatible `ALTER TABLE` migration on first
   open; no `lore ingest --force` required. (#50)
+- The XDG state tier (`$XDG_STATE_HOME`) is now documented and reachable via a new
+  `default_trace_dir()` helper; XDG path resolution moves to the `etcetera` crate without changing
+  default paths or `$HOME`-fallback semantics. (#52)
 
 ## [0.2.0] - 2026-05-12
 
