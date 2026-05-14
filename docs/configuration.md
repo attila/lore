@@ -204,6 +204,7 @@ checks performed during reconciliation. Both removals and re-indexes are logged.
 | `LORE_DEBUG`      | Enable verbose debug logging              | `1`, `true`, or `yes` to enable | Output writes to stderr with `[lore debug]` prefix. The value is read once on first check and cached for the process lifetime. |
 | `XDG_CONFIG_HOME` | Override the configuration base directory | Any absolute path               | Defaults to `$HOME/.config` when unset or empty.                                                                               |
 | `XDG_DATA_HOME`   | Override the data base directory          | Any absolute path               | Defaults to `$HOME/.local/share` when unset or empty.                                                                          |
+| `XDG_STATE_HOME`  | Override the state base directory         | Any absolute path               | Defaults to `$HOME/.local/state` when unset or empty. Reserved for trace files under `$XDG_STATE_HOME/lore/traces/`.           |
 | `HOME`            | Home directory (fallback for XDG)         | Set by the operating system     | Required when XDG variables are not set. If absent, lore reports an error suggesting `--config`.                               |
 
 ## File Paths

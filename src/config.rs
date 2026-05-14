@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use etcetera::base_strategy::{BaseStrategy, Xdg};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,47 +105,50 @@ impl Config {
     }
 }
 
-/// Resolve the XDG base directory for the given variable, falling back to `$HOME/<subpath>`.
-fn resolve_xdg_base(
-    xdg_value: Option<String>,
-    home_value: Option<String>,
-    home_subpath: &str,
-    purpose: &str,
-) -> anyhow::Result<PathBuf> {
-    if let Some(val) = xdg_value
-        && !val.is_empty()
-    {
-        return Ok(PathBuf::from(val));
-    }
-    let home = home_value.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Cannot determine {purpose} directory: $HOME is not set. \
-             Use --config to specify a path."
-        )
-    })?;
-    Ok(PathBuf::from(home).join(home_subpath))
-}
-
 /// Default config file path: `$XDG_CONFIG_HOME/lore/lore.toml` or `~/.config/lore/lore.toml`.
 pub fn default_config_path() -> anyhow::Result<PathBuf> {
-    let dir = resolve_xdg_base(
-        std::env::var("XDG_CONFIG_HOME").ok(),
-        std::env::var("HOME").ok(),
-        ".config",
-        "config",
-    )?;
-    Ok(dir.join("lore").join("lore.toml"))
+    let xdg = xdg_strategy("config")?;
+    Ok(xdg.config_dir().join("lore").join("lore.toml"))
 }
 
 /// Default database file path: `$XDG_DATA_HOME/lore/knowledge.db` or `~/.local/share/lore/knowledge.db`.
 pub fn default_database_path() -> anyhow::Result<PathBuf> {
-    let dir = resolve_xdg_base(
-        std::env::var("XDG_DATA_HOME").ok(),
-        std::env::var("HOME").ok(),
-        ".local/share",
-        "data",
-    )?;
-    Ok(dir.join("lore").join("knowledge.db"))
+    let xdg = xdg_strategy("data")?;
+    Ok(xdg.data_dir().join("lore").join("knowledge.db"))
+}
+
+/// Default trace directory: `$XDG_STATE_HOME/lore/traces` or `~/.local/state/lore/traces`.
+///
+/// Returns the directory that holds Track 2 Observability trace files. Individual
+/// trace filenames are determined by the writer (per-session id); this helper
+/// returns only the parent directory, with no trailing separator.
+pub fn default_trace_dir() -> anyhow::Result<PathBuf> {
+    let xdg = xdg_strategy("state")?;
+    // `BaseStrategy::state_dir` returns `Option<PathBuf>` for trait
+    // compatibility with non-XDG strategies; the `Xdg` implementation
+    // always returns `Some`.
+    let state = xdg.state_dir().expect("Xdg::state_dir always returns Some");
+    Ok(state.join("lore").join("traces"))
+}
+
+/// Construct an `Xdg` strategy, mapping the missing-`$HOME` case onto the
+/// existing operator-facing wording. We pre-check `$HOME` ourselves because
+/// `etcetera` (via `std::env::home_dir`) falls back to `/etc/passwd` when
+/// `$HOME` is unset, which would silently produce a path instead of the
+/// explicit `--config` recovery hint.
+fn xdg_strategy(purpose: &str) -> anyhow::Result<Xdg> {
+    if std::env::var_os("HOME").is_none_or(|v| v.is_empty()) {
+        return Err(anyhow::anyhow!(
+            "Cannot determine {purpose} directory: $HOME is not set. \
+             Use --config to specify a path."
+        ));
+    }
+    Xdg::new().map_err(|_| {
+        anyhow::anyhow!(
+            "Cannot determine {purpose} directory: $HOME is not set. \
+             Use --config to specify a path."
+        )
+    })
 }
 
 #[cfg(test)]
@@ -201,69 +205,134 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xdg_config_home_set() {
-        let path = resolve_xdg_base(
-            Some("/custom/config".to_string()),
-            Some("/home/user".to_string()),
-            ".config",
-            "config",
-        )
-        .unwrap();
-        assert_eq!(path, PathBuf::from("/custom/config"));
-    }
+    // -- default_config_path / default_database_path (U2: etcetera swap) ----
+    //
+    // Each scenario pins one operator-reachable branch of the public
+    // helpers, exercised through env mutation under `temp_env::with_vars`.
 
     #[test]
-    fn xdg_data_home_set() {
-        let path = resolve_xdg_base(
-            Some("/custom/data".to_string()),
-            Some("/home/user".to_string()),
-            ".local/share",
-            "data",
-        )
-        .unwrap();
-        assert_eq!(path, PathBuf::from("/custom/data"));
-    }
-
-    #[test]
-    fn xdg_var_unset_falls_back_to_home() {
-        let path =
-            resolve_xdg_base(None, Some("/home/user".to_string()), ".config", "config").unwrap();
-        assert_eq!(path, PathBuf::from("/home/user/.config"));
-    }
-
-    #[test]
-    fn xdg_var_empty_falls_back_to_home() {
-        let path = resolve_xdg_base(
-            Some(String::new()),
-            Some("/home/user".to_string()),
-            ".config",
-            "config",
-        )
-        .unwrap();
-        assert_eq!(path, PathBuf::from("/home/user/.config"));
-    }
-
-    #[test]
-    fn home_unset_returns_error() {
-        let result = resolve_xdg_base(None, None, ".config", "config");
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("$HOME is not set"),
-            "error should mention $HOME, got: {msg}"
-        );
-        assert!(
-            msg.contains("--config"),
-            "error should mention --config, got: {msg}"
+    fn default_config_path_uses_xdg_config_home_when_set() {
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some("/custom/config")),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_config_path().unwrap();
+                assert_eq!(path, PathBuf::from("/custom/config/lore/lore.toml"));
+            },
         );
     }
 
     #[test]
-    fn xdg_data_falls_back_to_home_local_share() {
-        let path =
-            resolve_xdg_base(None, Some("/home/user".to_string()), ".local/share", "data").unwrap();
-        assert_eq!(path, PathBuf::from("/home/user/.local/share"));
+    fn default_database_path_uses_xdg_data_home_when_set() {
+        temp_env::with_vars(
+            [
+                ("XDG_DATA_HOME", Some("/custom/data")),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_database_path().unwrap();
+                assert_eq!(path, PathBuf::from("/custom/data/lore/knowledge.db"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_config_path_falls_back_to_home_when_xdg_unset() {
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_config_path().unwrap();
+                assert_eq!(path, PathBuf::from("/home/user/.config/lore/lore.toml"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_config_path_falls_back_to_home_when_xdg_empty() {
+        // R-PR3 hard constraint: the empty-string branch must remain the
+        // $HOME-based default. etcetera honours this via `is_absolute()`
+        // — empty fails the absolute check, so the default applies.
+        temp_env::with_vars(
+            [("XDG_CONFIG_HOME", Some("")), ("HOME", Some("/home/user"))],
+            || {
+                let path = default_config_path().unwrap();
+                assert_eq!(path, PathBuf::from("/home/user/.config/lore/lore.toml"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_config_path_home_unset_returns_error_mentioning_config() {
+        temp_env::with_vars(
+            [("XDG_CONFIG_HOME", None::<&str>), ("HOME", None::<&str>)],
+            || {
+                let result = default_config_path();
+                let err = result.unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("config"),
+                    "error should mention config purpose, got: {msg}"
+                );
+                assert!(
+                    msg.contains("$HOME is not set"),
+                    "error should mention $HOME, got: {msg}"
+                );
+                assert!(
+                    msg.contains("--config"),
+                    "error should mention --config, got: {msg}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn default_database_path_falls_back_to_home_local_share_when_xdg_unset() {
+        temp_env::with_vars(
+            [
+                ("XDG_DATA_HOME", None::<&str>),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_database_path().unwrap();
+                assert_eq!(
+                    path,
+                    PathBuf::from("/home/user/.local/share/lore/knowledge.db")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn default_database_path_home_unset_returns_error_mentioning_config() {
+        // Symmetry with `default_config_path_home_unset_returns_error_mentioning_config`.
+        // The legacy suite only covered the `config` purpose token; pinning
+        // `data` here costs little and documents the contract for both
+        // helpers explicitly.
+        temp_env::with_vars(
+            [("XDG_DATA_HOME", None::<&str>), ("HOME", None::<&str>)],
+            || {
+                let result = default_database_path();
+                let err = result.unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("data"),
+                    "error should mention data purpose, got: {msg}"
+                );
+                assert!(
+                    msg.contains("$HOME is not set"),
+                    "error should mention $HOME, got: {msg}"
+                );
+                assert!(
+                    msg.contains("--config"),
+                    "error should mention --config, got: {msg}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -416,5 +485,77 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.search.min_relevance_universal, Some(0.75));
         assert_eq!(loaded, config);
+    }
+
+    // -- default_trace_dir (U1: etcetera path resolution) -------------------
+    //
+    // These tests mutate the process environment via `temp_env`, which
+    // serialises env access through a reentrant mutex so concurrent test
+    // threads don't observe each other's overrides.
+
+    #[test]
+    fn default_trace_dir_uses_xdg_state_home_when_set() {
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some("/custom/state")),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_trace_dir().unwrap();
+                assert_eq!(path, PathBuf::from("/custom/state/lore/traces"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_trace_dir_falls_back_to_home_when_xdg_unset() {
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", None::<&str>),
+                ("HOME", Some("/home/user")),
+            ],
+            || {
+                let path = default_trace_dir().unwrap();
+                assert_eq!(path, PathBuf::from("/home/user/.local/state/lore/traces"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_trace_dir_falls_back_to_home_when_xdg_empty() {
+        // R-PR3: empty XDG_*_HOME must fall back to the $HOME-based default.
+        // etcetera honours this via an `is_absolute()` check on the env value
+        // — an empty string is not absolute, so the default applies.
+        temp_env::with_vars(
+            [("XDG_STATE_HOME", Some("")), ("HOME", Some("/home/user"))],
+            || {
+                let path = default_trace_dir().unwrap();
+                assert_eq!(path, PathBuf::from("/home/user/.local/state/lore/traces"));
+            },
+        );
+    }
+
+    #[test]
+    fn default_trace_dir_home_unset_returns_error_mentioning_config() {
+        temp_env::with_vars(
+            [("XDG_STATE_HOME", None::<&str>), ("HOME", None::<&str>)],
+            || {
+                let result = default_trace_dir();
+                let err = result.unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("state"),
+                    "error should mention state purpose, got: {msg}"
+                );
+                assert!(
+                    msg.contains("$HOME is not set"),
+                    "error should mention $HOME, got: {msg}"
+                );
+                assert!(
+                    msg.contains("--config"),
+                    "error should mention --config, got: {msg}"
+                );
+            },
+        );
     }
 }
