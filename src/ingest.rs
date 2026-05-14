@@ -612,6 +612,12 @@ fn process_change(
             match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
+                    if indexed.embedding_failures > 0 {
+                        result.errors.push(format!(
+                            "{} embedding failure(s) while indexing {path}",
+                            indexed.embedding_failures
+                        ));
+                    }
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
                     fold_malformed_applies_when(result, &indexed.malformed_applies_when);
                     fold_language_metadata(result, &indexed);
@@ -652,6 +658,12 @@ fn process_change(
             match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
+                    if indexed.embedding_failures > 0 {
+                        result.errors.push(format!(
+                            "{} embedding failure(s) while indexing {to}",
+                            indexed.embedding_failures
+                        ));
+                    }
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
                     fold_malformed_applies_when(result, &indexed.malformed_applies_when);
                     fold_language_metadata(result, &indexed);
@@ -921,6 +933,12 @@ pub fn full_ingest(
         match index_single_file(db, embedder, knowledge_dir, file_path, strategy) {
             Ok(indexed) => {
                 result.chunks_created += indexed.chunks_indexed;
+                if indexed.embedding_failures > 0 {
+                    result.errors.push(format!(
+                        "{} embedding failure(s) while indexing {}",
+                        indexed.embedding_failures, indexed.rel_path
+                    ));
+                }
                 fold_universal_metadata(
                     &mut result,
                     &indexed.rel_path,
