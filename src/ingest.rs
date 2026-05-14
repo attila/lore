@@ -540,7 +540,7 @@ fn delta_ingest(
     // Count unchanged files: existing sources minus those that this delta
     // will actually touch. Ignored changes do not affect indexed state, so
     // they must not deflate the unchanged count.
-    let sources_before = db.stats().map(|s| s.sources).unwrap_or(0);
+    let sources_before = db.stats().map_or(0, |s| s.sources);
     let existing_changed = changes
         .iter()
         .filter(|c| match c {

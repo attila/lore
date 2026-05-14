@@ -9,9 +9,7 @@
 use std::sync::LazyLock;
 
 static IS_DEBUG: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("LORE_DEBUG")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    std::env::var("LORE_DEBUG").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
 });
 
 /// Returns `true` when `LORE_DEBUG` is set to a truthy value.
