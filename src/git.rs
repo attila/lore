@@ -623,7 +623,19 @@ mod tests {
         )
         .unwrap();
 
-        push_branch(dir, &branch).unwrap();
+        // Neutralise inherited GIT_CONFIG_* env vars before pushing.
+        // Sandboxes (e.g. nono) inject URL-rewrite entries via
+        // GIT_CONFIG_COUNT; an empty-string `insteadOf` would rewrite
+        // this local bare-repo URL to ssh://git@github.com/.
+        temp_env::with_vars(
+            [
+                ("GIT_CONFIG_COUNT", Some("0")),
+                ("GIT_CONFIG_GLOBAL", Some("/dev/null")),
+            ],
+            || {
+                push_branch(dir, &branch).unwrap();
+            },
+        );
 
         // Verify content on the bare remote.
         let bare_dir = bare.path();
