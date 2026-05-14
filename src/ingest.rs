@@ -1566,9 +1566,11 @@ fn emit_language_tally(result: &IngestResult, on_progress: &dyn Fn(&str)) {
     let total = result.patterns_total;
     let declared = result.patterns_with_language;
     let fallback = total.saturating_sub(declared);
+    let declared_verb = if declared == 1 { "declares" } else { "declare" };
+    let fallback_verb = if fallback == 1 { "relies" } else { "rely" };
     on_progress(&format!(
-        "Patterns: {total} ingested; {declared} declare language:, \
-         {fallback} fall back to FTS coincidence."
+        "Patterns: {total} ingested; {declared} {declared_verb} a language, \
+         {fallback} {fallback_verb} on body keywords."
     ));
 }
 
@@ -5077,8 +5079,8 @@ mod tests {
             .cloned()
             .expect("coverage tally line must fire at end of full_ingest");
         assert!(tally.contains("2 ingested"));
-        assert!(tally.contains("1 declare language:"));
-        assert!(tally.contains("1 fall back to FTS coincidence"));
+        assert!(tally.contains("1 declares a language"));
+        assert!(tally.contains("1 relies on body keywords"));
     }
 
     #[test]

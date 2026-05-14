@@ -135,8 +135,8 @@ test` infers both JavaScript and TypeScript), they OR-join inside parentheses:
 Patterns can also declare their applicable languages explicitly via the `language:` frontmatter
 field — see [Pattern language declaration](#pattern-language-declaration). Declared patterns reach
 retrieval through a structural gate that matches against the inferred-language set without requiring
-the canonical token to appear in the pattern body; undeclared patterns continue to use the FTS
-coincidence path described here.
+the canonical token to appear in the pattern body; undeclared patterns continue to rely on the
+keyword-matching path described here.
 
 ### What the Engine Cannot See
 
@@ -479,8 +479,8 @@ predicate (`applies_when`) is the categorical complement to that numerical floor
 
 The optional `language:` frontmatter field declares which programming language(s) a pattern is
 about. Declaring it lets lore's retrieval surface the pattern on a relevant tool call even when the
-pattern body never mentions the canonical token in prose. Without a declaration, retrieval falls
-back to FTS coincidence — the pattern surfaces only when its body happens to contain the
+pattern body never mentions the canonical token in prose. Without a declaration, the pattern's
+discoverability depends on body keywords — it surfaces only when its body happens to contain the
 inferred-language word that lore extracts from the tool call.
 
 ### Purpose
@@ -496,6 +496,30 @@ error handling can use prose like "Use anyhow for errors" without the word "rust
 body, and still surface on a Rust file edit. Authors with patterns that already mention the
 canonical token in prose can skip the declaration; lore will continue to find them through the
 fallback path.
+
+### Declaration is for eligibility, not ranking
+
+Declaring `language: rust` does one thing: it tells lore the pattern is about Rust. That makes lore
+_consider_ the pattern on every Rust tool call, even when the body never mentions "rust" in prose.
+It does not, on its own, push the pattern up the ranking.
+
+Once a pattern is eligible, lore decides which patterns are most relevant by where the query words
+land:
+
+- Words in a **heading** carry the most weight (e.g. `## Rust error handling`)
+- Words in **tags** carry the next-most weight (e.g. `tags: [rust, errors]`)
+- Words in the **body** carry the least
+
+So a pattern with `language: rust` and a generic heading like "Use anyhow for application errors"
+will surface on every Rust tool call, but might still rank below an undeclared pattern whose heading
+reads `## Rust error handling` for the same query.
+
+**Practical advice.** Treat the declaration and the heading/tags as separate levers:
+
+1. Declare `language:` so lore always considers the pattern for that language.
+2. Name the language in your heading too — the strongest ranking lever.
+3. Use the language as a tag — second-strongest.
+4. Body mentions are the weakest signal; do not rely on them alone.
 
 ### Syntax
 
@@ -562,8 +586,8 @@ to whichever ecosystem the consumer happens to use. The list captures applicabil
 
 Omit `language:` when the pattern applies to too many languages to enumerate, or when the content is
 language-agnostic (cross-cutting concerns like git workflow, code review etiquette, accessibility
-heuristics). Retrieval falls back to FTS coincidence on the body terms — if the body contains
-relevant vocabulary, lore will still surface the pattern.
+heuristics). Retrieval falls back to body-keyword matching — if the body contains relevant
+vocabulary, lore will still surface the pattern.
 
 ### Composition with `applies_when` and `universal`
 

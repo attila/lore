@@ -139,7 +139,7 @@ column:
    FTS branches use. Take the top `top_k` after filtering. This preserves the structural gate's
    guarantee that wrong-language-labelled patterns cannot sneak in via semantic similarity. When the
    inferred set is empty the filter degenerates to no filter — terms-only retrieval per the "no
-   declaration, FTS coincidence" fallback rule.
+   declaration, match on body keywords" fallback rule.
 
 The two FTS branches are **disjoint by predicate**: a chunk has `language_json IS NULL` xor
 `language_json` containing the inferred lang. No pattern double-counts across the two FTS branches.
@@ -148,11 +148,21 @@ code-organisation choice, not an arithmetic inflation. Each FTS branch carries i
 consistent BM25 weighting against its own MATCH terms; RRF uses positional rank from `enumerate`,
 not raw BM25 score, so cross-branch score commensurability is not a concern.
 
+**Declaration is a gate, not a ranking signal.** The structural branch's MATCH expression contains
+only the enrichment terms — the inferred language tokens never enter the FTS predicate. A declared
+pattern is admitted regardless of body vocabulary, but its rank inside the structural branch is
+decided by how strongly the enrichment terms match the chunk's `title` (BM25 weight 10), `tags` (5),
+and `body` (1). A pattern declaring `language: rust` with prose like "Use anyhow for errors" can
+rank below an undeclared pattern whose heading reads `## Rust error handling` for the same query —
+the declaration ensures eligibility, not dominance. This is intentional: the gate's job is to
+prevent declared patterns from being filtered out by absence of a body keyword, not to override BM25
+ranking inside their branch.
+
 > **Why declare `language:`?** When a pattern's body uses prose that does not happen to repeat the
 > canonical language token, the FTS-fallback branch will miss it. Declaring `language: rust` lets
 > the pattern surface on every Rust tool call regardless of body vocabulary; without the declaration
-> the pattern relies on FTS coincidence — which works for patterns that already mention the
-> canonical token in prose, and fails silently for the rest.
+> the pattern relies on its body containing the canonical keyword — which works for patterns that
+> already mention the language in prose, and fails silently for the rest.
 
 ## FTS5 Search
 
