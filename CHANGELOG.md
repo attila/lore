@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-14
+
 ### Fixed
 
 - `update_pattern` and `append_to_pattern` no longer leave stale chunks in the index when the
