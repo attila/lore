@@ -23,8 +23,14 @@ test:
     cargo test --features test-support
 
 # Run dependency audits
+#
+# `GIT_CONFIG_*` overrides neutralise URL rewrites before gix (used by
+# cargo-deny) fetches the RustSec advisory DB. Without them, a `[url] insteadOf`
+# rule in `~/.gitconfig` or sandbox-injected `GIT_CONFIG_KEY_*` rewrites can
+# turn the HTTPS clone into an SSH one and fail in environments where port 22
+# is blocked.
 deny:
-    cargo deny check
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 cargo deny check
 
 # Build documentation
 doc:
