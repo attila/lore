@@ -41,7 +41,7 @@
       reason, forcing Claude to retry with conventions visible. Requires solid deduplication to
       avoid infinite loops (see
       `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
-- [ ] Predicated-universal dedup behaviour — revisit `src/hook.rs`'s
+- [ ] Predicated-universal deduplication behaviour — revisit `src/hook.rs`'s
       `r.is_universal || !seen.contains(&r.id)` filter in `dedup_filter_and_record` once Track 2
       observability data is in. Track 1B deliberately kept the bypass for predicated universals as a
       Key Technical Decision (intent: re-inject on every matching call), but ~45 KB/session of

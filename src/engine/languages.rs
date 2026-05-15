@@ -126,12 +126,17 @@ pub fn is_known_token(token: &str) -> bool {
 /// Returns the human-readable `display_name` for `token`, falling back
 /// to `token` itself when no entry matches.
 ///
-/// Used by surfaces that render language tokens to operators (currently
-/// `lore status`). The fallback covers the case where a stored
-/// `language_json` array contains a token the table does not (yet)
-/// cover — for example, a knowledge base ingested while pinned to a
-/// newer language pack than the running binary. Returning the raw
-/// token keeps the output legible rather than silently dropping it.
+/// Suitable for any surface that renders language tokens to operators.
+/// The fallback covers the case where a stored `language_json` array
+/// contains a token the table does not (yet) cover — for example, a
+/// knowledge base ingested while pinned to a newer language pack than
+/// the running binary. Returning the raw token keeps the output
+/// legible rather than silently dropping it.
+///
+/// The returned slice's lifetime is tied to `token`: known tokens
+/// return a `&'static str` borrowed from [`LANGUAGES`]; unknown tokens
+/// return the input slice unchanged. Callers that need to own the
+/// result should clone it.
 pub fn display_name_for(token: &str) -> &str {
     LANGUAGES
         .iter()

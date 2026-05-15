@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `lore status` now reports a per-language source-count breakdown plus an `undeclared` bucket, so
+  operators can see at a glance how much of the knowledge base participates in the structural
+  language gate. (#)
+
 ## [0.3.1] - 2026-05-14
 
 ### Fixed

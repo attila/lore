@@ -704,11 +704,9 @@ impl KnowledgeDB {
     /// avoids needing `COUNT(DISTINCT source_file)` and matches the
     /// authorial view used by [`KnowledgeDB::stats`].
     ///
-    /// Multi-language sources (`language_json` is a JSON array) appear
-    /// once per declared token via `json_each`, so the sum of declared
-    /// counts plus `undeclared` can exceed `DBStats::sources`. This is
-    /// the intended semantics — `lore status` surfaces gate coverage
-    /// per language, not a partition of sources.
+    /// Returns a [`LanguageCounts`]; see that type for field semantics
+    /// (multi-bucket counting and the bucket-sum-exceeds-sources rule
+    /// live in one place).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn language_counts(&self) -> anyhow::Result<LanguageCounts> {
         let mut declared_stmt = self.conn.prepare(
@@ -1845,14 +1843,15 @@ mod tests {
     }
 
     #[test]
-    fn language_counts_multiple_chunks_same_source_count_source_once() {
+    fn language_counts_reads_patterns_not_chunks() {
         let db = open_memory_db(4);
         db.init().unwrap();
 
         // Seed the patterns row for "a.md" once, then add a second chunk
         // pointing at the same source. The aggregate reads from
-        // `patterns` so the source must only contribute one "rust"
-        // increment regardless of how many chunks share it.
+        // `patterns` (where `source_file` is the primary key) so the
+        // source must only contribute one "rust" increment regardless of
+        // how many chunks share it — no `COUNT(DISTINCT)` needed.
         seed_pattern_and_chunk(
             &db,
             &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
