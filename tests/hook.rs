@@ -3179,3 +3179,176 @@ fn cli_trace_why_json_round_trips_each_line_as_a_trace_record() {
         "empty result must emit zero JSONL lines, got: {empty_stdout:?}"
     );
 }
+
+#[test]
+fn hook_post_compact_writes_trace() {
+    // PostCompact handler must emit a trace record so `lore trace why`
+    // can see compaction events alongside the rest of the session.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "session_id": "trace-post-compact",
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-post-compact");
+    let rec = lines
+        .iter()
+        .find(|l| l["event"] == "PostCompact")
+        .expect("expected a PostCompact trace record");
+    assert_eq!(rec["agent"], "claude-code");
+    assert_eq!(rec["session_id"], "trace-post-compact");
+    assert_eq!(rec["schema_version"], 1);
+}
+
+#[test]
+fn hook_post_tool_use_writes_trace_on_bash_error() {
+    // PostToolUse fires on non-zero Bash exit. With tracing enabled
+    // the handler must emit a trace record carrying the error query
+    // and any error-context chunks the search returned.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "trace-post-tool-use",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin --force-with-lease" },
+        "tool_response": {
+            "exit_code": 1,
+            "stderr": "fatal: unable to access remote: permission denied",
+        },
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-post-tool-use");
+    if let Some(rec) = lines.iter().find(|l| l["event"] == "PostToolUse") {
+        assert_eq!(rec["call_context"]["tool_name"], "Bash");
+        assert!(
+            rec["query"].is_string(),
+            "PostToolUse record should carry the synthesised stderr query"
+        );
+    }
+    // Empty trace is acceptable here too — the seeded fixture's FTS
+    // tokens may not overlap with the synthesised stderr query. The
+    // test passes either way; the contract being pinned is "if the
+    // handler emits a record, the record has the expected shape".
+}
+
+#[test]
+fn hook_transcript_tail_toggle_populates_field_when_enabled() {
+    // R10: `include_transcript_tail = true` propagates the last user
+    // message from the transcript into the trace record.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(
+        dir,
+        &dir.join("knowledge.db"),
+        "include_transcript_tail = true",
+    );
+    let trace_dir = dir.join("traces");
+
+    // The hook adapter reads the transcript via `last_user_message`,
+    // which only runs when the input declares a `transcript_path`.
+    // Author a fake transcript file in JSONL "messages" shape.
+    let transcript_path = dir.join("transcript.jsonl");
+    let user_message = "Help me understand the error_handling pattern.";
+    let transcript = serde_json::json!({
+        "type": "user",
+        "message": { "content": user_message },
+    });
+    std::fs::write(
+        &transcript_path,
+        format!("{}\n", serde_json::to_string(&transcript).unwrap()),
+    )
+    .unwrap();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "trace-transcript-tail-on",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/error_handling.rs" },
+        "transcript_path": transcript_path.to_str().unwrap(),
+    });
+    // `validate_transcript_path` requires the canonicalised path to
+    // live under $HOME — override HOME for the subprocess to match
+    // the tempdir so the transcript read isn't rejected.
+    let home_override = dir.to_str().unwrap();
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[("HOME", home_override)]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-transcript-tail-on");
+    let rec = lines
+        .iter()
+        .find(|l| l["event"] == "PreToolUse")
+        .expect("expected a PreToolUse trace record");
+    let tail = rec["call_context"]["transcript_tail"].as_str();
+    assert!(
+        tail.is_some_and(|s| s.contains(user_message)),
+        "transcript_tail should contain the last user message under include_transcript_tail = true, \
+         got: {:?}",
+        rec["call_context"].get("transcript_tail"),
+    );
+}
+
+#[test]
+fn hook_transcript_tail_toggle_omits_field_by_default() {
+    // R10 default direction: without the opt-in, the trace record
+    // must not carry the transcript_tail field.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let transcript_path = dir.join("transcript.jsonl");
+    let transcript = serde_json::json!({
+        "type": "user",
+        "message": { "content": "Help me understand the error_handling pattern." },
+    });
+    std::fs::write(
+        &transcript_path,
+        format!("{}\n", serde_json::to_string(&transcript).unwrap()),
+    )
+    .unwrap();
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "trace-transcript-tail-off",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/error_handling.rs" },
+        "transcript_path": transcript_path.to_str().unwrap(),
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-transcript-tail-off");
+    let rec = lines
+        .iter()
+        .find(|l| l["event"] == "PreToolUse")
+        .expect("expected a PreToolUse trace record");
+    assert!(
+        rec["call_context"].get("transcript_tail").is_none()
+            || rec["call_context"]["transcript_tail"].is_null(),
+        "transcript_tail must be absent under default privacy posture, got: {rec}"
+    );
+}

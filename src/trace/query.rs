@@ -365,4 +365,163 @@ mod tests {
         assert!(text.contains("session=s2"));
         assert!(text.contains("---"));
     }
+
+    #[test]
+    fn collect_reads_gzipped_session_file_transparently() {
+        // A session whose `.jsonl` has been gzipped by the maintenance
+        // pass must still be readable via `collect()` — gzip
+        // transparency is the whole point of the `.gz` successor.
+        let dir = tempfile::tempdir().unwrap();
+        let trace_dir = dir.path().join("traces-gz");
+        append_record(&trace_dir, &sample("s1"));
+        append_record(&trace_dir, &sample("s1"));
+        let raw_path = super::super::writer::trace_file_path(&trace_dir, "s1");
+        let raw = std::fs::read(&raw_path).unwrap();
+        // Gzip the file in place by writing the gz successor and
+        // removing the source — mirrors what `maintenance::gzip_file`
+        // does in production.
+        let gz_path = raw_path.with_extension("jsonl.gz");
+        let gz_file = std::fs::File::create(&gz_path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        enc.finish().unwrap();
+        std::fs::remove_file(&raw_path).unwrap();
+        let records = collect(&trace_dir, Some("s1"), None, None, None, None).unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "gzipped session must read back as two records, got: {records:?}"
+        );
+    }
+
+    #[test]
+    fn collect_skips_malformed_lines_without_aborting() {
+        // A torn / corrupt line in a trace file (NFS interleave, partial
+        // write, manual edit gone wrong) must not abort the read. The
+        // surrounding valid records still surface; the malformed line
+        // is reported via stderr under the diagnostics flag.
+        let dir = tempfile::tempdir().unwrap();
+        let trace_dir = dir.path().join("traces-malformed");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        let path = super::super::writer::trace_file_path(&trace_dir, "s1");
+        let valid = serde_json::to_string(&sample("s1")).unwrap();
+        let content = format!("{valid}\n{{not valid json}}\n{valid}\n");
+        std::fs::write(&path, content).unwrap();
+        let records =
+            collect_with_diagnostics(&trace_dir, Some("s1"), None, None, None, None, false)
+                .unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "expected the two valid records, malformed line should be skipped, got: {records:?}"
+        );
+    }
+
+    #[test]
+    fn pretty_print_sanitises_control_characters_in_session_id() {
+        // Defence against terminal-control-sequence injection: a
+        // tampered session_id containing ANSI escapes must render as
+        // an escaped literal, not drive the operator's terminal.
+        let rec = TraceRecord::PostCompact(PostCompactRecord {
+            schema_version: SCHEMA_VERSION,
+            ts: "2026-05-15T14:23:01.234Z".to_string(),
+            session_id: "\x1b[2Jevil".to_string(),
+            agent: AGENT_CLAUDE_CODE.to_string(),
+            duration_ms: 5,
+        });
+        let mut buf = Vec::new();
+        pretty_print(&mut buf, &[rec]).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains('\x1b'),
+            "raw ESC byte must not reach the terminal, got: {text:?}"
+        );
+        assert!(
+            text.contains("evil"),
+            "the visible suffix must survive sanitisation, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn collect_combined_filters_compose() {
+        // --event + --tool + --agent are AND-combined; a record must
+        // pass all three filters to land in the output.
+        use super::super::record::{CallContextSnapshot, ConfigSnapshot, Phases, PreToolUseRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let trace_dir = dir.path().join("traces-combined");
+
+        let pre_bash = TraceRecord::PreToolUse(PreToolUseRecord {
+            schema_version: SCHEMA_VERSION,
+            ts: "2026-05-15T14:00:00.000Z".to_string(),
+            session_id: "s1".to_string(),
+            agent: AGENT_CLAUDE_CODE.to_string(),
+            call_context: CallContextSnapshot {
+                tool_name: "Bash".to_string(),
+                command_head: Some("git".to_string()),
+                command_full: None,
+                file_path: None,
+                description: None,
+                inferred_languages: vec![],
+                transcript_tail: None,
+            },
+            query: None,
+            candidates: vec![],
+            injected: vec![],
+            config: ConfigSnapshot {
+                hybrid: true,
+                top_k: 5,
+                min_relevance: 0.6,
+                min_relevance_universal: 0.6,
+                embedder_model: "nomic-embed-text".to_string(),
+            },
+            ollama: None,
+            duration_ms: 1,
+            phases: Phases::default(),
+        });
+        append_record(&trace_dir, &pre_bash);
+        // A PostCompact record in the same session that should NOT
+        // match an --event PreToolUse filter.
+        append_record(&trace_dir, &sample("s1"));
+
+        // Event-only filter retains the Bash record.
+        let event_only =
+            collect(&trace_dir, Some("s1"), None, Some("PreToolUse"), None, None).unwrap();
+        assert_eq!(event_only.len(), 1, "event filter alone keeps PreToolUse");
+
+        // Event + tool match the same record.
+        let event_tool = collect(
+            &trace_dir,
+            Some("s1"),
+            None,
+            Some("PreToolUse"),
+            Some("Bash"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(event_tool.len(), 1);
+
+        // Event + tool + agent — composes positively.
+        let event_tool_agent = collect(
+            &trace_dir,
+            Some("s1"),
+            None,
+            Some("PreToolUse"),
+            Some("Bash"),
+            Some(AGENT_CLAUDE_CODE),
+        )
+        .unwrap();
+        assert_eq!(event_tool_agent.len(), 1);
+
+        // Event + agent with a wrong tool — composes negatively.
+        let mismatched_tool = collect(
+            &trace_dir,
+            Some("s1"),
+            None,
+            Some("PreToolUse"),
+            Some("Edit"),
+            Some(AGENT_CLAUDE_CODE),
+        )
+        .unwrap();
+        assert_eq!(mismatched_tool.len(), 0);
+    }
 }
