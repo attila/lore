@@ -6,8 +6,9 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
-use lore::database::KnowledgeDB;
+use lore::database::{KnowledgeDB, LanguageCounts};
 use lore::embeddings::{Embedder, OllamaClient};
+use lore::engine::languages::display_name_for;
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -725,6 +726,36 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Render the value portion of the `Languages:` status line, or `None`
+/// when the line should be suppressed (no declared languages and no
+/// undeclared sources — empty database).
+///
+/// Declared entries sort by count descending with an alphabetical
+/// tiebreak on the rendered display name (per R4 — operators see the
+/// display name, not the token, so ties must order against what they
+/// read). The `undeclared` bucket, when non-zero, always renders last.
+fn format_languages_line(counts: &LanguageCounts) -> Option<String> {
+    if counts.declared.is_empty() && counts.undeclared == 0 {
+        return None;
+    }
+
+    let mut entries: Vec<(&str, usize)> = counts
+        .declared
+        .iter()
+        .map(|(token, count)| (display_name_for(token), *count))
+        .collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut parts: Vec<String> = entries
+        .iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect();
+    if counts.undeclared > 0 {
+        parts.push(format!("undeclared {}", counts.undeclared));
+    }
+    Some(parts.join(", "))
+}
+
 #[allow(clippy::unnecessary_wraps)]
 fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
     let Ok(config) = Config::load(config_path) else {
@@ -778,6 +809,12 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  Chunks:       {}", stats.chunks);
         eprintln!("  Sources:      {}", stats.sources);
 
+        if let Ok(counts) = db.language_counts()
+            && let Some(line) = format_languages_line(&counts)
+        {
+            eprintln!("  Languages:    {line}");
+        }
+
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
             let short = git::short_sha(&config.knowledge_dir, &sha);
             eprintln!("  Last commit:  {short}");
@@ -823,5 +860,66 @@ mod tests {
         // `lore ingest --file path` without `--force`; orthogonal to schema.
         let path = Path::new("draft.md");
         assert!(!should_skip_schema_probe(false, Some(path)));
+    }
+
+    // -- format_languages_line ----------------------------------------------
+
+    fn counts(declared: &[(&str, usize)], undeclared: usize) -> LanguageCounts {
+        LanguageCounts {
+            declared: declared
+                .iter()
+                .map(|(t, n)| ((*t).to_string(), *n))
+                .collect(),
+            undeclared,
+        }
+    }
+
+    #[test]
+    fn format_languages_line_returns_none_when_no_sources() {
+        assert!(format_languages_line(&counts(&[], 0)).is_none());
+    }
+
+    #[test]
+    fn format_languages_line_all_declared_no_undeclared() {
+        let line = format_languages_line(&counts(&[("rust", 12), ("yaml", 3)], 0)).unwrap();
+        assert_eq!(line, "Rust 12, YAML 3");
+    }
+
+    #[test]
+    fn format_languages_line_all_undeclared_no_declared() {
+        let line = format_languages_line(&counts(&[], 5)).unwrap();
+        assert_eq!(line, "undeclared 5");
+    }
+
+    #[test]
+    fn format_languages_line_mixed_sorts_count_desc_undeclared_last() {
+        let line =
+            format_languages_line(&counts(&[("yaml", 3), ("rust", 12), ("typescript", 5)], 5))
+                .unwrap();
+        assert_eq!(line, "Rust 12, TypeScript 5, YAML 3, undeclared 5");
+    }
+
+    #[test]
+    fn format_languages_line_alphabetical_tiebreak_on_display_name() {
+        // Equal counts: alphabetical tiebreak applies to the rendered
+        // display name (`Rust` < `TypeScript`), not the raw token.
+        let line = format_languages_line(&counts(&[("typescript", 5), ("rust", 5)], 0)).unwrap();
+        assert_eq!(line, "Rust 5, TypeScript 5");
+    }
+
+    #[test]
+    fn format_languages_line_resolves_display_names() {
+        // `golang` -> `Go` is the only token whose display name differs
+        // beyond casing, so it's the canary for display-name resolution.
+        let line = format_languages_line(&counts(&[("golang", 4)], 0)).unwrap();
+        assert_eq!(line, "Go 4");
+    }
+
+    #[test]
+    fn format_languages_line_unknown_token_falls_back_to_raw_token() {
+        // A token not in LANGUAGES (e.g. a knowledge base ingested with
+        // a newer pack than the binary covers) renders as-is.
+        let line = format_languages_line(&counts(&[("kotlin", 2)], 0)).unwrap();
+        assert_eq!(line, "kotlin 2");
     }
 }

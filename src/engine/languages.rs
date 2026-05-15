@@ -123,6 +123,22 @@ pub fn is_known_token(token: &str) -> bool {
     LANGUAGES.iter().any(|entry| entry.token == token)
 }
 
+/// Returns the human-readable `display_name` for `token`, falling back
+/// to `token` itself when no entry matches.
+///
+/// Used by surfaces that render language tokens to operators (currently
+/// `lore status`). The fallback covers the case where a stored
+/// `language_json` array contains a token the table does not (yet)
+/// cover — for example, a knowledge base ingested while pinned to a
+/// newer language pack than the running binary. Returning the raw
+/// token keeps the output legible rather than silently dropping it.
+pub fn display_name_for(token: &str) -> &str {
+    LANGUAGES
+        .iter()
+        .find(|entry| entry.token == token)
+        .map_or(token, |entry| entry.display_name)
+}
+
 /// Iterate over `LANGUAGES` collecting the canonical tokens of every
 /// entry whose `extensions` slice contains `ext` (matched after
 /// `ext.to_lowercase()`).
@@ -272,5 +288,22 @@ mod tests {
         // Display names are not tokens — authors must type the token.
         assert!(!is_known_token("Rust"));
         assert!(!is_known_token("Go"));
+    }
+
+    #[test]
+    fn display_name_for_resolves_known_tokens() {
+        assert_eq!(display_name_for("rust"), "Rust");
+        assert_eq!(display_name_for("typescript"), "TypeScript");
+        assert_eq!(display_name_for("javascript"), "JavaScript");
+        assert_eq!(display_name_for("yaml"), "YAML");
+        assert_eq!(display_name_for("python"), "Python");
+        // `golang` is the canonical token; "Go" is the display name.
+        assert_eq!(display_name_for("golang"), "Go");
+    }
+
+    #[test]
+    fn display_name_for_falls_back_to_raw_token_when_unknown() {
+        assert_eq!(display_name_for("kotlin"), "kotlin");
+        assert_eq!(display_name_for(""), "");
     }
 }
