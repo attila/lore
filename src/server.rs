@@ -508,6 +508,12 @@ fn tool_definitions() -> Value {
                              knowledge_dir, knowledge_dir_status (\"populated\", \"empty\", \
                              or \"missing\"), empty_knowledge_dir (bool), git_repository, \
                              last_ingested_commit, chunks_indexed, sources_indexed, \
+                             languages_declared (token -> source-count map matching the \
+                             `language:` frontmatter surface, e.g. \
+                             `{\"rust\": 12, \"typescript\": 5}`; multi-language sources \
+                             count in each declared bucket so the sum can exceed \
+                             sources_indexed), languages_undeclared (integer count of \
+                             sources with no `language:` declaration), \
                              inbox_workflow_configured, delta_ingest_available, \
                              loreignore_active, and universal_advisories (count, \
                              oversized bodies, near-miss tags from the most recent full or \
@@ -1061,6 +1067,18 @@ fn handle_lore_status(
     let stats = ctx.db.stats().ok();
     let chunks = stats.as_ref().map(|s| s.chunks);
     let sources = stats.as_ref().map(|s| s.sources);
+    let language_counts = ctx.db.language_counts().ok();
+    // Token-keyed map (`{"rust": 12, "typescript": 5}`) matching the
+    // canonical `language:` frontmatter surface. Agents tagging new
+    // patterns or debugging the structural language gate read the same
+    // tokens here that they would write into a pattern's frontmatter.
+    let languages_declared = language_counts.as_ref().map(|lc| {
+        lc.declared
+            .iter()
+            .map(|(token, count)| (token.clone(), json!(count)))
+            .collect::<serde_json::Map<_, _>>()
+    });
+    let languages_undeclared = language_counts.as_ref().map(|lc| lc.undeclared);
     let inbox_workflow_configured = ctx.config.inbox_branch_prefix().is_some();
     let delta_ingest_available = is_git_repo && last_commit.is_some();
     // Compute the effective scan state in a single pass. `effective_scan_state`
@@ -1103,6 +1121,8 @@ fn handle_lore_status(
         "last_ingested_commit": last_commit,
         "chunks_indexed": chunks,
         "sources_indexed": sources,
+        "languages_declared": languages_declared,
+        "languages_undeclared": languages_undeclared,
         "inbox_workflow_configured": inbox_workflow_configured,
         "delta_ingest_available": delta_ingest_available,
         "loreignore_active": loreignore_active,
@@ -1139,6 +1159,17 @@ fn handle_lore_status(
             "absent"
         },
     );
+
+    // Append the same Languages: breakdown the CLI surfaces, when the
+    // database has anything to report. Suppression mirrors
+    // `lore status`: silent when the database is empty.
+    let summary = if let Some(lc) = language_counts.as_ref()
+        && let Some(line) = crate::status::format_languages_line(lc)
+    {
+        format!("{summary} Languages: {line}.")
+    } else {
+        summary
+    };
 
     let summary_with_fence = maybe_append_lore_metadata_fence(summary, &metadata, include_metadata);
     text_response(req, &summary_with_fence)
@@ -2700,6 +2731,84 @@ mod tests {
         assert!(
             text.contains("(populated)"),
             "summary should mention the populated state, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_surfaces_language_breakdown_to_agents() {
+        // Arrange: seed three patterns — one Rust, one multi-language
+        // (Rust + TypeScript), and one with no `language:` declaration.
+        let h = TestHarness::new();
+        let upsert = |source: &str, language_json: Option<String>| {
+            h.db.upsert_pattern(&crate::chunking::PatternRow {
+                source_file: source.to_string(),
+                title: source.to_string(),
+                tags: String::new(),
+                is_universal: false,
+                raw_body: format!("body for {source}"),
+                content_hash: "0000000000000000".into(),
+                applies_when_json: None,
+                language_json,
+            })
+            .unwrap();
+        };
+        upsert("a.md", Some(r#"["rust"]"#.into()));
+        upsert("b.md", Some(r#"["rust","typescript"]"#.into()));
+        upsert("c.md", None);
+
+        // Act
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":62,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        );
+
+        // Assert: JSON metadata carries token-keyed counts (bucket sum 3
+        // exceeds sources_indexed 2 — that is the intended multi-bucket
+        // semantics).
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["sources_indexed"], 3);
+        assert_eq!(metadata["languages_declared"]["rust"], 2);
+        assert_eq!(metadata["languages_declared"]["typescript"], 1);
+        assert!(metadata["languages_declared"].get("javascript").is_none());
+        assert_eq!(metadata["languages_undeclared"], 1);
+
+        // Assert: prose summary mentions the rendered Languages line
+        // (display names, count-desc, alphabetical tiebreak, undeclared last).
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Languages: Rust 2, TypeScript 1, undeclared 1."),
+            "summary should include rendered Languages line, got: {text}"
+        );
+    }
+
+    #[test]
+    fn lore_status_suppresses_language_line_when_db_empty() {
+        // No patterns seeded — empty bucket suppression applies on both
+        // the prose summary and the JSON map (which is present but empty).
+        let h = TestHarness::new();
+
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":63,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["languages_undeclared"], 0);
+        // `languages_declared` is present but an empty map — agents can
+        // pattern-match on emptiness rather than absence.
+        assert!(metadata["languages_declared"].is_object());
+        assert_eq!(metadata["languages_declared"].as_object().unwrap().len(), 0);
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("Languages:"),
+            "summary should suppress Languages line on empty DB, got: {text}"
         );
     }
 
