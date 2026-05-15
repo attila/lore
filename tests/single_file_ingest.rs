@@ -85,9 +85,70 @@ fn single_file_ingest(
     )
 }
 
+/// Write a markdown file with a language frontmatter block.
+fn write_md_with_language(dir: &Path, name: &str, language_yaml: &str) {
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let body = format!(
+        "---\n{language_yaml}\ntags: [test]\n---\n\n# Test\n\nBody text long enough to chunk.\n"
+    );
+    fs::write(&path, body).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Invariant: every chunk under a given `source_file` carries the same
+/// `language_json` value as the parent `patterns` row.
+///
+/// The new `KnowledgeDB::language_counts` aggregate reads from
+/// `patterns`; the structural retrieval gate reads from `chunks`. The
+/// two copies must stay in sync — drift would let `lore status` and
+/// the search gate disagree silently. Exercises the real production
+/// ingest path so any future write-side change that forgets either
+/// table is caught here.
+#[test]
+fn language_json_invariant_patterns_and_chunks_columns_stay_in_sync() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Three patterns spanning the realistic surface: a single-language
+    // declaration, a multi-language declaration, and no `language:` at
+    // all (column should be NULL on both tables).
+    write_md_with_language(dir, "rust-only.md", "language: rust");
+    write_md_with_language(dir, "multi.md", "language: [rust, typescript]");
+    write_md(dir, "untagged.md", "Untagged", "Plain body");
+
+    let db = memory_db();
+    single_file_ingest(&db, dir, "rust-only.md", false);
+    single_file_ingest(&db, dir, "multi.md", false);
+    single_file_ingest(&db, dir, "untagged.md", false);
+
+    for source in &["rust-only.md", "multi.md", "untagged.md"] {
+        let pattern_json = db
+            .pattern_language_json_for_source(source)
+            .unwrap()
+            .expect("patterns row exists after ingest");
+        let chunks = db.chunks_by_sources(&[source]).unwrap();
+        assert!(
+            !chunks.is_empty(),
+            "expected at least one chunk for source `{source}`"
+        );
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.language_json.as_deref(),
+                pattern_json.as_deref(),
+                "language_json drift for source `{source}`, chunk `{}`: \
+                 patterns has {pattern_json:?}, chunk has {:?}",
+                chunk.id,
+                chunk.language_json,
+            );
+        }
+    }
+}
 
 #[test]
 fn uncommitted_file_in_non_git_dir_is_indexed_and_searchable() {
