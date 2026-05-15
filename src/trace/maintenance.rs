@@ -227,13 +227,16 @@ fn enumerate_trace_files(
         if path.file_name().and_then(|s| s.to_str()) == Some(LAST_PRUNED_AT_FILE) {
             continue;
         }
-        // `symlink_metadata` so symlinked entries are visible as
-        // symlinks rather than followed — the maintenance pass must
-        // not chase a symlink out of the trace directory.
-        let Ok(meta) = entry.metadata() else {
+        // Use `symlink_metadata` (lstat) so a symlink looks like a
+        // symlink rather than its target. The maintenance pass must
+        // not gzip/delete files outside the trace directory; an
+        // operator who symlinks `~/.bashrc` into the trace dir would
+        // otherwise see lore eat the target after the retention
+        // horizon. Skip both symlinks and non-files outright.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.is_file() {
+        if meta.is_symlink() || !meta.is_file() {
             continue;
         }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -414,5 +417,36 @@ mod tests {
         // No state file → lazy runs immediately, but the cap bounds it.
         let summary = run_lazy(&trace_dir, 30, 0);
         assert_eq!(summary.deleted, MAX_PRUNE_PER_RUN);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_skips_symlinked_entries() {
+        // An operator-placed symlink in the trace directory must not be
+        // chased by the maintenance pass: gzipping the target and
+        // deleting it after the retention horizon would consume files
+        // outside the lore-managed state tier.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+
+        // A regular old file that SHOULD be pruned.
+        let real = trace_dir.join("real.jsonl");
+        touch_with_age(&real, 60);
+
+        // An external file that the operator symlinked into the dir.
+        let external = tmp.path().join("external.jsonl");
+        touch_with_age(&external, 60);
+        let symlink = trace_dir.join("via-symlink.jsonl");
+        std::os::unix::fs::symlink(&external, &symlink).unwrap();
+
+        let summary = run_manual(&trace_dir, 30, 0);
+        assert_eq!(summary.deleted, 1, "only the real file should be deleted");
+        assert!(!real.exists(), "real file should be deleted");
+        assert!(symlink.exists(), "symlink itself should be left alone");
+        assert!(
+            external.exists(),
+            "symlink target must not be touched outside the trace dir"
+        );
     }
 }
