@@ -743,8 +743,16 @@ impl KnowledgeDB {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        // A pattern with `language_json = '[]'` (empty JSON array)
+        // carries no actionable language signal — `json_each` yields no
+        // rows for it, so the declared query already excludes it. Roll
+        // it into the undeclared bucket here so it doesn't vanish from
+        // both sides of the breakdown. The ingest validator should make
+        // empty arrays unreachable in practice, but the read side stays
+        // forgiving.
         let undeclared: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM patterns WHERE language_json IS NULL",
+            "SELECT COUNT(*) FROM patterns \
+             WHERE language_json IS NULL OR json_array_length(language_json) = 0",
             [],
             |row| row.get(0),
         )?;
@@ -1860,6 +1868,49 @@ mod tests {
         let mut declared = counts.declared;
         declared.sort();
         assert_eq!(declared, vec![lc("rust", 1), lc("yaml", 1)]);
+    }
+
+    #[test]
+    fn language_counts_empty_array_language_json_counts_as_undeclared() {
+        // `language_json = '[]'` is a degenerate state — non-NULL but
+        // carries no language signal. Without the empty-array branch,
+        // such a source vanishes from both the declared buckets (no
+        // json_each rows) and the undeclared bucket (`IS NULL` filter
+        // misses it). Defence-in-depth: roll it into `undeclared` so
+        // the operator still sees the source somewhere.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Seed via upsert_pattern directly so we can plant the exact
+        // `'[]'` value the validator would normally reject.
+        db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: "empty.md".to_string(),
+            title: "Empty".into(),
+            tags: String::new(),
+            is_universal: false,
+            raw_body: "body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+            language_json: Some("[]".to_string()),
+        })
+        .unwrap();
+        // And one with a real declared language so the empty-array
+        // pattern doesn't camouflage as the only source.
+        db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: "rust.md".to_string(),
+            title: "Rust".into(),
+            tags: String::new(),
+            is_universal: false,
+            raw_body: "body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+            language_json: Some(r#"["rust"]"#.to_string()),
+        })
+        .unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.declared, vec![lc("rust", 1)]);
+        assert_eq!(counts.undeclared, 1);
     }
 
     #[test]
