@@ -91,6 +91,23 @@ pub struct DBStats {
     pub sources: usize,
 }
 
+/// Per-language source counts plus the count of sources with no
+/// `language:` declaration. Returned by [`KnowledgeDB::language_counts`]
+/// and rendered by `lore status` to show how much of the knowledge base
+/// participates in the structural language gate.
+///
+/// `declared` holds `(token, count)` pairs as returned by SQL, where
+/// `token` is the canonical FTS5-safe identifier from `language_json`
+/// (e.g. `"rust"`, `"typescript"`). Sorting and display-name resolution
+/// happen at the call site so this struct stays I/O-shaped. A
+/// multi-language source (`language: [rust, typescript]`) contributes a
+/// `+1` to each token bucket it declares, so the sum of `declared`
+/// counts plus `undeclared` can exceed `DBStats::sources`.
+pub struct LanguageCounts {
+    pub declared: Vec<(String, usize)>,
+    pub undeclared: usize,
+}
+
 /// One entry per source document, used by `lore list` and the MCP
 /// `list_patterns` tool.
 ///
@@ -674,6 +691,49 @@ impl KnowledgeDB {
             chunks: chunks as usize,
             #[allow(clippy::cast_possible_truncation)]
             sources: sources as usize,
+        })
+    }
+
+    /// Per-language source counts plus the undeclared bucket.
+    ///
+    /// Reads the `patterns` table directly — it is 1:1 with source files
+    /// (`source_file` is the primary key), so each row contributes
+    /// exactly once to either a declared language bucket or to
+    /// `undeclared`. The `chunks` table carries the same `language_json`
+    /// denormalised for retrieval queries; aggregating from `patterns`
+    /// avoids needing `COUNT(DISTINCT source_file)` and matches the
+    /// authorial view used by [`KnowledgeDB::stats`].
+    ///
+    /// Multi-language sources (`language_json` is a JSON array) appear
+    /// once per declared token via `json_each`, so the sum of declared
+    /// counts plus `undeclared` can exceed `DBStats::sources`. This is
+    /// the intended semantics — `lore status` surfaces gate coverage
+    /// per language, not a partition of sources.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn language_counts(&self) -> anyhow::Result<LanguageCounts> {
+        let mut declared_stmt = self.conn.prepare(
+            "SELECT je.value AS token, COUNT(*) AS n \
+             FROM patterns p, json_each(p.language_json) je \
+             WHERE p.language_json IS NOT NULL \
+             GROUP BY je.value",
+        )?;
+        let declared = declared_stmt
+            .query_map([], |row| {
+                let token: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((token, count as usize))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let undeclared: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM patterns WHERE language_json IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(LanguageCounts {
+            declared,
+            undeclared: undeclared as usize,
         })
     }
 
@@ -1652,6 +1712,161 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 3);
         assert_eq!(stats.sources, 2);
+    }
+
+    // -- language_counts --------------------------------------------------
+
+    /// Helper: build a chunk pre-tagged with a `language_json` array.
+    /// `tokens` are the canonical FTS5-safe identifiers stored in the
+    /// JSON array (e.g. `["rust"]`, `["rust", "typescript"]`).
+    fn make_chunk_with_language(
+        id: &str,
+        title: &str,
+        body: &str,
+        source: &str,
+        tokens: &[&str],
+    ) -> Chunk {
+        let mut chunk = make_chunk(id, title, body, source);
+        let json = serde_json::to_string(tokens).expect("token array serialises");
+        chunk.language_json = Some(json);
+        chunk
+    }
+
+    #[test]
+    fn language_counts_empty_db_returns_zero_buckets() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert!(counts.declared.is_empty());
+        assert_eq!(counts.undeclared, 0);
+    }
+
+    #[test]
+    fn language_counts_single_language_sources_only() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c2", "T2", "Body two", "b.md", &["rust"]),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c3", "T3", "Body three", "c.md", &["typescript"]),
+            None,
+        );
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+
+        let mut declared = counts.declared;
+        declared.sort();
+        assert_eq!(
+            declared,
+            vec![("rust".to_string(), 2), ("typescript".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn language_counts_all_undeclared_sources() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(&db, &make_chunk("c1", "T1", "Body one", "a.md"), None);
+        seed_pattern_and_chunk(&db, &make_chunk("c2", "T2", "Body two", "b.md"), None);
+
+        let counts = db.language_counts().unwrap();
+        assert!(counts.declared.is_empty());
+        assert_eq!(counts.undeclared, 2);
+    }
+
+    #[test]
+    fn language_counts_multi_language_source_counts_in_each_bucket() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // One source declaring two languages — should add +1 to each
+        // bucket, so the bucket sum (2) exceeds the source count (1).
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust", "typescript"]),
+            None,
+        );
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+
+        let mut declared = counts.declared;
+        declared.sort();
+        assert_eq!(
+            declared,
+            vec![("rust".to_string(), 1), ("typescript".to_string(), 1)]
+        );
+
+        let bucket_sum: usize = declared.iter().map(|(_, n)| n).sum();
+        let stats = db.stats().unwrap();
+        assert!(bucket_sum > stats.sources);
+    }
+
+    #[test]
+    fn language_counts_mixed_declared_and_undeclared() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c2", "T2", "Body two", "b.md", &["yaml"]),
+            None,
+        );
+        seed_pattern_and_chunk(&db, &make_chunk("c3", "T3", "Body three", "c.md"), None);
+        seed_pattern_and_chunk(&db, &make_chunk("c4", "T4", "Body four", "d.md"), None);
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 2);
+
+        let mut declared = counts.declared;
+        declared.sort();
+        assert_eq!(
+            declared,
+            vec![("rust".to_string(), 1), ("yaml".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn language_counts_multiple_chunks_same_source_count_source_once() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Seed the patterns row for "a.md" once, then add a second chunk
+        // pointing at the same source. The aggregate reads from
+        // `patterns` so the source must only contribute one "rust"
+        // increment regardless of how many chunks share it.
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
+            None,
+        );
+        db.insert_chunk(
+            &make_chunk_with_language("c2", "T2", "Body two", "a.md", &["rust"]),
+            None,
+        )
+        .unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+        assert_eq!(counts.declared, vec![("rust".to_string(), 1)]);
     }
 
     // -- source_files -----------------------------------------------------
