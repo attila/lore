@@ -2707,7 +2707,7 @@ fn hook_search_path_min_relevance_universal_filters_universal_above_score() {
     // Step 1: with floors at 0.0, the universal chunk is in the result set.
     config.search.min_relevance = 0.0;
     config.search.min_relevance_universal = None;
-    let results_low =
+    let (results_low, _) =
         lore::hook::search_with_threshold(&db, &embedder, &config, "gizmo widget review")
             .expect("search should succeed");
     assert!(
@@ -2725,7 +2725,7 @@ fn hook_search_path_min_relevance_universal_filters_universal_above_score() {
     // is filtered out by the raised universal floor.
     config.search.min_relevance = 0.0;
     config.search.min_relevance_universal = Some(1.5);
-    let results_high =
+    let (results_high, _) =
         lore::hook::search_with_threshold(&db, &embedder, &config, "gizmo widget review")
             .expect("search should succeed with raised universal floor");
     assert!(
@@ -2759,7 +2759,7 @@ fn hook_search_path_min_relevance_universal_defaults_to_min_relevance() {
     // inherits and filters the chunk.
     config.search.min_relevance = 1.5;
     config.search.min_relevance_universal = None;
-    let results_inherit =
+    let (results_inherit, _) =
         lore::hook::search_with_threshold(&db, &embedder, &config, "gizmo widget review")
             .expect("search should succeed");
     assert!(
@@ -2780,7 +2780,7 @@ fn hook_search_path_min_relevance_universal_defaults_to_min_relevance() {
     // takes precedence over the inherited value.
     config.search.min_relevance = 1.5;
     config.search.min_relevance_universal = Some(0.0);
-    let results_override =
+    let (results_override, _) =
         lore::hook::search_with_threshold(&db, &embedder, &config, "gizmo widget review")
             .expect("search should succeed");
     assert!(
@@ -3008,6 +3008,56 @@ fn hook_redaction_full_command_when_opted_in() {
     assert_eq!(
         rec["call_context"]["command_full"],
         "git push origin --force-with-lease"
+    );
+}
+
+#[test]
+fn hook_pre_tool_use_trace_populates_phases() {
+    // Covers R6 per-phase timing: a successful PreToolUse search must
+    // produce a trace whose `phases` records at least query extraction
+    // and one search-pathway field. Without this the plan's widened
+    // return type would regress to `Phases::default()` and the
+    // operator dogfooding question ("was it embedding-bound or
+    // FTS-bound?") becomes unanswerable from the trace.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "trace-phases",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "src/error_handling.rs" },
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-phases");
+    let rec = lines
+        .iter()
+        .find(|l| l["event"] == "PreToolUse")
+        .expect("expected a PreToolUse trace record");
+    let phases = &rec["phases"];
+    assert!(
+        phases.is_object(),
+        "phases should serialise as an object, got: {phases}"
+    );
+    // `query_extract_ms` is always measured for a successful query
+    // extraction. The hook config disables hybrid, so the search
+    // pathway lands in `search_fts_ms`. Either way, at least one of
+    // the search-pathway fields must be populated.
+    assert!(
+        phases["query_extract_ms"].is_u64(),
+        "query_extract_ms should be populated: {phases}"
+    );
+    let search_recorded = phases["search_fts_ms"].is_u64() || phases["search_vector_ms"].is_u64();
+    assert!(
+        search_recorded,
+        "at least one search-pathway field should be populated: {phases}"
     );
 }
 

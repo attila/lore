@@ -609,7 +609,7 @@ fn cmd_search(
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
-    let results = hook::search_with_threshold(&db, &ollama, &config, query)?;
+    let (results, _phases) = hook::search_with_threshold(&db, &ollama, &config, query)?;
     lore_debug!("search: {} results", results.len());
 
     if json {
