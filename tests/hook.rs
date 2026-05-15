@@ -3085,3 +3085,97 @@ fn hook_silent_failure_under_read_only_trace_dir() {
     // even though the trace write cannot succeed.
     invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
 }
+
+#[test]
+fn cli_trace_why_json_round_trips_each_line_as_a_trace_record() {
+    // End-to-end smoke test for `lore trace why --json`:
+    //   * Each stdout line is a complete JSON object that round-trips
+    //     through serde_json::from_str::<serde_json::Value>.
+    //   * stderr is empty under --json (the cli-suppress-stderr-in-
+    //     json-mode contract).
+    //   * Empty result emits zero lines, not a JSON array literal —
+    //     the plan's R17 "raw JSONL pass-through" contract.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    // Seed two hook invocations against the same session so the trace
+    // file holds at least two records.
+    for tool_input in [
+        serde_json::json!({ "file_path": "src/error_handling.rs" }),
+        serde_json::json!({ "file_path": "src/conventions.rs" }),
+    ] {
+        let input = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "cli-trace-roundtrip",
+            "tool_name": "Edit",
+            "tool_input": tool_input,
+        });
+        invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+    }
+
+    // Populated session: each stdout line is a complete JSON object.
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "trace",
+            "why",
+            "cli-trace-roundtrip",
+        ])
+        .env("LORE_TRACE_DIR", &trace_dir)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.is_empty(),
+        "--json must suppress stderr diagnostics, got: {stderr}"
+    );
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "expected at least one record on stdout, got empty"
+    );
+    for line in &lines {
+        let parsed: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line is not valid JSON: {e}\nline: {line}"));
+        assert!(
+            parsed["event"].is_string(),
+            "each record must carry an `event` tag, got: {parsed}"
+        );
+        assert_eq!(parsed["schema_version"], 1);
+    }
+
+    // Empty session: zero stdout lines (not a JSON array literal).
+    let empty_output = Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "trace",
+            "why",
+            "nonexistent-session",
+        ])
+        .env("LORE_TRACE_DIR", &trace_dir)
+        .assert()
+        .success();
+    let empty_stdout = String::from_utf8(empty_output.get_output().stdout.clone()).unwrap();
+    let empty_stderr = String::from_utf8(empty_output.get_output().stderr.clone()).unwrap();
+    assert!(
+        empty_stderr.is_empty(),
+        "stderr must stay empty under --json"
+    );
+    assert!(
+        empty_stdout.is_empty() || empty_stdout == "\n",
+        "empty result must emit zero JSONL lines, got: {empty_stdout:?}"
+    );
+}
