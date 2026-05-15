@@ -91,20 +91,37 @@ pub struct DBStats {
     pub sources: usize,
 }
 
+/// One declared-language bucket as returned by
+/// [`KnowledgeDB::language_counts`].
+///
+/// `token` is the canonical FTS5-safe identifier from `language_json`
+/// (e.g. `"rust"`, `"typescript"` — see [`crate::engine::languages`]).
+/// `count` is the number of distinct source files that declared this
+/// language.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LanguageCount {
+    pub token: String,
+    pub count: usize,
+}
+
 /// Per-language source counts plus the count of sources with no
 /// `language:` declaration. Returned by [`KnowledgeDB::language_counts`]
 /// and rendered by `lore status` to show how much of the knowledge base
 /// participates in the structural language gate.
 ///
-/// `declared` holds `(token, count)` pairs as returned by SQL, where
-/// `token` is the canonical FTS5-safe identifier from `language_json`
-/// (e.g. `"rust"`, `"typescript"`). Sorting and display-name resolution
-/// happen at the call site so this struct stays I/O-shaped. A
-/// multi-language source (`language: [rust, typescript]`) contributes a
-/// `+1` to each token bucket it declares, so the sum of `declared`
-/// counts plus `undeclared` can exceed `DBStats::sources`.
+/// `declared` holds [`LanguageCount`] entries as returned by SQL.
+/// Sorting and display-name resolution happen at the call site so this
+/// struct stays I/O-shaped. A multi-language source
+/// (`language: [rust, typescript]`) contributes a `+1` to each token
+/// bucket it declares, so the sum of `declared` counts plus
+/// `undeclared` can exceed `DBStats::sources`.
+///
+/// Marked `#[non_exhaustive]` so future additive fields (e.g. a
+/// `total_sources` helper) do not become a breaking change for
+/// downstream consumers.
+#[non_exhaustive]
 pub struct LanguageCounts {
-    pub declared: Vec<(String, usize)>,
+    pub declared: Vec<LanguageCount>,
     pub undeclared: usize,
 }
 
@@ -719,7 +736,10 @@ impl KnowledgeDB {
             .query_map([], |row| {
                 let token: String = row.get(0)?;
                 let count: i64 = row.get(1)?;
-                Ok((token, count as usize))
+                Ok(LanguageCount {
+                    token,
+                    count: count as usize,
+                })
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1730,6 +1750,15 @@ mod tests {
         chunk
     }
 
+    /// Short helper to construct a `LanguageCount` from a `(token, count)`
+    /// pair — keeps the assertion sites compact.
+    fn lc(token: &str, count: usize) -> LanguageCount {
+        LanguageCount {
+            token: token.to_string(),
+            count,
+        }
+    }
+
     #[test]
     fn language_counts_empty_db_returns_zero_buckets() {
         let db = open_memory_db(4);
@@ -1766,10 +1795,7 @@ mod tests {
 
         let mut declared = counts.declared;
         declared.sort();
-        assert_eq!(
-            declared,
-            vec![("rust".to_string(), 2), ("typescript".to_string(), 1)]
-        );
+        assert_eq!(declared, vec![lc("rust", 2), lc("typescript", 1)]);
     }
 
     #[test]
@@ -1803,12 +1829,9 @@ mod tests {
 
         let mut declared = counts.declared;
         declared.sort();
-        assert_eq!(
-            declared,
-            vec![("rust".to_string(), 1), ("typescript".to_string(), 1)]
-        );
+        assert_eq!(declared, vec![lc("rust", 1), lc("typescript", 1)]);
 
-        let bucket_sum: usize = declared.iter().map(|(_, n)| n).sum();
+        let bucket_sum: usize = declared.iter().map(|c| c.count).sum();
         let stats = db.stats().unwrap();
         assert!(bucket_sum > stats.sources);
     }
@@ -1836,10 +1859,7 @@ mod tests {
 
         let mut declared = counts.declared;
         declared.sort();
-        assert_eq!(
-            declared,
-            vec![("rust".to_string(), 1), ("yaml".to_string(), 1)]
-        );
+        assert_eq!(declared, vec![lc("rust", 1), lc("yaml", 1)]);
     }
 
     #[test]
@@ -1865,7 +1885,7 @@ mod tests {
 
         let counts = db.language_counts().unwrap();
         assert_eq!(counts.undeclared, 0);
-        assert_eq!(counts.declared, vec![("rust".to_string(), 1)]);
+        assert_eq!(counts.declared, vec![lc("rust", 1)]);
     }
 
     // -- source_files -----------------------------------------------------

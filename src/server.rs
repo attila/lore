@@ -1075,7 +1075,7 @@ fn handle_lore_status(
     let languages_declared = language_counts.as_ref().map(|lc| {
         lc.declared
             .iter()
-            .map(|(token, count)| (token.clone(), json!(count)))
+            .map(|c| (c.token.clone(), json!(c.count)))
             .collect::<serde_json::Map<_, _>>()
     });
     let languages_undeclared = language_counts.as_ref().map(|lc| lc.undeclared);

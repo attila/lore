@@ -25,7 +25,7 @@ pub fn format_languages_line(counts: &LanguageCounts) -> Option<String> {
     let mut entries: Vec<(&str, usize)> = counts
         .declared
         .iter()
-        .map(|(token, count)| (display_name_for(token), *count))
+        .map(|c| (display_name_for(&c.token), c.count))
         .collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
@@ -42,12 +42,16 @@ pub fn format_languages_line(counts: &LanguageCounts) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::LanguageCount;
 
     fn counts(declared: &[(&str, usize)], undeclared: usize) -> LanguageCounts {
         LanguageCounts {
             declared: declared
                 .iter()
-                .map(|(t, n)| ((*t).to_string(), *n))
+                .map(|(t, n)| LanguageCount {
+                    token: (*t).to_string(),
+                    count: *n,
+                })
                 .collect(),
             undeclared,
         }
