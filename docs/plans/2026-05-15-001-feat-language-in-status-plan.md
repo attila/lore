@@ -1,6 +1,6 @@
 ---
 date: 2026-05-15
-status: active
+status: completed
 type: feat
 scope: lightweight
 origin: docs/brainstorms/2026-05-15-language-in-status-requirements.md
