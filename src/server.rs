@@ -1056,6 +1056,7 @@ fn handle_list_patterns(
 /// inbox workflow configuration. Designed for agents that need to know whether
 /// pending writes will be committed before they call `add_pattern`,
 /// `update_pattern`, or `append_to_pattern`.
+#[allow(clippy::too_many_lines)]
 fn handle_lore_status(
     req: &JsonRpcRequest,
     ctx: &ServerContext<'_>,
@@ -1125,7 +1126,7 @@ fn handle_lore_status(
         .flatten()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
 
-    let metadata = json!({
+    let mut metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
         "knowledge_dir_status": knowledge_dir_status,
         "empty_knowledge_dir": empty_knowledge_dir,
@@ -1141,6 +1142,17 @@ fn handle_lore_status(
         "loreignore_active": loreignore_active,
         "universal_advisories": universal_advisories,
     });
+
+    // Track 2 Observability: surface trace state when tracing is on.
+    // Mirrors the existing `empty_knowledge_dir` conditional pattern —
+    // the `trace` key is omitted entirely when tracing is disabled.
+    if ctx.config.trace_enabled()
+        && let Ok(trace_dir) = crate::config::resolve_trace_dir()
+        && let Some(obj) = metadata.as_object_mut()
+    {
+        let stats = crate::trace::TraceStats::compute(&trace_dir, ctx.config);
+        obj.insert("trace".to_string(), build_trace_status_value(&stats));
+    }
 
     let summary = format!(
         "Knowledge base: {} ({}) — {} {} across {} {}. Git repository: {}. \
@@ -1187,6 +1199,34 @@ fn handle_lore_status(
 
     let summary_with_fence = maybe_append_lore_metadata_fence(summary, &metadata, include_metadata);
     text_response(req, &summary_with_fence)
+}
+
+/// Build the JSON value surfaced under `metadata.trace` on the MCP
+/// `lore_status` tool. Matches the same shape the CLI `lore status`
+/// Trace block displays — `directory`, `session_count`, `total_bytes`,
+/// `oldest`, `newest`, `last_pruned_at` plus a `capture` sub-object
+/// with `command_head_only`, `transcript_tail_included`, and a
+/// `warnings: []` array that is non-empty when privacy-elevated
+/// toggles are on.
+fn build_trace_status_value(stats: &crate::trace::TraceStats) -> Value {
+    let oldest = stats.oldest.map(crate::trace::format_rfc3339_millis);
+    let newest = stats.newest.map(crate::trace::format_rfc3339_millis);
+    let last_pruned_at = stats
+        .last_pruned_at
+        .map(crate::trace::format_rfc3339_millis);
+    json!({
+        "directory": stats.directory.display().to_string(),
+        "session_count": stats.session_count,
+        "total_bytes": stats.total_bytes,
+        "oldest": oldest,
+        "newest": newest,
+        "last_pruned_at": last_pruned_at,
+        "capture": {
+            "command_head_only": stats.capture.command_head_only,
+            "transcript_tail_included": stats.capture.transcript_tail_included,
+            "warnings": stats.capture.warnings,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,13 +1341,26 @@ fn build_search_metadata(
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            json!({
-                "rank": i + 1,
-                "title": r.title,
-                "source_file": r.source_file,
-                "score": r.score,
-                "is_universal": r.is_universal,
-            })
+            let mut row = serde_json::Map::new();
+            row.insert("rank".to_string(), json!(i + 1));
+            row.insert("title".to_string(), json!(r.title));
+            row.insert("source_file".to_string(), json!(r.source_file));
+            row.insert("score".to_string(), json!(r.score));
+            row.insert("is_universal".to_string(), json!(r.is_universal));
+            // Pre-fusion component scores (Track 2 Observability). Each
+            // appears only when the chunk surfaced from the corresponding
+            // hybrid-search branch — omitting `None` keeps the response
+            // shape minimal for callers that don't care.
+            if let Some(v) = r.score_fts_fallback {
+                row.insert("score_fts_fallback".to_string(), json!(v));
+            }
+            if let Some(v) = r.score_fts_structural {
+                row.insert("score_fts_structural".to_string(), json!(v));
+            }
+            if let Some(v) = r.score_vector {
+                row.insert("score_vector".to_string(), json!(v));
+            }
+            Value::Object(row)
         })
         .collect();
     json!({
@@ -1986,6 +2039,26 @@ mod tests {
             "expected a positive score, got: {}",
             first["score"]
         );
+
+        // Track 2 Observability: per-row pre-fusion component scores are
+        // surfaced when present. Hybrid search routed at least one branch
+        // (FTS-fallback or vector) through the chunk, so at least one of
+        // the three new optional fields appears on the row. Each is
+        // omitted when None, kept as a finite f64 when Some.
+        let pre_fusion_keys = ["score_fts_fallback", "score_fts_structural", "score_vector"];
+        let any_pre_fusion = pre_fusion_keys.iter().any(|k| first.get(*k).is_some());
+        assert!(
+            any_pre_fusion,
+            "expected at least one pre-fusion score field on hybrid results, got: {first}"
+        );
+        for k in pre_fusion_keys {
+            if let Some(v) = first.get(k) {
+                let n = v
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{k} should be a number, got: {v}"));
+                assert!(n.is_finite(), "{k} should be finite, got: {v}");
+            }
+        }
 
         // Prose body still contains the rendered result row — the fenced
         // block is appended at the end, not interleaved with the prose.

@@ -2795,3 +2795,243 @@ fn hook_search_path_min_relevance_universal_defaults_to_min_relevance() {
             .collect::<Vec<_>>(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Track 2 Observability — hook trace integration
+// ---------------------------------------------------------------------------
+
+fn write_config_with_trace(dir: &Path, db_path: &Path, extra_trace: &str) -> std::path::PathBuf {
+    let config_path = dir.join("lore.toml");
+    let content = format!(
+        r#"
+knowledge_dir = "{knowledge_dir}"
+database = "{database}"
+bind = "localhost:3100"
+
+[ollama]
+host = "http://127.0.0.1:11434"
+model = "nomic-embed-text"
+
+[search]
+hybrid = false
+top_k = 5
+min_relevance = 0.0
+
+[chunking]
+strategy = "heading"
+max_tokens = 1024
+
+[trace]
+enabled = true
+{extra_trace}
+"#,
+        knowledge_dir = dir.display(),
+        database = db_path.display(),
+    );
+    fs::write(&config_path, content).unwrap();
+    config_path
+}
+
+fn invoke_hook_with_trace_dir(
+    config_path: &Path,
+    trace_dir: &Path,
+    input: &serde_json::Value,
+    env: &[(&str, &str)],
+) {
+    let mut cmd = Command::cargo_bin("lore").unwrap();
+    cmd.args(["hook", "--config", config_path.to_str().unwrap()])
+        .env("LORE_TRACE_DIR", trace_dir)
+        .write_stdin(serde_json::to_string(input).unwrap());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.assert().success();
+}
+
+fn read_trace_lines(trace_dir: &Path, session_id: &str) -> Vec<serde_json::Value> {
+    // Trace filenames are FNV-1a hashes of the session id — mirrors the
+    // dedup-file discipline. Look the path up via the public helper so
+    // the test stays aligned with whatever the writer chooses.
+    let path = lore::trace::trace_file_path(trace_dir, session_id);
+    if !path.exists() {
+        return Vec::new();
+    }
+    fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("trace line is valid JSON"))
+        .collect()
+}
+
+#[test]
+fn hook_session_start_writes_trace_when_enabled() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "trace-session-1",
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-session-1");
+    assert_eq!(lines.len(), 1, "expected 1 trace line, got {lines:?}");
+    assert_eq!(lines[0]["event"], "SessionStart");
+    assert_eq!(lines[0]["agent"], "claude-code");
+    assert_eq!(lines[0]["schema_version"], 1);
+    assert!(
+        lines[0]["config"]["trace_enabled"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+}
+
+#[test]
+fn hook_lore_trace_env_var_overrides_disabled_config() {
+    // Covers AE1: LORE_TRACE=1 enables tracing even when [trace] enabled = false.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config(dir, &dir.join("knowledge.db")); // no [trace]
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "trace-env-on",
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[("LORE_TRACE", "1")]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-env-on");
+    assert_eq!(lines.len(), 1, "LORE_TRACE=1 should turn tracing on");
+}
+
+#[test]
+fn hook_lore_trace_zero_overrides_enabled_config() {
+    // Covers AE1 in the off direction: LORE_TRACE=0 disables tracing even
+    // when [trace] enabled = true.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "trace-env-off",
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[("LORE_TRACE", "0")]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-env-off");
+    assert_eq!(
+        lines.len(),
+        0,
+        "LORE_TRACE=0 should force tracing off regardless of config"
+    );
+}
+
+#[test]
+fn hook_redaction_default_omits_full_command_body() {
+    // Covers AE2 default-redact: command body is reduced to head; full
+    // command is absent unless include_full_command = true.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "trace-redact-default",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin --force-with-lease" },
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-redact-default");
+    let rec = lines
+        .iter()
+        .find(|l| l["event"] == "PreToolUse")
+        .expect("expected a PreToolUse trace record, got none — the trace pipeline must record this Bash invocation for the redaction assertion to be meaningful");
+    assert_eq!(rec["call_context"]["command_head"], "git");
+    assert!(
+        rec["call_context"].get("command_full").is_none()
+            || rec["call_context"]["command_full"].is_null(),
+        "command_full must be absent under default redaction: {rec}"
+    );
+}
+
+#[test]
+fn hook_redaction_full_command_when_opted_in() {
+    // Covers AE2 opted-in: include_full_command = true captures the body.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(
+        dir,
+        &dir.join("knowledge.db"),
+        "include_full_command = true",
+    );
+    let trace_dir = dir.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "trace-full-cmd",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push origin --force-with-lease" },
+    });
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+
+    let lines = read_trace_lines(&trace_dir, "trace-full-cmd");
+    let rec = lines
+        .iter()
+        .find(|l| l["event"] == "PreToolUse")
+        .expect("expected a PreToolUse trace record under include_full_command = true");
+    assert_eq!(
+        rec["call_context"]["command_full"],
+        "git push origin --force-with-lease"
+    );
+}
+
+#[test]
+fn hook_silent_failure_under_read_only_trace_dir() {
+    // Covers AE5: writing to an unwriteable trace dir does not break the
+    // hook's normal output.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let embedder = FakeEmbedder::new();
+    let db = open_db(dir, embedder.dimensions());
+    let _ = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
+    let config_path = write_config_with_trace(dir, &dir.join("knowledge.db"), "");
+    // Use a path component that already exists as a file (blocks mkdir).
+    let blocker = dir.join("blocker-file");
+    fs::write(&blocker, "").unwrap();
+    let trace_dir = blocker.join("traces");
+
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "trace-silent-fail",
+    });
+    // assert!().success() inside helper verifies the exit code stays 0
+    // even though the trace write cannot succeed.
+    invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[]);
+}

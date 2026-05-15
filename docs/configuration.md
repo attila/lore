@@ -278,3 +278,64 @@ inputs are rejected with a JSON-RPC `-32000` error before any processing occurs.
 | `body`              | 262,144 bytes (256 KB) |
 | `tags` (serialised) | 8,192 bytes (8 KB)     |
 | `top_k`             | 100                    |
+
+## Per-Hook Trace Logging (Track 2 Observability)
+
+When tracing is enabled, every canonical hook event (PreToolUse, PostToolUse, SessionStart,
+PostCompact) appends one JSON Lines record to a per-session file under
+`$XDG_STATE_HOME/lore/traces/<session-id>.jsonl`. Inspect them with `lore trace why <session-id>` or
+pass through to `jq` via `lore trace why <session-id> --json`.
+
+Tracing is **disabled by default**. Two opt-in surfaces share a single precedence: the `LORE_TRACE`
+environment variable overrides the persistent `[trace] enabled` config flag whenever the env value
+is recognised.
+
+### Configuration Keys
+
+| Key                       | Type    | Default | Description                                                                                                          |
+| ------------------------- | ------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                 | bool    | `false` | Master switch. `LORE_TRACE=1` / `=0` overrides for a single process.                                                 |
+| `retain_days`             | integer | `30`    | Files older than this many days are deleted on the next maintenance pass. Set to `0` to disable deletion entirely.   |
+| `gzip_older_than_days`    | integer | `7`     | Files older than this many days are gzipped in place. Set to `0` to disable compression.                             |
+| `include_full_command`    | bool    | `false` | When `true`, captures the full Bash command body. Default redaction stores only the first whitespace-delimited head. |
+| `include_transcript_tail` | bool    | `false` | When `true`, includes the eager transcript-tail read (already capped at 32 KB by the hook adapter).                  |
+
+### `LORE_TRACE` Parsing
+
+Truthy values: `1`, `true`, `yes`. Falsy values: `0`, `false`, `no`. All parsing is **case-
+sensitive**. Any other value, including the empty string, is treated as unset and silently falls
+through to `[trace] enabled` — matching the `LORE_DEBUG` fail-soft convention.
+
+See
+[`docs/solutions/conventions/env-var-plus-config-flag-coexistence-2026-05-15.md`](solutions/conventions/env-var-plus-config-flag-coexistence-2026-05-15.md)
+for the reusable convention this toggle codifies.
+
+### Maintenance
+
+A lazy compress-then-prune pass runs on every SessionStart, throttled to at most once per 24 hours
+and capped at 100 files compressed plus 100 files deleted per run. Run `lore trace prune` manually
+for an unbounded pass — both writers bump the `.last_pruned_at` state file so the throttle stays
+honest.
+
+At the default knobs (`retain_days = 30`, `gzip_older_than_days = 7`) a heavy operator session-load
+produces roughly 30–60 MB of post-gzip trace data per operator. Tighten `retain_days` to budget
+less; widen it to retain more history for analysis.
+
+### Privacy Posture
+
+Default capture stores tool name, command head, file path, description, query, candidate ids with
+pre-fusion scores, and per-phase duration breakdown. `include_full_command` and
+`include_transcript_tail` are explicit opt-ins that capture more sensitive content and surface as
+**privacy-sensitive** warnings in `lore status` and the MCP `lore_status` `trace.capture.warnings`
+array.
+
+### Trace Directory Location
+
+The trace directory follows XDG state resolution and is **not** configurable via `lore.toml`:
+
+1. `$XDG_STATE_HOME/lore/traces/`
+2. `~/.local/state/lore/traces/`
+
+On Unix, the directory is created mode `0o700` and individual trace files mode `0o600` so operators
+on multi-user systems, shared CI runners, and containers with shared home volumes are not surprised
+by world-readable trace content.

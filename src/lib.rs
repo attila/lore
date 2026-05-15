@@ -13,3 +13,4 @@ pub mod loreignore;
 pub mod provision;
 pub mod server;
 pub mod status;
+pub mod trace;

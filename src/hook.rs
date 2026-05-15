@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::chunking::AppliesWhen;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::Embedder;
 use crate::engine::{self, CallContext};
 use crate::lore_debug;
+use crate::trace;
 
 /// Maximum bytes of a Bash command echoed in `predicate suppress:` debug
 /// lines. Predicate-suppression logs name the offending pattern source plus
@@ -130,6 +131,7 @@ fn handle_session_start(
     db: &KnowledgeDB,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
+    let start = std::time::Instant::now();
     let dedup_path = session_dedup_path(input);
     if let Some(ref path) = dedup_path
         && let Err(e) = reset_dedup(path)
@@ -139,6 +141,23 @@ fn handle_session_start(
     }
 
     let context = format_session_context(db, &config.knowledge_dir)?;
+
+    if config.trace_enabled()
+        && let Some(session_id) = input.session_id.as_deref()
+    {
+        emit_session_start_trace(config, session_id, start);
+        // Lazy maintenance: 24h-throttled compress + prune. Fire-and-forget;
+        // failures degrade to `LORE_DEBUG` diagnostics inside the maintenance
+        // module.
+        if let Some(trace_dir) = resolve_trace_dir() {
+            let _ = trace::maintenance::run_lazy(
+                &trace_dir,
+                config.trace.retain_days,
+                config.trace.gzip_older_than_days,
+            );
+        }
+    }
+
     Ok(Some(HookOutput::SystemMessage {
         system_message: context,
     }))
@@ -168,12 +187,14 @@ fn handle_session_start(
 ///    integration test).
 /// 7. [`dedup_filter_and_record`] on the surviving chunks.
 /// 8. [`format_imperative`] + emit `additionalContext`.
+#[allow(clippy::too_many_lines)]
 fn handle_pre_tool_use(
     input: &HookInput,
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
+    let start = std::time::Instant::now();
     // 1. skip_agent FIRST — before the eager transcript-tail read so
     //    Explore/Plan subagents never trigger filesystem I/O.
     if skip_agent(input) {
@@ -211,92 +232,98 @@ fn handle_pre_tool_use(
         &inferred_langs,
     )?;
 
-    if seeds.is_empty() {
+    // 5. Sibling expansion + 6. predicate filter + 7. dedup. Each step
+    //    can collapse the candidate set to empty; the trace write at
+    //    step 8 must still see the final state (possibly empty) so
+    //    `lore trace why` can explain "we searched, nothing survived".
+    let combined = if seeds.is_empty() {
         lore_debug!("search returned no results");
-        return Ok(None);
-    }
-
-    let seed_universal = seeds.iter().filter(|r| r.is_universal).count();
-
-    // 5. Sibling expansion — single DB call. `is_universal` and
-    //    `applies_when_json` are file-level fields stored on every chunk
-    //    row, so expanding propagates predicate state without a join
-    //    (whole-file semantics).
-    let expanded = expand_to_siblings(db, &seeds);
-    lore_debug!(
-        "expand: {} seeds -> {} after sibling expansion ({} universal seeds)",
-        seeds.len(),
-        expanded.len(),
-        seed_universal,
-    );
-
-    // 6. Predicate filter (Track 1, R8). Run ONLY for universal chunks
-    //    with a `Some` `applies_when_json`. Non-universal chunks and
-    //    universals with no predicate pass through unchanged. Dropped
-    //    chunks are removed from `Vec<SearchResult>` BEFORE dedup sees the
-    //    list — the dedup file therefore never records a suppressed id
-    //    (read-side or write-side). A future predicate-passing call can
-    //    still inject the same chunk; suppression is per-call, not
-    //    per-session.
-    let after_predicate = apply_predicate_filter(expanded, &cc);
-
-    if after_predicate.is_empty() {
-        lore_debug!("nothing to inject after predicate filter");
-        return Ok(None);
-    }
-
-    // 7. Dedup. `dedup_filter_and_record` bypasses the `seen.contains`
-    //    check for universal chunks (read-side filter) and appends every
-    //    surfaced chunk to the dedup file (write side). The dedup file
-    //    therefore remains a faithful "what was injected this session"
-    //    log — defensive consistency per the session-dedup-lifecycle
-    //    learning. Suppressed chunks were removed in step 6, so they are
-    //    invisible to this stage.
-    let dedup_path = session_dedup_path(input);
-    let combined = if let Some(ref path) = dedup_path
-        && path.exists()
-    {
-        let pre_count = after_predicate.len();
-        match dedup_filter_and_record(path, &after_predicate) {
-            Ok(filtered) => {
-                let kept_universal = filtered.iter().filter(|r| r.is_universal).count();
-                lore_debug!(
-                    "dedup: {} before -> {} after ({} universal kept by read-bypass) ({})",
-                    pre_count,
-                    filtered.len(),
-                    kept_universal,
-                    path.display()
-                );
-                filtered
-            }
-            Err(e) => {
-                eprintln!("lore hook: dedup filter error: {e}");
-                lore_debug!("dedup filter error (continuing without dedup): {e}");
-                after_predicate
-            }
-        }
+        Vec::new()
     } else {
-        lore_debug!("dedup inactive (no session file)");
-        after_predicate
+        let seed_universal = seeds.iter().filter(|r| r.is_universal).count();
+        let expanded = expand_to_siblings(db, &seeds);
+        lore_debug!(
+            "expand: {} seeds -> {} after sibling expansion ({} universal seeds)",
+            seeds.len(),
+            expanded.len(),
+            seed_universal,
+        );
+        let after_predicate = apply_predicate_filter(expanded, &cc);
+        if after_predicate.is_empty() {
+            lore_debug!("nothing to inject after predicate filter");
+            Vec::new()
+        } else {
+            let dedup_path = session_dedup_path(input);
+            let merged = if let Some(ref path) = dedup_path
+                && path.exists()
+            {
+                let pre_count = after_predicate.len();
+                match dedup_filter_and_record(path, &after_predicate) {
+                    Ok(filtered) => {
+                        let kept_universal = filtered.iter().filter(|r| r.is_universal).count();
+                        lore_debug!(
+                            "dedup: {} before -> {} after ({} universal kept by read-bypass) ({})",
+                            pre_count,
+                            filtered.len(),
+                            kept_universal,
+                            path.display()
+                        );
+                        filtered
+                    }
+                    Err(e) => {
+                        eprintln!("lore hook: dedup filter error: {e}");
+                        lore_debug!("dedup filter error (continuing without dedup): {e}");
+                        after_predicate
+                    }
+                }
+            } else {
+                lore_debug!("dedup inactive (no session file)");
+                after_predicate
+            };
+            if merged.is_empty() {
+                lore_debug!("nothing to inject after expansion + dedup");
+            } else {
+                let kept_universal = merged.iter().filter(|r| r.is_universal).count();
+                let kept_ranked = merged.len() - kept_universal;
+                let sources: HashSet<&str> =
+                    merged.iter().map(|r| r.source_file.as_str()).collect();
+                lore_debug!(
+                    "injecting {} chunks ({} universal + {} ranked) from {} sources",
+                    merged.len(),
+                    kept_universal,
+                    kept_ranked,
+                    sources.len()
+                );
+            }
+            merged
+        }
     };
 
+    // 8. Trace write (Track 2 Observability). Fire-and-forget; gated by
+    //    `Config::trace_enabled()`. Slot is post-dedup, pre-format so the
+    //    record reflects the actually-injected chunk set. The record is
+    //    written on EVERY invocation that produced a usable query —
+    //    including the "search returned nothing" case — so `lore trace
+    //    why` can explain why a tool call wasn't enriched.
+    if config.trace_enabled()
+        && let Some(session_id) = input.session_id.as_deref()
+    {
+        emit_pre_tool_use_trace(
+            config,
+            session_id,
+            &cc,
+            Some(query.clone()),
+            &inferred_langs,
+            &combined,
+            start,
+        );
+    }
+
     if combined.is_empty() {
-        lore_debug!("nothing to inject after expansion + dedup");
         return Ok(None);
     }
 
-    let kept_universal = combined.iter().filter(|r| r.is_universal).count();
-    let kept_ranked = combined.len() - kept_universal;
-    let sources: HashSet<&str> = combined.iter().map(|r| r.source_file.as_str()).collect();
-    lore_debug!(
-        "injecting {} chunks ({} universal + {} ranked) from {} sources",
-        combined.len(),
-        kept_universal,
-        kept_ranked,
-        sources.len()
-    );
-
-    // 8. Format and emit.
+    // 9. Format and emit.
     let context = format_imperative(&combined);
 
     Ok(Some(HookOutput::HookSpecific {
@@ -422,6 +449,7 @@ fn handle_post_compact(
     db: &KnowledgeDB,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
+    let start = std::time::Instant::now();
     let dedup_path = session_dedup_path(input);
     if let Some(ref path) = dedup_path
         && let Err(e) = reset_dedup(path)
@@ -431,6 +459,13 @@ fn handle_post_compact(
     }
 
     let context = format_session_context(db, &config.knowledge_dir)?;
+
+    if config.trace_enabled()
+        && let Some(session_id) = input.session_id.as_deref()
+    {
+        emit_post_compact_trace(session_id, start);
+    }
+
     Ok(Some(HookOutput::SystemMessage {
         system_message: context,
     }))
@@ -443,6 +478,7 @@ fn handle_post_tool_use(
     embedder: &dyn Embedder,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
+    let start = std::time::Instant::now();
     // Only handle Bash tool errors.
     if input.tool_name.as_deref() != Some("Bash") {
         return Ok(None);
@@ -500,6 +536,21 @@ fn handle_post_tool_use(
         "PostToolUse: injecting {} error-context chunks",
         results.len()
     );
+
+    if config.trace_enabled()
+        && let Some(session_id) = input.session_id.as_deref()
+    {
+        let cc = input.to_call_context();
+        emit_post_tool_use_trace(
+            config,
+            session_id,
+            &cc,
+            Some(query.clone()),
+            &results,
+            start,
+        );
+    }
+
     let context = format_imperative(&results);
     Ok(Some(HookOutput::HookSpecific {
         hook_specific_output: HookSpecificOutput {
@@ -1122,6 +1173,211 @@ pub fn format_imperative(results: &[SearchResult]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Trace integration (Track 2 Observability)
+// ---------------------------------------------------------------------------
+
+/// Resolve the trace directory once per hook invocation. Returns `None`
+/// when `$HOME` resolution fails — same fail-soft contract the rest of
+/// the trace path follows. Delegates to `config::resolve_trace_dir` so
+/// every surface (hook, CLI, MCP) honours the same `LORE_TRACE_DIR`
+/// test override.
+fn resolve_trace_dir() -> Option<PathBuf> {
+    config::resolve_trace_dir().ok()
+}
+
+/// Capture the verbatim `CallContextSnapshot` from a [`CallContext`], honouring
+/// the `[trace] include_full_command` / `include_transcript_tail` toggles.
+fn snapshot_call_context(cc: &CallContext, config: &Config) -> trace::CallContextSnapshot {
+    let command_head = cc
+        .command
+        .as_deref()
+        .and_then(|c| c.split_whitespace().next())
+        .map(str::to_string);
+    let command_full = if config.trace.include_full_command {
+        cc.command.clone()
+    } else {
+        None
+    };
+    let transcript_tail = if config.trace.include_transcript_tail {
+        cc.transcript_tail.clone()
+    } else {
+        None
+    };
+    trace::CallContextSnapshot {
+        tool_name: cc.tool_name.clone().unwrap_or_default(),
+        command_head,
+        command_full,
+        file_path: cc.file_path.clone(),
+        description: cc.description.clone(),
+        inferred_languages: Vec::new(),
+        transcript_tail,
+    }
+}
+
+/// Build a [`trace::ConfigSnapshot`] from the active [`Config`].
+fn snapshot_search_config(config: &Config) -> trace::ConfigSnapshot {
+    trace::ConfigSnapshot {
+        hybrid: config.search.hybrid,
+        top_k: config.search.top_k,
+        min_relevance: config.search.min_relevance,
+        min_relevance_universal: config.search.effective_min_relevance_universal(),
+        embedder_model: config.ollama.model.clone(),
+    }
+}
+
+/// Build the full configuration snapshot recorded once at `SessionStart`.
+fn snapshot_full_config(config: &Config) -> trace::FullConfigSnapshot {
+    trace::FullConfigSnapshot {
+        knowledge_dir: config.knowledge_dir.display().to_string(),
+        database: config.database.display().to_string(),
+        bind: config.bind.clone(),
+        ollama_host: config.ollama.host.clone(),
+        ollama_model: config.ollama.model.clone(),
+        search: snapshot_search_config(config),
+        chunking_strategy: config.chunking.strategy.clone(),
+        chunking_max_tokens: config.chunking.max_tokens,
+        trace_enabled: config.trace.enabled,
+        trace_retain_days: config.trace.retain_days,
+        trace_gzip_older_than_days: config.trace.gzip_older_than_days,
+        trace_include_full_command: config.trace.include_full_command,
+        trace_include_transcript_tail: config.trace.include_transcript_tail,
+    }
+}
+
+/// Build per-candidate trace rows from the final injected list. Each row
+/// carries `deduped = false` and `above_threshold = true` since these
+/// chunks survived the full pipeline; non-surviving candidates are not
+/// recorded in v1 (the full pre-filter list is a follow-up).
+fn build_candidate_rows(results: &[SearchResult]) -> Vec<trace::CandidateRecord> {
+    results
+        .iter()
+        .map(|r| trace::CandidateRecord {
+            chunk_id: r.id.clone(),
+            source_file: r.source_file.clone(),
+            is_universal: r.is_universal,
+            has_predicate: r.applies_when_json.is_some(),
+            has_language_declaration: r.language_json.is_some(),
+            score_fts_fallback: r.score_fts_fallback,
+            score_fts_structural: r.score_fts_structural,
+            score_vector: r.score_vector,
+            score_combined: r.score,
+            // `apply_predicate_filter` only evaluates predicates for
+            // universal chunks (Track 1 R8), so a non-universal chunk
+            // with a dormant `applies_when_json` reaches the trace
+            // writer without its predicate having been executed. Label
+            // the predicate as untouched in that case rather than
+            // claiming a `Matched` evaluation that never happened.
+            predicate_outcome: if r.applies_when_json.is_some() && r.is_universal {
+                trace::PredicateOutcome::Matched
+            } else {
+                trace::PredicateOutcome::NoPredicate
+            },
+            above_threshold: true,
+            deduped: false,
+        })
+        .collect()
+}
+
+/// Convenience: now in milliseconds since `start`.
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Emit a `PreToolUse` trace record. Fire-and-forget; gated upstream.
+fn emit_pre_tool_use_trace(
+    config: &Config,
+    session_id: &str,
+    cc: &CallContext,
+    query: Option<String>,
+    inferred_langs: &[String],
+    injected: &[SearchResult],
+    start: std::time::Instant,
+) {
+    let Some(trace_dir) = resolve_trace_dir() else {
+        return;
+    };
+    let mut call_context = snapshot_call_context(cc, config);
+    call_context.inferred_languages = inferred_langs.to_vec();
+    let injected_ids: Vec<String> = injected.iter().map(|r| r.id.clone()).collect();
+    let record = trace::TraceRecord::PreToolUse(trace::PreToolUseRecord {
+        schema_version: trace::SCHEMA_VERSION,
+        ts: trace::format_rfc3339_millis(std::time::SystemTime::now()),
+        session_id: session_id.to_string(),
+        agent: trace::AGENT_CLAUDE_CODE.to_string(),
+        call_context,
+        query,
+        candidates: build_candidate_rows(injected),
+        injected: injected_ids,
+        config: snapshot_search_config(config),
+        ollama: None,
+        duration_ms: elapsed_ms(start),
+        phases: trace::Phases::default(),
+    });
+    trace::append_record(&trace_dir, &record);
+}
+
+/// Emit a `PostToolUse` trace record. Fire-and-forget; gated upstream.
+fn emit_post_tool_use_trace(
+    config: &Config,
+    session_id: &str,
+    cc: &CallContext,
+    query: Option<String>,
+    injected: &[SearchResult],
+    start: std::time::Instant,
+) {
+    let Some(trace_dir) = resolve_trace_dir() else {
+        return;
+    };
+    let injected_ids: Vec<String> = injected.iter().map(|r| r.id.clone()).collect();
+    let record = trace::TraceRecord::PostToolUse(trace::PostToolUseRecord {
+        schema_version: trace::SCHEMA_VERSION,
+        ts: trace::format_rfc3339_millis(std::time::SystemTime::now()),
+        session_id: session_id.to_string(),
+        agent: trace::AGENT_CLAUDE_CODE.to_string(),
+        call_context: snapshot_call_context(cc, config),
+        query,
+        candidates: build_candidate_rows(injected),
+        injected: injected_ids,
+        config: snapshot_search_config(config),
+        ollama: None,
+        duration_ms: elapsed_ms(start),
+        phases: trace::Phases::default(),
+    });
+    trace::append_record(&trace_dir, &record);
+}
+
+/// Emit a `SessionStart` trace record. Fire-and-forget; gated upstream.
+fn emit_session_start_trace(config: &Config, session_id: &str, start: std::time::Instant) {
+    let Some(trace_dir) = resolve_trace_dir() else {
+        return;
+    };
+    let record = trace::TraceRecord::SessionStart(trace::SessionStartRecord {
+        schema_version: trace::SCHEMA_VERSION,
+        ts: trace::format_rfc3339_millis(std::time::SystemTime::now()),
+        session_id: session_id.to_string(),
+        agent: trace::AGENT_CLAUDE_CODE.to_string(),
+        config: snapshot_full_config(config),
+        duration_ms: elapsed_ms(start),
+    });
+    trace::append_record(&trace_dir, &record);
+}
+
+/// Emit a `PostCompact` trace record. Fire-and-forget; gated upstream.
+fn emit_post_compact_trace(session_id: &str, start: std::time::Instant) {
+    let Some(trace_dir) = resolve_trace_dir() else {
+        return;
+    };
+    let record = trace::TraceRecord::PostCompact(trace::PostCompactRecord {
+        schema_version: trace::SCHEMA_VERSION,
+        ts: trace::format_rfc3339_millis(std::time::SystemTime::now()),
+        session_id: session_id.to_string(),
+        agent: trace::AGENT_CLAUDE_CODE.to_string(),
+        duration_ms: elapsed_ms(start),
+    });
+    trace::append_record(&trace_dir, &record);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1394,6 +1650,9 @@ mod tests {
             is_universal: true,
             applies_when_json: applies_when_json.map(String::from),
             language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
         }
     }
 
@@ -1409,6 +1668,9 @@ mod tests {
             is_universal: false,
             applies_when_json: None,
             language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
         }
     }
 
@@ -1575,6 +1837,9 @@ mod tests {
             is_universal,
             applies_when_json: None,
             language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
         }
     }
 
@@ -1725,6 +1990,9 @@ mod tests {
             is_universal: false,
             applies_when_json: None,
             language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
         }];
 
         let formatted = format_imperative(&results);
@@ -1747,6 +2015,9 @@ mod tests {
                 is_universal: false,
                 applies_when_json: None,
                 language_json: None,
+                score_fts_fallback: None,
+                score_fts_structural: None,
+                score_vector: None,
             },
             SearchResult {
                 id: "c2".into(),
@@ -1759,6 +2030,9 @@ mod tests {
                 is_universal: false,
                 applies_when_json: None,
                 language_json: None,
+                score_fts_fallback: None,
+                score_fts_structural: None,
+                score_vector: None,
             },
         ];
 
@@ -2078,6 +2352,9 @@ mod tests {
             is_universal: false,
             applies_when_json: None,
             language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
         }
     }
 

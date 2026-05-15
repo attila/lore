@@ -164,6 +164,54 @@ fn no_unsanctioned_runtime_disk_reads_in_hook_server_main() {
          reset_dedup, dedup_filter_and_record."
     );
 
+    // src/trace/writer.rs — append-only JSONL writer with strict
+    // open-write-close discipline. Allowed: one `OpenOptions` chain (Unix
+    // and non-Unix branches share counting since `cfg`-gated bodies are
+    // collapsed by the textual strip). No `read_to_string` or `File::open`.
+    let trace_writer = strip_test_modules(&read_source("trace/writer.rs"));
+    assert_eq!(
+        count_substring(&trace_writer, "std::fs::OpenOptions"),
+        2,
+        "trace/writer.rs OpenOptions count changed — allowed: one for Unix \
+         (with mode 0o600) and one for the non-Unix best-effort fallback."
+    );
+    assert_eq!(
+        count_substring(&trace_writer, "std::fs::read_to_string"),
+        0,
+        "trace/writer.rs must not perform runtime disk reads — it is an \
+         append-only writer."
+    );
+
+    // src/trace/maintenance.rs — lazy compress+prune plus manual
+    // unbounded variant. Allowed file-I/O surfaces: the gzip target
+    // OpenOptions (Unix and non-Unix branches, mode 0o600 on Unix) and
+    // one read_to_string on the .last_pruned_at throttle state file.
+    let trace_maintenance = strip_test_modules(&read_source("trace/maintenance.rs"));
+    assert_eq!(
+        count_substring(&trace_maintenance, "std::fs::OpenOptions"),
+        2,
+        "trace/maintenance.rs OpenOptions count changed — allowed: one Unix \
+         (mode 0o600) and one non-Unix fallback for the gzip target."
+    );
+    assert_eq!(
+        count_substring(&trace_maintenance, "std::fs::read_to_string"),
+        1,
+        "trace/maintenance.rs read_to_string count changed — allowed: \
+         one for read_last_pruned_at on the throttle state file."
+    );
+
+    // src/trace/query.rs — read-only consumer surface for
+    // `lore trace why`. Reads are via plain `std::fs::read` for the
+    // raw bytes; no `OpenOptions` (it never writes), and no
+    // `read_to_string` (the maybe-gzipped reader handles decoding).
+    let trace_query = strip_test_modules(&read_source("trace/query.rs"));
+    assert_eq!(
+        count_substring(&trace_query, "std::fs::OpenOptions"),
+        0,
+        "trace/query.rs must not write to disk — it is a read-only \
+         consumer surface."
+    );
+
     // src/server.rs — the MCP server does not read the filesystem at
     // runtime. Its write-path tools (add_pattern etc.) route through
     // ingest, not through direct fs calls in server.rs.

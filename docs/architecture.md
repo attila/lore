@@ -29,6 +29,9 @@ following are explicitly not covered and may read from disk at runtime without c
   to enrich `PreToolUse` queries.
 - Configuration: `knowledge.toml` loaded at CLI startup.
 - Git metadata: `git rev-parse` subprocess invocations to detect repository state.
+- Per-hook trace files (`$XDG_STATE_HOME/lore/traces/*.jsonl[.gz]`) and the throttle state file
+  (`.last_pruned_at`) — Track 2 Observability writes, the `lore trace why` reader, and the lazy
+  maintenance pass. Trace files are session-local state, not indexed content.
 
 **Trust boundary.** Any caller with DB write access — the ingest pipeline, and the three MCP write
 tools (`add_pattern` / `update_pattern` / `append_to_pattern`) — is trusted to produce content that

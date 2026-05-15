@@ -14,6 +14,8 @@ pub struct Config {
     pub chunking: ChunkingConfig,
     #[serde(default)]
     pub git: Option<GitConfig>,
+    #[serde(default)]
+    pub trace: TraceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,6 +54,52 @@ fn default_min_relevance() -> f64 {
     0.6
 }
 
+/// Per-hook trace logging config (Track 2 Observability).
+///
+/// Mirrors the `SearchConfig` per-field-default pattern so the `[trace]` section
+/// is discoverable in every fresh `lore init` while remaining off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceConfig {
+    #[serde(default = "default_trace_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_retain_days")]
+    pub retain_days: u32,
+    #[serde(default = "default_gzip_older_than_days")]
+    pub gzip_older_than_days: u32,
+    #[serde(default = "default_include_full_command")]
+    pub include_full_command: bool,
+    #[serde(default = "default_include_transcript_tail")]
+    pub include_transcript_tail: bool,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_trace_enabled(),
+            retain_days: default_retain_days(),
+            gzip_older_than_days: default_gzip_older_than_days(),
+            include_full_command: default_include_full_command(),
+            include_transcript_tail: default_include_transcript_tail(),
+        }
+    }
+}
+
+fn default_trace_enabled() -> bool {
+    false
+}
+fn default_retain_days() -> u32 {
+    30
+}
+fn default_gzip_older_than_days() -> u32 {
+    7
+}
+fn default_include_full_command() -> bool {
+    false
+}
+fn default_include_transcript_tail() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChunkingConfig {
     pub strategy: String,
@@ -80,6 +128,23 @@ impl Config {
                 max_tokens: 1024,
             },
             git: None,
+            trace: TraceConfig::default(),
+        }
+    }
+
+    /// Returns `true` when per-hook tracing should be active for this process.
+    ///
+    /// Precedence: `LORE_TRACE` env var (when recognised) overrides the
+    /// persistent `[trace] enabled` config flag. Recognised truthy values:
+    /// `1`, `true`, `yes` (case-sensitive). Recognised falsy values: `0`,
+    /// `false`, `no` (case-sensitive). Any other value, including the empty
+    /// string, is treated as unset and silently falls through to
+    /// `self.trace.enabled` — mirroring `LORE_DEBUG`'s fail-soft semantics.
+    pub fn trace_enabled(&self) -> bool {
+        match std::env::var("LORE_TRACE").ok().as_deref() {
+            Some("1" | "true" | "yes") => true,
+            Some("0" | "false" | "no") => false,
+            _ => self.trace.enabled,
         }
     }
 
@@ -129,6 +194,20 @@ pub fn default_trace_dir() -> anyhow::Result<PathBuf> {
     // always returns `Some`.
     let state = xdg.state_dir().expect("Xdg::state_dir always returns Some");
     Ok(state.join("lore").join("traces"))
+}
+
+/// Resolve the trace directory honouring the test-only `LORE_TRACE_DIR`
+/// override. Single source of truth for `lore status`, the MCP
+/// `lore_status` tool, the `lore trace { why, prune }` subcommands, and
+/// the hook trace integration. Returning [`anyhow::Result`] mirrors
+/// `default_trace_dir`'s contract — callers translate the `Err` shape
+/// into their own discipline (`Option` for hook fire-and-forget,
+/// propagation for CLI surfaces).
+pub fn resolve_trace_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("LORE_TRACE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    default_trace_dir()
 }
 
 /// Construct an `Xdg` strategy, mapping the missing-`$HOME` case onto the
@@ -533,6 +612,148 @@ mod tests {
                 assert_eq!(path, PathBuf::from("/home/user/.local/state/lore/traces"));
             },
         );
+    }
+
+    // -- TraceConfig + trace_enabled (U1) ------------------------------------
+
+    #[test]
+    fn trace_config_defaults_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config.toml");
+        let config = sample_config();
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(!loaded.trace.enabled);
+        assert_eq!(loaded.trace.retain_days, 30);
+        assert_eq!(loaded.trace.gzip_older_than_days, 7);
+        assert!(!loaded.trace.include_full_command);
+        assert!(!loaded.trace.include_transcript_tail);
+    }
+
+    #[test]
+    fn trace_config_round_trip_with_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config.toml");
+        let mut config = sample_config();
+        config.trace.enabled = true;
+        config.trace.retain_days = 14;
+        config.trace.gzip_older_than_days = 3;
+        config.trace.include_full_command = true;
+        config.trace.include_transcript_tail = true;
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn trace_config_absent_section_deserialises_to_defaults() {
+        let toml_text = "\
+            knowledge_dir = \"docs\"\n\
+            database = \"lore.db\"\n\
+            bind = \"localhost:3100\"\n\n\
+            [ollama]\n\
+            host = \"http://127.0.0.1:11434\"\n\
+            model = \"nomic-embed-text\"\n\n\
+            [search]\n\
+            hybrid = true\n\
+            top_k = 5\n\
+            min_relevance = 0.6\n\n\
+            [chunking]\n\
+            strategy = \"heading\"\n\
+            max_tokens = 1024\n";
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.trace, TraceConfig::default());
+    }
+
+    #[test]
+    fn trace_config_empty_section_deserialises_to_defaults() {
+        let toml_text = "\
+            knowledge_dir = \"docs\"\n\
+            database = \"lore.db\"\n\
+            bind = \"localhost:3100\"\n\n\
+            [ollama]\n\
+            host = \"http://127.0.0.1:11434\"\n\
+            model = \"nomic-embed-text\"\n\n\
+            [search]\n\
+            hybrid = true\n\
+            top_k = 5\n\
+            min_relevance = 0.6\n\n\
+            [chunking]\n\
+            strategy = \"heading\"\n\
+            max_tokens = 1024\n\n\
+            [trace]\n";
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.trace, TraceConfig::default());
+    }
+
+    #[test]
+    fn trace_enabled_env_var_overrides_config_off() {
+        // AE1: env var wins over config when config is off.
+        let mut config = sample_config();
+        config.trace.enabled = false;
+        temp_env::with_var("LORE_TRACE", Some("1"), || {
+            assert!(config.trace_enabled());
+        });
+        temp_env::with_var("LORE_TRACE", Some("true"), || {
+            assert!(config.trace_enabled());
+        });
+        temp_env::with_var("LORE_TRACE", Some("yes"), || {
+            assert!(config.trace_enabled());
+        });
+    }
+
+    #[test]
+    fn trace_enabled_env_var_overrides_config_on() {
+        // AE1: env var wins over config when config is on.
+        let mut config = sample_config();
+        config.trace.enabled = true;
+        temp_env::with_var("LORE_TRACE", Some("0"), || {
+            assert!(!config.trace_enabled());
+        });
+        temp_env::with_var("LORE_TRACE", Some("false"), || {
+            assert!(!config.trace_enabled());
+        });
+        temp_env::with_var("LORE_TRACE", Some("no"), || {
+            assert!(!config.trace_enabled());
+        });
+    }
+
+    #[test]
+    fn trace_enabled_falls_through_when_env_unset() {
+        let mut config = sample_config();
+        config.trace.enabled = false;
+        temp_env::with_var("LORE_TRACE", None::<&str>, || {
+            assert!(!config.trace_enabled());
+        });
+        config.trace.enabled = true;
+        temp_env::with_var("LORE_TRACE", None::<&str>, || {
+            assert!(config.trace_enabled());
+        });
+    }
+
+    #[test]
+    fn trace_enabled_falls_through_on_unrecognised_env_value() {
+        // Mirrors LORE_DEBUG's fail-soft contract: unknown / wrongly-cased
+        // / empty values are treated as unset, no warning emitted.
+        let mut config = sample_config();
+        config.trace.enabled = true;
+        for raw in ["maybe", "TRUE", "True", "Yes", "ON", "", " 1", "1 "] {
+            temp_env::with_var("LORE_TRACE", Some(raw), || {
+                assert!(
+                    config.trace_enabled(),
+                    "value {raw:?} should fall through to config.trace.enabled=true"
+                );
+            });
+        }
+        config.trace.enabled = false;
+        for raw in ["maybe", "TRUE", "FALSE", "Off", ""] {
+            temp_env::with_var("LORE_TRACE", Some(raw), || {
+                assert!(
+                    !config.trace_enabled(),
+                    "value {raw:?} should fall through to config.trace.enabled=false"
+                );
+            });
+        }
     }
 
     #[test]

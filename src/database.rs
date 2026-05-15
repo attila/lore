@@ -83,6 +83,25 @@ pub struct SearchResult {
     /// `json_each()` for membership checks; the DB layer stays
     /// JSON-naive (no deserialisation, just a round-trip).
     pub language_json: Option<String>,
+    /// Pre-fusion BM25 score from the FTS-fallback branch of
+    /// [`KnowledgeDB::search_hybrid_gated`] / [`KnowledgeDB::search_hybrid`].
+    /// `None` when the chunk did not appear in that branch's input list.
+    /// Populated by the hybrid call sites before passing into
+    /// `reciprocal_rank_fusion_n`; surfaced through Track 2 trace records
+    /// and the MCP `lore-metadata` fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_fts_fallback: Option<f64>,
+    /// Pre-fusion BM25 score from the FTS-structural branch (declared-
+    /// language gated). `None` when the chunk did not appear in that
+    /// branch — including for the two-list legacy path that has no
+    /// structural branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_fts_structural: Option<f64>,
+    /// Pre-fusion vector distance from the embedding branch. `None` when
+    /// embedding was unavailable (FTS-only fallback) or when the chunk
+    /// did not appear in the vector branch's input list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_vector: Option<f64>,
 }
 
 /// Aggregate statistics about the database contents.
@@ -308,6 +327,9 @@ impl KnowledgeDB {
                 is_universal: row.get::<_, i64>(7)? != 0,
                 applies_when_json: row.get::<_, Option<String>>(8)?,
                 language_json: row.get::<_, Option<String>>(9)?,
+                score_fts_fallback: None,
+                score_fts_structural: None,
+                score_vector: None,
             })
         })?;
 
@@ -346,6 +368,9 @@ impl KnowledgeDB {
                 is_universal: row.get::<_, i64>(7)? != 0,
                 applies_when_json: row.get::<_, Option<String>>(8)?,
                 language_json: row.get::<_, Option<String>>(9)?,
+                score_fts_fallback: None,
+                score_fts_structural: None,
+                score_vector: None,
             })
         })?;
 
@@ -361,13 +386,15 @@ impl KnowledgeDB {
         query_embedding: Option<&[f32]>,
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let fts_results = self.search_fts(query, limit * 2)?;
+        let mut fts_results = self.search_fts(query, limit * 2)?;
+        tag_pre_fusion(&mut fts_results, PreFusionBranch::FtsFallback);
 
         let Some(emb) = query_embedding else {
             return Ok(fts_results.into_iter().take(limit).collect());
         };
 
-        let vec_results = self.search_vector(emb, limit * 2)?;
+        let mut vec_results = self.search_vector(emb, limit * 2)?;
+        tag_pre_fusion(&mut vec_results, PreFusionBranch::Vector);
 
         Ok(reciprocal_rank_fusion(&fts_results, &vec_results, limit))
     }
@@ -535,12 +562,14 @@ impl KnowledgeDB {
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
         let over = limit.saturating_mul(2);
-        let fts_fallback = self.search_fts_fallback(cleaned_terms, inferred_langs, over)?;
-        let fts_structural = if inferred_langs.is_empty() {
+        let mut fts_fallback = self.search_fts_fallback(cleaned_terms, inferred_langs, over)?;
+        tag_pre_fusion(&mut fts_fallback, PreFusionBranch::FtsFallback);
+        let mut fts_structural = if inferred_langs.is_empty() {
             Vec::new()
         } else {
             self.search_fts_structural(cleaned_terms, inferred_langs, over)?
         };
+        tag_pre_fusion(&mut fts_structural, PreFusionBranch::FtsStructural);
 
         match query_embedding {
             None => Ok(reciprocal_rank_fusion_n(
@@ -548,7 +577,8 @@ impl KnowledgeDB {
                 limit,
             )),
             Some(emb) => {
-                let vec_results = self.search_vector_gated(emb, inferred_langs, over)?;
+                let mut vec_results = self.search_vector_gated(emb, inferred_langs, over)?;
+                tag_pre_fusion(&mut vec_results, PreFusionBranch::Vector);
                 Ok(reciprocal_rank_fusion_n(
                     &[&fts_fallback, &fts_structural, &vec_results],
                     limit,
@@ -684,6 +714,9 @@ impl KnowledgeDB {
                 is_universal: row.get::<_, i64>(7)? != 0,
                 applies_when_json: row.get::<_, Option<String>>(8)?,
                 language_json: row.get::<_, Option<String>>(9)?,
+                score_fts_fallback: None,
+                score_fts_structural: None,
+                score_vector: None,
             })
         })?;
 
@@ -1393,6 +1426,9 @@ fn read_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResult> {
         is_universal: row.get::<_, i64>(7)? != 0,
         applies_when_json: row.get::<_, Option<String>>(8)?,
         language_json: row.get::<_, Option<String>>(9)?,
+        score_fts_fallback: None,
+        score_fts_structural: None,
+        score_vector: None,
     })
 }
 
@@ -1415,6 +1451,33 @@ fn structural_admits(language_json: Option<&str>, inferred_langs: &[String]) -> 
         return false;
     };
     tokens.iter().any(|t| inferred_langs.iter().any(|l| l == t))
+}
+
+/// Pre-fusion list-of-origin tag for [`tag_pre_fusion`]. Identifies which
+/// `search_hybrid*` branch produced the input list so the per-list score
+/// can be preserved as `score_fts_fallback` / `score_fts_structural` /
+/// `score_vector` on the result rows before fusion overwrites `.score`
+/// with the normalised RRF value.
+#[derive(Debug, Clone, Copy)]
+enum PreFusionBranch {
+    FtsFallback,
+    FtsStructural,
+    Vector,
+}
+
+/// Annotate each `SearchResult` in `list` with its branch-of-origin's
+/// pre-fusion score in the corresponding `Option<f64>` field. Idempotent:
+/// re-tagging the same list with the same branch is a no-op since the
+/// field already contains `Some(r.score)`.
+fn tag_pre_fusion(list: &mut [SearchResult], branch: PreFusionBranch) {
+    for r in list.iter_mut() {
+        let score = r.score;
+        match branch {
+            PreFusionBranch::FtsFallback => r.score_fts_fallback = Some(score),
+            PreFusionBranch::FtsStructural => r.score_fts_structural = Some(score),
+            PreFusionBranch::Vector => r.score_vector = Some(score),
+        }
+    }
 }
 
 /// Merge two ranked result lists using Reciprocal Rank Fusion (k = 60).
@@ -1449,7 +1512,18 @@ fn reciprocal_rank_fusion_n(lists: &[&[SearchResult]], limit: usize) -> Vec<Sear
             let rrf = 1.0 / (k + i as f64 + 1.0);
             scores
                 .entry(r.id.clone())
-                .and_modify(|(_, s)| *s += rrf)
+                .and_modify(|(existing, s)| {
+                    *s += rrf;
+                    // Closure widening: a chunk that appears in multiple
+                    // input lists retains the pre-fusion component score
+                    // from each one. Without this, the second-list `r`
+                    // would otherwise be dropped by `and_modify`.
+                    existing.score_fts_fallback =
+                        existing.score_fts_fallback.or(r.score_fts_fallback);
+                    existing.score_fts_structural =
+                        existing.score_fts_structural.or(r.score_fts_structural);
+                    existing.score_vector = existing.score_vector.or(r.score_vector);
+                })
                 .or_insert_with(|| (r.clone(), rrf));
         }
     }
@@ -2062,6 +2136,9 @@ mod tests {
             is_universal: false,
             applies_when_json: None,
             language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
         };
         let a = vec![stub("x"), stub("y")];
         let b = vec![stub("y"), stub("z")];
@@ -2078,6 +2155,102 @@ mod tests {
         let max_rrf = 2.0 / 61.0;
         let expected_y = raw / max_rrf;
         assert!((merged[0].score - expected_y).abs() < 1e-10);
+    }
+
+    // -- Pre-fusion-score preservation (U3, Track 2 Observability) ---------
+
+    fn stub_result(id: &str, score: f64) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: String::new(),
+            body: String::new(),
+            tags: String::new(),
+            source_file: String::new(),
+            heading_path: String::new(),
+            score,
+            is_universal: false,
+            applies_when_json: None,
+            language_json: None,
+            score_fts_fallback: None,
+            score_fts_structural: None,
+            score_vector: None,
+        }
+    }
+
+    #[test]
+    fn tag_pre_fusion_populates_fts_fallback_field() {
+        let mut list = vec![stub_result("x", 0.42)];
+        tag_pre_fusion(&mut list, PreFusionBranch::FtsFallback);
+        assert_eq!(list[0].score_fts_fallback, Some(0.42));
+        assert_eq!(list[0].score_fts_structural, None);
+        assert_eq!(list[0].score_vector, None);
+    }
+
+    #[test]
+    fn tag_pre_fusion_populates_vector_field() {
+        let mut list = vec![stub_result("x", 1.23)];
+        tag_pre_fusion(&mut list, PreFusionBranch::Vector);
+        assert_eq!(list[0].score_vector, Some(1.23));
+        assert_eq!(list[0].score_fts_fallback, None);
+        assert_eq!(list[0].score_fts_structural, None);
+    }
+
+    #[test]
+    fn rrf_preserves_component_scores_for_chunks_in_one_list() {
+        let mut a = vec![stub_result("only-fts", 0.7)];
+        tag_pre_fusion(&mut a, PreFusionBranch::FtsFallback);
+        let b: Vec<SearchResult> = vec![];
+        let merged = reciprocal_rank_fusion(&a, &b, 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "only-fts");
+        assert_eq!(merged[0].score_fts_fallback, Some(0.7));
+        assert_eq!(merged[0].score_vector, None);
+        assert_eq!(merged[0].score_fts_structural, None);
+    }
+
+    #[test]
+    fn rrf_preserves_both_component_scores_for_cross_list_collision() {
+        // A chunk that appears in BOTH FTS-fallback and vector lists must
+        // retain both per-list scores after fusion.
+        let mut a = vec![stub_result("shared", 0.7)];
+        tag_pre_fusion(&mut a, PreFusionBranch::FtsFallback);
+        let mut b = vec![stub_result("shared", 0.9)];
+        tag_pre_fusion(&mut b, PreFusionBranch::Vector);
+        let merged = reciprocal_rank_fusion(&a, &b, 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "shared");
+        assert_eq!(merged[0].score_fts_fallback, Some(0.7));
+        assert_eq!(merged[0].score_vector, Some(0.9));
+    }
+
+    #[test]
+    fn rrf_preserves_all_three_component_scores_across_three_lists() {
+        // A chunk shared by all three branches keeps all three pre-fusion
+        // scores after fusion — the closure widening's primary purpose.
+        let mut a = vec![stub_result("triple", 0.5)];
+        tag_pre_fusion(&mut a, PreFusionBranch::FtsFallback);
+        let mut b = vec![stub_result("triple", 0.6)];
+        tag_pre_fusion(&mut b, PreFusionBranch::FtsStructural);
+        let mut c = vec![stub_result("triple", 0.7)];
+        tag_pre_fusion(&mut c, PreFusionBranch::Vector);
+        let merged = reciprocal_rank_fusion_n(&[&a, &b, &c], 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].score_fts_fallback, Some(0.5));
+        assert_eq!(merged[0].score_fts_structural, Some(0.6));
+        assert_eq!(merged[0].score_vector, Some(0.7));
+    }
+
+    #[test]
+    fn rrf_post_fusion_sort_order_unchanged_by_field_additions() {
+        // Pin the pre-existing ordering invariant: shared "y" beats
+        // singletons regardless of the new fields.
+        let mut a = vec![stub_result("x", 0.0), stub_result("y", 0.0)];
+        tag_pre_fusion(&mut a, PreFusionBranch::FtsFallback);
+        let mut b = vec![stub_result("y", 0.0), stub_result("z", 0.0)];
+        tag_pre_fusion(&mut b, PreFusionBranch::Vector);
+        let merged = reciprocal_rank_fusion(&a, &b, 10);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].id, "y");
     }
 
     // -- U5 helpers: build_fts_fallback_match + structural_admits -----------
