@@ -183,15 +183,18 @@ fn no_unsanctioned_runtime_disk_reads_in_hook_server_main() {
     );
 
     // src/trace/maintenance.rs — lazy compress+prune plus manual
-    // unbounded variant. Allowed file-I/O surfaces: the gzip target
-    // OpenOptions (Unix and non-Unix branches, mode 0o600 on Unix) and
-    // one read_to_string on the .last_pruned_at throttle state file.
+    // unbounded variant. Allowed file-I/O surfaces: two OpenOptions
+    // chains for the gzip target (Unix mode 0o600 + non-Unix
+    // fallback), one OpenOptions chain for `try_claim_throttle_slot`'s
+    // atomic `create_new` claim on .last_pruned_at, and one
+    // read_to_string on the throttle state file itself.
     let trace_maintenance = strip_test_modules(&read_source("trace/maintenance.rs"));
     assert_eq!(
         count_substring(&trace_maintenance, "std::fs::OpenOptions"),
-        2,
-        "trace/maintenance.rs OpenOptions count changed — allowed: one Unix \
-         (mode 0o600) and one non-Unix fallback for the gzip target."
+        3,
+        "trace/maintenance.rs OpenOptions count changed — allowed: \
+         gzip target Unix (mode 0o600), gzip target non-Unix fallback, \
+         and try_claim_throttle_slot's create_new claim on the state file."
     );
     assert_eq!(
         count_substring(&trace_maintenance, "std::fs::read_to_string"),

@@ -84,28 +84,50 @@ pub fn run_lazy(
     // Consult the in-memory shadow first (cheap, no syscall). Falls
     // back to the on-disk state file when the process hasn't run a
     // pass yet (cold start).
-    if let Some(last) = read_throttle_state(trace_dir, &state_path) {
-        // `duration_since` returns `Err` when `last` is in the future
-        // (clock skew + NTP correction, container snapshot, tampered
-        // state file). Treat the future-timestamp case as "throttle is
-        // not credible" and run the pass — otherwise a stale value
-        // like `u64::MAX` would block maintenance until wall time
-        // catches up, which can be years.
-        match SystemTime::now().duration_since(last) {
-            Ok(elapsed) if elapsed < LAZY_THROTTLE => {
-                lore_debug!(
-                    "trace maintenance: throttled (last run {}s ago)",
-                    elapsed.as_secs()
-                );
+    match read_throttle_state(trace_dir, &state_path) {
+        Some(last) => {
+            // `duration_since` returns `Err` when `last` is in the
+            // future (clock skew + NTP correction, container
+            // snapshot, tampered state file). Treat the future-
+            // timestamp case as "throttle is not credible" and run
+            // the pass — otherwise a stale value like `u64::MAX`
+            // would block maintenance until wall time catches up.
+            match SystemTime::now().duration_since(last) {
+                Ok(elapsed) if elapsed < LAZY_THROTTLE => {
+                    lore_debug!(
+                        "trace maintenance: throttled (last run {}s ago)",
+                        elapsed.as_secs()
+                    );
+                    return MaintenanceSummary {
+                        skipped: true,
+                        ..Default::default()
+                    };
+                }
+                Ok(_) => {} // elapsed >= throttle window — run.
+                Err(_) => {
+                    lore_debug!("trace maintenance: state file in future, running");
+                }
+            }
+        }
+        None => {
+            // No state on disk or in memory — try to atomically claim
+            // the throttle slot so two parallel SessionStarts don't
+            // both kick off a full pass on first run. Exactly one
+            // process succeeds via `O_CREAT | O_EXCL`; the loser
+            // short-circuits as throttled. Real-world race window is
+            // narrow (operator opens two Claude Code instances at
+            // once), but the cost of closing it is one syscall.
+            if !try_claim_throttle_slot(&state_path, SystemTime::now()) {
+                lore_debug!("trace maintenance: throttle slot claimed by another process");
                 return MaintenanceSummary {
                     skipped: true,
                     ..Default::default()
                 };
             }
-            Ok(_) => {} // elapsed >= throttle window — run.
-            Err(_) => {
-                lore_debug!("trace maintenance: state file in future, running");
-            }
+            // We hold the claim; the state file now exists and
+            // contains the claim timestamp. The run-end
+            // `record_throttle_state` rewrites it with the
+            // completion timestamp.
         }
     }
     let summary = run_pass(
@@ -353,6 +375,41 @@ fn write_last_pruned_at(path: &Path, t: SystemTime) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Attempt to atomically claim the throttle slot by creating the
+/// state file with `O_CREAT | O_EXCL`. Exactly one process succeeds
+/// when several race on first-run; the rest see `AlreadyExists` and
+/// back off as throttled.
+///
+/// Returns `true` when this process now owns the throttle window,
+/// `false` when the file already existed (another process won the
+/// race) or when a non-EEXIST error occurred (conservative — treat as
+/// "can't claim, back off").
+fn try_claim_throttle_slot(path: &Path, t: SystemTime) -> bool {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            // Best-effort write: even if the write fails, the file
+            // exists and acts as the claim — a subsequent
+            // `read_throttle_state` will see an empty/zero timestamp
+            // and decide based on the throttle window, which is the
+            // safer direction than abandoning the claim.
+            let _ = file.write_all(secs.to_string().as_bytes());
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            lore_debug!("trace maintenance: claim attempt failed: {e}");
+            false
+        }
+    }
+}
+
 /// Read the throttle timestamp via the in-memory shadow with a
 /// disk-state fallback. Returns `None` when neither source has a
 /// value (first run after process start with no prior on-disk state).
@@ -502,6 +559,25 @@ mod tests {
             external.exists(),
             "symlink target must not be touched outside the trace dir"
         );
+    }
+
+    #[test]
+    fn try_claim_throttle_slot_returns_true_on_first_call_false_on_second() {
+        // Models the parallel SessionStart race: two processes try to
+        // claim the same throttle slot. EXACTLY one wins; the other
+        // sees AlreadyExists and falls through to the throttled path.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join(".last_pruned_at");
+        let now = SystemTime::now();
+        assert!(
+            try_claim_throttle_slot(&state_path, now),
+            "first claim must succeed"
+        );
+        assert!(
+            !try_claim_throttle_slot(&state_path, now),
+            "second claim must fail with AlreadyExists"
+        );
+        assert!(state_path.exists());
     }
 
     #[test]
