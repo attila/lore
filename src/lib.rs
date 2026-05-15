@@ -12,3 +12,4 @@ pub mod lockfile;
 pub mod loreignore;
 pub mod provision;
 pub mod server;
+pub mod status;
