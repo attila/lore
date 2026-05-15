@@ -59,6 +59,14 @@
 
 ## Completed
 
+- [x] Language coverage in `lore status` — new `Languages:` line in the CLI status output reports
+      per-language source counts (rendered via `LANGUAGES.display_name`) plus an `undeclared`
+      bucket, built on the `language_json` column from #50. The same breakdown is exposed to agents
+      through the MCP `lore_status` tool's metadata fence as `languages_declared` /
+      `languages_undeclared` / `languages_error`. Defence-in-depth hardening: subquery dedup of
+      per-source tokens, empty-array rollup into `undeclared`, shared read transaction across the
+      two count queries, and unknown-token sanitisation at both ingest and render. See
+      `docs/plans/2026-05-15-001-feat-language-in-status-plan.md`.
 - [x] Replace hand-rolled XDG resolution with `etcetera` — `default_config_path` and
       `default_database_path` now use `etcetera::base_strategy::Xdg`, making the XDG-everywhere
       macOS posture explicit at the call site rather than implicit in hand-rolled code. Adds
