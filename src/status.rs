@@ -22,12 +22,12 @@ pub fn format_languages_line(counts: &LanguageCounts) -> Option<String> {
         return None;
     }
 
-    let mut entries: Vec<(&str, usize)> = counts
+    let mut entries: Vec<(String, usize)> = counts
         .declared
         .iter()
-        .map(|c| (display_name_for(&c.token), c.count))
+        .map(|c| (sanitise_for_line(display_name_for(&c.token)), c.count))
         .collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut parts: Vec<String> = entries
         .iter()
@@ -37,6 +37,29 @@ pub fn format_languages_line(counts: &LanguageCounts) -> Option<String> {
         parts.push(format!("undeclared {}", counts.undeclared));
     }
     Some(parts.join(", "))
+}
+
+/// Replace characters that would break the `Rust 5, TypeScript 5, ...`
+/// single-line format — commas (the field separator), whitespace
+/// (would visually merge with the `, ` separator or create new lines),
+/// and ASCII control characters. Maps each offending character to `_`.
+///
+/// Known tokens in [`crate::engine::languages::LANGUAGES`] are vetted
+/// at codegen time and pass through unchanged. The fallback path of
+/// [`display_name_for`] returns the raw token, which is the only
+/// realistic source of disallowed characters — and even there, the
+/// ingest validator filters them out. This is the render-side
+/// defence-in-depth backstop.
+fn sanitise_for_line(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == ',' || c.is_whitespace() || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -104,5 +127,28 @@ mod tests {
         // a newer pack than the binary covers) renders as-is.
         let line = format_languages_line(&counts(&[("kotlin", 2)], 0)).unwrap();
         assert_eq!(line, "kotlin 2");
+    }
+
+    #[test]
+    fn format_languages_line_sanitises_unknown_tokens_with_separator_chars() {
+        // Defence-in-depth render-side: an unknown token containing
+        // commas, whitespace, or control characters would corrupt the
+        // single-line `, `-separated format. Sanitiser replaces them
+        // with `_`. The ingest validator filters these out, so this
+        // is only reachable via manual SQL edit or a future bug.
+        let line = format_languages_line(&counts(&[("foo,bar", 1), ("baz\nqux", 1)], 0)).unwrap();
+        // Ordering: alphabetical tiebreak on sanitised display name
+        // (`_` is ASCII 0x5F, `b` is 0x62 — so `baz_qux` < `foo_bar`).
+        assert_eq!(line, "baz_qux 1, foo_bar 1");
+    }
+
+    #[test]
+    fn format_languages_line_leaves_known_display_names_unchanged() {
+        // The sanitiser must not corrupt vetted display names. None of
+        // today's LANGUAGES entries carry forbidden characters; this
+        // pins that contract so a future entry with e.g. `C++` or `F#`
+        // is not accidentally caught by an over-broad sanitiser.
+        let line = format_languages_line(&counts(&[("rust", 1), ("typescript", 1)], 0)).unwrap();
+        assert_eq!(line, "Rust 1, TypeScript 1");
     }
 }
