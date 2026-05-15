@@ -2660,6 +2660,73 @@ mod tests {
     }
 
     #[test]
+    fn lore_status_emits_trace_object_when_tracing_enabled() {
+        // R22 contract: when `Config::trace_enabled()` is true, the MCP
+        // `lore_status` response's metadata fence carries a `trace`
+        // object with the directory + counts + capture posture.
+        let mut h = TestHarness::new();
+        h.config.trace.enabled = true;
+        h.config.trace.include_full_command = true; // elevates a warning.
+        let trace_dir = h.config.knowledge_dir.join("traces-mcp-on");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+
+        let resp = temp_env::with_var("LORE_TRACE_DIR", Some(trace_dir.as_os_str()), || {
+            h.request_value(
+                r#"{
+                        "jsonrpc":"2.0","id":80,"method":"tools/call",
+                        "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+                    }"#,
+            )
+        });
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        let trace = &metadata["trace"];
+        assert!(
+            trace.is_object(),
+            "expected a `trace` object on the metadata fence, got: {metadata}"
+        );
+        assert_eq!(trace["directory"], trace_dir.display().to_string());
+        assert_eq!(trace["session_count"], 0);
+        assert_eq!(trace["total_bytes"], 0);
+        // Capture posture must surface the privacy-elevated toggle so
+        // agents pattern-matching on `capture.warnings` see the audit.
+        let capture = &trace["capture"];
+        assert!(capture.is_object());
+        assert_eq!(capture["command_head_only"], false);
+        assert_eq!(capture["transcript_tail_included"], false);
+        let warnings = capture["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|w| w == "full_command_body_captured"),
+            "expected full_command_body_captured warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn lore_status_omits_trace_object_when_tracing_disabled() {
+        // R22 contract, off direction: when tracing is disabled, the
+        // `trace` key is absent entirely (mirrors the
+        // `empty_knowledge_dir` conditional-field pattern).
+        let h = TestHarness::new();
+        assert!(
+            !h.config.trace.enabled,
+            "harness default should leave tracing off"
+        );
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":81,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}
+            }"#,
+        );
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        assert!(
+            metadata.get("trace").is_none() || metadata["trace"].is_null(),
+            "`trace` key must be omitted when tracing is disabled, got: {metadata}"
+        );
+    }
+
+    #[test]
     fn lore_status_reports_git_state() {
         // Arrange
         // Initialise the harness's knowledge_dir as a git repository so the
