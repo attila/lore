@@ -2,6 +2,12 @@
 
 ## Up Next
 
+- [ ] Track 2 Observability — opt-in, agent-agnostic per-hook trace logging written as JSONL records
+      under `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` (one file per session), plus a
+      `lore trace why <session>` query CLI. Enables data-driven decisions on threshold tuning,
+      refactor validation, debug, and continuous dogfooding. Builds on `default_trace_dir()` from
+      the etcetera refactor (PR #52) and the three-list RRF pipeline from language detection (PR
+      #50). See `docs/brainstorms/2026-05-14-track-2-observability-requirements.md`.
 - [ ] Extend the shared language table — six entries today (Rust, TypeScript, JavaScript, YAML,
       Python, Go). Adding Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, and shell scripts is now a
       single struct-literal change per language thanks to the shared `LANGUAGES` slice in
@@ -44,6 +50,13 @@
 
 ## Completed
 
+- [x] Replace hand-rolled XDG resolution with `etcetera` — `default_config_path` and
+      `default_database_path` now use `etcetera::base_strategy::Xdg`, making the XDG-everywhere
+      macOS posture explicit at the call site rather than implicit in hand-rolled code. Adds
+      `default_trace_dir()` returning `$XDG_STATE_HOME/lore/traces` (with
+      `$HOME/.local/state/lore/traces` fallback) as quiet infrastructure for the forthcoming Track 2
+      Observability work. No observable Linux or macOS behaviour change for the two existing
+      helpers. See `docs/plans/2026-05-14-001-refactor-etcetera-xdg-path-resolution-plan.md`.
 - [x] Language detection architecture — refactored signal detection around a single shared
       declarative table (`src/engine/languages.rs`) covering extensions, command keywords, marker
       filenames, and directory hints. Word-boundary bash matcher replaces the prior substring
