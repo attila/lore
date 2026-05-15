@@ -2133,6 +2133,25 @@ Body text long enough to chunk through heading mode.
     }
 
     #[test]
+    fn serialise_language_list_empty_vec_returns_none_not_empty_array() {
+        // Defence-in-depth pin: an empty language token list must
+        // serialise to `None`, never to `Some("[]")`. The read-side
+        // `KnowledgeDB::language_counts` treats an empty JSON array
+        // as undeclared so the bucket invariant holds, but the ingest
+        // side should never emit that state in the first place.
+        assert_eq!(serialise_language_list(&[]), None);
+    }
+
+    #[test]
+    fn parse_then_serialise_empty_flow_list_yields_no_language_json() {
+        // End-to-end confirmation: `language: []` in frontmatter
+        // never reaches the database as a literal `'[]'` string.
+        let md = "---\nlanguage: []\n---\n# x\n";
+        let (langs, _) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(serialise_language_list(&langs), None);
+    }
+
+    #[test]
     fn parse_language_missing_field() {
         let md = "---\ntags: [workflow]\n---\n# x\n";
         let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
