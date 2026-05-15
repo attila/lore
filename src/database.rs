@@ -726,11 +726,18 @@ impl KnowledgeDB {
     /// live in one place).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn language_counts(&self) -> anyhow::Result<LanguageCounts> {
+        // Inner SELECT DISTINCT collapses any duplicate token within a
+        // single source's `language_json` array (e.g. `["rust","rust"]`)
+        // to one (source, token) row before the outer GROUP BY counts
+        // sources per language. The ingest validator's lowercase
+        // normalisation already discourages duplicates in practice;
+        // this is the read-side defence-in-depth backstop.
         let mut declared_stmt = self.conn.prepare(
-            "SELECT je.value AS token, COUNT(*) AS n \
-             FROM patterns p, json_each(p.language_json) je \
-             WHERE p.language_json IS NOT NULL \
-             GROUP BY je.value",
+            "SELECT token, COUNT(*) AS n FROM ( \
+                SELECT DISTINCT p.source_file, je.value AS token \
+                FROM patterns p, json_each(p.language_json) je \
+                WHERE p.language_json IS NOT NULL \
+             ) GROUP BY token",
         )?;
         let declared = declared_stmt
             .query_map([], |row| {
@@ -1868,6 +1875,34 @@ mod tests {
         let mut declared = counts.declared;
         declared.sort();
         assert_eq!(declared, vec![lc("rust", 1), lc("yaml", 1)]);
+    }
+
+    #[test]
+    fn language_counts_duplicate_token_in_array_counts_source_once() {
+        // `language_json = '["rust","rust"]'` is a degenerate state —
+        // the ingest validator lowercases tokens but does not dedupe,
+        // so an author writing `[Rust, rust]` would land here. Without
+        // the inner SELECT DISTINCT, the json_each join would yield
+        // two `(source, "rust")` rows and the outer COUNT would
+        // double-count the source. Pin the dedup behaviour.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: "dup.md".to_string(),
+            title: "Dup".into(),
+            tags: String::new(),
+            is_universal: false,
+            raw_body: "body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+            language_json: Some(r#"["rust","rust"]"#.to_string()),
+        })
+        .unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+        assert_eq!(counts.declared, vec![lc("rust", 1)]);
     }
 
     #[test]
