@@ -102,15 +102,42 @@ impl TraceStats {
     }
 }
 
+/// One row of the [`PRIVACY_ELEVATED_TOGGLES`] registry. Each entry maps a
+/// `TraceConfig` accessor to the warning token surfaced through
+/// `lore status` and the MCP `lore_status` `capture.warnings` array.
+///
+/// Future privacy-elevated toggles add a row here. The hand-maintained
+/// `if config.trace.<toggle> { warnings.push(...) }` ladder was the
+/// previous shape and silently bypassed audit when a contributor forgot
+/// to update both surfaces.
+struct PrivacyToggle {
+    /// Read `true` iff this toggle is currently turned on for the config.
+    is_elevated: fn(&crate::config::TraceConfig) -> bool,
+    /// Stable token surfaced to MCP consumers in `capture.warnings`.
+    /// Must not change across releases — agents pattern-match on it.
+    warning_token: &'static str,
+}
+
+/// Single source of truth for privacy-elevated trace toggles. Walked by
+/// [`CapturePosture::from_config`]; extend here when adding a new toggle.
+const PRIVACY_ELEVATED_TOGGLES: &[PrivacyToggle] = &[
+    PrivacyToggle {
+        is_elevated: |t| t.include_full_command,
+        warning_token: "full_command_body_captured",
+    },
+    PrivacyToggle {
+        is_elevated: |t| t.include_transcript_tail,
+        warning_token: "transcript_tail_captured",
+    },
+];
+
 impl CapturePosture {
     pub fn from_config(config: &Config) -> Self {
-        let mut warnings = Vec::new();
-        if config.trace.include_full_command {
-            warnings.push("full_command_body_captured");
-        }
-        if config.trace.include_transcript_tail {
-            warnings.push("transcript_tail_captured");
-        }
+        let warnings: Vec<&'static str> = PRIVACY_ELEVATED_TOGGLES
+            .iter()
+            .filter(|toggle| (toggle.is_elevated)(&config.trace))
+            .map(|toggle| toggle.warning_token)
+            .collect();
         Self {
             command_head_only: !config.trace.include_full_command,
             transcript_tail_included: config.trace.include_transcript_tail,
