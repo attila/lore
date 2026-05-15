@@ -66,13 +66,13 @@ hook:
    `seen.contains` check so they re-inject on every relevant tool call; non-universal chunks are
    filtered as before. Every surfaced chunk (universal or not) is appended to the dedup file so it
    remains a faithful injection log.
-6. **Trace write (Track 2 Observability).** When `Config::trace_enabled()` is true — i.e. either
-   `[trace] enabled = true` in `lore.toml` or `LORE_TRACE=1` in the env — the hook appends one JSON
-   Lines record to `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` capturing the call context,
-   query, candidate set with pre-fusion component scores, injected ids, and total duration. The
-   write is fire-and-forget: failures degrade to `LORE_DEBUG`-gated stderr and the hook returns its
-   normal payload. `SessionStart`, `PostToolUse`, and `PostCompact` use the same slot (after their
-   main decision, before return). Inspect the records with `lore trace why`.
+6. **Trace write.** When `Config::trace_enabled()` is true — i.e. either `[trace] enabled = true` in
+   `lore.toml` or `LORE_TRACE=1` in the env — the hook appends one JSON Lines record to
+   `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` capturing the call context, query, candidate set
+   with pre-fusion component scores, injected ids, and total duration. The write is fire-and-forget:
+   failures degrade to `LORE_DEBUG`-gated stderr and the hook returns its normal payload.
+   `SessionStart`, `PostToolUse`, and `PostCompact` use the same slot (after their main decision,
+   before return). Inspect the records with `lore trace why`.
 7. Formats the results as imperative directives and returns them in `additionalContext`
 
 The output format groups chunks by source file:

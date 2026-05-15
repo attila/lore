@@ -279,7 +279,7 @@ inputs are rejected with a JSON-RPC `-32000` error before any processing occurs.
 | `tags` (serialised) | 8,192 bytes (8 KB)     |
 | `top_k`             | 100                    |
 
-## Per-Hook Trace Logging (Track 2 Observability)
+## Per-Hook Trace Logging
 
 When tracing is enabled, every canonical hook event (PreToolUse, PostToolUse, SessionStart,
 PostCompact) appends one JSON Lines record to a per-session file under
