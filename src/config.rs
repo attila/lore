@@ -196,16 +196,25 @@ pub fn default_trace_dir() -> anyhow::Result<PathBuf> {
     Ok(state.join("lore").join("traces"))
 }
 
-/// Resolve the trace directory honouring the test-only `LORE_TRACE_DIR`
-/// override. Single source of truth for `lore status`, the MCP
+/// Resolve the trace directory used by `lore status`, the MCP
 /// `lore_status` tool, the `lore trace { why, prune }` subcommands, and
 /// the hook trace integration. Returning [`anyhow::Result`] mirrors
 /// `default_trace_dir`'s contract — callers translate the `Err` shape
 /// into their own discipline (`Option` for hook fire-and-forget,
 /// propagation for CLI surfaces).
+///
+/// **Test-only override:** under `cfg(debug_assertions)` (i.e. dev and
+/// `cargo test` builds), `LORE_TRACE_DIR` short-circuits the XDG lookup.
+/// Release builds ignore the variable so operators cannot accidentally
+/// rely on it; the plan's "trace directory is XDG-state-only" decision
+/// is preserved on the production surface. Per-environment redirection
+/// is available via `XDG_STATE_HOME` in either build mode.
 pub fn resolve_trace_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("LORE_TRACE_DIR") {
-        return Ok(PathBuf::from(dir));
+    #[cfg(debug_assertions)]
+    {
+        if let Some(dir) = std::env::var_os("LORE_TRACE_DIR") {
+            return Ok(PathBuf::from(dir));
+        }
     }
     default_trace_dir()
 }
