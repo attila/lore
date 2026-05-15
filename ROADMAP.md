@@ -41,6 +41,15 @@
       reason, forcing Claude to retry with conventions visible. Requires solid deduplication to
       avoid infinite loops (see
       `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
+- [ ] Predicated-universal dedup behaviour — revisit `src/hook.rs`'s
+      `r.is_universal || !seen.contains(&r.id)` filter in `dedup_filter_and_record` once Track 2
+      observability data is in. Track 1B deliberately kept the bypass for predicated universals as a
+      Key Technical Decision (intent: re-inject on every matching call), but ~45 KB/session of
+      repeated injection for `agents/unattended-work.md` has been flagged as a real cost. One-line
+      override: `(r.is_universal && r.applies_when_json.is_none()) || !seen.contains(&r.id)`.
+      Deferred until observability data quantifies whether per-call reminders change agent
+      behaviour; see Key Technical Decisions in
+      `docs/plans/2026-05-08-001-feat-sessionstart-respect-applies-when-plan.md`.
 - [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
       `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
