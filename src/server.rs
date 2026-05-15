@@ -514,6 +514,10 @@ fn tool_definitions() -> Value {
                              count in each declared bucket so the sum can exceed \
                              sources_indexed), languages_undeclared (integer count of \
                              sources with no `language:` declaration), \
+                             languages_error (null in normal operation; carries the \
+                             error message when the language aggregation query fails, \
+                             so agents can distinguish a broken query from a genuinely \
+                             empty knowledge base), \
                              inbox_workflow_configured, delta_ingest_available, \
                              loreignore_active, and universal_advisories (count, \
                              oversized bodies, near-miss tags from the most recent full or \
@@ -1067,18 +1071,26 @@ fn handle_lore_status(
     let stats = ctx.db.stats().ok();
     let chunks = stats.as_ref().map(|s| s.chunks);
     let sources = stats.as_ref().map(|s| s.sources);
-    let language_counts = ctx.db.language_counts().ok();
+    // Capture the result rather than `.ok()`-discarding it: agents
+    // diagnosing why language coverage is missing need to distinguish
+    // an empty knowledge base (counts present, all-zero) from a broken
+    // query (counts absent, error attached).
+    let language_counts_result = ctx.db.language_counts();
     // Token-keyed map (`{"rust": 12, "typescript": 5}`) matching the
     // canonical `language:` frontmatter surface. Agents tagging new
     // patterns or debugging the structural language gate read the same
     // tokens here that they would write into a pattern's frontmatter.
-    let languages_declared = language_counts.as_ref().map(|lc| {
+    let languages_declared = language_counts_result.as_ref().ok().map(|lc| {
         lc.declared
             .iter()
             .map(|c| (c.token.clone(), json!(c.count)))
             .collect::<serde_json::Map<_, _>>()
     });
-    let languages_undeclared = language_counts.as_ref().map(|lc| lc.undeclared);
+    let languages_undeclared = language_counts_result.as_ref().ok().map(|lc| lc.undeclared);
+    let languages_error = language_counts_result
+        .as_ref()
+        .err()
+        .map(std::string::ToString::to_string);
     let inbox_workflow_configured = ctx.config.inbox_branch_prefix().is_some();
     let delta_ingest_available = is_git_repo && last_commit.is_some();
     // Compute the effective scan state in a single pass. `effective_scan_state`
@@ -1123,6 +1135,7 @@ fn handle_lore_status(
         "sources_indexed": sources,
         "languages_declared": languages_declared,
         "languages_undeclared": languages_undeclared,
+        "languages_error": languages_error,
         "inbox_workflow_configured": inbox_workflow_configured,
         "delta_ingest_available": delta_ingest_available,
         "loreignore_active": loreignore_active,
@@ -1160,15 +1173,16 @@ fn handle_lore_status(
         },
     );
 
-    // Append the same Languages: breakdown the CLI surfaces, when the
-    // database has anything to report. Suppression mirrors
-    // `lore status`: silent when the database is empty.
-    let summary = if let Some(lc) = language_counts.as_ref()
-        && let Some(line) = crate::status::format_languages_line(lc)
-    {
-        format!("{summary} Languages: {line}.")
-    } else {
-        summary
+    // Append the same Languages: breakdown the CLI surfaces. On query
+    // failure, append the error inline rather than silently suppressing
+    // — agents should be able to distinguish empty-DB from broken-query
+    // from the prose alone, not just the JSON fence.
+    let summary = match language_counts_result.as_ref() {
+        Ok(lc) => match crate::status::format_languages_line(lc) {
+            Some(line) => format!("{summary} Languages: {line}."),
+            None => summary,
+        },
+        Err(e) => format!("{summary} Languages: query failed ({e})."),
     };
 
     let summary_with_fence = maybe_append_lore_metadata_fence(summary, &metadata, include_metadata);

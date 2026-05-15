@@ -779,10 +779,19 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  Chunks:       {}", stats.chunks);
         eprintln!("  Sources:      {}", stats.sources);
 
-        if let Ok(counts) = db.language_counts()
-            && let Some(line) = format_languages_line(&counts)
-        {
-            eprintln!("  Languages:    {line}");
+        // Surface query failures inline rather than silently suppressing
+        // the Languages line — a sub-query error would otherwise look
+        // identical to a genuinely empty database, blinding the operator
+        // to the very state `lore status` exists to diagnose.
+        match db.language_counts() {
+            Ok(counts) => {
+                if let Some(line) = format_languages_line(&counts) {
+                    eprintln!("  Languages:    {line}");
+                }
+            }
+            Err(e) => {
+                eprintln!("  Languages:    ✗ query failed: {e}");
+            }
         }
 
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
