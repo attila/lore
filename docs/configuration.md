@@ -339,3 +339,10 @@ The trace directory follows XDG state resolution and is **not** configurable via
 On Unix, the directory is created mode `0o700` and individual trace files mode `0o600` so operators
 on multi-user systems, shared CI runners, and containers with shared home volumes are not surprised
 by world-readable trace content.
+
+Trace files are appended without locking; the per-write atomicity guarantee relies on POSIX
+`O_APPEND`. On NFS-mounted home directories and other filesystems that do not enforce `O_APPEND`
+atomicity, two concurrent hook invocations can interleave bytes and produce a torn JSON line. The
+reader recovers — malformed lines are skipped with a `LORE_DEBUG`-gated warning — but the
+corresponding record is lost. Point the trace directory at local storage when running lore on NFS or
+SMB-backed home directories.
