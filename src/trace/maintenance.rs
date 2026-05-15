@@ -19,12 +19,33 @@
 //!
 //! Both writers bump the `.last_pruned_at` state file in the trace
 //! directory so the throttle is honest about which writer last ran.
+//!
+//! **Disk-state-with-in-memory-shadow.** The throttle decision consults
+//! a process-local `LazyLock<Mutex<HashMap<PathBuf, SystemTime>>>` first
+//! (cheap, no syscall), then falls back to reading `.last_pruned_at`
+//! from disk. After every pass the in-memory map is updated
+//! unconditionally; the disk write is best-effort. On hosts where the
+//! state file is unwriteable (read-only mount, disk full, SELinux
+//! denial) the cross-process throttle stops working but each process
+//! still throttles itself, so a hot loop of SessionStarts in one
+//! process can't trigger repeated full-directory walks. Pattern is the
+//! standard one used by OpenTelemetry Collector's `file_storage`,
+//! Datadog Agent, Vector, and Loki Promtail.
 
+use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::lore_debug;
+
+/// Process-local shadow of the on-disk throttle state. Keyed on the
+/// resolved trace directory path so tests using different temp dirs
+/// don't share state. Updated unconditionally after every maintenance
+/// pass; read before consulting disk.
+static IN_MEMORY_THROTTLE: LazyLock<Mutex<HashMap<PathBuf, SystemTime>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// File name of the throttle state file inside the trace directory.
 pub const LAST_PRUNED_AT_FILE: &str = ".last_pruned_at";
@@ -60,7 +81,10 @@ pub fn run_lazy(
         return MaintenanceSummary::default();
     }
     let state_path = trace_dir.join(LAST_PRUNED_AT_FILE);
-    if let Some(last) = read_last_pruned_at(&state_path) {
+    // Consult the in-memory shadow first (cheap, no syscall). Falls
+    // back to the on-disk state file when the process hasn't run a
+    // pass yet (cold start).
+    if let Some(last) = read_throttle_state(trace_dir, &state_path) {
         // `duration_since` returns `Err` when `last` is in the future
         // (clock skew + NTP correction, container snapshot, tampered
         // state file). Treat the future-timestamp case as "throttle is
@@ -92,7 +116,7 @@ pub fn run_lazy(
         Some(MAX_PRUNE_PER_RUN),
         Verbosity::Silent,
     );
-    let _ = write_last_pruned_at(&state_path, SystemTime::now());
+    record_throttle_state(trace_dir, &state_path, SystemTime::now());
     summary
 }
 
@@ -115,7 +139,7 @@ pub fn run_manual(
         Verbosity::Verbose,
     );
     let state_path = trace_dir.join(LAST_PRUNED_AT_FILE);
-    let _ = write_last_pruned_at(&state_path, SystemTime::now());
+    record_throttle_state(trace_dir, &state_path, SystemTime::now());
     summary
 }
 
@@ -329,6 +353,36 @@ fn write_last_pruned_at(path: &Path, t: SystemTime) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read the throttle timestamp via the in-memory shadow with a
+/// disk-state fallback. Returns `None` when neither source has a
+/// value (first run after process start with no prior on-disk state).
+fn read_throttle_state(trace_dir: &Path, state_path: &Path) -> Option<SystemTime> {
+    if let Ok(map) = IN_MEMORY_THROTTLE.lock()
+        && let Some(t) = map.get(trace_dir).copied()
+    {
+        return Some(t);
+    }
+    read_last_pruned_at(state_path)
+}
+
+/// Record the throttle timestamp in both the in-memory shadow and on
+/// disk. The in-memory update always happens; the disk write is
+/// best-effort and degrades to a `LORE_DEBUG`-gated diagnostic on
+/// failure. This pairing keeps the process-local throttle working even
+/// when the state file is unwriteable (read-only mount, disk full, etc.)
+/// so a hot loop of SessionStarts can't repeatedly walk the directory.
+fn record_throttle_state(trace_dir: &Path, state_path: &Path, t: SystemTime) {
+    if let Ok(mut map) = IN_MEMORY_THROTTLE.lock() {
+        map.insert(trace_dir.to_path_buf(), t);
+    }
+    if let Err(e) = write_last_pruned_at(state_path, t) {
+        lore_debug!(
+            "trace maintenance: failed to persist throttle state ({e}); \
+             in-memory shadow will throttle this process"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +501,47 @@ mod tests {
         assert!(
             external.exists(),
             "symlink target must not be touched outside the trace dir"
+        );
+    }
+
+    #[test]
+    fn in_memory_throttle_engages_when_disk_state_is_absent() {
+        // Simulate a host where the on-disk state file fails to land
+        // (read-only mount, disk full, etc.) by deleting the file
+        // between the first and second lazy run. The second invocation
+        // must still throttle off the in-memory shadow rather than
+        // re-running the full maintenance pass.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces-in-memory");
+        fs::create_dir_all(&trace_dir).unwrap();
+        touch_with_age(&trace_dir.join("aged.jsonl"), 60);
+
+        // First run lays down state on disk AND in memory.
+        let summary_first = run_lazy(&trace_dir, 30, 0);
+        assert_eq!(
+            summary_first.deleted, 1,
+            "first run should prune the aged file"
+        );
+        assert!(
+            trace_dir.join(LAST_PRUNED_AT_FILE).exists(),
+            "first run should write the state file"
+        );
+
+        // Simulate the disk-state-loss case: someone removed the state
+        // file out-of-band. The in-memory shadow should still throttle.
+        fs::remove_file(trace_dir.join(LAST_PRUNED_AT_FILE)).unwrap();
+        // Lay down another aged file that would be pruned if the
+        // throttle didn't engage.
+        touch_with_age(&trace_dir.join("aged-again.jsonl"), 60);
+
+        let summary_second = run_lazy(&trace_dir, 30, 0);
+        assert!(
+            summary_second.skipped,
+            "in-memory shadow should keep the throttle engaged when disk state is missing"
+        );
+        assert!(
+            trace_dir.join("aged-again.jsonl").exists(),
+            "throttled run must not prune"
         );
     }
 }
