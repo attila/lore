@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `lore status` inserts a new `Languages:` line between `Sources:` and `Last commit:` reporting a
+  per-language source-count breakdown plus an `undeclared` bucket; the same data is exposed as
+  `languages_declared` / `languages_undeclared` on the MCP `lore_status` tool's metadata fence for
+  agent or script consumers. (#58)
+
 ## [0.3.1] - 2026-05-14
 
 ### Fixed

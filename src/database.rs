@@ -91,6 +91,40 @@ pub struct DBStats {
     pub sources: usize,
 }
 
+/// One declared-language bucket as returned by
+/// [`KnowledgeDB::language_counts`].
+///
+/// `token` is the canonical FTS5-safe identifier from `language_json`
+/// (e.g. `"rust"`, `"typescript"` — see [`crate::engine::languages`]).
+/// `count` is the number of distinct source files that declared this
+/// language.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LanguageCount {
+    pub token: String,
+    pub count: usize,
+}
+
+/// Per-language source counts plus the count of sources with no
+/// `language:` declaration. Returned by [`KnowledgeDB::language_counts`]
+/// and rendered by `lore status` to show how much of the knowledge base
+/// participates in the structural language gate.
+///
+/// `declared` holds [`LanguageCount`] entries as returned by SQL.
+/// Sorting and display-name resolution happen at the call site so this
+/// struct stays I/O-shaped. A multi-language source
+/// (`language: [rust, typescript]`) contributes a `+1` to each token
+/// bucket it declares, so the sum of `declared` counts plus
+/// `undeclared` can exceed `DBStats::sources`.
+///
+/// Marked `#[non_exhaustive]` so future additive fields (e.g. a
+/// `total_sources` helper) do not become a breaking change for
+/// downstream consumers.
+#[non_exhaustive]
+pub struct LanguageCounts {
+    pub declared: Vec<LanguageCount>,
+    pub undeclared: usize,
+}
+
 /// One entry per source document, used by `lore list` and the MCP
 /// `list_patterns` tool.
 ///
@@ -674,6 +708,77 @@ impl KnowledgeDB {
             chunks: chunks as usize,
             #[allow(clippy::cast_possible_truncation)]
             sources: sources as usize,
+        })
+    }
+
+    /// Per-language source counts plus the undeclared bucket.
+    ///
+    /// Reads the `patterns` table directly — it is 1:1 with source files
+    /// (`source_file` is the primary key), so each row contributes
+    /// exactly once to either a declared language bucket or to
+    /// `undeclared`. The `chunks` table carries the same `language_json`
+    /// denormalised for retrieval queries; aggregating from `patterns`
+    /// matches the authorial view used by [`KnowledgeDB::stats`] and
+    /// keeps the SQL clear of any de-duplication step.
+    ///
+    /// Returns a [`LanguageCounts`]; see that type for field semantics
+    /// (multi-bucket counting and the bucket-sum-exceeds-sources rule
+    /// live in one place).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn language_counts(&self) -> anyhow::Result<LanguageCounts> {
+        // Wrap both reads in a single transaction so the declared and
+        // undeclared counts come from the same WAL snapshot — a
+        // concurrent ingest commit landing between the queries would
+        // otherwise make the buckets disagree by one source. In
+        // practice this is single-user dev and the queries finish in
+        // microseconds; the transaction is paranoia, but it keeps the
+        // method's contract crisp ("counts are mutually consistent").
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Inner SELECT DISTINCT collapses any duplicate token within a
+        // single source's `language_json` array (e.g. `["rust","rust"]`)
+        // to one (source, token) row before the outer GROUP BY counts
+        // sources per language. The ingest validator's lowercase
+        // normalisation already discourages duplicates in practice;
+        // this is the read-side defence-in-depth backstop.
+        let mut declared_stmt = tx.prepare(
+            "SELECT token, COUNT(*) AS n FROM ( \
+                SELECT DISTINCT p.source_file, je.value AS token \
+                FROM patterns p, json_each(p.language_json) je \
+                WHERE p.language_json IS NOT NULL \
+             ) GROUP BY token",
+        )?;
+        let declared = declared_stmt
+            .query_map([], |row| {
+                let token: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok(LanguageCount {
+                    token,
+                    count: count as usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(declared_stmt);
+
+        // A pattern with `language_json = '[]'` (empty JSON array)
+        // carries no actionable language signal — `json_each` yields no
+        // rows for it, so the declared query already excludes it. Roll
+        // it into the undeclared bucket here so it doesn't vanish from
+        // both sides of the breakdown. The ingest validator should make
+        // empty arrays unreachable in practice, but the read side stays
+        // forgiving.
+        let undeclared: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM patterns \
+             WHERE language_json IS NULL OR json_array_length(language_json) = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        tx.commit()?;
+
+        Ok(LanguageCounts {
+            declared,
+            undeclared: undeclared as usize,
         })
     }
 
@@ -1652,6 +1757,233 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 3);
         assert_eq!(stats.sources, 2);
+    }
+
+    // -- language_counts --------------------------------------------------
+
+    /// Helper: build a chunk pre-tagged with a `language_json` array.
+    /// `tokens` are the canonical FTS5-safe identifiers stored in the
+    /// JSON array (e.g. `["rust"]`, `["rust", "typescript"]`).
+    fn make_chunk_with_language(
+        id: &str,
+        title: &str,
+        body: &str,
+        source: &str,
+        tokens: &[&str],
+    ) -> Chunk {
+        let mut chunk = make_chunk(id, title, body, source);
+        let json = serde_json::to_string(tokens).expect("token array serialises");
+        chunk.language_json = Some(json);
+        chunk
+    }
+
+    /// Short helper to construct a `LanguageCount` from a `(token, count)`
+    /// pair — keeps the assertion sites compact.
+    fn lc(token: &str, count: usize) -> LanguageCount {
+        LanguageCount {
+            token: token.to_string(),
+            count,
+        }
+    }
+
+    #[test]
+    fn language_counts_empty_db_returns_zero_buckets() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert!(counts.declared.is_empty());
+        assert_eq!(counts.undeclared, 0);
+    }
+
+    #[test]
+    fn language_counts_single_language_sources_only() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c2", "T2", "Body two", "b.md", &["rust"]),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c3", "T3", "Body three", "c.md", &["typescript"]),
+            None,
+        );
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+
+        let mut declared = counts.declared;
+        declared.sort();
+        assert_eq!(declared, vec![lc("rust", 2), lc("typescript", 1)]);
+    }
+
+    #[test]
+    fn language_counts_all_undeclared_sources() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(&db, &make_chunk("c1", "T1", "Body one", "a.md"), None);
+        seed_pattern_and_chunk(&db, &make_chunk("c2", "T2", "Body two", "b.md"), None);
+
+        let counts = db.language_counts().unwrap();
+        assert!(counts.declared.is_empty());
+        assert_eq!(counts.undeclared, 2);
+    }
+
+    #[test]
+    fn language_counts_multi_language_source_counts_in_each_bucket() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // One source declaring two languages — should add +1 to each
+        // bucket, so the bucket sum (2) exceeds the source count (1).
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust", "typescript"]),
+            None,
+        );
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+
+        let mut declared = counts.declared;
+        declared.sort();
+        assert_eq!(declared, vec![lc("rust", 1), lc("typescript", 1)]);
+
+        let bucket_sum: usize = declared.iter().map(|c| c.count).sum();
+        let stats = db.stats().unwrap();
+        assert!(bucket_sum > stats.sources);
+    }
+
+    #[test]
+    fn language_counts_mixed_declared_and_undeclared() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
+            None,
+        );
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c2", "T2", "Body two", "b.md", &["yaml"]),
+            None,
+        );
+        seed_pattern_and_chunk(&db, &make_chunk("c3", "T3", "Body three", "c.md"), None);
+        seed_pattern_and_chunk(&db, &make_chunk("c4", "T4", "Body four", "d.md"), None);
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 2);
+
+        let mut declared = counts.declared;
+        declared.sort();
+        assert_eq!(declared, vec![lc("rust", 1), lc("yaml", 1)]);
+    }
+
+    #[test]
+    fn language_counts_duplicate_token_in_array_counts_source_once() {
+        // `language_json = '["rust","rust"]'` is a degenerate state —
+        // the ingest validator lowercases tokens but does not dedupe,
+        // so an author writing `[Rust, rust]` would land here. Without
+        // the inner SELECT DISTINCT, the json_each join would yield
+        // two `(source, "rust")` rows and the outer COUNT would
+        // double-count the source. Pin the dedup behaviour.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: "dup.md".to_string(),
+            title: "Dup".into(),
+            tags: String::new(),
+            is_universal: false,
+            raw_body: "body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+            language_json: Some(r#"["rust","rust"]"#.to_string()),
+        })
+        .unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+        assert_eq!(counts.declared, vec![lc("rust", 1)]);
+    }
+
+    #[test]
+    fn language_counts_empty_array_language_json_counts_as_undeclared() {
+        // `language_json = '[]'` is a degenerate state — non-NULL but
+        // carries no language signal. Without the empty-array branch,
+        // such a source vanishes from both the declared buckets (no
+        // json_each rows) and the undeclared bucket (`IS NULL` filter
+        // misses it). Defence-in-depth: roll it into `undeclared` so
+        // the operator still sees the source somewhere.
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Seed via upsert_pattern directly so we can plant the exact
+        // `'[]'` value the validator would normally reject.
+        db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: "empty.md".to_string(),
+            title: "Empty".into(),
+            tags: String::new(),
+            is_universal: false,
+            raw_body: "body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+            language_json: Some("[]".to_string()),
+        })
+        .unwrap();
+        // And one with a real declared language so the empty-array
+        // pattern doesn't camouflage as the only source.
+        db.upsert_pattern(&crate::chunking::PatternRow {
+            source_file: "rust.md".to_string(),
+            title: "Rust".into(),
+            tags: String::new(),
+            is_universal: false,
+            raw_body: "body".into(),
+            content_hash: "0000000000000000".into(),
+            applies_when_json: None,
+            language_json: Some(r#"["rust"]"#.to_string()),
+        })
+        .unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.declared, vec![lc("rust", 1)]);
+        assert_eq!(counts.undeclared, 1);
+    }
+
+    #[test]
+    fn language_counts_reads_patterns_not_chunks() {
+        let db = open_memory_db(4);
+        db.init().unwrap();
+
+        // Seed the patterns row for "a.md" once, then add a second chunk
+        // pointing at the same source. The aggregate reads from
+        // `patterns` (where `source_file` is the primary key) so the
+        // source must only contribute one "rust" increment regardless of
+        // how many chunks share it — no `COUNT(DISTINCT)` needed.
+        seed_pattern_and_chunk(
+            &db,
+            &make_chunk_with_language("c1", "T1", "Body one", "a.md", &["rust"]),
+            None,
+        );
+        db.insert_chunk(
+            &make_chunk_with_language("c2", "T2", "Body two", "a.md", &["rust"]),
+            None,
+        )
+        .unwrap();
+
+        let counts = db.language_counts().unwrap();
+        assert_eq!(counts.undeclared, 0);
+        assert_eq!(counts.declared, vec![lc("rust", 1)]);
     }
 
     // -- source_files -----------------------------------------------------

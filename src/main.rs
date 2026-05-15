@@ -11,6 +11,7 @@ use lore::embeddings::{Embedder, OllamaClient};
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
+use lore::status::format_languages_line;
 use lore::{git, ingest, provision, server};
 
 #[derive(Parser)]
@@ -777,6 +778,21 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!();
         eprintln!("  Chunks:       {}", stats.chunks);
         eprintln!("  Sources:      {}", stats.sources);
+
+        // Surface query failures inline rather than silently suppressing
+        // the Languages line — a sub-query error would otherwise look
+        // identical to a genuinely empty database, blinding the operator
+        // to the very state `lore status` exists to diagnose.
+        match db.language_counts() {
+            Ok(counts) => {
+                if let Some(line) = format_languages_line(&counts) {
+                    eprintln!("  Languages:    {line}");
+                }
+            }
+            Err(e) => {
+                eprintln!("  Languages:    ✗ query failed: {e}");
+            }
+        }
 
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
             let short = git::short_sha(&config.knowledge_dir, &sha);

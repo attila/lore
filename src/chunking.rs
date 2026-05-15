@@ -596,7 +596,30 @@ pub fn parse_frontmatter_language_list(
         }
     };
 
+    // Strip structurally invalid tokens — anything containing the
+    // line separator character (`,`) or an ASCII control character
+    // (newline, tab, etc.) would corrupt the rendered `Languages:`
+    // line in `lore status`. Spaces are deliberately not filtered:
+    // an existing test pins quoted scalars with internal whitespace
+    // as legitimate single tokens, and the renderer's own sanitiser
+    // handles spaces if any slip through. Removed tokens still
+    // surface via the malformed advisory so the operator can find
+    // and fix the bad frontmatter.
     let mut malformed = Vec::new();
+    let tokens: Vec<String> = tokens
+        .into_iter()
+        .filter(|token| {
+            if token.chars().any(|c| c == ',' || c.is_control()) {
+                malformed.push(MalformedLanguageEntry {
+                    file_path: source_file.to_string(),
+                    token: token.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     for token in &tokens {
         if !crate::engine::is_known_token(token) {
             malformed.push(MalformedLanguageEntry {
@@ -2130,6 +2153,39 @@ Body text long enough to chunk through heading mode.
         let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
         assert!(langs.is_empty());
         assert!(malformed.is_empty());
+    }
+
+    #[test]
+    fn parse_language_token_with_embedded_comma_is_filtered_and_flagged() {
+        // A quoted scalar token containing the field separator (`,`)
+        // would corrupt the rendered `Languages:` line if it reached
+        // the database. Filter it out at parse time and surface via
+        // the malformed advisory so the operator can fix the
+        // frontmatter.
+        let md = "---\nlanguage: \"foo,bar\"\n---\n# x\n";
+        let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
+        assert!(langs.is_empty());
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].token, "foo,bar");
+    }
+
+    #[test]
+    fn serialise_language_list_empty_vec_returns_none_not_empty_array() {
+        // Defence-in-depth pin: an empty language token list must
+        // serialise to `None`, never to `Some("[]")`. The read-side
+        // `KnowledgeDB::language_counts` treats an empty JSON array
+        // as undeclared so the bucket invariant holds, but the ingest
+        // side should never emit that state in the first place.
+        assert_eq!(serialise_language_list(&[]), None);
+    }
+
+    #[test]
+    fn parse_then_serialise_empty_flow_list_yields_no_language_json() {
+        // End-to-end confirmation: `language: []` in frontmatter
+        // never reaches the database as a literal `'[]'` string.
+        let md = "---\nlanguage: []\n---\n# x\n";
+        let (langs, _) = parse_frontmatter_language_list(md, "p.md");
+        assert_eq!(serialise_language_list(&langs), None);
     }
 
     #[test]

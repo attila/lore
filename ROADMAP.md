@@ -41,6 +41,15 @@
       reason, forcing Claude to retry with conventions visible. Requires solid deduplication to
       avoid infinite loops (see
       `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
+- [ ] Predicated-universal deduplication behaviour — revisit `src/hook.rs`'s
+      `r.is_universal || !seen.contains(&r.id)` filter in `dedup_filter_and_record` once Track 2
+      observability data is in. Track 1B deliberately kept the bypass for predicated universals as a
+      Key Technical Decision (intent: re-inject on every matching call), but ~45 KB/session of
+      repeated injection for `agents/unattended-work.md` has been flagged as a real cost. One-line
+      override: `(r.is_universal && r.applies_when_json.is_none()) || !seen.contains(&r.id)`.
+      Deferred until observability data quantifies whether per-call reminders change agent
+      behaviour; see Key Technical Decisions in
+      `docs/plans/2026-05-08-001-feat-sessionstart-respect-applies-when-plan.md`.
 - [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
       `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
@@ -50,6 +59,14 @@
 
 ## Completed
 
+- [x] Language coverage in `lore status` — new `Languages:` line in the CLI status output reports
+      per-language source counts (rendered via `LANGUAGES.display_name`) plus an `undeclared`
+      bucket, built on the `language_json` column from #50. The same breakdown is exposed to agents
+      through the MCP `lore_status` tool's metadata fence as `languages_declared` /
+      `languages_undeclared` / `languages_error`. Defence-in-depth hardening: subquery dedup of
+      per-source tokens, empty-array rollup into `undeclared`, shared read transaction across the
+      two count queries, and unknown-token sanitisation at both ingest and render. See
+      `docs/plans/2026-05-15-001-feat-language-in-status-plan.md`.
 - [x] Replace hand-rolled XDG resolution with `etcetera` — `default_config_path` and
       `default_database_path` now use `etcetera::base_strategy::Xdg`, making the XDG-everywhere
       macOS posture explicit at the call site rather than implicit in hand-rolled code. Adds
