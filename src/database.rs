@@ -726,13 +726,22 @@ impl KnowledgeDB {
     /// live in one place).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn language_counts(&self) -> anyhow::Result<LanguageCounts> {
+        // Wrap both reads in a single transaction so the declared and
+        // undeclared counts come from the same WAL snapshot — a
+        // concurrent ingest commit landing between the queries would
+        // otherwise make the buckets disagree by one source. In
+        // practice this is single-user dev and the queries finish in
+        // microseconds; the transaction is paranoia, but it keeps the
+        // method's contract crisp ("counts are mutually consistent").
+        let tx = self.conn.unchecked_transaction()?;
+
         // Inner SELECT DISTINCT collapses any duplicate token within a
         // single source's `language_json` array (e.g. `["rust","rust"]`)
         // to one (source, token) row before the outer GROUP BY counts
         // sources per language. The ingest validator's lowercase
         // normalisation already discourages duplicates in practice;
         // this is the read-side defence-in-depth backstop.
-        let mut declared_stmt = self.conn.prepare(
+        let mut declared_stmt = tx.prepare(
             "SELECT token, COUNT(*) AS n FROM ( \
                 SELECT DISTINCT p.source_file, je.value AS token \
                 FROM patterns p, json_each(p.language_json) je \
@@ -749,6 +758,7 @@ impl KnowledgeDB {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(declared_stmt);
 
         // A pattern with `language_json = '[]'` (empty JSON array)
         // carries no actionable language signal — `json_each` yields no
@@ -757,12 +767,14 @@ impl KnowledgeDB {
         // both sides of the breakdown. The ingest validator should make
         // empty arrays unreachable in practice, but the read side stays
         // forgiving.
-        let undeclared: i64 = self.conn.query_row(
+        let undeclared: i64 = tx.query_row(
             "SELECT COUNT(*) FROM patterns \
              WHERE language_json IS NULL OR json_array_length(language_json) = 0",
             [],
             |row| row.get(0),
         )?;
+
+        tx.commit()?;
 
         Ok(LanguageCounts {
             declared,
