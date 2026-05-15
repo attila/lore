@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `languages_declared` / `languages_undeclared` on the MCP `lore_status` tool's metadata fence for
   agent or script consumers. (#58)
 - Add opt-in per-hook trace logging under `$XDG_STATE_HOME/lore/traces/` with `lore trace why` query
-  CLI and `lore trace prune` maintenance. (#N)
+  CLI and `lore trace prune` maintenance. (#59)
 
 ## [0.3.1] - 2026-05-14
 
