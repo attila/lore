@@ -217,6 +217,97 @@ fn status_without_config_shows_init_hint() {
         .stderr(predicate::str::contains("lore init"));
 }
 
+#[test]
+fn status_renders_languages_line_for_mixed_declared_and_undeclared_kb() {
+    // End-to-end coverage for the wiring between the SQL aggregation,
+    // the formatter, and the `eprintln!` in `cmd_status`. Unit tests
+    // already pin the helpers; this catches stream/label regressions
+    // (e.g. a stray `println!`, a typo'd label, or a reorder against
+    // `Sources:`).
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+
+    // Three patterns: one declared rust, one declared multi-language
+    // (rust + typescript — bucket sum exceeds source count), one with
+    // no `language:` declaration.
+    std::fs::write(
+        knowledge_dir.join("rust-only.md"),
+        "---\n\
+         language: rust\n\
+         tags: [rust]\n\
+         ---\n\n\
+         # Rust only\n\nBody text long enough to ingest.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        knowledge_dir.join("multi-lang.md"),
+        "---\n\
+         language: [rust, typescript]\n\
+         tags: [rust, typescript]\n\
+         ---\n\n\
+         # Multi-language\n\nBody text long enough to ingest.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        knowledge_dir.join("untagged.md"),
+        "---\n\
+         tags: [cli]\n\
+         ---\n\n\
+         # Untagged\n\nBody text long enough to ingest.\n",
+    )
+    .unwrap();
+
+    let db_path = tmp.path().join("knowledge.db");
+    let config = Config::default_with(knowledge_dir.clone(), db_path, "nomic-embed-text");
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
+
+    let assert = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["--config", config_path.to_str().unwrap(), "status"])
+        .assert()
+        .success();
+
+    // Rendered with display names, sorted by count desc with alpha
+    // tiebreak on display name (Rust 2, TypeScript 1), undeclared last.
+    assert.stderr(predicate::str::contains(
+        "Languages:    Rust 2, TypeScript 1, undeclared 1",
+    ));
+}
+
+#[test]
+fn status_suppresses_languages_line_on_empty_knowledge_dir() {
+    // Empty knowledge dir → empty DB → Languages line suppressed.
+    // Sources line is also `0` but should still render.
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+
+    let db_path = tmp.path().join("knowledge.db");
+    let config = Config::default_with(knowledge_dir.clone(), db_path, "nomic-embed-text");
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let embedder = FakeEmbedder::new();
+    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    db.init().unwrap();
+    // No ingest call — DB stays empty.
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["--config", config_path.to_str().unwrap(), "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Sources:      0"))
+        .stderr(predicate::str::contains("Languages:").not());
+}
+
 // -- top-k ------------------------------------------------------------------
 
 #[test]

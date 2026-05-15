@@ -718,8 +718,8 @@ impl KnowledgeDB {
     /// exactly once to either a declared language bucket or to
     /// `undeclared`. The `chunks` table carries the same `language_json`
     /// denormalised for retrieval queries; aggregating from `patterns`
-    /// avoids needing `COUNT(DISTINCT source_file)` and matches the
-    /// authorial view used by [`KnowledgeDB::stats`].
+    /// matches the authorial view used by [`KnowledgeDB::stats`] and
+    /// keeps the SQL clear of any de-duplication step.
     ///
     /// Returns a [`LanguageCounts`]; see that type for field semantics
     /// (multi-bucket counting and the bucket-sum-exceeds-sources rule
