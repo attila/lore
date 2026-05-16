@@ -784,28 +784,48 @@ language ("always," "never").
 **Fix:** Replace "consider" and "might want to" with direct imperatives. Agents deprioritise
 suggestions under time pressure; they follow directives.
 
-## Debugging with LORE_DEBUG
+## Debugging Pattern Injection
 
-When a pattern does not surface as expected, trace the hook pipeline to identify where the breakdown
-occurs.
+When a pattern does not surface as expected, two surfaces tell you where the breakdown happened.
+Reach for `lore trace why` first; reach for `LORE_DEBUG` only for live single-invocation
+investigation.
 
-Set the environment variable before running a session:
+### `lore trace why` — durable, queryable, cross-session
+
+Enable tracing once via `[trace] enabled = true` in `lore.toml` (or `LORE_TRACE=1` per session),
+then inspect the records:
+
+```sh
+lore trace why <session-id>                              # full session
+lore trace why <session-id> --tool Edit --json | jq      # filter + structured
+lore trace why --recent 20 --event PreToolUse            # across sessions
+```
+
+Each record captures the extracted query, every candidate considered with its pre-fusion component
+scores (FTS-fallback, FTS-structural, vector) and post-RRF combined score, the predicate outcome,
+the deduplication decision, the final `injected` set, and per-phase timing. Records persist until
+the retention horizon (default 30 days), so you can investigate "why didn't my pattern surface on
+the call three minutes ago" without rerunning anything. See
+[Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) in the Configuration Reference for
+the full setup.
+
+### `LORE_DEBUG=1` — ephemeral, real-time, per-invocation
 
 ```sh
 LORE_DEBUG=1 claude
 ```
 
-The debug output writes to stderr with the prefix `[lore debug]` and shows:
+Writes diagnostic lines to stderr with the prefix `[lore debug]` as the hook runs. Use this when you
+want to watch one hook fire live, or when tracing wasn't enabled at the time of interest. The same
+information ends up in trace records (and more), so prefer trace records for after-the- fact
+investigation.
 
-- The extracted query terms and assembled FTS5 query
-- The search results with scores and source files
-- The deduplication decisions (which chunks were filtered as already injected)
-- The final injected content
+### What the diagnostics tell you
 
-This tells you whether the problem is an **injection gap** (the query did not produce terms that
-match your pattern) or a **compliance gap** (the pattern was injected but the agent did not follow
-it). Injection gaps are solved by improving vocabulary coverage. Compliance gaps are solved by
-strengthening imperative voice and incident grounding.
+Either surface answers the same question: is the problem an **injection gap** (the query did not
+produce terms that match your pattern) or a **compliance gap** (the pattern was injected but the
+agent did not follow it)? Injection gaps are solved by improving vocabulary coverage. Compliance
+gaps are solved by strengthening imperative voice and incident grounding.
 
 ## Pattern Review Checklist
 
