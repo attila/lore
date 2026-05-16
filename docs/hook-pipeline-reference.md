@@ -66,7 +66,14 @@ hook:
    `seen.contains` check so they re-inject on every relevant tool call; non-universal chunks are
    filtered as before. Every surfaced chunk (universal or not) is appended to the dedup file so it
    remains a faithful injection log.
-6. Formats the results as imperative directives and returns them in `additionalContext`
+6. **Trace write.** When `Config::trace_enabled()` is true — i.e. either `[trace] enabled = true` in
+   `lore.toml` or `LORE_TRACE=1` in the env — the hook appends one JSON Lines record to
+   `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` capturing the call context, query, candidate set
+   with pre-fusion component scores, injected ids, and total duration. The write is fire-and-forget:
+   failures degrade to `LORE_DEBUG`-gated stderr and the hook returns its normal payload.
+   `SessionStart`, `PostToolUse`, and `PostCompact` use the same slot (after their main decision,
+   before return). Inspect the records with `lore trace why`.
+7. Formats the results as imperative directives and returns them in `additionalContext`
 
 The output format groups chunks by source file:
 
@@ -296,8 +303,8 @@ For the full details of term extraction, cleaning, and query assembly, see the
 
 ## Tuning Injection Behaviour
 
-Four settings control how aggressively lore injects patterns. All are configured in `lore.toml`
-under the `[search]` section unless noted otherwise.
+Five settings control how aggressively lore injects patterns. Four live in `lore.toml` under the
+`[search]` section; the fifth is a CLI flag for rebuilding the index.
 
 ### Relevance Threshold (`search.min_relevance`)
 
@@ -310,6 +317,22 @@ Default: `0.6`. Controls the minimum normalised score a pattern must reach to be
 
 The threshold applies only to hybrid search with successful embedding. When the search falls back to
 FTS5 only, no threshold is applied.
+
+### Universal Floor (`search.min_relevance_universal`)
+
+Default: unset (inherits `min_relevance`). A per-tier floor applied only to universal-tagged
+patterns at PreToolUse search time.
+
+Use this when universal patterns over-fire on weakly-related queries but you don't want to raise
+`min_relevance` across the board (which would also cull legitimate non-universal matches). Setting
+`min_relevance_universal = 0.75` while leaving `min_relevance = 0.6` raises the bar for the
+universal tier only.
+
+This knob is the numerical complement to the
+[`applies_when`](pattern-authoring-guide.md#toolcommand-predicate-applies_when) predicate. Reach for
+the predicate when over-firing is on a structural axis (the pattern fires on Bash calls it has no
+business addressing); reach for `min_relevance_universal` when over-firing is on a relevance axis
+(the pattern fires on calls in its tool class but with weak topical overlap).
 
 ### Result Count (`search.top_k`)
 
@@ -353,19 +376,41 @@ ingestion and does not recreate the table.
    If the pattern does not appear, the issue is vocabulary coverage — see the
    [Pattern Authoring Guide](pattern-authoring-guide.md).
 
-2. **Trace the hook pipeline:**
+2. **Inspect the trace for that session:**
+
+   ```sh
+   lore trace why <session-id>
+   lore trace why --recent 20 --event PreToolUse        # across all sessions
+   lore trace why <session-id> --tool Edit --json | jq  # filter + structured
+   ```
+
+   Tracing must be enabled — either set `[trace] enabled = true` in `lore.toml` or run with
+   `LORE_TRACE=1` in the environment. Each record captures the call context, extracted query,
+   candidate list with pre-fusion component scores, the final injected set, and per-phase timings.
+   Records persist across sessions and can be filtered with `--event`, `--tool`, `--agent`, and
+   `--recent`. See [Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) in the
+   Configuration Reference for the full setup.
+
+   This is the primary diagnostic for "why didn't this pattern surface?" because it answers the
+   question across an entire session, not just the call you happen to be watching live. The trace
+   tells you whether the pattern was filtered by deduplication, dropped below the relevance
+   threshold, suppressed by `applies_when`, or never matched the query at all.
+
+3. **Single-invocation real-time debug:**
 
    ```sh
    LORE_DEBUG=1 claude
    ```
 
-   Debug output on stderr (prefixed `[lore debug]`) shows the extracted query, search results,
-   deduplication decisions, and injected content. This tells you whether the pattern was found but
-   already deduplicated, found but below the relevance threshold, or not found at all.
+   `LORE_DEBUG` writes ephemeral stderr output (prefixed `[lore debug]`) — useful when you want to
+   watch one hook fire in real time, but not for cross-session investigation. Reach for it when the
+   trace output above is missing because tracing wasn't enabled at the time, or when you want to see
+   live diagnostics from the hook adapter that don't land in trace records.
 
-3. **Check deduplication:** If the pattern was injected earlier in the session, deduplication
+4. **Check deduplication:** If the pattern was injected earlier in the session, deduplication
    prevents re-injection. PostCompact resets deduplication, so patterns become available again after
-   context compression.
+   context compression. The trace record's `injected` array tells you exactly which chunks fired on
+   each prior call.
 
 ### MCP Tools Are Stale After Binary Update
 

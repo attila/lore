@@ -134,6 +134,51 @@ EXIT CODES:
 
     /// Check health of all components
     Status,
+
+    /// Inspect or maintain per-hook trace files.
+    Trace {
+        #[command(subcommand)]
+        action: TraceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceAction {
+    /// Explain lore's injection decisions for a session by reading its
+    /// trace file. Defaults to pretty-print; `--json` emits raw JSONL.
+    #[command(after_help = "EXAMPLES:
+  lore trace why <session-id>             Pretty-print every record for a session
+  lore trace why <session-id> --json      Raw JSONL pass-through
+  lore trace why --recent 20              Most recent 20 records across all sessions
+  lore trace why <id> --event PreToolUse  Filter by canonical event name
+  lore trace why <id> --tool Bash         Filter by tool name")]
+    Why {
+        /// Session id to inspect. Optional when `--recent` is used.
+        session: Option<String>,
+
+        /// Walk the trace directory newest-first and return the latest N
+        /// records across all sessions.
+        #[arg(long)]
+        recent: Option<usize>,
+
+        /// Filter to records with this canonical event name.
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Filter to records with this `call_context.tool_name`.
+        #[arg(long)]
+        tool: Option<String>,
+
+        /// Filter to records with this agent identifier.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+
+    /// Run an unbounded maintenance pass: compress files older than the
+    /// configured gzip horizon and delete files older than `retain_days`.
+    /// Bumps the throttle state file so subsequent lazy passes back off
+    /// for 24 hours.
+    Prune,
 }
 
 fn main() {
@@ -178,6 +223,7 @@ fn main() {
         Commands::ExtractQueries => cmd_extract_queries(),
         Commands::List => cmd_list(&config_path, json),
         Commands::Status => cmd_status(&config_path),
+        Commands::Trace { action } => cmd_trace(&config_path, action, json),
     };
 
     if let Err(e) = result {
@@ -563,7 +609,7 @@ fn cmd_search(
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
     db.init()?;
 
-    let results = hook::search_with_threshold(&db, &ollama, &config, query)?;
+    let (results, _phases) = hook::search_with_threshold(&db, &ollama, &config, query)?;
     lore_debug!("search: {} results", results.len());
 
     if json {
@@ -801,6 +847,118 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         eprintln!();
     }
 
+    if config.trace_enabled()
+        && let Ok(trace_dir) = resolve_trace_dir()
+    {
+        let trace_info = lore::trace::TraceStats::compute(&trace_dir, &config);
+        eprintln!("Trace:");
+        eprintln!("  Directory:    {}", trace_info.directory.display());
+        eprintln!("  Sessions:     {}", trace_info.session_count);
+        eprintln!("  Total:        {} bytes", trace_info.total_bytes);
+        if let Some(o) = trace_info.oldest {
+            eprintln!("  Oldest:       {}", lore::trace::format_rfc3339_millis(o));
+        }
+        if let Some(n) = trace_info.newest {
+            eprintln!("  Newest:       {}", lore::trace::format_rfc3339_millis(n));
+        }
+        match trace_info.last_pruned_at {
+            Some(t) => eprintln!("  Last pruned:  {}", lore::trace::format_rfc3339_millis(t)),
+            None => eprintln!("  Last pruned:  never"),
+        }
+        if trace_info.capture.warnings.is_empty() {
+            eprintln!("  Capture:      default redaction (command head only, transcript tail off)");
+        } else {
+            if config.trace.include_full_command {
+                eprintln!(
+                    "  Capture:      FULL COMMAND BODY  (privacy-sensitive — \
+                     [trace] include_full_command = true)"
+                );
+            }
+            if config.trace.include_transcript_tail {
+                eprintln!(
+                    "                TRANSCRIPT TAIL     (privacy-sensitive — \
+                     [trace] include_transcript_tail = true)"
+                );
+            }
+        }
+        eprintln!();
+    }
+
+    Ok(())
+}
+
+fn resolve_trace_dir() -> anyhow::Result<PathBuf> {
+    lore::config::resolve_trace_dir()
+}
+
+fn cmd_trace(config_path: &Path, action: TraceAction, json: bool) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let trace_dir = resolve_trace_dir()?;
+    match action {
+        TraceAction::Prune => {
+            cmd_trace_prune(&trace_dir, &config);
+            Ok(())
+        }
+        TraceAction::Why {
+            session,
+            recent,
+            event,
+            tool,
+            agent,
+        } => cmd_trace_why(
+            &trace_dir,
+            session.as_deref(),
+            recent,
+            event.as_deref(),
+            tool.as_deref(),
+            agent.as_deref(),
+            json,
+        ),
+    }
+}
+
+fn cmd_trace_prune(trace_dir: &Path, config: &Config) {
+    eprintln!("Pruning trace directory: {}", trace_dir.display());
+    let summary = lore::trace::maintenance::run_manual(
+        trace_dir,
+        config.trace.retain_days,
+        config.trace.gzip_older_than_days,
+    );
+    eprintln!(
+        "Compressed: {}, deleted: {}, errors: {}",
+        summary.compressed, summary.deleted, summary.errors,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_trace_why(
+    trace_dir: &Path,
+    session: Option<&str>,
+    recent: Option<usize>,
+    event: Option<&str>,
+    tool: Option<&str>,
+    agent: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    // `--json` mode suppresses stderr diagnostics per the
+    // cli-suppress-stderr-in-json-mode convention; the reader runs
+    // silent and emits raw JSONL on stdout (zero lines on empty,
+    // not a JSON array — matches R17's "raw JSONL pass-through").
+    let records = lore::trace::query::collect_with_diagnostics(
+        trace_dir, session, recent, event, tool, agent, !json,
+    )?;
+    if json {
+        for rec in &records {
+            println!("{}", serde_json::to_string(rec)?);
+        }
+        return Ok(());
+    }
+    if records.is_empty() {
+        eprintln!("No traces found for the given filters.");
+        return Ok(());
+    }
+    let mut stdout = std::io::stdout().lock();
+    lore::trace::query::pretty_print(&mut stdout, &records)?;
     Ok(())
 }
 

@@ -238,6 +238,29 @@ count is the typical hybrid path (FTS-fallback + FTS-structural + vector); when 
 is skipped or fails, RRF reduces to two lists; when the inferred-language set is empty, the
 structural branch is skipped and RRF reduces accordingly.
 
+### Inspecting Pre-Fusion Component Scores
+
+Each candidate's per-branch scores are preserved through the fusion step and surface on three
+optional fields of the result row: `score_fts_fallback`, `score_fts_structural`, and `score_vector`.
+A field is present when the chunk appeared in the corresponding branch's input list and absent
+otherwise — so a chunk that surfaces only through the vector branch carries `score_vector` and
+`null` on the other two.
+
+These fields are visible in two places:
+
+- **`lore trace why <session> --json`** — every candidate row in a PreToolUse or PostToolUse trace
+  record carries the three fields alongside the post-fusion `score_combined`. Use this for
+  after-the-fact diagnosis of why one pattern beat another. See
+  [Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) for the trace setup.
+- **MCP `search_patterns` with `include_metadata: true`** — each result in the `lore-metadata`
+  fenced JSON block carries the same three fields, enabling agents to reason about per-branch
+  contributions without depending on the trace surface.
+
+The post-fusion `score` is normalised to 0–1 (the field documented above); the pre-fusion scores
+keep their native shapes (FTS BM25 values, which are typically negative; vector distances, which
+depend on the embedding metric). They are useful for relative comparison within a single result set,
+not for absolute thresholding.
+
 ## Relevance Threshold
 
 The `min_relevance` setting (default: 0.6) filters results below a minimum normalised score. This

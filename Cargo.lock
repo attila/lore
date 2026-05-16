@@ -779,6 +779,7 @@ dependencies = [
  "clap",
  "etcetera",
  "fd-lock",
+ "flate2",
  "ignore",
  "insta",
  "predicates",
