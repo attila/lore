@@ -135,7 +135,7 @@ EXIT CODES:
     /// Check health of all components
     Status,
 
-    /// Inspect or maintain Track 2 Observability trace files.
+    /// Inspect or maintain per-hook trace files.
     Trace {
         #[command(subcommand)]
         action: TraceAction,

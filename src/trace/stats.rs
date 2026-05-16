@@ -88,13 +88,26 @@ impl TraceStats {
                 if !(name.ends_with(".jsonl") || name.ends_with(".jsonl.gz")) {
                     continue;
                 }
-                if let Ok(meta) = e.metadata() {
-                    stats.session_count += 1;
-                    stats.total_bytes = stats.total_bytes.saturating_add(meta.len());
-                    if let Ok(modified) = meta.modified() {
-                        stats.oldest = Some(stats.oldest.map_or(modified, |o| o.min(modified)));
-                        stats.newest = Some(stats.newest.map_or(modified, |n| n.max(modified)));
-                    }
+                // Use `symlink_metadata` so a symlink doesn't get
+                // counted as a session — mirrors
+                // `maintenance::enumerate_trace_files`, which skips
+                // symlinks for the same reason. Without this filter,
+                // `lore status` reports N+1 sessions when an operator
+                // drops one symlink into the trace dir, while a
+                // following `lore trace prune` would touch only N
+                // files — a surprising asymmetry between the two
+                // operator surfaces.
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                stats.session_count += 1;
+                stats.total_bytes = stats.total_bytes.saturating_add(meta.len());
+                if let Ok(modified) = meta.modified() {
+                    stats.oldest = Some(stats.oldest.map_or(modified, |o| o.min(modified)));
+                    stats.newest = Some(stats.newest.map_or(modified, |n| n.max(modified)));
                 }
             }
         }
@@ -225,5 +238,31 @@ mod tests {
         let posture = CapturePosture::from_config(&cfg);
         assert!(posture.transcript_tail_included);
         assert!(posture.warnings.contains(&"transcript_tail_captured"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_count_skips_symlinks_for_symmetry_with_maintenance() {
+        // `lore status` and the MCP `lore_status` `trace` object share the
+        // walk in `TraceStats::compute`. Maintenance refuses to touch
+        // symlinks (`enumerate_trace_files` filters them via
+        // `symlink_metadata` + `is_symlink`). Without the same filter
+        // here, an operator who drops one symlink into the trace dir
+        // sees `session_count = N+1` from status while a following
+        // `lore trace prune` only acts on N real files — a surprising
+        // asymmetry between the two surfaces.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        let real = trace_dir.join("real.jsonl");
+        std::fs::write(&real, b"{}\n").unwrap();
+        let external = tmp.path().join("external.jsonl");
+        std::fs::write(&external, b"{}\n").unwrap();
+        std::os::unix::fs::symlink(&external, trace_dir.join("via-symlink.jsonl")).unwrap();
+        let stats = TraceStats::compute(&trace_dir, &sample_config());
+        assert_eq!(
+            stats.session_count, 1,
+            "only the real .jsonl file should count; the symlink is skipped",
+        );
     }
 }
