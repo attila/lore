@@ -1,7 +1,7 @@
 ---
 title: "feat: shared trace-walk predicate; tighten `lore trace prune` to trace data files"
 type: feat
-status: active
+status: completed
 date: 2026-05-16
 deepened: 2026-05-17
 ---
