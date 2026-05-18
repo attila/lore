@@ -203,6 +203,41 @@ fn no_unsanctioned_runtime_disk_reads_in_hook_server_main() {
          one for read_last_pruned_at on the throttle state file."
     );
 
+    // src/trace/stats.rs — `lore status` / MCP `lore_status.trace`
+    // walker. Stats delegates filesystem classification to
+    // `walk::is_real_trace_file`; this block pins both halves of the
+    // invariant. Negative: zero direct stat calls in the runtime
+    // source. The `.metadata(` substring (with open paren) catches
+    // the `DirEntry::metadata()` method shape — the more ergonomic
+    // shortcut a contributor would reach for, and the form used at
+    // `src/trace/query.rs:120`. Positive: at least one delegation to
+    // the shared predicate.
+    let trace_stats = strip_test_modules(&read_source("trace/stats.rs"));
+    assert_eq!(
+        count_substring(&trace_stats, "std::fs::metadata"),
+        0,
+        "trace/stats.rs must not call std::fs::metadata directly — \
+         delegate filesystem classification to walk::is_real_trace_file."
+    );
+    assert_eq!(
+        count_substring(&trace_stats, "std::fs::symlink_metadata"),
+        0,
+        "trace/stats.rs must not call std::fs::symlink_metadata directly — \
+         delegate filesystem classification to walk::is_real_trace_file."
+    );
+    assert_eq!(
+        count_substring(&trace_stats, ".metadata("),
+        0,
+        "trace/stats.rs must not call DirEntry::metadata directly — \
+         delegate filesystem classification to walk::is_real_trace_file."
+    );
+    assert!(
+        count_substring(&trace_stats, "walk::is_real_trace_file") >= 1,
+        "trace/stats.rs must delegate to walk::is_real_trace_file at least \
+         once — the predicate is the shared classification helper for the \
+         stats and maintenance walkers."
+    );
+
     // src/trace/query.rs — read-only consumer surface for
     // `lore trace why`. Reads are via plain `std::fs::read` for the
     // raw bytes; no `OpenOptions` (it never writes), and no

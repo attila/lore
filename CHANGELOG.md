@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Trace maintenance now only deletes trace data files (`.jsonl` / `.jsonl.gz`) after the retention
+  horizon; other files in the trace directory are left alone instead of being swept — applies to
+  both `lore trace prune` and the SessionStart-triggered lazy maintenance pass. (#60)
+
 ### Added
 
 - `lore status` inserts a new `Languages:` line between `Sources:` and `Last commit:` reporting a

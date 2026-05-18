@@ -38,6 +38,7 @@ pub mod maintenance;
 pub mod query;
 pub mod record;
 pub mod stats;
+pub mod walk;
 pub mod writer;
 
 pub use stats::{CapturePosture, TraceStats};

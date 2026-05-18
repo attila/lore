@@ -195,7 +195,16 @@ fn run_pass(
         return summary;
     };
 
-    // Compress phase. Only .jsonl files older than the gzip horizon.
+    // Compress phase. The enumerator surfaces both `.jsonl` and
+    // `.jsonl.gz` real trace files; this loop only acts on `.jsonl`.
+    // `gzip_file` carries its own `.gz` short-circuit as a
+    // defence-in-depth guard against re-compression, but the loop
+    // filters first so already-gzipped entries don't inflate
+    // `summary.compressed` (the `.gz` short-circuit returns `Ok(())`
+    // which the success arm would otherwise count) or consume
+    // `compress_cap` slots. See `src/trace/walk.rs` and the plan's
+    // Key Technical Decisions for the bidirectional contract between
+    // the walk predicate's accept-set and `gzip_file`.
     for (path, mtime) in &files {
         if compress_cap.is_some_and(|cap| summary.compressed >= cap) {
             break;
@@ -252,9 +261,18 @@ fn run_pass(
     summary
 }
 
-/// Enumerate trace files in `trace_dir`, skipping the throttle state
-/// file and non-files. Returns `None` and bumps `summary.errors` when
+/// Enumerate trace files in `trace_dir`, skipping anything that the
+/// shared [`super::walk::is_real_trace_file`] predicate rejects (the
+/// throttle state file, foreign-extension files, symlinks, and
+/// non-regular files). Returns `None` and bumps `summary.errors` when
 /// the directory read itself fails; the caller short-circuits the pass.
+///
+/// `unwrap_or(SystemTime::UNIX_EPOCH)` on the mtime fallback is
+/// load-bearing prune-eligibility policy: a file whose `modified()`
+/// cannot be read is treated as ancient and becomes eligible for
+/// compress or prune on this pass. Stats applies the opposite policy
+/// (skip aggregate updates on failure); the divergence is preserved
+/// by having the predicate return metadata only.
 fn enumerate_trace_files(
     trace_dir: &Path,
     summary: &mut MaintenanceSummary,
@@ -270,21 +288,9 @@ fn enumerate_trace_files(
     let mut out: Vec<(PathBuf, SystemTime)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.file_name().and_then(|s| s.to_str()) == Some(LAST_PRUNED_AT_FILE) {
-            continue;
-        }
-        // Use `symlink_metadata` (lstat) so a symlink looks like a
-        // symlink rather than its target. The maintenance pass must
-        // not gzip/delete files outside the trace directory; an
-        // operator who symlinks `~/.bashrc` into the trace dir would
-        // otherwise see lore eat the target after the retention
-        // horizon. Skip both symlinks and non-files outright.
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        let Some(meta) = super::walk::is_real_trace_file(&path) else {
             continue;
         };
-        if meta.is_symlink() || !meta.is_file() {
-            continue;
-        }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         out.push((path, mtime));
     }
@@ -578,6 +584,78 @@ mod tests {
             "second claim must fail with AlreadyExists"
         );
         assert!(state_path.exists());
+    }
+
+    #[test]
+    fn run_pass_compress_phase_does_not_recount_already_gzipped() {
+        // `enumerate_trace_files` surfaces both `.jsonl` and
+        // `.jsonl.gz` entries (the predicate's accept-set), so the
+        // compress loop must filter to `.jsonl` before delegating to
+        // `gzip_file`. `gzip_file`'s `.gz` short-circuit returns
+        // `Ok(())`, which the success arm would otherwise count as a
+        // compression — inflating `summary.compressed` and consuming
+        // `compress_cap` slots on `.gz`-first iteration orders.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+
+        // Only `.jsonl.gz` entries — all already gzipped, all past
+        // the gzip horizon. The expected outcome is a zero-effect
+        // compress phase.
+        touch_with_age(&trace_dir.join("aged-a.jsonl.gz"), 30);
+        touch_with_age(&trace_dir.join("aged-b.jsonl.gz"), 30);
+
+        let summary = run_pass(&trace_dir, 0, 7, None, None, Verbosity::Verbose);
+
+        assert_eq!(
+            summary.compressed, 0,
+            "compress phase must not count already-gzipped entries: {summary:?}"
+        );
+        assert_eq!(
+            summary.errors, 0,
+            "compress phase must not raise errors on already-gzipped entries: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn run_pass_prune_phase_skips_foreign_extensions() {
+        // Pins both the prune-hardening behaviour change (the trace
+        // maintenance pass only deletes `.jsonl` / `.jsonl.gz` real
+        // trace files after the retention horizon, leaving foreign
+        // files alone) and the bidirectional `walk.rs` ↔ `gzip_file`
+        // contract: the `.jsonl.gz` entry must survive the compress
+        // phase (gzip_file's `.gz` short-circuit) and reach the
+        // prune-phase delete. Exercising `run_pass` directly covers
+        // both `run_lazy` and `run_manual` via the shared call path.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+
+        let expired_jsonl = trace_dir.join("expired.jsonl");
+        let expired_gz = trace_dir.join("expired.jsonl.gz");
+        let expired_tmp = trace_dir.join("editor-leftover.tmp");
+        touch_with_age(&expired_jsonl, 60);
+        touch_with_age(&expired_gz, 60);
+        touch_with_age(&expired_tmp, 60);
+
+        let summary = run_pass(&trace_dir, 30, 0, None, None, Verbosity::Verbose);
+
+        assert_eq!(
+            summary.deleted, 2,
+            "prune deletes the .jsonl and .jsonl.gz but not the foreign .tmp: {summary:?}"
+        );
+        assert!(
+            !expired_jsonl.exists(),
+            "expired .jsonl trace data file should be pruned"
+        );
+        assert!(
+            !expired_gz.exists(),
+            "expired .jsonl.gz trace data file should be pruned"
+        );
+        assert!(
+            expired_tmp.exists(),
+            "foreign .tmp file must not be swept by the prune phase"
+        );
     }
 
     #[test]
