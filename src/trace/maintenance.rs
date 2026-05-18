@@ -195,16 +195,22 @@ fn run_pass(
         return summary;
     };
 
-    // Compress phase. The enumerator only surfaces `.jsonl` /
-    // `.jsonl.gz` real trace files; the `.gz` short-circuit in
-    // `gzip_file` is the load-bearing guard that keeps already-gzipped
-    // entries from being re-compressed. See `src/trace/walk.rs` and
-    // the plan's Key Technical Decisions for the bidirectional
-    // contract between the walk predicate's accept-set and
-    // `gzip_file`.
+    // Compress phase. The enumerator surfaces both `.jsonl` and
+    // `.jsonl.gz` real trace files; this loop only acts on `.jsonl`.
+    // `gzip_file` carries its own `.gz` short-circuit as a
+    // defence-in-depth guard against re-compression, but the loop
+    // filters first so already-gzipped entries don't inflate
+    // `summary.compressed` (the `.gz` short-circuit returns `Ok(())`
+    // which the success arm would otherwise count) or consume
+    // `compress_cap` slots. See `src/trace/walk.rs` and the plan's
+    // Key Technical Decisions for the bidirectional contract between
+    // the walk predicate's accept-set and `gzip_file`.
     for (path, mtime) in &files {
         if compress_cap.is_some_and(|cap| summary.compressed >= cap) {
             break;
+        }
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
         }
         if gzip_older_than_days == 0 {
             continue;
@@ -578,6 +584,37 @@ mod tests {
             "second claim must fail with AlreadyExists"
         );
         assert!(state_path.exists());
+    }
+
+    #[test]
+    fn run_pass_compress_phase_does_not_recount_already_gzipped() {
+        // `enumerate_trace_files` surfaces both `.jsonl` and
+        // `.jsonl.gz` entries (the predicate's accept-set), so the
+        // compress loop must filter to `.jsonl` before delegating to
+        // `gzip_file`. `gzip_file`'s `.gz` short-circuit returns
+        // `Ok(())`, which the success arm would otherwise count as a
+        // compression — inflating `summary.compressed` and consuming
+        // `compress_cap` slots on `.gz`-first iteration orders.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+
+        // Only `.jsonl.gz` entries — all already gzipped, all past
+        // the gzip horizon. The expected outcome is a zero-effect
+        // compress phase.
+        touch_with_age(&trace_dir.join("aged-a.jsonl.gz"), 30);
+        touch_with_age(&trace_dir.join("aged-b.jsonl.gz"), 30);
+
+        let summary = run_pass(&trace_dir, 0, 7, None, None, Verbosity::Verbose);
+
+        assert_eq!(
+            summary.compressed, 0,
+            "compress phase must not count already-gzipped entries: {summary:?}"
+        );
+        assert_eq!(
+            summary.errors, 0,
+            "compress phase must not raise errors on already-gzipped entries: {summary:?}"
+        );
     }
 
     #[test]
