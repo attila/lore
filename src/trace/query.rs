@@ -100,6 +100,23 @@ pub fn collect_with_diagnostics(
 
 /// Walk `trace_dir`, returning `.jsonl[.gz]` files in newest-first
 /// mtime order. Skips the throttle state file.
+///
+/// Deliberately does NOT delegate to [`super::walk::is_real_trace_file`].
+/// `lore trace why` is a read-only consumer surface: the
+/// symlink-safety argument that drove the predicate in
+/// [`super::stats::TraceStats::compute`] and
+/// [`super::maintenance::enumerate_trace_files`] (don't gzip / delete
+/// files outside the trace directory) doesn't apply here — reading a
+/// symlinked trace file can't lose operator data. Following symlinks
+/// (via `e.metadata()` rather than `symlink_metadata`) is the
+/// historical behaviour and is preserved on purpose.
+///
+/// Consequence: `lore trace why` may surface sessions that
+/// `lore status` does not count. That asymmetry is small and
+/// acknowledged; a future contributor "unifying" the walk should
+/// re-read this comment and the plan at
+/// `docs/plans/2026-05-16-001-feat-trace-walk-predicate-plan.md`
+/// before changing it.
 fn list_trace_files_newest_first(trace_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     if !trace_dir.exists() {
         return Ok(Vec::new());

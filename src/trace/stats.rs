@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use crate::config::Config;
 
 use super::maintenance::LAST_PRUNED_AT_FILE;
+use super::walk;
 
 /// Snapshot of the trace directory's on-disk state plus the operator's
 /// configured capture posture.
@@ -85,24 +86,15 @@ impl TraceStats {
                     stats.last_pruned_at = last;
                     continue;
                 }
-                if !(name.ends_with(".jsonl") || name.ends_with(".jsonl.gz")) {
-                    continue;
-                }
-                // Use `symlink_metadata` so a symlink doesn't get
-                // counted as a session — mirrors
-                // `maintenance::enumerate_trace_files`, which skips
-                // symlinks for the same reason. Without this filter,
-                // `lore status` reports N+1 sessions when an operator
-                // drops one symlink into the trace dir, while a
-                // following `lore trace prune` would touch only N
-                // files — a surprising asymmetry between the two
-                // operator surfaces.
-                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                // Filesystem classification (extension gate, symlink
+                // refusal, regular-file check) is delegated to
+                // `walk::is_real_trace_file` so this surface and
+                // `maintenance::enumerate_trace_files` stay
+                // self-symmetric on the discipline. See
+                // `src/trace/walk.rs` for the predicate's contract.
+                let Some(meta) = walk::is_real_trace_file(&path) else {
                     continue;
                 };
-                if meta.is_symlink() || !meta.is_file() {
-                    continue;
-                }
                 stats.session_count += 1;
                 stats.total_bytes = stats.total_bytes.saturating_add(meta.len());
                 if let Ok(modified) = meta.modified() {
@@ -238,6 +230,71 @@ mod tests {
         let posture = CapturePosture::from_config(&cfg);
         assert!(posture.transcript_tail_included);
         assert!(posture.warnings.contains(&"transcript_tail_captured"));
+    }
+
+    #[test]
+    fn total_bytes_excludes_last_pruned_at() {
+        // Pins the invariant that the maintenance state file is not
+        // counted toward `total_bytes` and is consumed exclusively
+        // for the `last_pruned_at` timestamp. Dropping the state-file
+        // name check or the extension check in
+        // `walk::is_real_trace_file` makes this fail loudly.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+
+        // Known-size trace data file.
+        let session = trace_dir.join("session.jsonl");
+        let payload = b"{\"k\":\"v\"}\n";
+        std::fs::write(&session, payload).unwrap();
+        let session_len = payload.len() as u64;
+
+        // `.last_pruned_at` with a parseable Unix timestamp. The body
+        // is intentionally larger than zero so that any accidental
+        // inclusion would shift `total_bytes` past the bare session
+        // length and trip the assertion.
+        let pruned_at_secs: u64 = 1_700_000_000;
+        std::fs::write(
+            trace_dir.join(LAST_PRUNED_AT_FILE),
+            pruned_at_secs.to_string(),
+        )
+        .unwrap();
+
+        let stats = TraceStats::compute(&trace_dir, &sample_config());
+
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(
+            stats.total_bytes, session_len,
+            "total_bytes must equal the real session file's length; .last_pruned_at must be excluded"
+        );
+        assert_eq!(
+            stats.last_pruned_at,
+            SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(pruned_at_secs)),
+            "last_pruned_at must be parsed from the state file's contents"
+        );
+    }
+
+    #[test]
+    fn last_pruned_at_is_none_when_state_file_is_malformed() {
+        // Malformed `.last_pruned_at` (non-numeric contents) keeps
+        // `last_pruned_at` as `None` and must still be excluded from
+        // `total_bytes`.
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("traces");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+
+        let session = trace_dir.join("session.jsonl");
+        let payload = b"{}\n";
+        std::fs::write(&session, payload).unwrap();
+        std::fs::write(trace_dir.join(LAST_PRUNED_AT_FILE), b"not-a-timestamp").unwrap();
+
+        let stats = TraceStats::compute(&trace_dir, &sample_config());
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(stats.total_bytes, payload.len() as u64);
+        assert!(
+            stats.last_pruned_at.is_none(),
+            "malformed state file should leave last_pruned_at as None"
+        );
     }
 
     #[cfg(unix)]
