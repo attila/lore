@@ -702,10 +702,9 @@ fn parse_language_arg(
     let Some(lang_val) = args.get("language") else {
         return Ok(None);
     };
-    if let Some(s) = lang_val.as_str() {
-        return Ok(Some(vec![s.to_string()]));
-    }
-    if let Some(arr) = lang_val.as_array() {
+    let raw: Vec<String> = if let Some(s) = lang_val.as_str() {
+        vec![s.to_string()]
+    } else if let Some(arr) = lang_val.as_array() {
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             let Some(s) = item.as_str() else {
@@ -716,12 +715,36 @@ fn parse_language_arg(
             };
             out.push(s.to_string());
         }
-        return Ok(Some(out));
+        out
+    } else {
+        return Err(error_response(
+            req,
+            "language must be a string or array of strings",
+        ));
+    };
+    // Reject tokens that would corrupt the on-disk flow-list shape or the
+    // chunking parser's view of the frontmatter. The YAML flow-list renderer
+    // joins tokens with ', ' inside `[...]`; an embedded `,`, `]`, or
+    // newline therefore would either truncate the list or split the token
+    // on parser read-back, producing a silent round-trip mismatch the agent
+    // cannot easily detect. Hard-erroring at the MCP boundary is preferable
+    // to letting the chunking parser's defensive filter drop the token
+    // post-split.
+    for token in &raw {
+        if let Some(c) = token
+            .chars()
+            .find(|c| matches!(c, ',' | '[' | ']') || c.is_control())
+        {
+            return Err(error_response(
+                req,
+                &format!(
+                    "language token {token:?} contains forbidden character {c:?}; \
+                     tokens must not contain commas, square brackets, or control characters"
+                ),
+            ));
+        }
     }
-    Err(error_response(
-        req,
-        "language must be a string or array of strings",
-    ))
+    Ok(Some(raw))
 }
 
 // ---------------------------------------------------------------------------
@@ -2723,6 +2746,38 @@ mod tests {
             message.contains("array entries must be strings"),
             "error must name the entry constraint, got: {message}"
         );
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_token_containing_comma() {
+        // Correctness review finding 2: a token with an embedded comma
+        // would render as `language: [a,b]` and the chunking parser would
+        // split it into two distinct tokens, producing a round-trip
+        // mismatch the agent cannot easily detect. Hard-erroring at the
+        // boundary surfaces the mistake before any write.
+        let req = dummy_request();
+        let args = json!({ "language": "objective-c, swift" });
+        let err = parse_language_err(&req, &args);
+        let value = serde_json::to_value(&err).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("forbidden character") && message.contains("commas"),
+            "error must name the delimiter constraint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_token_containing_brackets() {
+        let req = dummy_request();
+        let args = json!({ "language": ["rust[" ] });
+        parse_language_err(&req, &args);
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_token_containing_newline() {
+        let req = dummy_request();
+        let args = json!({ "language": "rust\ngo" });
+        parse_language_err(&req, &args);
     }
 
     #[test]

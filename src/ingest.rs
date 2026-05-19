@@ -1370,6 +1370,19 @@ pub fn update_pattern(
     // post-write `index_single_file` re-parses the file and surfaces them
     // through the normal advisory path. U3 closes the inbox-branch
     // short-circuit's blind spot for that path.
+    //
+    // Intentional asymmetry with `tags`'s preserve branch: the language
+    // parser lowercases tokens at read time (see
+    // `crate::chunking::parse_frontmatter_language_list`), so a body-only
+    // `update_pattern` against an existing `language: [Rust]` file rewrites
+    // the line as `language: [rust]`. The DB has stored the lowercased form
+    // since PR #50; the file now converges to match rather than drifting.
+    // `tags`'s preserve path keeps the original casing because the tags
+    // parser does not lowercase — language tokens are validated against
+    // the canonical `LANGUAGES` table where lowercase is the canonical form,
+    // tags are free-form. Pinned by
+    // `update_pattern_preserve_lowercases_existing_mixed_case_language` so
+    // a future change to either parser's casing posture surfaces here.
     let preserved_lang: Vec<String>;
     let preserved_lang_refs: Vec<&str>;
     let language_to_apply: &[&str] = if let Some(l) = language {
@@ -3268,6 +3281,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    #[test]
+    fn update_pattern_preserve_lowercases_existing_mixed_case_language() {
+        // Intentional contract pin (correctness review finding 1):
+        // the language parser lowercases tokens at read time, so a body-only
+        // `update_pattern` against an existing `language: [Rust]` file
+        // rewrites the line as `language: [rust]`. The DB has stored the
+        // lowercased form since PR #50; the file converges to match the
+        // canonical form on the first body-only update. Asymmetric with
+        // `tags`'s preserve branch by design — see the explanatory comment
+        // in `update_pattern` for the rationale.
+        //
+        // A future change to either the language or tag parser's casing
+        // posture lands here: if the language parser stops lowercasing, this
+        // test starts failing and the author can decide whether the new
+        // behaviour is desired.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("mixed.md"),
+            "---\nlanguage: [Rust, Kotlin]\n---\n\n# Mixed\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "mixed.md",
+            "Replacement body long enough.",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("mixed.md")).unwrap();
+        assert!(
+            content.contains("language: [rust, kotlin]"),
+            "preserve branch must canonicalise mixed-case tokens to the \
+             parser's lowercase form, got:\n{content}"
+        );
+        // DB state must match — it already did before the rewrite, since
+        // the parser lowercases on read.
+        assert_eq!(
+            language_json_for(&db, "mixed.md").as_deref(),
+            Some("[\"rust\",\"kotlin\"]")
+        );
     }
 
     // Note: inbox-branch parity tests for `language_warnings` live in
