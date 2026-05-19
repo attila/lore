@@ -341,7 +341,9 @@ fn tool_definitions() -> Value {
                 "Create a new pattern in the knowledge base. Use only when the user explicitly \
                  asks to save, record, or document a pattern. Creates a markdown file and indexes \
                  it; the change is committed to git when the knowledge base is a git repository, \
-                 otherwise the file is written without a commit.",
+                 otherwise the file is written without a commit. Pass `language` to opt the \
+                 pattern into the structural retrieval gate (warn-and-proceed for unknown \
+                 tokens).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -366,12 +368,28 @@ fn tool_definitions() -> Value {
                              docs/pattern-authoring-guide.md §\"When to use the universal tag\" \
                              and §\"Tool/command predicate (applies_when)\"."
                     },
+                    "language": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ],
+                        "description":
+                            "Optional language declaration that opts the pattern into the \
+                             structural retrieval gate. Accepts a single token (`\"rust\"`) or \
+                             an array (`[\"java\", \"kotlin\"]`). Tokens are lowercased and \
+                             validated against the canonical language table; unknown tokens \
+                             warn-and-proceed (the pattern is still written, the offending \
+                             tokens are surfaced on stderr and in the response's \
+                             `lore-metadata` fence as `language_warnings`)."
+                    },
                     "include_metadata": {
                         "type": "boolean",
                         "description":
                             "When true, appends a `lore-metadata` fenced code block to the \
                              end of the response containing machine-readable JSON with the \
-                             written file path, chunk count, and commit status. Defaults to false.",
+                             written file path, chunk count, commit status, and \
+                             `language_warnings` (array of unknown language tokens; empty when \
+                             every token validated). Defaults to false.",
                         "default": false
                     }
                 },
@@ -384,7 +402,9 @@ fn tool_definitions() -> Value {
                 "Replace the content of an existing pattern. Use only when the user explicitly \
                  asks to update or rewrite a pattern. Overwrites the file and re-indexes; the \
                  change is committed to git when the knowledge base is a git repository, \
-                 otherwise the file is written without a commit.",
+                 otherwise the file is written without a commit. `tags` and `language` share \
+                 three-way semantics (preserve when omitted, clear with `[]`, replace with a \
+                 non-empty value); unknown language tokens warn-and-proceed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -409,12 +429,29 @@ fn tool_definitions() -> Value {
                              injection tier (see `add_pattern`'s `tags` description for the \
                              interaction with `applies_when` predicates)."
                     },
+                    "language": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ],
+                        "description":
+                            "Optional language declaration. Three-way semantics mirror `tags`: \
+                             omit to preserve the existing frontmatter `language:` list (the \
+                             default that prevents the de-language footgun on body-only \
+                             rewrites); pass an empty array `[]` to clear; pass a non-empty \
+                             value (string or array) to replace the list wholesale. Tokens are \
+                             lowercased and validated against the canonical language table; \
+                             unknown tokens warn-and-proceed and surface on stderr and in the \
+                             response's `lore-metadata` fence as `language_warnings`."
+                    },
                     "include_metadata": {
                         "type": "boolean",
                         "description":
                             "When true, appends a `lore-metadata` fenced code block to the \
                              end of the response containing machine-readable JSON with the \
-                             updated file path, chunk count, and commit status. Defaults to false.",
+                             updated file path, chunk count, commit status, and \
+                             `language_warnings` (array of unknown language tokens; empty when \
+                             every token validated). Defaults to false.",
                         "default": false
                     }
                 },
@@ -427,7 +464,9 @@ fn tool_definitions() -> Value {
                 "Add a new section to an existing pattern without replacing it. Use when the user \
                  wants to add examples, edge cases, or notes to an existing pattern. Appends a \
                  heading and body and re-indexes; the change is committed to git when the \
-                 knowledge base is a git repository, otherwise the file is written without a commit.",
+                 knowledge base is a git repository, otherwise the file is written without a commit. \
+                 Does not accept a `language` argument — appends are body-only by definition; use \
+                 `update_pattern` to change the frontmatter `language:` declaration.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -584,6 +623,7 @@ const MAX_SOURCE_FILE_BYTES: usize = 512;
 const MAX_HEADING_BYTES: usize = 512;
 const MAX_BODY_BYTES: usize = 262_144; // 256 KB
 const MAX_TAGS_BYTES: usize = 8192; // 8 KB serialised JSON
+const MAX_LANGUAGE_BYTES: usize = 8192; // 8 KB serialised JSON
 const MAX_TOP_K: u64 = 100;
 
 /// Return an error response if `value` exceeds `max_bytes`.
@@ -615,6 +655,96 @@ fn check_tags_limit(req: &JsonRpcRequest, args: &Value) -> Option<JsonRpcRespons
         }
     }
     None
+}
+
+/// Return an error response if the serialised `language` argument exceeds the
+/// limit. Same shape as [`check_tags_limit`]; size-checks the raw JSON shape
+/// before [`parse_language_arg`] coerces it.
+fn check_language_limit(req: &JsonRpcRequest, args: &Value) -> Option<JsonRpcResponse> {
+    if let Some(lang_val) = args.get("language") {
+        let serialised = serde_json::to_string(lang_val).unwrap_or_default();
+        if serialised.len() > MAX_LANGUAGE_BYTES {
+            return Some(error_response(
+                req,
+                &format!("language exceeds maximum serialised size of {MAX_LANGUAGE_BYTES} bytes"),
+            ));
+        }
+    }
+    None
+}
+
+/// Parse the MCP `language` argument into a canonical `Option<Vec<String>>`.
+///
+/// The MCP `inputSchema` accepts `oneOf [string, array<string>]`, mirroring
+/// the YAML frontmatter shapes [`crate::chunking::parse_frontmatter_language_list`]
+/// already accepts (scalar, flow list, block list). This helper folds both
+/// JSON shapes into the same canonical shape downstream code consumes:
+///
+/// - Absent (`None`): no `language` key. `update_pattern` interprets this as
+///   "preserve existing frontmatter `language:`", mirroring the `tags`
+///   three-way semantics that prevent the body-only-rewrite footgun.
+///   `add_pattern` has no existing list to preserve, so it folds the absent
+///   case into the no-render path.
+/// - `Some(vec![])`: caller passed `[]`. `update_pattern` clears the
+///   frontmatter `language:` line; `add_pattern` writes no `language:` line.
+/// - `Some(vec!["rust"])` (scalar input) or `Some(vec!["java", "kotlin"])`
+///   (array input): caller passed a value. Both shapes coerce to `Vec<String>`.
+///
+/// Tokens are stored verbatim (no lowercasing or validation here — the
+/// frontmatter parser owns canonical lowercasing and `is_known_token`
+/// validation, so the MCP layer does not duplicate that logic and risk
+/// diverging from it). Non-string array entries and non-string/non-array
+/// top-level shapes return a structured error.
+fn parse_language_arg(
+    req: &JsonRpcRequest,
+    args: &Value,
+) -> Result<Option<Vec<String>>, JsonRpcResponse> {
+    let Some(lang_val) = args.get("language") else {
+        return Ok(None);
+    };
+    let raw: Vec<String> = if let Some(s) = lang_val.as_str() {
+        vec![s.to_string()]
+    } else if let Some(arr) = lang_val.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Some(s) = item.as_str() else {
+                return Err(error_response(
+                    req,
+                    "language array entries must be strings",
+                ));
+            };
+            out.push(s.to_string());
+        }
+        out
+    } else {
+        return Err(error_response(
+            req,
+            "language must be a string or array of strings",
+        ));
+    };
+    // Reject tokens that would corrupt the on-disk flow-list shape or the
+    // chunking parser's view of the frontmatter. The YAML flow-list renderer
+    // joins tokens with ', ' inside `[...]`; an embedded `,`, `]`, or
+    // newline therefore would either truncate the list or split the token
+    // on parser read-back, producing a silent round-trip mismatch the agent
+    // cannot easily detect. Hard-erroring at the MCP boundary is preferable
+    // to letting the chunking parser's defensive filter drop the token
+    // post-split.
+    for token in &raw {
+        if let Some(c) = token
+            .chars()
+            .find(|c| matches!(c, ',' | '[' | ']') || c.is_control())
+        {
+            return Err(error_response(
+                req,
+                &format!(
+                    "language token {token:?} contains forbidden character {c:?}; \
+                     tokens must not contain commas, square brackets, or control characters"
+                ),
+            ));
+        }
+    }
+    Ok(Some(raw))
 }
 
 // ---------------------------------------------------------------------------
@@ -814,6 +944,19 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
     if let Some(err) = check_tags_limit(req, args) {
         return err;
     }
+    if let Some(err) = check_language_limit(req, args) {
+        return err;
+    }
+    // Parse the language argument at the MCP boundary so a malformed call
+    // hits a structured error before any write lock is taken. The
+    // empty-array case is semantically identical to absent for
+    // `add_pattern` (no existing list to preserve), so both fold into an
+    // empty borrow for the ingest helper.
+    let language_owned = match parse_language_arg(req, args) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(resp) => return resp,
+    };
+    let language_refs: Vec<&str> = language_owned.iter().map(String::as_str).collect();
 
     eprintln!("[lore] Add pattern: \"{title}\"");
 
@@ -833,6 +976,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         title,
         body,
         &tags,
+        &language_refs,
         ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
@@ -843,6 +987,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
                 "chunks_indexed": result.chunks_indexed,
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
+                "language_warnings": result.language_warnings,
             });
             let prose = format!(
                 "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
@@ -887,6 +1032,20 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     if let Some(err) = check_tags_limit(req, args) {
         return err;
     }
+    if let Some(err) = check_language_limit(req, args) {
+        return err;
+    }
+    // `language` mirrors `tags`'s three-way semantics: absent preserves,
+    // `[]` clears, `[...]` replaces. The parsed shape carries that
+    // distinction through to `ingest::update_pattern` which routes it into
+    // the preserve / clear / replace branches.
+    let language_owned: Option<Vec<String>> = match parse_language_arg(req, args) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let language_refs: Option<Vec<&str>> = language_owned
+        .as_ref()
+        .map(|v| v.iter().map(String::as_str).collect());
 
     eprintln!("[lore] Update pattern: \"{source_file}\"");
 
@@ -906,6 +1065,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         source_file,
         body,
         tags_owned.as_deref(),
+        language_refs.as_deref(),
         ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
@@ -916,6 +1076,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "chunks_indexed": result.chunks_indexed,
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
+                "language_warnings": result.language_warnings,
             });
             let prose = format!(
                 "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
@@ -979,6 +1140,7 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "chunks_indexed": result.chunks_indexed,
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
+                "language_warnings": result.language_warnings,
             });
             let prose = format!(
                 "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
@@ -2476,6 +2638,389 @@ mod tests {
         );
     }
 
+    // -- language arg parsing (U1) -----------------------------------------
+    //
+    // Cover the four shape categories the MCP boundary must handle:
+    //   - absent → `None` (`update_pattern` interprets this as preserve)
+    //   - scalar string → `Some(vec![s])`
+    //   - array of strings → `Some(vec)`
+    //   - malformed (non-string scalar, array with non-string entries) →
+    //     structured error before the write lock is taken
+    //
+    // The handlers in U1 parse and validate; U2 wires the parsed value
+    // through to `ingest::*`. These tests pin the parsing contract directly
+    // via `parse_language_arg`, exercise the boundary-error path through the
+    // `add_pattern` handler (so malformed input fails before any write lock
+    // is taken), and assert the catalogue's schema-shape contract in the
+    // `tool_definitions_*` tests that follow.
+
+    fn dummy_request() -> JsonRpcRequest {
+        serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#).unwrap()
+    }
+
+    /// Resolve [`parse_language_arg`] to its OK value, failing the test with
+    /// a stringified version of the error response when the helper errors.
+    /// `JsonRpcResponse` does not implement `Debug`, so `unwrap()` is not
+    /// available; this helper routes through `serde_json::to_string` instead.
+    fn parse_language_ok(req: &JsonRpcRequest, args: &Value) -> Option<Vec<String>> {
+        match parse_language_arg(req, args) {
+            Ok(v) => v,
+            Err(resp) => panic!(
+                "parse_language_arg returned an error: {}",
+                serde_json::to_string(&resp).unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Resolve [`parse_language_arg`] to its error response, failing the test
+    /// if it succeeded.
+    fn parse_language_err(req: &JsonRpcRequest, args: &Value) -> JsonRpcResponse {
+        match parse_language_arg(req, args) {
+            Ok(v) => panic!("parse_language_arg succeeded unexpectedly with: {v:?}"),
+            Err(resp) => resp,
+        }
+    }
+
+    #[test]
+    fn parse_language_arg_absent_returns_none() {
+        let req = dummy_request();
+        let args = json!({});
+        assert_eq!(parse_language_ok(&req, &args), None);
+    }
+
+    #[test]
+    fn parse_language_arg_scalar_coerces_to_single_element_vec() {
+        let req = dummy_request();
+        let args = json!({ "language": "rust" });
+        assert_eq!(
+            parse_language_ok(&req, &args),
+            Some(vec!["rust".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_language_arg_array_preserves_order_and_duplicates() {
+        let req = dummy_request();
+        let args = json!({ "language": ["java", "kotlin", "java"] });
+        assert_eq!(
+            parse_language_ok(&req, &args),
+            Some(vec![
+                "java".to_string(),
+                "kotlin".to_string(),
+                "java".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_language_arg_empty_array_returns_some_empty_vec() {
+        // The empty-array case is semantically distinct from absent on
+        // `update_pattern` (clear vs preserve). The helper must preserve the
+        // distinction; the caller folds them together for `add_pattern`.
+        let req = dummy_request();
+        let args = json!({ "language": [] });
+        assert_eq!(parse_language_ok(&req, &args), Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_non_string_scalar() {
+        let req = dummy_request();
+        let args = json!({ "language": 42 });
+        let err = parse_language_err(&req, &args);
+        let value = serde_json::to_value(&err).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("string or array of strings"),
+            "error must name the accepted shapes, got: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_array_with_non_string_entries() {
+        let req = dummy_request();
+        let args = json!({ "language": ["rust", 7] });
+        let err = parse_language_err(&req, &args);
+        let value = serde_json::to_value(&err).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("array entries must be strings"),
+            "error must name the entry constraint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_token_containing_comma() {
+        // Correctness review finding 2: a token with an embedded comma
+        // would render as `language: [a,b]` and the chunking parser would
+        // split it into two distinct tokens, producing a round-trip
+        // mismatch the agent cannot easily detect. Hard-erroring at the
+        // boundary surfaces the mistake before any write.
+        let req = dummy_request();
+        let args = json!({ "language": "objective-c, swift" });
+        let err = parse_language_err(&req, &args);
+        let value = serde_json::to_value(&err).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("forbidden character") && message.contains("commas"),
+            "error must name the delimiter constraint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_token_containing_brackets() {
+        let req = dummy_request();
+        let args = json!({ "language": ["rust[" ] });
+        parse_language_err(&req, &args);
+    }
+
+    #[test]
+    fn parse_language_arg_rejects_token_containing_newline() {
+        let req = dummy_request();
+        let args = json!({ "language": "rust\ngo" });
+        parse_language_err(&req, &args);
+    }
+
+    #[test]
+    fn add_pattern_rejects_malformed_language_before_write_lock() {
+        // Regression guard: a non-string/non-array `language` argument must
+        // hit a structured error before any write or lock acquisition. The
+        // assertion uses the response's error shape — if the handler were to
+        // ignore the argument it would succeed and create the pattern.
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":31,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Test Malformed",
+                        "body":"Body text that is long enough for a chunk.",
+                        "language": 42
+                    }
+                }
+            }"#,
+        );
+        assert!(!resp["error"].is_null(), "expected an error response");
+        let message = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("string or array of strings"),
+            "expected a structured shape error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_rejects_language_exceeding_size_limit() {
+        let h = TestHarness::new();
+        // Build an array of single-character tokens whose serialised JSON
+        // size exceeds the limit. Each `"a",` adds 4 bytes of serialised
+        // form; a comfortably-over-limit payload uses 3000 entries.
+        let huge: Vec<&str> = (0..3000).map(|_| "a").collect();
+        let req_json = serde_json::json!({
+            "jsonrpc":"2.0","id":32,"method":"tools/call",
+            "params":{
+                "name":"add_pattern",
+                "arguments":{
+                    "title":"Test Limit",
+                    "body":"Body text that is long enough for a chunk.",
+                    "language": huge
+                }
+            }
+        });
+        let resp = h.request_value(&req_json.to_string());
+        let message = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("language exceeds maximum"),
+            "expected the language limit error, got: {message}"
+        );
+    }
+
+    // -- tool_definitions schema shape (U1 contract pins) -----------------
+    //
+    // The schemas are the MCP contract — these tests pin the `language`
+    // property's presence and shape on the two write tools that accept it,
+    // and (in U4) pin its absence on `append_to_pattern`. Drift in either
+    // direction silently reintroduces the dropped-argument failure mode the
+    // plan exists to fix.
+
+    fn tool_schema(name: &str) -> Value {
+        let tools = tool_definitions();
+        let arr = tools.as_array().expect("tool_definitions returns an array");
+        arr.iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} not found in tool_definitions"))
+            .clone()
+    }
+
+    #[test]
+    fn tool_definitions_add_pattern_has_language_oneof_shape() {
+        let tool = tool_schema("add_pattern");
+        let lang = &tool["inputSchema"]["properties"]["language"];
+        assert!(lang.is_object(), "add_pattern must expose `language`");
+        let one_of = lang["oneOf"].as_array().expect("language.oneOf array");
+        assert_eq!(one_of.len(), 2, "language.oneOf must have two branches");
+        assert_eq!(one_of[0]["type"], "string");
+        assert_eq!(one_of[1]["type"], "array");
+        assert_eq!(one_of[1]["items"]["type"], "string");
+        assert!(
+            lang["description"].as_str().is_some_and(|s| !s.is_empty()),
+            "language.description must be non-empty"
+        );
+        let required: Vec<&str> = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !required.contains(&"language"),
+            "language must remain optional"
+        );
+        // Regression guards on the original required fields and sibling
+        // properties so a careless edit cannot silently drop them.
+        assert!(required.contains(&"title") && required.contains(&"body"));
+        let props = &tool["inputSchema"]["properties"];
+        for sibling in ["title", "body", "tags", "include_metadata"] {
+            assert!(props.get(sibling).is_some(), "{sibling} must stay present");
+        }
+    }
+
+    #[test]
+    fn tool_definitions_update_pattern_has_language_oneof_shape() {
+        let tool = tool_schema("update_pattern");
+        let lang = &tool["inputSchema"]["properties"]["language"];
+        assert!(lang.is_object(), "update_pattern must expose `language`");
+        let one_of = lang["oneOf"].as_array().expect("language.oneOf array");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(one_of[0]["type"], "string");
+        assert_eq!(one_of[1]["type"], "array");
+        assert_eq!(one_of[1]["items"]["type"], "string");
+        let required: Vec<&str> = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!required.contains(&"language"));
+        assert!(required.contains(&"source_file") && required.contains(&"body"));
+        let props = &tool["inputSchema"]["properties"];
+        for sibling in ["source_file", "body", "tags", "include_metadata"] {
+            assert!(props.get(sibling).is_some(), "{sibling} must stay present");
+        }
+    }
+
+    #[test]
+    fn tool_definitions_append_pattern_does_not_accept_language() {
+        // Load-bearing pin for Decision 3 (schema honesty over surface
+        // symmetry). A future symmetry-driven PR adding `language` to append
+        // would silently reintroduce the dropped-argument footgun on what
+        // an agent believes is a body-only operation. This test fails fast
+        // if that happens.
+        let tool = tool_schema("append_to_pattern");
+        let props = &tool["inputSchema"]["properties"];
+        assert!(
+            props.get("language").is_none(),
+            "append_to_pattern must not declare a `language` property; \
+             frontmatter changes belong on update_pattern"
+        );
+        for sibling in ["source_file", "heading", "body", "include_metadata"] {
+            assert!(props.get(sibling).is_some(), "{sibling} must stay present");
+        }
+    }
+
+    // -- tool description prose (U4 drift guards) --------------------------
+    //
+    // The schema descriptions are the contract agents read when they list
+    // tools, so the keywords below are part of the public API surface. Each
+    // assertion below pins a specific failure mode by name: if a future edit
+    // drops the keyword the test calls out, the test fails, and the author
+    // either restores the keyword or the test's failure message names what
+    // changed and why. Substring matches keyed on stable nouns
+    // (`language`, `update_pattern`, `preserve` / `clear` / `replace`) keep
+    // the assertions resilient to innocent wording tweaks.
+
+    /// Helper: fetch a tool's top-level `description` string.
+    fn tool_description(name: &str) -> String {
+        tool_schema(name)["description"]
+            .as_str()
+            .expect("description must be a string")
+            .to_string()
+    }
+
+    #[test]
+    fn add_pattern_description_mentions_language_and_warn_behaviour() {
+        let desc = tool_description("add_pattern");
+        assert!(
+            desc.contains("language"),
+            "add_pattern description must mention `language`, got: {desc}"
+        );
+        assert!(
+            desc.contains("warn-and-proceed") || desc.contains("unknown"),
+            "add_pattern description must document the unknown-token \
+             advisory behaviour, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn update_pattern_description_mentions_language_and_three_way_semantics() {
+        let desc = tool_description("update_pattern");
+        assert!(
+            desc.contains("language"),
+            "update_pattern description must mention `language`, got: {desc}"
+        );
+        // The three-way semantics keywords are load-bearing: an agent
+        // reading the description must learn the preserve/clear/replace
+        // distinction without having to test the boundary themselves.
+        assert!(
+            desc.contains("preserve"),
+            "update_pattern description must document the preserve case, got: {desc}"
+        );
+        assert!(
+            desc.contains("clear"),
+            "update_pattern description must document the clear case, got: {desc}"
+        );
+        assert!(
+            desc.contains("replace"),
+            "update_pattern description must document the replace case, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn append_pattern_description_points_at_update_pattern_for_language() {
+        // The description is how agents discover the right tool when they
+        // want to change frontmatter; the pointer is part of the schema
+        // contract per Decision 3 in the plan.
+        let desc = tool_description("append_to_pattern");
+        assert!(
+            desc.contains("update_pattern"),
+            "append_to_pattern description must point at update_pattern for \
+             frontmatter changes, got: {desc}"
+        );
+        assert!(
+            desc.contains("language"),
+            "append_to_pattern description must mention `language` to flag \
+             the missing field for the agent, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn update_pattern_language_field_description_documents_three_way_semantics() {
+        // The per-field description is what agents see when they expand a
+        // schema in their tool registry. Pin the three keywords directly so
+        // the field-level contract cannot drift away from the tool-level
+        // contract.
+        let tool = tool_schema("update_pattern");
+        let lang_desc = tool["inputSchema"]["properties"]["language"]["description"]
+            .as_str()
+            .expect("language.description must be a string");
+        for keyword in ["preserve", "clear", "replace"] {
+            assert!(
+                lang_desc.contains(keyword),
+                "update_pattern.language.description must contain `{keyword}` \
+                 to document the three-way semantics, got: {lang_desc}"
+            );
+        }
+    }
+
     // -- lore_status -------------------------------------------------------
 
     #[test]
@@ -3046,6 +3591,51 @@ mod tests {
             metadata["file_path"].is_string(),
             "metadata should expose file_path"
         );
+        // U3: the field is always present, even on the all-valid baseline,
+        // so agents can pattern-match on `language_warnings` without first
+        // checking for key existence.
+        let warnings = metadata["language_warnings"]
+            .as_array()
+            .expect("language_warnings must be an array on the metadata fence");
+        assert!(
+            warnings.is_empty(),
+            "no language passed must yield an empty warnings array, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_metadata_fence_carries_language_warnings_for_unknown_tokens() {
+        // U3 contract: an `add_pattern` call carrying an unknown language
+        // token writes the file (warn-and-proceed) and surfaces the
+        // offending token through the metadata fence so MCP-side agents can
+        // detect the drift without scraping stderr.
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":80,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Lang Warn",
+                        "body":"Body text that is long enough for chunking.",
+                        "language":["rust","objectiv-c"],
+                        "include_metadata":true
+                    }
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        let warnings = metadata["language_warnings"]
+            .as_array()
+            .expect("language_warnings must be an array on the metadata fence");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning for the single unknown token, got: {warnings:?}"
+        );
+        assert_eq!(warnings[0], "objectiv-c");
     }
 
     /// When the caller does NOT pass `include_metadata: true`, the write

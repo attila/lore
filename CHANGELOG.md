@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- MCP `add_pattern` and `update_pattern` accept an optional `language` argument that opts the
+  pattern into the structural retrieval gate, warn-and-proceed for unknown tokens. (#63)
 - `lore status` inserts a new `Languages:` line between `Sources:` and `Last commit:` reporting a
   per-language source-count breakdown plus an `undeclared` bucket; the same data is exposed as
   `languages_declared` / `languages_undeclared` on the MCP `lore_status` tool's metadata fence for

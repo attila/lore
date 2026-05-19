@@ -201,6 +201,15 @@ pub struct WriteResult {
     pub chunks_indexed: usize,
     pub commit_status: CommitStatus,
     pub embedding_failures: usize,
+    /// Unknown-language-token advisories surfaced by the chunking parser
+    /// when the just-written file is reindexed (or, on the inbox-branch
+    /// short-circuit, when the parser is invoked directly on the
+    /// about-to-be-written content). One entry per unique offending token,
+    /// preserving first-seen order, lowercased to match the parser's
+    /// canonical form. Empty when every token validated against
+    /// [`crate::engine::is_known_token`]; never `None` so callers can
+    /// always render the field as an array on a `lore-metadata` fence.
+    pub language_warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,11 +1137,44 @@ pub fn ingest_single_file(
 // Write operations
 // ---------------------------------------------------------------------------
 
+/// Collapse a list of [`MalformedLanguageEntry`] advisories into the
+/// `language_warnings: Vec<String>` shape that `WriteResult` exposes to
+/// agents, and emit one stderr line per unique unknown token so the CLI
+/// observability surface matches the metadata-fence surface. Order is
+/// first-seen; duplicates are dropped.
+///
+/// Shared between the normal write path (advisories from
+/// [`index_single_file`]) and the inbox-branch short-circuit (advisories
+/// from a direct [`crate::chunking::parse_frontmatter_language_list`]
+/// call on the about-to-be-written content). Without this shared helper
+/// the short-circuit would silently swallow the warning, leaving
+/// agent-submitted patterns advisory-blind on what is the most common
+/// agent submission path — the exact dropped-argument failure mode the
+/// `language` argument exists to fix, on a different code path.
+fn collect_language_warnings(entries: &[MalformedLanguageEntry], source_file: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries {
+        if out.iter().any(|t| t == &entry.token) {
+            continue;
+        }
+        eprintln!(
+            "Warning: pattern {source_file}: unknown language token `{}`.",
+            entry.token
+        );
+        out.push(entry.token.clone());
+    }
+    out
+}
+
 /// Create a new pattern file, index it, and commit.
 ///
 /// When `inbox_branch_prefix` is `Some`, the file is committed to a
 /// per-submission branch and pushed to the remote instead of being written
 /// to disk and indexed locally.
+#[allow(clippy::too_many_arguments)] // Canonical MCP write path; refactoring
+// into a struct would obscure the call
+// sites without making them easier to
+// read.
 pub fn add_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -1140,6 +1182,7 @@ pub fn add_pattern(
     title: &str,
     body: &str,
     tags: &[&str],
+    language: &[&str],
     inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     // Sanitise the title at the canonical write boundary: trim surrounding
@@ -1162,9 +1205,21 @@ pub fn add_pattern(
     // Validate slug doesn't contain path traversal components.
     validate_slug(&filename)?;
 
-    let content = build_file_content(title, body, tags);
+    let content = build_file_content(title, body, tags, language);
 
     if let Some(prefix) = inbox_branch_prefix {
+        // Inbox-branch parity: the short-circuit pushes the file to a remote
+        // branch without invoking `index_single_file`, so the chunking
+        // parser's malformed-language advisories are never fired by the
+        // ingest layer for this path. Invoke the parser directly on the
+        // about-to-be-written content so the warning reaches stderr and the
+        // returned `language_warnings` matches what the local-write path
+        // would have produced. Without this, agent-submitted patterns
+        // (the dominant inbox use case) would silently swallow unknown
+        // language tokens.
+        let (_, malformed) = crate::chunking::parse_frontmatter_language_list(&content, &filename);
+        let language_warnings = collect_language_warnings(&malformed, &filename);
+
         let branch = git::commit_to_new_branch(
             knowledge_dir,
             prefix,
@@ -1180,6 +1235,7 @@ pub fn add_pattern(
             chunks_indexed: 0,
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
+            language_warnings,
         });
     }
 
@@ -1227,8 +1283,10 @@ pub fn add_pattern(
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        malformed_language,
         ..
     } = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let language_warnings = collect_language_warnings(&malformed_language, &filename);
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1241,6 +1299,7 @@ pub fn add_pattern(
         chunks_indexed: chunks,
         commit_status,
         embedding_failures,
+        language_warnings,
     })
 }
 
@@ -1256,6 +1315,16 @@ pub fn add_pattern(
 ///   drop every tag (including `universal`, de-universalising the pattern).
 /// - `Some(&[])` — explicitly clear all tags.
 /// - `Some(&[...])` — replace the tag list wholesale.
+///
+/// `language` follows the same three-way semantics as `tags`. The
+/// preserve-on-`None` branch reads the existing `language:` frontmatter
+/// via [`crate::chunking::parse_frontmatter_language_list`] so a body-only
+/// rewrite does not silently de-language a pattern — the analogue of the
+/// de-universalisation footgun that motivated `tags`'s preserve semantics.
+#[allow(clippy::too_many_arguments)] // Canonical MCP write path; refactoring
+// into a struct would obscure the call
+// sites without making them easier to
+// read.
 pub fn update_pattern(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -1263,6 +1332,7 @@ pub fn update_pattern(
     source_file: &str,
     body: &str,
     tags: Option<&[&str]>,
+    language: Option<&[&str]>,
     inbox_branch_prefix: Option<&str>,
 ) -> anyhow::Result<WriteResult> {
     let file_path = knowledge_dir.join(source_file);
@@ -1283,19 +1353,59 @@ pub fn update_pattern(
     // the body through `update_pattern` but forgets to pass `tags`, which
     // previously silently cleared every tag — including `universal`, which
     // would de-universalise a pinned pattern without any signal.
-    let preserved: Vec<String>;
-    let preserved_refs: Vec<&str>;
+    let preserved_tags: Vec<String>;
+    let preserved_tag_refs: Vec<&str>;
     let tags_to_apply: &[&str] = if let Some(t) = tags {
         t
     } else {
-        preserved = crate::chunking::parse_frontmatter_tag_list(&existing);
-        preserved_refs = preserved.iter().map(String::as_str).collect();
-        &preserved_refs
+        preserved_tags = crate::chunking::parse_frontmatter_tag_list(&existing);
+        preserved_tag_refs = preserved_tags.iter().map(String::as_str).collect();
+        &preserved_tag_refs
     };
 
-    let content = build_file_content(&title, body, tags_to_apply);
+    // Mirror of the `tags` preserve-on-`None` branch — see Decision 2 in the
+    // language-arg plan doc for the analogous footgun this guards against.
+    // `parse_frontmatter_language_list` validates against the canonical
+    // table; we discard the malformed-token advisories here because the
+    // post-write `index_single_file` re-parses the file and surfaces them
+    // through the normal advisory path. U3 closes the inbox-branch
+    // short-circuit's blind spot for that path.
+    //
+    // Intentional asymmetry with `tags`'s preserve branch: the language
+    // parser lowercases tokens at read time (see
+    // `crate::chunking::parse_frontmatter_language_list`), so a body-only
+    // `update_pattern` against an existing `language: [Rust]` file rewrites
+    // the line as `language: [rust]`. The DB has stored the lowercased form
+    // since PR #50; the file now converges to match rather than drifting.
+    // `tags`'s preserve path keeps the original casing because the tags
+    // parser does not lowercase — language tokens are validated against
+    // the canonical `LANGUAGES` table where lowercase is the canonical form,
+    // tags are free-form. Pinned by
+    // `update_pattern_preserve_lowercases_existing_mixed_case_language` so
+    // a future change to either parser's casing posture surfaces here.
+    let preserved_lang: Vec<String>;
+    let preserved_lang_refs: Vec<&str>;
+    let language_to_apply: &[&str] = if let Some(l) = language {
+        l
+    } else {
+        let (tokens, _) = crate::chunking::parse_frontmatter_language_list(&existing, source_file);
+        preserved_lang = tokens;
+        preserved_lang_refs = preserved_lang.iter().map(String::as_str).collect();
+        &preserved_lang_refs
+    };
+
+    let content = build_file_content(&title, body, tags_to_apply, language_to_apply);
 
     if let Some(prefix) = inbox_branch_prefix {
+        // Inbox-branch parity: see [`add_pattern`]'s short-circuit for the
+        // same rationale — the short-circuit skips `index_single_file`, so
+        // the parser is invoked directly on the about-to-be-written content
+        // to keep stderr and metadata-fence advisories aligned with the
+        // local-write path.
+        let (_, malformed) =
+            crate::chunking::parse_frontmatter_language_list(&content, source_file);
+        let language_warnings = collect_language_warnings(&malformed, source_file);
+
         let slug = file_stem(source_file);
         let branch = git::commit_to_new_branch(
             knowledge_dir,
@@ -1312,6 +1422,7 @@ pub fn update_pattern(
             chunks_indexed: 0,
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
+            language_warnings,
         });
     }
 
@@ -1320,8 +1431,10 @@ pub fn update_pattern(
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        malformed_language,
         ..
     } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
+    let language_warnings = collect_language_warnings(&malformed_language, source_file);
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1334,6 +1447,7 @@ pub fn update_pattern(
         chunks_indexed: chunks,
         commit_status,
         embedding_failures,
+        language_warnings,
     })
 }
 
@@ -1374,6 +1488,14 @@ pub fn append_to_pattern(
     content.push('\n');
 
     if let Some(prefix) = inbox_branch_prefix {
+        // Inbox-branch parity (append edition): the heading-and-body append
+        // preserves the existing frontmatter, but the existing frontmatter
+        // may already carry unknown language tokens. Surface them so the
+        // append-via-MCP path is no quieter than `add_pattern` / `update_pattern`.
+        let (_, malformed) =
+            crate::chunking::parse_frontmatter_language_list(&content, source_file);
+        let language_warnings = collect_language_warnings(&malformed, source_file);
+
         let slug = file_stem(source_file);
         let branch = git::commit_to_new_branch(
             knowledge_dir,
@@ -1390,6 +1512,7 @@ pub fn append_to_pattern(
             chunks_indexed: 0,
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
+            language_warnings,
         });
     }
 
@@ -1398,8 +1521,10 @@ pub fn append_to_pattern(
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        malformed_language,
         ..
     } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
+    let language_warnings = collect_language_warnings(&malformed_language, source_file);
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1412,6 +1537,7 @@ pub fn append_to_pattern(
         chunks_indexed: chunks,
         commit_status,
         embedding_failures,
+        language_warnings,
     })
 }
 
@@ -1881,12 +2007,27 @@ fn slugify(title: &str) -> String {
         .join("-")
 }
 
-/// Build a markdown file from title, body, and optional frontmatter tags.
-fn build_file_content(title: &str, body: &str, tags: &[&str]) -> String {
+/// Build a markdown file from title, body, and optional frontmatter tags
+/// and language tokens.
+///
+/// Frontmatter ordering is fixed: `tags:` first, then `language:`. Both
+/// render as flow lists for parser symmetry — single-element lists render
+/// as `language: [rust]` rather than the scalar form so the on-disk shape
+/// stays uniform regardless of how the caller passed the value. The
+/// frontmatter block is omitted entirely when both fields are empty so the
+/// pre-`language` write shape is preserved byte-for-byte.
+fn build_file_content(title: &str, body: &str, tags: &[&str], language: &[&str]) -> String {
     let mut content = String::new();
-    if !tags.is_empty() {
+    let has_tags = !tags.is_empty();
+    let has_language = !language.is_empty();
+    if has_tags || has_language {
         content.push_str("---\n");
-        let _ = writeln!(content, "tags: [{}]", tags.join(", "));
+        if has_tags {
+            let _ = writeln!(content, "tags: [{}]", tags.join(", "));
+        }
+        if has_language {
+            let _ = writeln!(content, "language: [{}]", language.join(", "));
+        }
         content.push_str("---\n\n");
     }
     let _ = write!(content, "# {title}\n\n");
@@ -2335,6 +2476,7 @@ mod tests {
             "My Pattern",
             "Pattern body that is long enough for chunking.",
             &["design", "rust"],
+            &[],
             None,
         )
         .unwrap();
@@ -2361,7 +2503,7 @@ mod tests {
 
         fs::write(dir.join("existing.md"), "# Existing\n").unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "Existing", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "Existing", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("already exists"), "unexpected error: {msg}");
@@ -2386,7 +2528,7 @@ mod tests {
 
         fs::write(dir.join("api-notes.md"), "# API Notes\n").unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "API: Notes", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "API: Notes", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Slug \"api-notes\""), "missing slug: {msg}");
@@ -2418,7 +2560,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "API Notes", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "API Notes", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2444,7 +2586,7 @@ mod tests {
 
         fs::write(dir.join("café.md"), "# café\n").unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "cafe\u{0301}", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "cafe\u{0301}", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2464,7 +2606,16 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = add_pattern(&db, &embedder, dir, "\u{0301}\u{0301}", "body", &[], None);
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "\u{0301}\u{0301}",
+            "body",
+            &[],
+            &[],
+            None,
+        );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2482,7 +2633,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = add_pattern(&db, &embedder, dir, "", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2509,11 +2660,21 @@ mod tests {
             "  My Pattern  ",
             "body text",
             &[],
+            &[],
             None,
         )
         .unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "My Pattern", "other body", &[], None);
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "My Pattern",
+            "other body",
+            &[],
+            &[],
+            None,
+        );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2535,7 +2696,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = add_pattern(&db, &embedder, dir, "Hello\nWorld", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "Hello\nWorld", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2553,7 +2714,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = add_pattern(&db, &embedder, dir, "Hello\rWorld", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "Hello\rWorld", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2576,7 +2737,7 @@ mod tests {
         // Create a directory at the path `add_pattern` would target.
         fs::create_dir_all(dir.join("blocked.md")).unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "Blocked", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "Blocked", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         // The fs::write that follows the discriminator may also fail with an
@@ -2602,7 +2763,7 @@ mod tests {
         // Existing file's heading is NFD (`e` + combining acute).
         fs::write(dir.join("café.md"), "# cafe\u{0301}\n").unwrap();
 
-        let result = add_pattern(&db, &embedder, dir, "café", "body", &[], None);
+        let result = add_pattern(&db, &embedder, dir, "café", "body", &[], &[], None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2637,6 +2798,7 @@ mod tests {
             "doc.md",
             "Brand new body that is long enough for a chunk.",
             Some(&["updated"]),
+            None,
             None,
         )
         .unwrap();
@@ -2676,6 +2838,7 @@ mod tests {
             dir,
             "pinned.md",
             "New body long enough for a chunk.",
+            None,
             None,
             None,
         )
@@ -2721,6 +2884,7 @@ mod tests {
             "New body long enough.",
             Some(&[]),
             None,
+            None,
         )
         .unwrap();
 
@@ -2730,6 +2894,451 @@ mod tests {
             "empty tags must remove the frontmatter block, got:\n{content}"
         );
     }
+
+    // -- language frontmatter rendering (U2) -------------------------------
+    //
+    // The U2 contract: build_file_content renders a canonical `language:`
+    // flow-list line, ordered after `tags:` so the two list fields share a
+    // stable visual order on disk; the absent case writes no language line;
+    // update_pattern threads the parameter through the same preserve / clear
+    // / replace branch as `tags`. Every test below also reads the resulting
+    // DB row's `language_json` so the on-disk shape lines up with what the
+    // chunking parser produces (the slice-shape-vs-pipeline-tests learning).
+
+    /// Read the `language_json` column from the `patterns` row for a
+    /// source file. Returns the JSON string as stored — `None` when no
+    /// `language:` frontmatter was parsed; `Some("[\"rust\"]")` when one
+    /// was. Flattens the double-`Option` (`no row` vs `row with NULL`) that
+    /// `pattern_language_json_for_source` returns since these tests always
+    /// write the file before reading.
+    fn language_json_for(db: &KnowledgeDB, source_file: &str) -> Option<String> {
+        db.pattern_language_json_for_source(source_file)
+            .unwrap()
+            .expect("pattern row must exist for source")
+    }
+
+    #[test]
+    fn add_pattern_with_language_renders_flow_list_frontmatter() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Rust Patterns",
+            "Body text that is long enough for a chunk.",
+            &[],
+            &["rust"],
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("rust-patterns.md")).unwrap();
+        assert!(
+            content.starts_with("---\nlanguage: [rust]\n---\n\n# Rust Patterns\n"),
+            "expected canonical flow-list shape, got:\n{content}"
+        );
+        // End-to-end: the DB row must agree with the on-disk shape so the
+        // structural retrieval gate fires.
+        assert_eq!(
+            language_json_for(&db, "rust-patterns.md").as_deref(),
+            Some("[\"rust\"]")
+        );
+    }
+
+    #[test]
+    fn add_pattern_with_language_array_preserves_order() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "JVM Patterns",
+            "Body text long enough for chunking.",
+            &[],
+            &["java", "kotlin", "groovy"],
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("jvm-patterns.md")).unwrap();
+        assert!(
+            content.contains("language: [java, kotlin, groovy]"),
+            "expected ordered flow-list, got:\n{content}"
+        );
+        assert_eq!(
+            language_json_for(&db, "jvm-patterns.md").as_deref(),
+            Some("[\"java\",\"kotlin\",\"groovy\"]")
+        );
+    }
+
+    #[test]
+    fn add_pattern_with_tags_and_language_orders_tags_then_language() {
+        // The on-disk frontmatter order is a public contract — agents that
+        // diff a file before/after an MCP call rely on the line order being
+        // stable. This pin catches accidental swaps.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Mixed",
+            "Body long enough for a chunk.",
+            &["universal"],
+            &["rust"],
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("mixed.md")).unwrap();
+        let frontmatter_block = content
+            .split("---\n\n")
+            .next()
+            .expect("expected frontmatter");
+        let tags_pos = frontmatter_block.find("tags:").expect("tags line present");
+        let lang_pos = frontmatter_block
+            .find("language:")
+            .expect("language line present");
+        assert!(
+            tags_pos < lang_pos,
+            "tags must precede language; got:\n{frontmatter_block}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_without_language_writes_no_language_line() {
+        // Regression guard: the absent-language case must produce the same
+        // file shape as before `language:` existed, so existing patterns
+        // and the unparametrised happy path stay byte-stable.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Plain",
+            "Body long enough for a chunk.",
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("plain.md")).unwrap();
+        assert!(
+            !content.contains("language:"),
+            "absent language must not render any frontmatter line, got:\n{content}"
+        );
+        assert!(
+            !content.contains("---\n"),
+            "no tags + no language must produce no frontmatter block, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn update_pattern_preserve_language_when_arg_absent() {
+        // The critical Decision 2 test — body-only rewrites must not
+        // silently de-language a pattern. Mirrors
+        // `update_pattern_with_none_tags_preserves_existing_frontmatter_tags`.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("multi.md"),
+            "---\nlanguage: [swift, objectivec]\n---\n\n# Multi\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "multi.md",
+            "Replacement body long enough for chunking.",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("multi.md")).unwrap();
+        assert!(
+            content.contains("language: [swift, objectivec]"),
+            "preserve-on-`None` must keep the existing language list; got:\n{content}"
+        );
+        assert_eq!(
+            language_json_for(&db, "multi.md").as_deref(),
+            Some("[\"swift\",\"objectivec\"]")
+        );
+    }
+
+    #[test]
+    fn update_pattern_clears_language_when_arg_is_empty_slice() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("rust.md"),
+            "---\nlanguage: [rust]\n---\n\n# Rust\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "rust.md",
+            "Replacement body long enough.",
+            None,
+            Some(&[]),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("rust.md")).unwrap();
+        assert!(
+            !content.contains("language:"),
+            "explicit empty must remove the language line, got:\n{content}"
+        );
+        assert_eq!(language_json_for(&db, "rust.md"), None);
+    }
+
+    #[test]
+    fn update_pattern_replaces_language_when_arg_is_non_empty() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("doc.md"),
+            "---\nlanguage: [rust]\n---\n\n# Doc\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "Replacement body long enough.",
+            None,
+            Some(&["go"]),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("doc.md")).unwrap();
+        assert!(
+            content.contains("language: [go]"),
+            "non-empty arg must replace the language list, got:\n{content}"
+        );
+        assert!(
+            !content.contains("rust"),
+            "old language must be gone, got:\n{content}"
+        );
+        assert_eq!(
+            language_json_for(&db, "doc.md").as_deref(),
+            Some("[\"go\"]")
+        );
+    }
+
+    // -- language_warnings on WriteResult (U3) -----------------------------
+    //
+    // The contract: every unknown language token that the chunking parser
+    // would have flagged also reaches the caller via `WriteResult` and a
+    // stderr line, regardless of which write path was taken — including the
+    // inbox-branch short-circuit, which historically skipped
+    // `index_single_file` entirely. Tests below pin both paths and the
+    // all-valid baseline (the field must still be present so MCP callers
+    // can render `language_warnings: []` rather than omit the key).
+
+    #[test]
+    fn add_pattern_language_warnings_collects_unknown_tokens() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Mixed Validity",
+            "Body long enough for a chunk.",
+            &[],
+            &["rust", "objectiv-c", "rust", "objectiv-c"],
+            None,
+        )
+        .unwrap();
+
+        // Dedup is first-seen order; the valid token is filtered out
+        // because `is_known_token("rust")` is true.
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    #[test]
+    fn add_pattern_language_warnings_empty_when_all_valid() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "All Valid",
+            "Body long enough for a chunk.",
+            &[],
+            // `golang` is the canonical token (display name "Go"); see
+            // src/engine/languages.rs entry around line 137.
+            &["rust", "golang"],
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.language_warnings.is_empty(),
+            "all-valid input must produce no warnings, got: {:?}",
+            result.language_warnings
+        );
+    }
+
+    #[test]
+    fn update_pattern_language_warnings_propagate_on_replace() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("doc.md"),
+            "---\nlanguage: [rust]\n---\n\n# Doc\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "Replacement body long enough.",
+            None,
+            Some(&["objectiv-c"]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    #[test]
+    fn update_pattern_language_warnings_fire_on_preserved_unknown_tokens() {
+        // Preserve-on-`None` re-renders the existing language list. The
+        // chunking parser's advisory then fires for any unknown token that
+        // was already on disk, surfacing it on this write even though the
+        // call did not pass `language`.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("legacy.md"),
+            "---\nlanguage: [objectiv-c]\n---\n\n# Legacy\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "legacy.md",
+            "Replacement body long enough.",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    #[test]
+    fn update_pattern_preserve_lowercases_existing_mixed_case_language() {
+        // Intentional contract pin (correctness review finding 1):
+        // the language parser lowercases tokens at read time, so a body-only
+        // `update_pattern` against an existing `language: [Rust]` file
+        // rewrites the line as `language: [rust]`. The DB has stored the
+        // lowercased form since PR #50; the file converges to match the
+        // canonical form on the first body-only update. Asymmetric with
+        // `tags`'s preserve branch by design — see the explanatory comment
+        // in `update_pattern` for the rationale.
+        //
+        // A future change to either the language or tag parser's casing
+        // posture lands here: if the language parser stops lowercasing, this
+        // test starts failing and the author can decide whether the new
+        // behaviour is desired.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("mixed.md"),
+            "---\nlanguage: [Rust, Kotlin]\n---\n\n# Mixed\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "mixed.md",
+            "Replacement body long enough.",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.join("mixed.md")).unwrap();
+        assert!(
+            content.contains("language: [rust, kotlin]"),
+            "preserve branch must canonicalise mixed-case tokens to the \
+             parser's lowercase form, got:\n{content}"
+        );
+        // DB state must match — it already did before the rewrite, since
+        // the parser lowercases on read.
+        assert_eq!(
+            language_json_for(&db, "mixed.md").as_deref(),
+            Some("[\"rust\",\"kotlin\"]")
+        );
+    }
+
+    // Note: inbox-branch parity tests for `language_warnings` live in
+    // `tests/branch_push.rs` alongside the other inbox-branch coverage
+    // because they need the `temp_env::with_vars` neutralisation plus the
+    // bare-remote scaffolding the integration test module already exposes.
 
     // -- append_to_pattern -------------------------------------------------
 
@@ -3130,6 +3739,7 @@ mod tests {
             "Git Test",
             "Body text that is long enough for a chunk.",
             &["test"],
+            &[],
             None,
         )
         .unwrap();
@@ -3172,6 +3782,7 @@ mod tests {
             "Inbox Pattern",
             "Body content long enough for chunking.",
             &[],
+            &[],
             Some("inbox/"),
         );
 
@@ -3204,6 +3815,7 @@ mod tests {
             "doc.md",
             "Replacement body that is long enough.",
             Some(&[]),
+            None,
             Some("inbox/"),
         );
 
@@ -3251,7 +3863,16 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = add_pattern(&db, &embedder, dir, "!@#$%^&*()", "body text", &[], None);
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "!@#$%^&*()",
+            "body text",
+            &[],
+            &[],
+            None,
+        );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -3282,7 +3903,7 @@ mod tests {
         let db = memory_db();
         let embedder = FakeEmbedder::new();
 
-        let result = update_pattern(&db, &embedder, dir, &rel, "new body", Some(&[]), None);
+        let result = update_pattern(&db, &embedder, dir, &rel, "new body", Some(&[]), None, None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

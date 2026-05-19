@@ -137,6 +137,7 @@ fn full_lifecycle() {
          Always include span context for distributed tracing.\n\
          Log at warn level for recoverable errors, error level for unrecoverable.\n",
         &["observability", "rust"],
+        &[],
         None,
     )
     .unwrap();
@@ -182,6 +183,7 @@ fn full_lifecycle() {
          Instrument all async functions with tracing spans.\n\
          Never use println for diagnostic output in production.\n",
         Some(&["observability", "production"]),
+        None,
         None,
     )
     .unwrap();

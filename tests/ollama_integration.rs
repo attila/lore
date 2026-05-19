@@ -222,6 +222,7 @@ fn ollama_lifecycle() {
          Always include span context for distributed tracing.\n\
          Log at warn level for recoverable errors, error level for unrecoverable.\n",
         &["observability", "rust"],
+        &[],
         None,
     )
     .unwrap();
@@ -247,6 +248,7 @@ fn ollama_lifecycle() {
          Export metrics via Prometheus endpoints.\n\
          Never use println for diagnostic output in production.\n",
         Some(&["observability", "production"]),
+        None,
         None,
     )
     .unwrap();
