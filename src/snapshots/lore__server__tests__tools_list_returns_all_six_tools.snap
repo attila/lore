@@ -42,8 +42,22 @@ expression: resp
             },
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the written file path, chunk count, and commit status. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the written file path, chunk count, commit status, and `language_warnings` (array of unknown language tokens; empty when every token validated). Defaults to false.",
               "type": "boolean"
+            },
+            "language": {
+              "description": "Optional language declaration that opts the pattern into the structural retrieval gate. Accepts a single token (`\"rust\"`) or an array (`[\"java\", \"kotlin\"]`). Tokens are lowercased and validated against the canonical language table; unknown tokens warn-and-proceed (the pattern is still written, the offending tokens are surfaced on stderr and in the response's `lore-metadata` fence as `language_warnings`).",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ]
             },
             "tags": {
               "description": "Optional tags for categorisation. Passing `\"universal\"` opts the pattern into the always-on injection tier — its body is emitted at every SessionStart and bypasses PreToolUse deduplication, unless the body's frontmatter also declares an `applies_when` predicate (in which case the pattern is deferred from SessionStart and re-injects on matching PreToolUse calls instead). See docs/pattern-authoring-guide.md §\"When to use the universal tag\" and §\"Tool/command predicate (applies_when)\".",
@@ -75,8 +89,22 @@ expression: resp
             },
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the updated file path, chunk count, and commit status. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with the updated file path, chunk count, commit status, and `language_warnings` (array of unknown language tokens; empty when every token validated). Defaults to false.",
               "type": "boolean"
+            },
+            "language": {
+              "description": "Optional language declaration. Three-way semantics mirror `tags`: omit to preserve the existing frontmatter `language:` list (the default that prevents the de-language footgun on body-only rewrites); pass an empty array `[]` to clear; pass a non-empty value (string or array) to replace the list wholesale. Tokens are lowercased and validated against the canonical language table; unknown tokens warn-and-proceed and surface on stderr and in the response's `lore-metadata` fence as `language_warnings`.",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ]
             },
             "source_file": {
               "description": "Relative path of the file to update (from search results)",
