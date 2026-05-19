@@ -201,6 +201,15 @@ pub struct WriteResult {
     pub chunks_indexed: usize,
     pub commit_status: CommitStatus,
     pub embedding_failures: usize,
+    /// Unknown-language-token advisories surfaced by the chunking parser
+    /// when the just-written file is reindexed (or, on the inbox-branch
+    /// short-circuit, when the parser is invoked directly on the
+    /// about-to-be-written content). One entry per unique offending token,
+    /// preserving first-seen order, lowercased to match the parser's
+    /// canonical form. Empty when every token validated against
+    /// [`crate::engine::is_known_token`]; never `None` so callers can
+    /// always render the field as an array on a `lore-metadata` fence.
+    pub language_warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1137,35 @@ pub fn ingest_single_file(
 // Write operations
 // ---------------------------------------------------------------------------
 
+/// Collapse a list of [`MalformedLanguageEntry`] advisories into the
+/// `language_warnings: Vec<String>` shape that `WriteResult` exposes to
+/// agents, and emit one stderr line per unique unknown token so the CLI
+/// observability surface matches the metadata-fence surface. Order is
+/// first-seen; duplicates are dropped.
+///
+/// Shared between the normal write path (advisories from
+/// [`index_single_file`]) and the inbox-branch short-circuit (advisories
+/// from a direct [`crate::chunking::parse_frontmatter_language_list`]
+/// call on the about-to-be-written content). Without this shared helper
+/// the short-circuit would silently swallow the warning, leaving
+/// agent-submitted patterns advisory-blind on what is the most common
+/// agent submission path — the exact dropped-argument failure mode the
+/// `language` argument exists to fix, on a different code path.
+fn collect_language_warnings(entries: &[MalformedLanguageEntry], source_file: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries {
+        if out.iter().any(|t| t == &entry.token) {
+            continue;
+        }
+        eprintln!(
+            "Warning: pattern {source_file}: unknown language token `{}`.",
+            entry.token
+        );
+        out.push(entry.token.clone());
+    }
+    out
+}
+
 /// Create a new pattern file, index it, and commit.
 ///
 /// When `inbox_branch_prefix` is `Some`, the file is committed to a
@@ -1170,6 +1208,18 @@ pub fn add_pattern(
     let content = build_file_content(title, body, tags, language);
 
     if let Some(prefix) = inbox_branch_prefix {
+        // Inbox-branch parity: the short-circuit pushes the file to a remote
+        // branch without invoking `index_single_file`, so the chunking
+        // parser's malformed-language advisories are never fired by the
+        // ingest layer for this path. Invoke the parser directly on the
+        // about-to-be-written content so the warning reaches stderr and the
+        // returned `language_warnings` matches what the local-write path
+        // would have produced. Without this, agent-submitted patterns
+        // (the dominant inbox use case) would silently swallow unknown
+        // language tokens.
+        let (_, malformed) = crate::chunking::parse_frontmatter_language_list(&content, &filename);
+        let language_warnings = collect_language_warnings(&malformed, &filename);
+
         let branch = git::commit_to_new_branch(
             knowledge_dir,
             prefix,
@@ -1185,6 +1235,7 @@ pub fn add_pattern(
             chunks_indexed: 0,
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
+            language_warnings,
         });
     }
 
@@ -1232,8 +1283,10 @@ pub fn add_pattern(
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        malformed_language,
         ..
     } = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    let language_warnings = collect_language_warnings(&malformed_language, &filename);
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1246,6 +1299,7 @@ pub fn add_pattern(
         chunks_indexed: chunks,
         commit_status,
         embedding_failures,
+        language_warnings,
     })
 }
 
@@ -1330,6 +1384,15 @@ pub fn update_pattern(
     let content = build_file_content(&title, body, tags_to_apply, language_to_apply);
 
     if let Some(prefix) = inbox_branch_prefix {
+        // Inbox-branch parity: see [`add_pattern`]'s short-circuit for the
+        // same rationale — the short-circuit skips `index_single_file`, so
+        // the parser is invoked directly on the about-to-be-written content
+        // to keep stderr and metadata-fence advisories aligned with the
+        // local-write path.
+        let (_, malformed) =
+            crate::chunking::parse_frontmatter_language_list(&content, source_file);
+        let language_warnings = collect_language_warnings(&malformed, source_file);
+
         let slug = file_stem(source_file);
         let branch = git::commit_to_new_branch(
             knowledge_dir,
@@ -1346,6 +1409,7 @@ pub fn update_pattern(
             chunks_indexed: 0,
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
+            language_warnings,
         });
     }
 
@@ -1354,8 +1418,10 @@ pub fn update_pattern(
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        malformed_language,
         ..
     } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
+    let language_warnings = collect_language_warnings(&malformed_language, source_file);
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1368,6 +1434,7 @@ pub fn update_pattern(
         chunks_indexed: chunks,
         commit_status,
         embedding_failures,
+        language_warnings,
     })
 }
 
@@ -1408,6 +1475,14 @@ pub fn append_to_pattern(
     content.push('\n');
 
     if let Some(prefix) = inbox_branch_prefix {
+        // Inbox-branch parity (append edition): the heading-and-body append
+        // preserves the existing frontmatter, but the existing frontmatter
+        // may already carry unknown language tokens. Surface them so the
+        // append-via-MCP path is no quieter than `add_pattern` / `update_pattern`.
+        let (_, malformed) =
+            crate::chunking::parse_frontmatter_language_list(&content, source_file);
+        let language_warnings = collect_language_warnings(&malformed, source_file);
+
         let slug = file_stem(source_file);
         let branch = git::commit_to_new_branch(
             knowledge_dir,
@@ -1424,6 +1499,7 @@ pub fn append_to_pattern(
             chunks_indexed: 0,
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
+            language_warnings,
         });
     }
 
@@ -1432,8 +1508,10 @@ pub fn append_to_pattern(
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        malformed_language,
         ..
     } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
+    let language_warnings = collect_language_warnings(&malformed_language, source_file);
 
     let commit_status = try_commit(
         knowledge_dir,
@@ -1446,6 +1524,7 @@ pub fn append_to_pattern(
         chunks_indexed: chunks,
         commit_status,
         embedding_failures,
+        language_warnings,
     })
 }
 
@@ -3068,6 +3147,133 @@ mod tests {
             Some("[\"go\"]")
         );
     }
+
+    // -- language_warnings on WriteResult (U3) -----------------------------
+    //
+    // The contract: every unknown language token that the chunking parser
+    // would have flagged also reaches the caller via `WriteResult` and a
+    // stderr line, regardless of which write path was taken — including the
+    // inbox-branch short-circuit, which historically skipped
+    // `index_single_file` entirely. Tests below pin both paths and the
+    // all-valid baseline (the field must still be present so MCP callers
+    // can render `language_warnings: []` rather than omit the key).
+
+    #[test]
+    fn add_pattern_language_warnings_collects_unknown_tokens() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Mixed Validity",
+            "Body long enough for a chunk.",
+            &[],
+            &["rust", "objectiv-c", "rust", "objectiv-c"],
+            None,
+        )
+        .unwrap();
+
+        // Dedup is first-seen order; the valid token is filtered out
+        // because `is_known_token("rust")` is true.
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    #[test]
+    fn add_pattern_language_warnings_empty_when_all_valid() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        let result = add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "All Valid",
+            "Body long enough for a chunk.",
+            &[],
+            // `golang` is the canonical token (display name "Go"); see
+            // src/engine/languages.rs entry around line 137.
+            &["rust", "golang"],
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.language_warnings.is_empty(),
+            "all-valid input must produce no warnings, got: {:?}",
+            result.language_warnings
+        );
+    }
+
+    #[test]
+    fn update_pattern_language_warnings_propagate_on_replace() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("doc.md"),
+            "---\nlanguage: [rust]\n---\n\n# Doc\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "Replacement body long enough.",
+            None,
+            Some(&["objectiv-c"]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    #[test]
+    fn update_pattern_language_warnings_fire_on_preserved_unknown_tokens() {
+        // Preserve-on-`None` re-renders the existing language list. The
+        // chunking parser's advisory then fires for any unknown token that
+        // was already on disk, surfacing it on this write even though the
+        // call did not pass `language`.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+
+        fs::write(
+            dir.join("legacy.md"),
+            "---\nlanguage: [objectiv-c]\n---\n\n# Legacy\n\nOriginal body long enough.\n",
+        )
+        .unwrap();
+
+        let result = update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "legacy.md",
+            "Replacement body long enough.",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    }
+
+    // Note: inbox-branch parity tests for `language_warnings` live in
+    // `tests/branch_push.rs` alongside the other inbox-branch coverage
+    // because they need the `temp_env::with_vars` neutralisation plus the
+    // bare-remote scaffolding the integration test module already exposes.
 
     // -- append_to_pattern -------------------------------------------------
 

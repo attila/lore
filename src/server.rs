@@ -958,6 +958,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
                 "chunks_indexed": result.chunks_indexed,
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
+                "language_warnings": result.language_warnings,
             });
             let prose = format!(
                 "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
@@ -1046,6 +1047,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "chunks_indexed": result.chunks_indexed,
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
+                "language_warnings": result.language_warnings,
             });
             let prose = format!(
                 "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
@@ -1109,6 +1111,7 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "chunks_indexed": result.chunks_indexed,
                 "embedding_failures": result.embedding_failures,
                 "commit_status": commit_status_metadata(&result.commit_status),
+                "language_warnings": result.language_warnings,
             });
             let prose = format!(
                 "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
@@ -3433,6 +3436,51 @@ mod tests {
             metadata["file_path"].is_string(),
             "metadata should expose file_path"
         );
+        // U3: the field is always present, even on the all-valid baseline,
+        // so agents can pattern-match on `language_warnings` without first
+        // checking for key existence.
+        let warnings = metadata["language_warnings"]
+            .as_array()
+            .expect("language_warnings must be an array on the metadata fence");
+        assert!(
+            warnings.is_empty(),
+            "no language passed must yield an empty warnings array, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_metadata_fence_carries_language_warnings_for_unknown_tokens() {
+        // U3 contract: an `add_pattern` call carrying an unknown language
+        // token writes the file (warn-and-proceed) and surfaces the
+        // offending token through the metadata fence so MCP-side agents can
+        // detect the drift without scraping stderr.
+        let h = TestHarness::new();
+        let resp = h.request_value(
+            r#"{
+                "jsonrpc":"2.0","id":80,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Lang Warn",
+                        "body":"Body text that is long enough for chunking.",
+                        "language":["rust","objectiv-c"],
+                        "include_metadata":true
+                    }
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null());
+        let metadata = metadata_from_response(&resp);
+        let warnings = metadata["language_warnings"]
+            .as_array()
+            .expect("language_warnings must be an array on the metadata fence");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning for the single unknown token, got: {warnings:?}"
+        );
+        assert_eq!(warnings[0], "objectiv-c");
     }
 
     /// When the caller does NOT pass `include_metadata: true`, the write

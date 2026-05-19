@@ -436,3 +436,110 @@ fn push_failure_is_hard_error() {
         "error should mention push/remote, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Inbox-branch language_warnings parity (U3 / Residual 2)
+//
+// The inbox-branch short-circuit historically skipped `index_single_file`,
+// so unknown-language-token advisories never reached the caller for the
+// dominant agent-submission path. U3 closes that by invoking
+// `parse_frontmatter_language_list` directly on the about-to-be-written
+// content before the push. These integration tests pin both the warn case
+// and the all-valid baseline against a real bare-remote setup.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inbox_add_pattern_collects_unknown_language_tokens() {
+    with_neutralised_git_env(|| {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let _bare = setup_repo_with_remote(dir);
+        let embedder = FakeEmbedder::new();
+        let db = open_db(dir, embedder.dimensions());
+
+        let result = ingest::add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Inbox Lang Warn",
+            "Body content long enough for chunking.\n",
+            &[],
+            &["objectiv-c"],
+            Some("inbox/"),
+        )
+        .expect("inbox-branch add should succeed against a wired bare remote");
+
+        assert!(matches!(result.commit_status, CommitStatus::Pushed { .. }));
+        assert_eq!(
+            result.language_warnings,
+            vec!["objectiv-c".to_string()],
+            "inbox-branch path must surface unknown tokens via the direct \
+             parser invocation; without it the dropped-argument failure mode \
+             would silently reappear on the agent-submission path"
+        );
+    });
+}
+
+#[test]
+fn inbox_add_pattern_returns_empty_warnings_when_tokens_are_valid() {
+    with_neutralised_git_env(|| {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let _bare = setup_repo_with_remote(dir);
+        let embedder = FakeEmbedder::new();
+        let db = open_db(dir, embedder.dimensions());
+
+        let result = ingest::add_pattern(
+            &db,
+            &embedder,
+            dir,
+            "Inbox Clean",
+            "Body content long enough for chunking.\n",
+            &[],
+            &["rust"],
+            Some("inbox/"),
+        )
+        .expect("inbox-branch add should succeed");
+
+        assert!(
+            result.language_warnings.is_empty(),
+            "all-valid input on the inbox-branch path must produce an empty \
+             warnings vec (not omitted) so MCP callers can render the field \
+             uniformly"
+        );
+    });
+}
+
+#[test]
+fn inbox_update_pattern_collects_unknown_language_tokens() {
+    with_neutralised_git_env(|| {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let _bare = setup_repo_with_remote(dir);
+        let embedder = FakeEmbedder::new();
+        let db = open_db(dir, embedder.dimensions());
+
+        // Seed an existing file on the working tree so `update_pattern`'s
+        // file-exists guard passes.
+        fs::write(
+            dir.join("doc.md"),
+            "# Doc\n\nOriginal body long enough for a chunk.\n",
+        )
+        .unwrap();
+
+        let result = ingest::update_pattern(
+            &db,
+            &embedder,
+            dir,
+            "doc.md",
+            "Replacement body long enough.\n",
+            None,
+            Some(&["objectiv-c"]),
+            Some("inbox/"),
+        )
+        .expect("inbox-branch update should succeed");
+
+        assert!(matches!(result.commit_status, CommitStatus::Pushed { .. }));
+        assert_eq!(result.language_warnings, vec!["objectiv-c".to_string()]);
+    });
+}
