@@ -4,6 +4,7 @@ type: feat
 status: active
 created: 2026-05-19
 origin: tmp/mcp-language-arg-ce-plan-prompt.md
+pr: https://github.com/attila/lore/pull/63
 ---
 
 # feat: Accept `language` on `add_pattern` / `update_pattern` / `append_to_pattern`
