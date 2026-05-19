@@ -21,7 +21,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add opt-in per-hook trace logging under `$XDG_STATE_HOME/lore/traces/` with `lore trace why` query
   CLI and `lore trace prune` maintenance. (#59)
 - `lore` detects 21 new languages: C, C++, C#, Swift, Kotlin, Shell, Objective-C, Scala, Elixir,
-  Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig, Perl, Ruby, Java, Groovy, and PHP. (#N)
+  Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig, Perl, Ruby, Java, Groovy, and PHP. (#61)
+
+### Fixed
+
+- Hook-driven language detection now reads both `command` and `description` from Bash tool calls;
+  previously a populated `description` shadowed the `command` and silently no-op'd the structural
+  retrieval gate for nearly every real Bash invocation. (#62)
+- Path-prefixed Bash invocations like `./gradlew`, `/usr/local/bin/cargo`, and `~/.cargo/bin/cargo`
+  are basename-normalised before keyword matching, so they resolve to their canonical language
+  instead of failing the keyword allow-list. (#62)
 
 ## [0.3.1] - 2026-05-14
 

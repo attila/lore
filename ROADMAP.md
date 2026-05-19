@@ -16,17 +16,6 @@
       path so the resulting file carries `language:` frontmatter, and validate tokens against
       `is_known_token` so unknown tokens hit the same R12 warn-and-proceed path that ingest already
       uses.
-- [ ] Infer Bash language from `command`, not `description` — `infer_languages` currently reads
-      `description` when set and falls back to `command`, which means agents that write a
-      human-readable description (most of them) get their language gate computed against English
-      prose instead of the actual shell command. The language gate silently no-ops for nearly every
-      Bash tool call. Split the two paths: `command` drives `language_from_bash`; `description`
-      (plus `command`) feeds FTS term harvesting via `harvest_terms`.
-- [ ] Basename-normalise bash command tokens before keyword matching — `./gradlew`,
-      `/usr/local/bin/gradle`, `bin/setup`, and `~/.cargo/bin/cargo` all fail to match their command
-      keyword today because the whitespace tokeniser preserves the path prefix. Pass each token
-      through `Path::new(tok).file_name()` before the keyword lookup so the basename is what hits
-      the allow-list. No false-positive risk: the command-keyword list is closed.
 
 ## Future
 
@@ -72,6 +61,13 @@
 
 ## Completed
 
+- [x] Hook-driven Bash language inference reads every signal — both `command` and `description` now
+      contribute to language detection (fixing the prior bug where a populated `description`
+      silently shadowed the `command`), and path-prefixed invocations like `./gradlew`,
+      `/usr/local/bin/gradle`, and `~/.cargo/bin/cargo` are basename-normalised before keyword
+      matching. The expanded `LANGUAGES` table now fires for real production Bash tool calls instead
+      of silently no-op'ing. See
+      `docs/solutions/best-practices/uat-through-real-binary-catches-inference-path-bugs-2026-05-19.md`.
 - [x] Extend the shared language table — added 21 new entries (Ruby, Java, C/C++, C#, PHP, Swift,
       Kotlin, Shell, Objective-C, Scala, Elixir, Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig,
       Perl, Groovy) and back-filled the existing six with missing version-pin markers and lockfiles,
