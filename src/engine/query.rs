@@ -768,8 +768,13 @@ mod tests {
     #[test]
     fn bash_bundle_install_does_not_match_bun() {
         // R2 regression test: substring matcher would have matched
-        // "bun" inside "bundle". Whole-token matcher must not.
-        assert!(language_from_bash("bundle install").is_empty());
+        // "bun" inside "bundle". Whole-token matcher must not — the
+        // command resolves to `ruby` (which owns `bundle`) and never to
+        // `bun`/javascript/typescript.
+        let langs = language_from_bash("bundle install");
+        assert_eq!(langs, vec!["ruby".to_string()]);
+        assert!(!langs.contains(&"javascript".to_string()));
+        assert!(!langs.contains(&"typescript".to_string()));
     }
 
     #[test]

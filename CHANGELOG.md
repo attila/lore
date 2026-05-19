@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   agent or script consumers. (#58)
 - Add opt-in per-hook trace logging under `$XDG_STATE_HOME/lore/traces/` with `lore trace why` query
   CLI and `lore trace prune` maintenance. (#59)
+- `lore` detects 21 new languages: C, C++, C#, Swift, Kotlin, Shell, Objective-C, Scala, Elixir,
+  Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig, Perl, Ruby, Java, Groovy, and PHP. (#N)
 
 ## [0.3.1] - 2026-05-14
 

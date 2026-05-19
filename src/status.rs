@@ -124,9 +124,11 @@ mod tests {
     #[test]
     fn format_languages_line_unknown_token_falls_back_to_raw_token() {
         // A token not in LANGUAGES (e.g. a knowledge base ingested with
-        // a newer pack than the binary covers) renders as-is.
-        let line = format_languages_line(&counts(&[("kotlin", 2)], 0)).unwrap();
-        assert_eq!(line, "kotlin 2");
+        // a newer pack than the binary covers) renders as-is. `matlab`
+        // is the still-unknown canary now that `kotlin` is a known
+        // token (MATLAB is the deferred `.m` contestation owner).
+        let line = format_languages_line(&counts(&[("matlab", 2)], 0)).unwrap();
+        assert_eq!(line, "matlab 2");
     }
 
     #[test]
@@ -144,11 +146,16 @@ mod tests {
 
     #[test]
     fn format_languages_line_leaves_known_display_names_unchanged() {
-        // The sanitiser must not corrupt vetted display names. None of
-        // today's LANGUAGES entries carry forbidden characters; this
-        // pins that contract so a future entry with e.g. `C++` or `F#`
-        // is not accidentally caught by an over-broad sanitiser.
-        let line = format_languages_line(&counts(&[("rust", 1), ("typescript", 1)], 0)).unwrap();
-        assert_eq!(line, "Rust 1, TypeScript 1");
+        // The sanitiser must not corrupt vetted display names. The
+        // table now ships entries whose display names contain `+` and
+        // `#` (`C++`, `C#`); both must pass through unchanged. ASCII
+        // ordering on the leading character (`#` 0x23 < `+` 0x2B < `R`
+        // 0x52 < `T` 0x54) drives the alphabetical tiebreak.
+        let line = format_languages_line(&counts(
+            &[("csharp", 1), ("cpp", 1), ("rust", 1), ("typescript", 1)],
+            0,
+        ))
+        .unwrap();
+        assert_eq!(line, "C# 1, C++ 1, Rust 1, TypeScript 1");
     }
 }

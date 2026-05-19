@@ -8,12 +8,6 @@
       refactor validation, debug, and continuous dogfooding. Builds on `default_trace_dir()` from
       the etcetera refactor (PR #52) and the three-list RRF pipeline from language detection (PR
       #50). See `docs/brainstorms/2026-05-14-track-2-observability-requirements.md`.
-- [ ] Extend the shared language table — six entries today (Rust, TypeScript, JavaScript, YAML,
-      Python, Go). Adding Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, and shell scripts is now a
-      single struct-literal change per language thanks to the shared `LANGUAGES` slice in
-      `src/engine/languages.rs`; each entry pairs extensions, command keywords, marker filenames,
-      and directory hints. Audit FTS5-tokenisability for hyphen/`+`/`#` tokens before adding
-      `objective-c`, `c++`, `f#`, etc.
 
 ## Future
 
@@ -59,6 +53,12 @@
 
 ## Completed
 
+- [x] Extend the shared language table — added 21 new entries (Ruby, Java, C/C++, C#, PHP, Swift,
+      Kotlin, Shell, Objective-C, Scala, Elixir, Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig,
+      Perl, Groovy) and back-filled the existing six with missing version-pin markers and lockfiles,
+      including the asymmetric `package-lock.json` on TypeScript that PR #50 left out. R5 contested
+      signals resolved: `.h` shared between `clang` and `cpp` (R5 multi-entry), `.m` single-owner to
+      `objectivec`. See `docs/plans/2026-05-18-001-feat-language-table-expansion-plan.md`.
 - [x] Language coverage in `lore status` — new `Languages:` line in the CLI status output reports
       per-language source counts (rendered via `LANGUAGES.display_name`) plus an `undeclared`
       bucket, built on the `language_json` column from #50. The same breakdown is exposed to agents
