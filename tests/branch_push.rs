@@ -133,6 +133,7 @@ fn add_pattern_pushes_to_inbox_branch() {
             "Error Handling",
             "Use anyhow for application errors.\n",
             &["rust"],
+            &[],
             Some("inbox/"),
         )
         .unwrap();
@@ -197,6 +198,7 @@ fn update_pattern_pushes_modified_file() {
             "testing.md",
             "New testing content with property-based tests.\n",
             Some(&["testing"]),
+            None,
             Some("inbox/"),
         )
         .unwrap();
@@ -287,6 +289,7 @@ fn two_adds_create_independent_branches() {
             "Pattern Alpha",
             "Alpha content.\n",
             &[],
+            &[],
             Some("inbox/"),
         )
         .unwrap();
@@ -297,6 +300,7 @@ fn two_adds_create_independent_branches() {
             dir,
             "Pattern Beta",
             "Beta content.\n",
+            &[],
             &[],
             Some("inbox/"),
         )
@@ -335,6 +339,7 @@ fn same_title_disambiguates_branch_name() {
             "My Pattern",
             "First version.\n",
             &[],
+            &[],
             Some("inbox/"),
         )
         .unwrap();
@@ -345,6 +350,7 @@ fn same_title_disambiguates_branch_name() {
             dir,
             "My Pattern",
             "Second version.\n",
+            &[],
             &[],
             Some("inbox/"),
         )
@@ -378,6 +384,7 @@ fn no_git_config_preserves_default_behavior() {
         "Local Pattern",
         "Body content that is long enough for a chunk.\n",
         &["local"],
+        &[],
         None,
     )
     .unwrap();
@@ -417,6 +424,7 @@ fn push_failure_is_hard_error() {
         dir,
         "Will Fail",
         "This should fail on push.\n",
+        &[],
         &[],
         Some("inbox/"),
     );

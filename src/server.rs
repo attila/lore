@@ -918,14 +918,16 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
     if let Some(err) = check_language_limit(req, args) {
         return err;
     }
-    // Parse to validate the argument shape at the MCP boundary so a malformed
-    // call hits a structured error before any write lock is taken. U2 wires
-    // the parsed value through `ingest::add_pattern`; for now the binding is
-    // intentionally unused.
-    let _language = match parse_language_arg(req, args) {
-        Ok(v) => v,
+    // Parse the language argument at the MCP boundary so a malformed call
+    // hits a structured error before any write lock is taken. The
+    // empty-array case is semantically identical to absent for
+    // `add_pattern` (no existing list to preserve), so both fold into an
+    // empty borrow for the ingest helper.
+    let language_owned = match parse_language_arg(req, args) {
+        Ok(v) => v.unwrap_or_default(),
         Err(resp) => return resp,
     };
+    let language_refs: Vec<&str> = language_owned.iter().map(String::as_str).collect();
 
     eprintln!("[lore] Add pattern: \"{title}\"");
 
@@ -945,6 +947,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         title,
         body,
         &tags,
+        &language_refs,
         ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
@@ -1002,14 +1005,17 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
     if let Some(err) = check_language_limit(req, args) {
         return err;
     }
-    // Parse to validate the argument shape at the MCP boundary so a malformed
-    // call hits a structured error before any write lock is taken. U2 wires
-    // the parsed value through `ingest::update_pattern`; for now the binding
-    // is intentionally unused.
-    let _language = match parse_language_arg(req, args) {
+    // `language` mirrors `tags`'s three-way semantics: absent preserves,
+    // `[]` clears, `[...]` replaces. The parsed shape carries that
+    // distinction through to `ingest::update_pattern` which routes it into
+    // the preserve / clear / replace branches.
+    let language_owned: Option<Vec<String>> = match parse_language_arg(req, args) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let language_refs: Option<Vec<&str>> = language_owned
+        .as_ref()
+        .map(|v| v.iter().map(String::as_str).collect());
 
     eprintln!("[lore] Update pattern: \"{source_file}\"");
 
@@ -1029,6 +1035,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         source_file,
         body,
         tags_owned.as_deref(),
+        language_refs.as_deref(),
         ctx.config.inbox_branch_prefix(),
     ) {
         Ok(result) => {
