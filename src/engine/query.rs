@@ -812,6 +812,77 @@ mod tests {
         assert_eq!(language_from_bash("CARGO build"), vec!["rust"]);
     }
 
+    // -----------------------------------------------------------------
+    // End-to-end `language_from_bash` coverage for shared command
+    // keywords across the expanded LANGUAGES table. The slice-level
+    // tests in `languages.rs::tests` pin the data; these tests pin the
+    // full split/lowercase/match pipeline through which a real Bash
+    // tool call resolves.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bash_gradle_build_yields_java_kotlin_groovy() {
+        // AE3 end-to-end (covers R4 Gradle three-way through the bash
+        // pipeline, not just the slice).
+        let langs = language_from_bash("gradle build");
+        assert!(langs.contains(&"java".to_string()));
+        assert!(langs.contains(&"kotlin".to_string()));
+        assert!(langs.contains(&"groovy".to_string()));
+    }
+
+    #[test]
+    fn bash_gradlew_yields_java_kotlin_groovy() {
+        // Note: `./gradlew` would not match because the bash tokeniser
+        // does not strip leading `./`. The bare `gradlew` form is what
+        // exercises the keyword path.
+        let langs = language_from_bash("gradlew assembleDebug");
+        assert!(langs.contains(&"java".to_string()));
+        assert!(langs.contains(&"kotlin".to_string()));
+        assert!(langs.contains(&"groovy".to_string()));
+    }
+
+    #[test]
+    fn bash_xcodebuild_yields_swift_and_objectivec() {
+        let langs = language_from_bash("xcodebuild -scheme App");
+        assert!(langs.contains(&"swift".to_string()));
+        assert!(langs.contains(&"objectivec".to_string()));
+    }
+
+    #[test]
+    fn bash_clang_yields_clang_and_objectivec() {
+        // `clang` is shared between the C entry (token `clang`) and
+        // `objectivec` (Obj-C is compiled with clang) per R5.
+        let langs = language_from_bash("clang -o hello hello.c");
+        assert!(langs.contains(&"clang".to_string()));
+        assert!(langs.contains(&"objectivec".to_string()));
+    }
+
+    #[test]
+    fn bash_single_owner_keywords_resolve_to_one_entry() {
+        // Spot-check single-owner keywords across the new entries: each
+        // command keyword belonging to exactly one entry resolves to
+        // that entry only. Catches any future accidental cross-listing.
+        for (cmd, expected) in [
+            ("mvn package", "java"),
+            ("cabal build", "haskell"),
+            ("composer install", "php"),
+            ("dotnet build", "csharp"),
+            ("mix deps.get", "elixir"),
+            ("sbt compile", "scala"),
+            ("zig build", "zig"),
+            ("terraform plan", "terraform"),
+            ("perl script.pl", "perl"),
+            ("ruby script.rb", "ruby"),
+        ] {
+            let langs = language_from_bash(cmd);
+            assert_eq!(
+                langs,
+                vec![expected.to_string()],
+                "{cmd} should resolve to [{expected}], got {langs:?}"
+            );
+        }
+    }
+
     // -- infer_languages priority chain --------------------------------------
 
     #[test]

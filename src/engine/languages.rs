@@ -418,9 +418,16 @@ pub fn languages_for_directory_hint(component: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn entry_for(token: &str) -> &'static LanguageEntry {
+        LANGUAGES
+            .iter()
+            .find(|e| e.token == token)
+            .unwrap_or_else(|| panic!("no entry for token {token}"))
+    }
+
     #[test]
     fn rust_entry_has_expected_signals() {
-        let rust = LANGUAGES.iter().find(|e| e.token == "rust").unwrap();
+        let rust = entry_for("rust");
         assert_eq!(rust.display_name, "Rust");
         assert!(rust.extensions.contains(&"rs"));
         assert!(rust.command_keywords.contains(&"cargo"));
@@ -432,7 +439,7 @@ mod tests {
         // Display name is "Go"; the FTS-safe token is "golang" because
         // bare `go` would conflict with the English stop-word list and
         // FTS5 tokeniser defaults.
-        let golang = LANGUAGES.iter().find(|e| e.token == "golang").unwrap();
+        let golang = entry_for("golang");
         assert_eq!(golang.display_name, "Go");
         assert!(golang.extensions.contains(&"go"));
         assert!(golang.command_keywords.contains(&"go"));
@@ -576,13 +583,6 @@ mod tests {
     // least one extension is listed, and (where applicable) at least one
     // command keyword and one marker. Mirrors `rust_entry_has_expected_signals`.
     // -----------------------------------------------------------------
-
-    fn entry_for(token: &str) -> &'static LanguageEntry {
-        LANGUAGES
-            .iter()
-            .find(|e| e.token == token)
-            .unwrap_or_else(|| panic!("no entry for token {token}"))
-    }
 
     #[test]
     fn bash_entry_has_expected_signals() {
@@ -900,6 +900,14 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
+    fn mm_extension_resolves_only_to_objectivec() {
+        // `.mm` is Objective-C++. Single-owner to `objectivec`.
+        let langs = languages_for_extension("mm");
+        assert_eq!(langs.len(), 1);
+        assert!(langs.contains(&"objectivec".to_string()));
+    }
+
+    #[test]
     fn m_extension_resolves_only_to_objectivec() {
         // AE2: `.m` is single-owner to `objectivec`; MATLAB-pattern
         // authors route through R12's unknown-token-warn path.
@@ -969,57 +977,63 @@ mod tests {
 
     // -----------------------------------------------------------------
     // Back-fill single-owner marker tests (U2).
+    //
+    // Assert single-ownership as "length == 1 AND contains <token>" so
+    // the tests do not couple to LANGUAGES slice ordering. A future
+    // legitimate co-claim on any of these markers will surface as a
+    // clear membership change, not an opaque ordering failure.
     // -----------------------------------------------------------------
+
+    fn assert_single_owner_marker(marker: &str, token: &str) {
+        let langs = languages_for_marker_filename(marker);
+        assert_eq!(
+            langs.len(),
+            1,
+            "{marker} should resolve to exactly one entry, got {langs:?}"
+        );
+        assert!(
+            langs.contains(&token.to_string()),
+            "{marker} should resolve to {token}, got {langs:?}"
+        );
+    }
 
     #[test]
     fn python_version_marker_fires_for_python_only() {
-        assert_eq!(
-            languages_for_marker_filename(".python-version"),
-            vec!["python"]
-        );
+        assert_single_owner_marker(".python-version", "python");
     }
 
     #[test]
     fn pipfile_lock_marker_fires_for_python_only() {
-        assert_eq!(
-            languages_for_marker_filename("Pipfile.lock"),
-            vec!["python"]
-        );
+        assert_single_owner_marker("Pipfile.lock", "python");
     }
 
     #[test]
     fn poetry_lock_marker_fires_for_python_only() {
-        assert_eq!(languages_for_marker_filename("poetry.lock"), vec!["python"]);
+        assert_single_owner_marker("poetry.lock", "python");
     }
 
     #[test]
     fn uv_lock_marker_fires_for_python_only() {
-        assert_eq!(languages_for_marker_filename("uv.lock"), vec!["python"]);
+        assert_single_owner_marker("uv.lock", "python");
     }
 
     #[test]
     fn go_version_marker_fires_for_golang_only() {
-        assert_eq!(languages_for_marker_filename(".go-version"), vec!["golang"]);
+        assert_single_owner_marker(".go-version", "golang");
     }
 
     #[test]
     fn go_work_marker_fires_for_golang_only() {
-        assert_eq!(languages_for_marker_filename("go.work"), vec!["golang"]);
+        assert_single_owner_marker("go.work", "golang");
     }
 
     #[test]
     fn rust_toolchain_toml_marker_fires_for_rust_only() {
-        assert_eq!(
-            languages_for_marker_filename("rust-toolchain.toml"),
-            vec!["rust"]
-        );
+        assert_single_owner_marker("rust-toolchain.toml", "rust");
     }
 
     #[test]
     fn rust_toolchain_marker_fires_for_rust_only() {
-        assert_eq!(
-            languages_for_marker_filename("rust-toolchain"),
-            vec!["rust"]
-        );
+        assert_single_owner_marker("rust-toolchain", "rust");
     }
 }
