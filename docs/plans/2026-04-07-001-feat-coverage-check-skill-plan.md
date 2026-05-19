@@ -1,9 +1,11 @@
 ---
 title: "feat: Coverage Check Skill (lore:coverage-check) with structured search metadata"
 type: feat
-status: active
+status: complete
 date: 2026-04-07
+completed: 2026-04-08
 origin: docs/brainstorms/2026-04-07-pattern-qa-skill-requirements.md
+pr: https://github.com/attila/lore/pull/32
 ---
 
 # feat: Coverage Check Skill (`lore:coverage-check`) with structured search metadata

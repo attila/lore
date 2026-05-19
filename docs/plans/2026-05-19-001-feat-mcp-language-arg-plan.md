@@ -1,8 +1,9 @@
 ---
 title: "feat: Accept language on MCP pattern-authoring tools"
 type: feat
-status: active
+status: complete
 created: 2026-05-19
+completed: 2026-05-19
 origin: tmp/mcp-language-arg-ce-plan-prompt.md
 pr: https://github.com/attila/lore/pull/63
 ---

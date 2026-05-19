@@ -2,13 +2,6 @@
 
 ## Up Next
 
-- [ ] Track 2 Observability — opt-in, agent-agnostic per-hook trace logging written as JSONL records
-      under `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` (one file per session), plus a
-      `lore trace why <session>` query CLI. Enables data-driven decisions on threshold tuning,
-      refactor validation, debug, and continuous dogfooding. Builds on `default_trace_dir()` from
-      the etcetera refactor (PR #52) and the three-list RRF pipeline from language detection (PR
-      #50). See `docs/brainstorms/2026-05-14-track-2-observability-requirements.md`.
-
 ## Future
 
 - [ ] Pre-release UX polish (deferred from edge-case-handling brainstorm) — friendlier
@@ -53,6 +46,13 @@
 
 ## Completed
 
+- [x] Track 2 Observability — opt-in per-hook trace logging written as JSONL records under
+      `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` (one file per session), plus
+      `lore trace why <session>` query CLI and `lore trace prune` maintenance. Enables data-driven
+      decisions on threshold tuning, refactor validation, debug, and continuous dogfooding. Builds
+      on `default_trace_dir()` from the etcetera refactor (PR #52) and the three-list RRF pipeline
+      from language detection (PR #50). See
+      `docs/plans/2026-05-15-001-feat-track-2-observability-plan.md`.
 - [x] Accept `language` on the `add_pattern` and `update_pattern` MCP tools — `inputSchema` now
       declares the field (`oneOf [string, array<string>]`), the handler coerces scalar input to an
       array at the boundary, and ingest renders a canonical `language: [...]` flow-list line into

@@ -3,7 +3,9 @@ date: 2026-05-14
 topic: language-detection-architecture
 type: feat
 origin: docs/brainstorms/2026-05-13-language-detection-architecture-requirements.md
-status: active
+status: complete
+completed: 2026-05-14
+pr: https://github.com/attila/lore/pull/50
 ---
 
 # feat: Language Detection Architecture
