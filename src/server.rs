@@ -341,7 +341,9 @@ fn tool_definitions() -> Value {
                 "Create a new pattern in the knowledge base. Use only when the user explicitly \
                  asks to save, record, or document a pattern. Creates a markdown file and indexes \
                  it; the change is committed to git when the knowledge base is a git repository, \
-                 otherwise the file is written without a commit.",
+                 otherwise the file is written without a commit. Pass `language` to opt the \
+                 pattern into the structural retrieval gate (warn-and-proceed for unknown \
+                 tokens).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -400,7 +402,9 @@ fn tool_definitions() -> Value {
                 "Replace the content of an existing pattern. Use only when the user explicitly \
                  asks to update or rewrite a pattern. Overwrites the file and re-indexes; the \
                  change is committed to git when the knowledge base is a git repository, \
-                 otherwise the file is written without a commit.",
+                 otherwise the file is written without a commit. `tags` and `language` share \
+                 three-way semantics (preserve when omitted, clear with `[]`, replace with a \
+                 non-empty value); unknown language tokens warn-and-proceed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -460,7 +464,9 @@ fn tool_definitions() -> Value {
                 "Add a new section to an existing pattern without replacing it. Use when the user \
                  wants to add examples, edge cases, or notes to an existing pattern. Appends a \
                  heading and body and re-indexes; the change is committed to git when the \
-                 knowledge base is a git repository, otherwise the file is written without a commit.",
+                 knowledge base is a git repository, otherwise the file is written without a commit. \
+                 Does not accept a `language` argument — appends are body-only by definition; use \
+                 `update_pattern` to change the frontmatter `language:` declaration.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2863,6 +2869,100 @@ mod tests {
         );
         for sibling in ["source_file", "heading", "body", "include_metadata"] {
             assert!(props.get(sibling).is_some(), "{sibling} must stay present");
+        }
+    }
+
+    // -- tool description prose (U4 drift guards) --------------------------
+    //
+    // The schema descriptions are the contract agents read when they list
+    // tools, so the keywords below are part of the public API surface. Each
+    // assertion below pins a specific failure mode by name: if a future edit
+    // drops the keyword the test calls out, the test fails, and the author
+    // either restores the keyword or the test's failure message names what
+    // changed and why. Substring matches keyed on stable nouns
+    // (`language`, `update_pattern`, `preserve` / `clear` / `replace`) keep
+    // the assertions resilient to innocent wording tweaks.
+
+    /// Helper: fetch a tool's top-level `description` string.
+    fn tool_description(name: &str) -> String {
+        tool_schema(name)["description"]
+            .as_str()
+            .expect("description must be a string")
+            .to_string()
+    }
+
+    #[test]
+    fn add_pattern_description_mentions_language_and_warn_behaviour() {
+        let desc = tool_description("add_pattern");
+        assert!(
+            desc.contains("language"),
+            "add_pattern description must mention `language`, got: {desc}"
+        );
+        assert!(
+            desc.contains("warn-and-proceed") || desc.contains("unknown"),
+            "add_pattern description must document the unknown-token \
+             advisory behaviour, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn update_pattern_description_mentions_language_and_three_way_semantics() {
+        let desc = tool_description("update_pattern");
+        assert!(
+            desc.contains("language"),
+            "update_pattern description must mention `language`, got: {desc}"
+        );
+        // The three-way semantics keywords are load-bearing: an agent
+        // reading the description must learn the preserve/clear/replace
+        // distinction without having to test the boundary themselves.
+        assert!(
+            desc.contains("preserve"),
+            "update_pattern description must document the preserve case, got: {desc}"
+        );
+        assert!(
+            desc.contains("clear"),
+            "update_pattern description must document the clear case, got: {desc}"
+        );
+        assert!(
+            desc.contains("replace"),
+            "update_pattern description must document the replace case, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn append_pattern_description_points_at_update_pattern_for_language() {
+        // The description is how agents discover the right tool when they
+        // want to change frontmatter; the pointer is part of the schema
+        // contract per Decision 3 in the plan.
+        let desc = tool_description("append_to_pattern");
+        assert!(
+            desc.contains("update_pattern"),
+            "append_to_pattern description must point at update_pattern for \
+             frontmatter changes, got: {desc}"
+        );
+        assert!(
+            desc.contains("language"),
+            "append_to_pattern description must mention `language` to flag \
+             the missing field for the agent, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn update_pattern_language_field_description_documents_three_way_semantics() {
+        // The per-field description is what agents see when they expand a
+        // schema in their tool registry. Pin the three keywords directly so
+        // the field-level contract cannot drift away from the tool-level
+        // contract.
+        let tool = tool_schema("update_pattern");
+        let lang_desc = tool["inputSchema"]["properties"]["language"]["description"]
+            .as_str()
+            .expect("language.description must be a string");
+        for keyword in ["preserve", "clear", "replace"] {
+            assert!(
+                lang_desc.contains(keyword),
+                "update_pattern.language.description must contain `{keyword}` \
+                 to document the three-way semantics, got: {lang_desc}"
+            );
         }
     }
 

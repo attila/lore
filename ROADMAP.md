@@ -8,14 +8,6 @@
       refactor validation, debug, and continuous dogfooding. Builds on `default_trace_dir()` from
       the etcetera refactor (PR #52) and the three-list RRF pipeline from language detection (PR
       #50). See `docs/brainstorms/2026-05-14-track-2-observability-requirements.md`.
-- [ ] Accept `language` on the `add_pattern` / `update_pattern` / `append_to_pattern` MCP tools —
-      the language table now covers 27 entries, but the MCP authoring path silently drops any
-      `language` argument because the input schema does not list it. Agents that create patterns via
-      MCP cannot declare a language at all; only manually-authored markdown picks up the structural
-      retrieval gate. Add the field to each tool's `inputSchema`, plumb it through the pattern-write
-      path so the resulting file carries `language:` frontmatter, and validate tokens against
-      `is_known_token` so unknown tokens hit the same R12 warn-and-proceed path that ingest already
-      uses.
 
 ## Future
 
@@ -61,6 +53,17 @@
 
 ## Completed
 
+- [x] Accept `language` on the `add_pattern` and `update_pattern` MCP tools — `inputSchema` now
+      declares the field (`oneOf [string, array<string>]`), the handler coerces scalar input to an
+      array at the boundary, and ingest renders a canonical `language: [...]` flow-list line into
+      the file's frontmatter. `update_pattern` mirrors `tags`'s three-way semantics (omit preserves,
+      `[]` clears, non-empty replaces) so body-only rewrites do not silently de-language a pattern.
+      Unknown tokens warn-and-proceed: every offending token reaches the caller via
+      `WriteResult.language_warnings` and the response's `lore-metadata` fence, including on the
+      inbox-branch short-circuit (which previously skipped indexing and silently dropped the
+      advisory). `append_to_pattern` deliberately does not accept `language` — appends are body-only
+      by definition, and Decision 3's regression pin in the schema tests fails fast if a future PR
+      adds the field. See `docs/plans/2026-05-19-001-feat-mcp-language-arg-plan.md`.
 - [x] Hook-driven Bash language inference reads every signal — both `command` and `description` now
       contribute to language detection (fixing the prior bug where a populated `description`
       silently shadowed the `command`), and path-prefixed invocations like `./gradlew`,
