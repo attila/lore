@@ -2140,11 +2140,13 @@ Body text long enough to chunk through heading mode.
 
     #[test]
     fn parse_language_mixed_known_and_unknown() {
-        let md = "---\nlanguage: [rust, kotlin]\n---\n# x\n";
+        // `matlab` is the still-unknown canary now that `kotlin` is a
+        // known token (MATLAB is the deferred `.m` contestation owner).
+        let md = "---\nlanguage: [rust, matlab]\n---\n# x\n";
         let (langs, malformed) = parse_frontmatter_language_list(md, "p.md");
-        assert_eq!(langs, vec!["rust".to_string(), "kotlin".to_string()]);
+        assert_eq!(langs, vec!["rust".to_string(), "matlab".to_string()]);
         assert_eq!(malformed.len(), 1);
-        assert_eq!(malformed[0].token, "kotlin");
+        assert_eq!(malformed[0].token, "matlab");
     }
 
     #[test]
@@ -2225,18 +2227,12 @@ Body text long enough to chunk through heading mode.
     }
 
     #[test]
-    fn parse_language_canonical_tokens_for_all_initial_six_languages() {
-        // R16: every entry currently in LANGUAGES must validate as known
-        // through the parser. Pinned so a typo in the table's `token`
-        // field would surface a malformed entry on a known-good fixture.
-        for token in [
-            "rust",
-            "typescript",
-            "javascript",
-            "yaml",
-            "python",
-            "golang",
-        ] {
+    fn parse_language_canonical_tokens_for_all_languages() {
+        // Every entry in LANGUAGES must validate as known through the
+        // parser. Iterating the table (rather than hardcoding tokens)
+        // keeps this test future-proof as the table grows.
+        for entry in crate::engine::languages::LANGUAGES {
+            let token = entry.token;
             let md = format!("---\nlanguage: {token}\n---\n# x\n");
             let (langs, malformed) = parse_frontmatter_language_list(&md, "p.md");
             assert_eq!(langs, vec![token.to_string()]);

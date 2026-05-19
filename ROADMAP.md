@@ -8,12 +8,25 @@
       refactor validation, debug, and continuous dogfooding. Builds on `default_trace_dir()` from
       the etcetera refactor (PR #52) and the three-list RRF pipeline from language detection (PR
       #50). See `docs/brainstorms/2026-05-14-track-2-observability-requirements.md`.
-- [ ] Extend the shared language table — six entries today (Rust, TypeScript, JavaScript, YAML,
-      Python, Go). Adding Ruby, Java, C/C++, C#, PHP, Swift, Kotlin, and shell scripts is now a
-      single struct-literal change per language thanks to the shared `LANGUAGES` slice in
-      `src/engine/languages.rs`; each entry pairs extensions, command keywords, marker filenames,
-      and directory hints. Audit FTS5-tokenisability for hyphen/`+`/`#` tokens before adding
-      `objective-c`, `c++`, `f#`, etc.
+- [ ] Accept `language` on the `add_pattern` / `update_pattern` / `append_to_pattern` MCP tools —
+      the language table now covers 27 entries, but the MCP authoring path silently drops any
+      `language` argument because the input schema does not list it. Agents that create patterns via
+      MCP cannot declare a language at all; only manually-authored markdown picks up the structural
+      retrieval gate. Add the field to each tool's `inputSchema`, plumb it through the pattern-write
+      path so the resulting file carries `language:` frontmatter, and validate tokens against
+      `is_known_token` so unknown tokens hit the same R12 warn-and-proceed path that ingest already
+      uses.
+- [ ] Infer Bash language from `command`, not `description` — `infer_languages` currently reads
+      `description` when set and falls back to `command`, which means agents that write a
+      human-readable description (most of them) get their language gate computed against English
+      prose instead of the actual shell command. The language gate silently no-ops for nearly every
+      Bash tool call. Split the two paths: `command` drives `language_from_bash`; `description`
+      (plus `command`) feeds FTS term harvesting via `harvest_terms`.
+- [ ] Basename-normalise bash command tokens before keyword matching — `./gradlew`,
+      `/usr/local/bin/gradle`, `bin/setup`, and `~/.cargo/bin/cargo` all fail to match their command
+      keyword today because the whitespace tokeniser preserves the path prefix. Pass each token
+      through `Path::new(tok).file_name()` before the keyword lookup so the basename is what hits
+      the allow-list. No false-positive risk: the command-keyword list is closed.
 
 ## Future
 
@@ -59,6 +72,12 @@
 
 ## Completed
 
+- [x] Extend the shared language table — added 21 new entries (Ruby, Java, C/C++, C#, PHP, Swift,
+      Kotlin, Shell, Objective-C, Scala, Elixir, Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig,
+      Perl, Groovy) and back-filled the existing six with missing version-pin markers and lockfiles,
+      including the asymmetric `package-lock.json` on TypeScript that PR #50 left out. R5 contested
+      signals resolved: `.h` shared between `clang` and `cpp` (R5 multi-entry), `.m` single-owner to
+      `objectivec`. See `docs/plans/2026-05-18-001-feat-language-table-expansion-plan.md`.
 - [x] Language coverage in `lore status` — new `Languages:` line in the CLI status output reports
       per-language source counts (rendered via `LANGUAGES.display_name`) plus an `undeclared`
       bucket, built on the `language_json` column from #50. The same breakdown is exposed to agents
