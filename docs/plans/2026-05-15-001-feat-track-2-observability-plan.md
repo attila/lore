@@ -1,9 +1,11 @@
 ---
 title: "feat: Track 2 Observability — per-hook decision tracing"
 type: feat
-status: active
+status: complete
 date: 2026-05-15
+completed: 2026-05-16
 origin: docs/brainstorms/2026-05-14-track-2-observability-requirements.md
+pr: https://github.com/attila/lore/pull/59
 ---
 
 # feat: Track 2 Observability — per-hook decision tracing
