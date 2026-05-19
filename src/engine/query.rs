@@ -138,12 +138,17 @@ pub fn infer_languages(ctx: &CallContext) -> Vec<String> {
     }
 
     if ctx.tool_name.as_deref() == Some(TOOL_BASH) {
-        let text = ctx
-            .description
-            .as_deref()
-            .or(ctx.command.as_deref())
-            .unwrap_or_default();
-        extend_unique(&mut out, language_from_bash(text));
+        // Union both `command` and `description` so language inference
+        // sees every available signal. Production Bash tool calls
+        // typically carry both fields; reading only one shadows the
+        // other and silently no-ops the structural gate. Command
+        // keywords matched against either source contribute; matching
+        // is whole-token-only so prose words that happen to coincide
+        // with a keyword are bounded.
+        let command_text = ctx.command.as_deref().unwrap_or_default();
+        let description_text = ctx.description.as_deref().unwrap_or_default();
+        extend_unique(&mut out, language_from_bash(command_text));
+        extend_unique(&mut out, language_from_bash(description_text));
     }
 
     out
@@ -172,12 +177,15 @@ fn harvest_terms(ctx: &CallContext) -> Vec<String> {
     }
 
     if ctx.tool_name.as_deref() == Some(TOOL_BASH) {
-        let text = ctx
-            .description
-            .as_deref()
-            .or(ctx.command.as_deref())
-            .unwrap_or_default();
-        terms.extend(split_into_words(text));
+        // Mirror `infer_languages`: harvest terms from both sources so
+        // a description-supplied filename or feature word enriches the
+        // query alongside the command's literal tokens.
+        if let Some(command) = ctx.command.as_deref() {
+            terms.extend(split_into_words(command));
+        }
+        if let Some(description) = ctx.description.as_deref() {
+            terms.extend(split_into_words(description));
+        }
     }
 
     if let Some(transcript_tail) = ctx.transcript_tail.as_deref() {
@@ -270,7 +278,17 @@ pub fn language_from_bash(command: &str) -> Vec<String> {
         if is_env_assignment(raw) {
             continue;
         }
-        let lower = raw.to_lowercase();
+        // Take the basename so path-prefixed invocations match the
+        // keyword list: `./gradlew`, `/usr/local/bin/gradle`, and
+        // `~/.cargo/bin/cargo` all resolve to their final segment.
+        // `Path::file_name` returns `None` only for paths ending in
+        // `..` or a trailing separator — fall back to the raw token in
+        // that case so the original whole-token contract holds.
+        let basename = Path::new(raw)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw);
+        let lower = basename.to_lowercase();
         extend_unique(&mut out, languages_for_command_keyword(&lower));
     }
     out
@@ -881,6 +899,105 @@ mod tests {
                 "{cmd} should resolve to [{expected}], got {langs:?}"
             );
         }
+    }
+
+    // -- basename normalisation in language_from_bash ------------------------
+
+    #[test]
+    fn bash_path_prefixed_gradlew_resolves_to_java_kotlin_groovy() {
+        // Real Bash tool calls often invoke wrappers via a relative
+        // path. The whitespace tokeniser preserves the prefix, so the
+        // matcher must basename-normalise before the keyword lookup.
+        let langs = language_from_bash("./gradlew assembleDebug");
+        assert!(langs.contains(&"java".to_string()));
+        assert!(langs.contains(&"kotlin".to_string()));
+        assert!(langs.contains(&"groovy".to_string()));
+    }
+
+    #[test]
+    fn bash_absolute_path_to_cargo_resolves_to_rust() {
+        // Homebrew, Nix, rustup, and PATH-shimming installs all surface
+        // their binaries by an absolute path. Basename normalisation
+        // strips the prefix before keyword matching.
+        assert_eq!(
+            language_from_bash("/usr/local/bin/cargo build --release"),
+            vec!["rust"]
+        );
+    }
+
+    #[test]
+    fn bash_tilde_prefixed_cargo_resolves_to_rust() {
+        // `~/.cargo/bin/cargo test` is the unexpanded rustup install
+        // path — still a valid Bash invocation; basename normalisation
+        // covers it.
+        assert_eq!(language_from_bash("~/.cargo/bin/cargo test"), vec!["rust"]);
+    }
+
+    #[test]
+    fn bash_bare_keyword_still_matches_after_basename_normalisation() {
+        // Regression guard: a bare keyword (no path prefix) must still
+        // match — `Path::file_name` returns `Some("cargo")` for the
+        // bare input, so the lookup path is unchanged.
+        assert_eq!(language_from_bash("cargo build"), vec!["rust"]);
+    }
+
+    #[test]
+    fn bash_path_components_other_than_basename_do_not_match() {
+        // Negative guard: a path whose intermediate component happens
+        // to be a keyword (e.g. `/opt/cargo-stash/script.sh`) must not
+        // produce a language. Only the basename feeds the lookup.
+        let langs = language_from_bash("/opt/cargo-stash/run.sh");
+        assert!(!langs.contains(&"rust".to_string()));
+    }
+
+    // -- infer_languages union of command and description --------------------
+
+    #[test]
+    fn bash_command_and_description_both_contribute_to_languages() {
+        // Production case: a real Claude Code Bash call carries both a
+        // `command` (with the language-bearing keyword) and a prose
+        // `description`. Both sources must contribute to the inferred
+        // language set so the structural retrieval gate fires.
+        let ctx = CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some("gradle build".to_string()),
+            description: Some("build the project".to_string()),
+            ..CallContext::empty()
+        };
+        let langs = infer_languages(&ctx);
+        assert!(langs.contains(&"java".to_string()));
+        assert!(langs.contains(&"kotlin".to_string()));
+        assert!(langs.contains(&"groovy".to_string()));
+    }
+
+    #[test]
+    fn bash_description_contributes_languages_when_command_is_quiet() {
+        // When the command itself has no language-bearing keyword
+        // (e.g. an `ssh` or `cd`-led command), a description that
+        // names a tool still surfaces the language. Preserves the
+        // existing description-only signal path.
+        let ctx = CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some("ssh prod 'tail -f log'".to_string()),
+            description: Some("watch the cargo build output".to_string()),
+            ..CallContext::empty()
+        };
+        let langs = infer_languages(&ctx);
+        assert!(langs.contains(&"rust".to_string()));
+    }
+
+    #[test]
+    fn bash_command_no_longer_shadowed_by_description() {
+        // Regression pin for the description-shadows-command bug: a
+        // prose description with no command keywords must not erase
+        // the language signal the command carries.
+        let ctx = CallContext {
+            tool_name: Some("Bash".to_string()),
+            command: Some("mvn test".to_string()),
+            description: Some("running the unit tests".to_string()),
+            ..CallContext::empty()
+        };
+        assert_eq!(infer_languages(&ctx), vec!["java"]);
     }
 
     // -- infer_languages priority chain --------------------------------------
