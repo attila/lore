@@ -14,8 +14,8 @@
 //! `typescript`. Detection accumulates languages as a set when shared
 //! signals fire.
 //!
-//! Linear iteration is appropriate: six entries today, low double digits
-//! long-term. No `OnceLock`, `phf_map`, or `lazy_static` — the
+//! Linear iteration is appropriate at the current low-double-digit
+//! entry count. No `OnceLock`, `phf_map`, or `lazy_static` — the
 //! static-slice convention from `STOP_WORDS` already exists in
 //! `query.rs`.
 
@@ -58,9 +58,9 @@ pub struct LanguageEntry {
 /// The shared language table. Order is not significant for correctness;
 /// `extract_query` accumulates matches across all entries.
 ///
-/// Per R16 (initial coverage), this lists the six languages that lore
-/// detected before the refactor. R17 keeps the slice at six; the
-/// follow-on language pack adds entries one at a time as separate PRs.
+/// The original six entries (PR #50, R16) are kept in their historical
+/// positions; subsequent additions appended below in alphabetical-by-token
+/// order for reviewer-friendly diffs.
 pub static LANGUAGES: &[LanguageEntry] = &[
     LanguageEntry {
         token: "rust",
