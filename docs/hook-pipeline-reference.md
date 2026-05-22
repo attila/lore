@@ -20,22 +20,26 @@ event payload from stdin and writes structured JSON to stdout.
 | SessionStart | `additionalContext` | All tools           | Primes the session with a pattern index and meta-instruction           |
 | PreToolUse   | `additionalContext` | `Edit\|Write\|Bash` | Searches for relevant patterns and injects them before the tool runs   |
 | PostToolUse  | `additionalContext` | `Bash`              | Searches for patterns related to Bash errors (non-zero exit code only) |
-| PostCompact  | `systemMessage`     | All tools           | Re-primes the session after context compression (see limitation below) |
+| PostCompact  | _(none)_            | All tools           | Resets the per-session dedup file; emits no hook output (see below)    |
 
-> **Why two different envelopes?** Claude Code routes `hookSpecificOutput.additionalContext` into
-> the model's conversation as a system reminder, while `systemMessage` renders as a transient
-> terminal chip and never reaches the model. SessionStart, PreToolUse, and PostToolUse all use
-> `additionalContext` so their payloads seed or augment the agent's context. Earlier releases
-> mistakenly used `systemMessage` for SessionStart, so the pinned-conventions index never entered
-> the conversation; this was corrected in 0.4.1.
+> **Why `additionalContext` for the first three events?** Claude Code routes
+> `hookSpecificOutput.additionalContext` into the model's conversation as a system reminder, while
+> the alternate `systemMessage` envelope renders as a transient terminal chip and never reaches the
+> model. SessionStart, PreToolUse, and PostToolUse all use `additionalContext` so their payloads
+> seed or augment the agent's context. Earlier releases mistakenly used `systemMessage` for
+> SessionStart, so the pinned-conventions index never entered the conversation; this was corrected
+> in 0.4.1.
 >
-> **Known limitation — PostCompact never reaches the model.** Claude Code's hook output validator
-> rejects `hookSpecificOutput` for the PostCompact event, leaving `systemMessage` as the only
-> available envelope. The pinned-conventions index is therefore re-rendered as a terminal chip after
-> `/compact` but does not re-seed the model's context. The first subsequent `PreToolUse` still
-> injects relevant patterns on demand, so functionality degrades gracefully, but the always-on tier
-> is unavailable until either Claude Code accepts `additionalContext` for PostCompact or lore
-> re-primes via a different channel (tracked in `ROADMAP.md`).
+> **Why PostCompact emits nothing.** Claude Code's hook output validator rejects
+> `hookSpecificOutput` for the PostCompact event, leaving only the chip-only `systemMessage`
+> envelope — which never reaches the model and would render as a long, recurring terminal chip with
+> no use to either user or agent. Rather than emit noise, the handler suppresses output entirely and
+> limits itself to its load-bearing side effect: truncating the per-session dedup file so the next
+> PreToolUse re-injects patterns the agent saw before compaction. The always-on pinned tier is
+> therefore unavailable post-compact, but on-demand injection continues to work. The hook is
+> retained as an extension point: when Claude Code accepts `additionalContext` for PostCompact, or
+> when a cleverer re-prime mechanism becomes available, the handler is the right place to plug it
+> in. The roadmap tracks candidate workarounds.
 
 ### SessionStart
 
@@ -111,15 +115,20 @@ PostToolUse does not fire for successful commands or for non-Bash tools.
 ### PostCompact
 
 Fires when the agent's context window is compressed (a natural event during long sessions). The hook
-truncates the deduplication file and re-emits the same content as SessionStart — the full pattern
-index and meta-instruction.
+truncates the per-session deduplication file so subsequent PreToolUse calls re-inject patterns the
+agent saw before compaction.
 
-The payload is wrapped in a `systemMessage` envelope rather than `additionalContext` because Claude
-Code's hook output validator rejects `hookSpecificOutput` for PostCompact. The content therefore
-renders as a transient terminal chip and does not enter the model's context after compaction. The
-dedup-file truncation still happens, so the next PreToolUse can re-inject relevant patterns on
-demand — but the pinned-conventions tier is not re-seeded automatically. This is a harness-level
-limitation, not a lore bug.
+The handler produces no hook output. Claude Code's validator rejects `hookSpecificOutput` for
+PostCompact, and the alternate `systemMessage` envelope would render as a long terminal chip that
+never reaches the model — pure noise with no audience. Suppressing the output keeps the terminal
+clean and is honest about the harness limitation: the always-on pinned-conventions tier cannot be
+re-seeded after compaction with the channels currently available. On-demand injection via PreToolUse
+continues to work normally.
+
+The handler is retained as an extension point — when Claude Code accepts `additionalContext` for
+PostCompact, or when a different re-prime mechanism becomes feasible (a `lore reprime`
+agent-callable surface, an opportunistic re-seed on the first PreToolUse after a truncated dedup
+file is observed, or similar), this is where it plugs in. See the corresponding roadmap entry.
 
 ## Engine and Adapter
 

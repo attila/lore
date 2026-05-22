@@ -479,10 +479,22 @@ fn expand_to_siblings(db: &KnowledgeDB, seeds: &[SearchResult]) -> Vec<SearchRes
         .unwrap_or_else(|_| seeds.to_vec())
 }
 
-/// Handle `PostCompact`: truncate dedup, re-emit `SessionStart` content.
+/// Handle `PostCompact`: truncate the per-session dedup file so the next
+/// `PreToolUse` re-injects relevant patterns on demand. Produces no hook
+/// output.
+///
+/// Claude Code's hook output validator rejects `hookSpecificOutput` for the
+/// `PostCompact` event, leaving only the chip-only `systemMessage` envelope
+/// — which renders as a transient terminal notification and never enters the
+/// model's context. Rather than emit a noisy, useless chip on every
+/// compaction, we suppress the output entirely. The handler is retained (and
+/// still receives `db` / `config`) so future iterations can layer cleverer
+/// re-prime mechanisms here when an envelope arrives. The roadmap tracks
+/// candidate workarounds.
+#[allow(clippy::unnecessary_wraps)] // returns Result to keep the handler signature uniform with peers
 fn handle_post_compact(
     input: &HookInput,
-    db: &KnowledgeDB,
+    _db: &KnowledgeDB,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
     let start = std::time::Instant::now();
@@ -494,20 +506,13 @@ fn handle_post_compact(
         lore_debug!("PostCompact dedup reset error: {e}");
     }
 
-    let context = format_session_context(db, &config.knowledge_dir)?;
-
     if config.trace_enabled()
         && let Some(session_id) = input.session_id.as_deref()
     {
         emit_post_compact_trace(session_id, start);
     }
 
-    // Claude Code's hook output validator rejects `hookSpecificOutput` for
-    // `PostCompact`, so we fall back to the chip-only `systemMessage`
-    // envelope. The payload therefore renders as a transient terminal
-    // notification and does not enter the model's context after `/compact` —
-    // a harness limitation tracked in the roadmap.
-    Ok(Some(HookOutput::system_message(context)))
+    Ok(None)
 }
 
 /// Handle `PostToolUse`: on Bash errors, search with stderr and return patterns.
