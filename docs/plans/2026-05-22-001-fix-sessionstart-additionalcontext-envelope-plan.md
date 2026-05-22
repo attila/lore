@@ -1,8 +1,9 @@
 ---
 title: "fix: Switch SessionStart and PostCompact to additionalContext envelope"
 type: fix
-status: active
+status: completed
 created: 2026-05-22
+completed: 2026-05-22
 ---
 
 # fix: Switch SessionStart and PostCompact to additionalContext envelope
@@ -236,6 +237,40 @@ for users who notice the terminal chip disappear and the pinned conventions begi
 - **Plugin trace records.** Existing trace records under `$XDG_STATE_HOME/lore/traces/` were written
   with the old envelope. No migration is needed — traces are session-scoped and self-healing on new
   sessions. Mentioned for awareness, not action.
+
+## Post-implementation notes
+
+The plan body above is preserved as the planning-time decision artefact. The shipped state diverges
+from it on one axis: live testing of `/compact` surfaced that Claude Code's hook output validator
+**rejects** `hookSpecificOutput` for the `PostCompact` event (while accepting it for `SessionStart`,
+`PreToolUse`, `PostToolUse`, and others). There is no envelope that delivers `PostCompact` output to
+the model.
+
+Shipped resolution:
+
+- `SessionStart` switched to `hookSpecificOutput.additionalContext` as planned. The original bug is
+  fixed: the lore intro and pinned-conventions index now reach the model on every `SessionStart`
+  source.
+- `PostCompact` produces no hook output at all. The dedup-file truncation still runs as a side
+  effect, so the next `PreToolUse` re-injects relevant patterns; the always-on pinned tier is
+  unavailable post-compact pending a future re-prime mechanism. The handler is retained as an
+  extension point.
+- The "delete `HookOutput::SystemMessage` variant" key decision from the plan still applies and was
+  honoured: with `PostCompact` returning `Ok(None)`, the variant has no callers and was removed. The
+  enum collapsed to a single-shape struct with one constructor (`additional_context`).
+- A typed `HookEventName` enum (replacing the `&str` parameter) was deferred to the next PR that
+  adds a hook event, per code review.
+
+Documentation of the harness limitation:
+
+- `docs/hook-pipeline-reference.md` event table marks `PostCompact`'s output field as _(none)_ with
+  an explanatory blockquote.
+- `ROADMAP.md` carries a `PostCompact re-prime workaround` entry listing candidate approaches.
+- `docs/solutions/integration-issues/verify-host-delivery-not-just-hook-exit-2026-05-22.md` captures
+  the broader learning about verifying host delivery rather than trusting upstream signals like
+  `exitCode=0` and visible terminal chips.
+- The companion pattern at `agents/claude-code-hook-output-envelopes.md` in the lore-patterns
+  repository documents the per-event envelope acceptance map for future integrations.
 
 ## References
 
