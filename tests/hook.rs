@@ -242,9 +242,14 @@ fn hook_session_start_returns_meta_instruction() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    let ctx = parsed["systemMessage"]
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+        Some("SessionStart"),
+        "SessionStart payload must carry hookEventName=SessionStart so Claude Code routes it into model context"
+    );
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("SessionStart should return a top-level systemMessage");
+        .expect("SessionStart should return hookSpecificOutput.additionalContext");
     assert!(
         ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
@@ -280,7 +285,9 @@ fn hook_session_start_advertises_git_advisory_for_non_git_dir() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
 
     assert!(
         ctx.contains("not a git repository"),
@@ -324,7 +331,9 @@ fn hook_session_start_omits_git_advisory_for_git_dir() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
 
     assert!(
         !ctx.contains("not a git repository"),
@@ -358,9 +367,14 @@ fn hook_post_compact_returns_session_context() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    let ctx = parsed["systemMessage"]
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+        Some("PostCompact"),
+        "PostCompact payload must carry hookEventName=PostCompact (not SessionStart) — mismatched event names are silently dropped by Claude Code"
+    );
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("PostCompact should return a top-level systemMessage");
+        .expect("PostCompact should return hookSpecificOutput.additionalContext");
     assert!(
         ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
@@ -665,8 +679,8 @@ fn hook_full_lifecycle_session_dedup_compact_reinject() {
 
     let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
     assert!(
-        start_parsed["systemMessage"].is_string(),
-        "SessionStart should return a systemMessage"
+        start_parsed["hookSpecificOutput"]["additionalContext"].is_string(),
+        "SessionStart should return hookSpecificOutput.additionalContext"
     );
 
     // 2. PreToolUse — first call should inject patterns.
@@ -790,12 +804,16 @@ fn hook_session_start_and_post_compact_return_same_content() {
     assert!(!start_stdout.is_empty());
     assert!(!compact_stdout.is_empty());
 
-    // Both use systemMessage — content should be identical.
+    // Both use hookSpecificOutput.additionalContext — content should be identical.
     let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
     let compact_parsed: serde_json::Value = serde_json::from_str(&compact_stdout).unwrap();
 
-    let start_ctx = start_parsed["systemMessage"].as_str().unwrap();
-    let compact_ctx = compact_parsed["systemMessage"].as_str().unwrap();
+    let start_ctx = start_parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let compact_ctx = compact_parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
     assert_eq!(
         start_ctx, compact_ctx,
         "SessionStart and PostCompact should return the same context content"
@@ -995,7 +1013,10 @@ fn invoke_session_start(config_path: &Path, session_id: &str) -> String {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    parsed["systemMessage"].as_str().unwrap().to_string()
+    parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -1056,7 +1077,9 @@ fn hook_post_compact_re_emits_pinned_section() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
 
     assert!(
         ctx.contains("## Pinned conventions"),
@@ -1284,7 +1307,9 @@ fn hook_post_compact_excludes_predicated_universal_from_pinned_section() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
 
     assert!(
         ctx.contains("genuinely-universal-marker"),
@@ -1565,7 +1590,7 @@ fn hook_session_start_truncates_pinned_section_at_render_budget() {
     assert!(
         ctx.contains("_[pinned conventions truncated at 32768 bytes"),
         "expected truncation marker once cumulative body crossed 32 KB; \
-         got {} bytes of systemMessage starting {:?}",
+         got {} bytes of additionalContext starting {:?}",
         ctx.len(),
         &ctx.chars().take(200).collect::<String>(),
     );

@@ -47,25 +47,30 @@ pub struct HookInput {
 
 /// Written to stdout as JSON.
 ///
-/// Two variants:
-/// - `HookSpecific` — for events that support `hookSpecificOutput`
-///   (`PreToolUse`, `PostToolUse`).
-/// - `SystemMessage` — for events where Claude Code only accepts a top-level
-///   `systemMessage` field (`SessionStart`, `PostCompact`).
+/// Every event uses the `hookSpecificOutput` envelope so the payload lands in
+/// the model's conversation context as a system reminder. The chip-only
+/// `systemMessage` envelope is intentionally not used: `SessionStart` and
+/// `PostCompact` exist to seed the model, not to notify the user, and the
+/// other events likewise need their content in context.
 #[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum HookOutput {
-    HookSpecific {
-        #[serde(rename = "hookSpecificOutput")]
-        hook_specific_output: HookSpecificOutput,
-    },
-    SystemMessage {
-        #[serde(rename = "systemMessage")]
-        system_message: String,
-    },
+pub struct HookOutput {
+    #[serde(rename = "hookSpecificOutput")]
+    pub hook_specific_output: HookSpecificOutput,
 }
 
-/// The payload nested inside `HookOutput::HookSpecific`.
+impl HookOutput {
+    /// Build a `HookOutput` for the given event name and context payload.
+    pub fn new(hook_event_name: &str, additional_context: String) -> Self {
+        Self {
+            hook_specific_output: HookSpecificOutput {
+                hook_event_name: hook_event_name.to_string(),
+                additional_context,
+            },
+        }
+    }
+}
+
+/// The payload nested inside `HookOutput`.
 #[derive(Debug, Serialize)]
 pub struct HookSpecificOutput {
     #[serde(rename = "hookEventName")]
@@ -158,9 +163,7 @@ fn handle_session_start(
         }
     }
 
-    Ok(Some(HookOutput::SystemMessage {
-        system_message: context,
-    }))
+    Ok(Some(HookOutput::new("SessionStart", context)))
 }
 
 /// Handle `PreToolUse`: extract query, search, predicate-filter, dedup-filter,
@@ -337,12 +340,7 @@ fn handle_pre_tool_use(
     // 9. Format and emit.
     let context = format_imperative(&combined);
 
-    Ok(Some(HookOutput::HookSpecific {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            additional_context: context,
-        },
-    }))
+    Ok(Some(HookOutput::new("PreToolUse", context)))
 }
 
 /// Apply the universal-pattern predicate filter to a list of expanded chunks.
@@ -477,9 +475,7 @@ fn handle_post_compact(
         emit_post_compact_trace(session_id, start);
     }
 
-    Ok(Some(HookOutput::SystemMessage {
-        system_message: context,
-    }))
+    Ok(Some(HookOutput::new("PostCompact", context)))
 }
 
 /// Handle `PostToolUse`: on Bash errors, search with stderr and return patterns.
@@ -564,12 +560,7 @@ fn handle_post_tool_use(
     }
 
     let context = format_imperative(&results);
-    Ok(Some(HookOutput::HookSpecific {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PostToolUse".to_string(),
-            additional_context: context,
-        },
-    }))
+    Ok(Some(HookOutput::new("PostToolUse", context)))
 }
 
 /// Apply the per-class relevance floor: universal chunks are filtered against
