@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `SessionStart` and `PostCompact` hook output now reaches the model as
+  `hookSpecificOutput.additionalContext` instead of the terminal-only `systemMessage` chip, so the
+  pinned-conventions index and meta-instruction actually seed the conversation on session start and
+  after compaction. (#N)
+
 ## [0.4.0] - 2026-05-19
 
 ### Changed

@@ -17,15 +17,23 @@ event payload from stdin and writes structured JSON to stdout.
 
 | Event        | Output field        | Matcher             | Purpose                                                                |
 | ------------ | ------------------- | ------------------- | ---------------------------------------------------------------------- |
-| SessionStart | `systemMessage`     | All tools           | Primes the session with a pattern index and meta-instruction           |
+| SessionStart | `additionalContext` | All tools           | Primes the session with a pattern index and meta-instruction           |
 | PreToolUse   | `additionalContext` | `Edit\|Write\|Bash` | Searches for relevant patterns and injects them before the tool runs   |
 | PostToolUse  | `additionalContext` | `Bash`              | Searches for patterns related to Bash errors (non-zero exit code only) |
-| PostCompact  | `systemMessage`     | All tools           | Re-primes the session after context compression                        |
+| PostCompact  | `additionalContext` | All tools           | Re-primes the session after context compression                        |
+
+> **Why `additionalContext` for every event?** Claude Code routes
+> `hookSpecificOutput.additionalContext` into the model's conversation as a system reminder, while
+> the alternate `systemMessage` envelope renders as a transient terminal chip and never reaches the
+> model. SessionStart and PostCompact exist to seed the agent with knowledge-base context, so they
+> need the same envelope PreToolUse and PostToolUse already use. Earlier releases mistakenly used
+> `systemMessage` for the two priming events, which meant the pinned-conventions index never entered
+> the conversation — corrected in 0.4.1.
 
 ### SessionStart
 
 Fires once at the beginning of every session. The hook creates (or truncates) the session
-deduplication file, then returns a `systemMessage` containing:
+deduplication file, then returns an `additionalContext` payload containing:
 
 - A meta-instruction telling the agent that patterns are injected automatically and should be
   followed as default conventions
@@ -96,9 +104,9 @@ PostToolUse does not fire for successful commands or for non-Bash tools.
 ### PostCompact
 
 Fires when the agent's context window is compressed (a natural event during long sessions). The hook
-truncates the deduplication file and re-emits the same content as SessionStart — the full pattern
-index and meta-instruction. This ensures the agent retains awareness of the knowledge base even
-after earlier injections have been compressed away.
+truncates the deduplication file and re-emits the same content as SessionStart through the same
+`additionalContext` envelope — the full pattern index and meta-instruction. This ensures the agent
+retains awareness of the knowledge base even after earlier injections have been compressed away.
 
 ## Engine and Adapter
 
