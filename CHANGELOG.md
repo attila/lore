@@ -6,11 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-22
+
 ### Fixed
 
 - `SessionStart` hook output now reaches the model as `hookSpecificOutput.additionalContext` instead
   of the terminal-only `systemMessage` chip, so the pinned-conventions index and meta-instruction
-  actually seed the conversation on session start. (#N)
+  actually seed the conversation on session start. (#65)
 
 ### Changed
 
@@ -19,7 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   never reaches the model and renders as long terminal noise on every `/compact`. The handler now
   does its dedup-file truncation silently; on-demand pattern injection via PreToolUse continues to
   work. The always-on pinned tier is unavailable post-compact pending a future re-prime mechanism.
-  See `docs/hook-pipeline-reference.md` and `ROADMAP.md`. (#N)
+  See `docs/hook-pipeline-reference.md` and `ROADMAP.md`. (#65)
 
 ## [0.4.0] - 2026-05-19
 
