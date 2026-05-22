@@ -47,25 +47,36 @@ pub struct HookInput {
 
 /// Written to stdout as JSON.
 ///
-/// Two variants:
-/// - `HookSpecific` — for events that support `hookSpecificOutput`
-///   (`PreToolUse`, `PostToolUse`).
-/// - `SystemMessage` — for events where Claude Code only accepts a top-level
-///   `systemMessage` field (`SessionStart`, `PostCompact`).
+/// Every emitting hook event uses the `hookSpecificOutput.additionalContext`
+/// envelope so the payload lands in the model's conversation as a system
+/// reminder. `PostCompact` is the one event that suppresses output entirely
+/// (Claude Code's validator rejects `hookSpecificOutput` there and the
+/// chip-only `systemMessage` envelope never reaches the model — see
+/// `docs/hook-pipeline-reference.md`).
 #[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum HookOutput {
-    HookSpecific {
-        #[serde(rename = "hookSpecificOutput")]
-        hook_specific_output: HookSpecificOutput,
-    },
-    SystemMessage {
-        #[serde(rename = "systemMessage")]
-        system_message: String,
-    },
+pub struct HookOutput {
+    #[serde(rename = "hookSpecificOutput")]
+    pub hook_specific_output: HookSpecificOutput,
 }
 
-/// The payload nested inside `HookOutput::HookSpecific`.
+impl HookOutput {
+    /// Build the `additionalContext` envelope for the given event.
+    ///
+    // The event name is a `&str` for now because there are only four valid
+    // values and all call sites use string literals. If a fifth event or a
+    // re-prime workaround lands, tighten this to a typed `HookEventName` enum
+    // to remove the typo class at compile time.
+    pub fn additional_context(hook_event_name: &str, additional_context: String) -> Self {
+        Self {
+            hook_specific_output: HookSpecificOutput {
+                hook_event_name: hook_event_name.to_string(),
+                additional_context,
+            },
+        }
+    }
+}
+
+/// The payload nested inside `HookOutput`.
 #[derive(Debug, Serialize)]
 pub struct HookSpecificOutput {
     #[serde(rename = "hookEventName")]
@@ -158,9 +169,10 @@ fn handle_session_start(
         }
     }
 
-    Ok(Some(HookOutput::SystemMessage {
-        system_message: context,
-    }))
+    Ok(Some(HookOutput::additional_context(
+        "SessionStart",
+        context,
+    )))
 }
 
 /// Handle `PreToolUse`: extract query, search, predicate-filter, dedup-filter,
@@ -337,12 +349,7 @@ fn handle_pre_tool_use(
     // 9. Format and emit.
     let context = format_imperative(&combined);
 
-    Ok(Some(HookOutput::HookSpecific {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            additional_context: context,
-        },
-    }))
+    Ok(Some(HookOutput::additional_context("PreToolUse", context)))
 }
 
 /// Apply the universal-pattern predicate filter to a list of expanded chunks.
@@ -454,10 +461,22 @@ fn expand_to_siblings(db: &KnowledgeDB, seeds: &[SearchResult]) -> Vec<SearchRes
         .unwrap_or_else(|_| seeds.to_vec())
 }
 
-/// Handle `PostCompact`: truncate dedup, re-emit `SessionStart` content.
+/// Handle `PostCompact`: truncate the per-session dedup file so the next
+/// `PreToolUse` re-injects relevant patterns on demand. Produces no hook
+/// output.
+///
+/// Claude Code's hook output validator rejects `hookSpecificOutput` for the
+/// `PostCompact` event, leaving only the chip-only `systemMessage` envelope
+/// — which renders as a transient terminal notification and never enters the
+/// model's context. Rather than emit a noisy, useless chip on every
+/// compaction, we suppress the output entirely. The handler is retained (and
+/// still receives `db` / `config`) so future iterations can layer cleverer
+/// re-prime mechanisms here when an envelope arrives. The roadmap tracks
+/// candidate workarounds.
+#[allow(clippy::unnecessary_wraps)] // returns Result to keep the handler signature uniform with peers
 fn handle_post_compact(
     input: &HookInput,
-    db: &KnowledgeDB,
+    _db: &KnowledgeDB,
     config: &Config,
 ) -> anyhow::Result<Option<HookOutput>> {
     let start = std::time::Instant::now();
@@ -469,17 +488,13 @@ fn handle_post_compact(
         lore_debug!("PostCompact dedup reset error: {e}");
     }
 
-    let context = format_session_context(db, &config.knowledge_dir)?;
-
     if config.trace_enabled()
         && let Some(session_id) = input.session_id.as_deref()
     {
         emit_post_compact_trace(session_id, start);
     }
 
-    Ok(Some(HookOutput::SystemMessage {
-        system_message: context,
-    }))
+    Ok(None)
 }
 
 /// Handle `PostToolUse`: on Bash errors, search with stderr and return patterns.
@@ -564,12 +579,7 @@ fn handle_post_tool_use(
     }
 
     let context = format_imperative(&results);
-    Ok(Some(HookOutput::HookSpecific {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PostToolUse".to_string(),
-            additional_context: context,
-        },
-    }))
+    Ok(Some(HookOutput::additional_context("PostToolUse", context)))
 }
 
 /// Apply the per-class relevance floor: universal chunks are filtered against

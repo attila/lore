@@ -242,9 +242,14 @@ fn hook_session_start_returns_meta_instruction() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    let ctx = parsed["systemMessage"]
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+        Some("SessionStart"),
+        "SessionStart payload must carry hookEventName=SessionStart so Claude Code routes it into model context"
+    );
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("SessionStart should return a top-level systemMessage");
+        .expect("SessionStart should return hookSpecificOutput.additionalContext");
     assert!(
         ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
@@ -280,7 +285,9 @@ fn hook_session_start_advertises_git_advisory_for_non_git_dir() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
 
     assert!(
         ctx.contains("not a git repository"),
@@ -324,7 +331,9 @@ fn hook_session_start_omits_git_advisory_for_git_dir() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
+    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
 
     assert!(
         !ctx.contains("not a git repository"),
@@ -335,7 +344,13 @@ fn hook_session_start_omits_git_advisory_for_git_dir() {
 }
 
 #[test]
-fn hook_post_compact_returns_session_context() {
+fn hook_post_compact_produces_no_output() {
+    // Claude Code's hook output validator rejects `hookSpecificOutput` for
+    // `PostCompact`, leaving only the chip-only `systemMessage` envelope —
+    // which never reaches the model and would render as a long, useless
+    // terminal chip. The handler suppresses output entirely; the only
+    // load-bearing PostCompact behaviour is dedup truncation, pinned by
+    // `hook_post_compact_resets_dedup_file` below.
     let (_tmp, config_path) = setup_test_env();
 
     let input = serde_json::json!({
@@ -352,22 +367,10 @@ fn hook_post_compact_returns_session_context() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     assert!(
-        !stdout.is_empty(),
-        "PostCompact should produce output like SessionStart"
-    );
-
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    let ctx = parsed["systemMessage"]
-        .as_str()
-        .expect("PostCompact should return a top-level systemMessage");
-    assert!(
-        ctx.contains("lore for the author"),
-        "should contain meta-instruction: {ctx}"
-    );
-    assert!(
-        ctx.contains("Available patterns:"),
-        "should list available patterns: {ctx}"
+        stdout.is_empty(),
+        "PostCompact must not emit a hook payload (harness validator rejects \
+         hookSpecificOutput and systemMessage is pure terminal noise); \
+         got: {stdout}"
     );
 }
 
@@ -665,8 +668,8 @@ fn hook_full_lifecycle_session_dedup_compact_reinject() {
 
     let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
     assert!(
-        start_parsed["systemMessage"].is_string(),
-        "SessionStart should return a systemMessage"
+        start_parsed["hookSpecificOutput"]["additionalContext"].is_string(),
+        "SessionStart should return hookSpecificOutput.additionalContext"
     );
 
     // 2. PreToolUse — first call should inject patterns.
@@ -711,7 +714,11 @@ fn hook_full_lifecycle_session_dedup_compact_reinject() {
         );
     }
 
-    // 4. PostCompact — should reset dedup and return session context.
+    // 4. PostCompact — should reset dedup. The handler suppresses hook output
+    //    entirely (Claude Code rejects hookSpecificOutput for PostCompact and
+    //    a systemMessage chip provides no model-facing value), so stdout must
+    //    be empty. The lifecycle-relevant observable is the dedup reset, pinned
+    //    by step 5 below.
     let compact_input = serde_json::json!({
         "hook_event_name": "PostCompact",
         "session_id": session_id
@@ -726,8 +733,8 @@ fn hook_full_lifecycle_session_dedup_compact_reinject() {
 
     let compact_stdout = String::from_utf8(compact_output.get_output().stdout.clone()).unwrap();
     assert!(
-        !compact_stdout.is_empty(),
-        "PostCompact should produce output"
+        compact_stdout.is_empty(),
+        "PostCompact must produce no hook output; got: {compact_stdout}"
     );
 
     // 5. Same PreToolUse again — after PostCompact reset, should re-inject.
@@ -749,59 +756,6 @@ fn hook_full_lifecycle_session_dedup_compact_reinject() {
     }
 
     // Clean up dedup file.
-    let dedup_path = lore::hook::dedup_file_path(&session_id);
-    let _ = std::fs::remove_file(dedup_path);
-}
-
-#[test]
-fn hook_session_start_and_post_compact_return_same_content() {
-    let (_tmp, config_path) = setup_test_env();
-    let session_id = format!("same-content-test-{}", std::process::id());
-
-    let start_input = serde_json::json!({
-        "hook_event_name": "SessionStart",
-        "session_id": session_id
-    });
-
-    let start_output = Command::cargo_bin("lore")
-        .unwrap()
-        .args(["hook", "--config", config_path.to_str().unwrap()])
-        .write_stdin(serde_json::to_string(&start_input).unwrap())
-        .assert()
-        .success();
-
-    let start_stdout = String::from_utf8(start_output.get_output().stdout.clone()).unwrap();
-
-    let compact_input = serde_json::json!({
-        "hook_event_name": "PostCompact",
-        "session_id": session_id
-    });
-
-    let compact_output = Command::cargo_bin("lore")
-        .unwrap()
-        .args(["hook", "--config", config_path.to_str().unwrap()])
-        .write_stdin(serde_json::to_string(&compact_input).unwrap())
-        .assert()
-        .success();
-
-    let compact_stdout = String::from_utf8(compact_output.get_output().stdout.clone()).unwrap();
-
-    // Both should produce output.
-    assert!(!start_stdout.is_empty());
-    assert!(!compact_stdout.is_empty());
-
-    // Both use systemMessage — content should be identical.
-    let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
-    let compact_parsed: serde_json::Value = serde_json::from_str(&compact_stdout).unwrap();
-
-    let start_ctx = start_parsed["systemMessage"].as_str().unwrap();
-    let compact_ctx = compact_parsed["systemMessage"].as_str().unwrap();
-    assert_eq!(
-        start_ctx, compact_ctx,
-        "SessionStart and PostCompact should return the same context content"
-    );
-
-    // Clean up.
     let dedup_path = lore::hook::dedup_file_path(&session_id);
     let _ = std::fs::remove_file(dedup_path);
 }
@@ -995,7 +949,10 @@ fn invoke_session_start(config_path: &Path, session_id: &str) -> String {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    parsed["systemMessage"].as_str().unwrap().to_string()
+    parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -1035,36 +992,6 @@ fn hook_session_start_emits_pinned_section_with_body_above_index_when_universal_
     assert!(
         ctx.contains("### Workflow Conventions"),
         "pinned section should label each pattern with its title: {ctx}"
-    );
-}
-
-#[test]
-fn hook_post_compact_re_emits_pinned_section() {
-    let (_tmp, config_path) = setup_with_universal_pattern();
-
-    let input = serde_json::json!({
-        "hook_event_name": "PostCompact",
-        "session_id": "test-post-compact-pinned",
-    });
-
-    let output = Command::cargo_bin("lore")
-        .unwrap()
-        .args(["hook", "--config", config_path.to_str().unwrap()])
-        .write_stdin(serde_json::to_string(&input).unwrap())
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
-
-    assert!(
-        ctx.contains("## Pinned conventions"),
-        "PostCompact should re-emit the pinned section: {ctx}"
-    );
-    assert!(
-        ctx.contains("Always push with `git push origin HEAD`"),
-        "pinned body should re-appear at PostCompact: {ctx}"
     );
 }
 
@@ -1263,49 +1190,14 @@ fn hook_session_start_skip_then_pre_tool_use_fire_couples_predicate_path() {
 }
 
 #[test]
-fn hook_post_compact_excludes_predicated_universal_from_pinned_section() {
-    // R4 / hazard pin: PostCompact shares format_session_context with
-    // SessionStart today, but pin the invariant directly so a future refactor
-    // splitting the shared path cannot silently regress predicated-chunk
-    // filtering on the PostCompact side (composition-cascade mitigation).
-    let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
-
-    let input = serde_json::json!({
-        "hook_event_name": "PostCompact",
-        "session_id": "test-track-1b-post-compact",
-    });
-
-    let output = Command::cargo_bin("lore")
-        .unwrap()
-        .args(["hook", "--config", config_path.to_str().unwrap()])
-        .write_stdin(serde_json::to_string(&input).unwrap())
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["systemMessage"].as_str().unwrap();
-
-    assert!(
-        ctx.contains("genuinely-universal-marker"),
-        "PostCompact should still re-emit the un-predicated universal body: {ctx}"
-    );
-    assert!(
-        !ctx.contains("predicated-git-marker"),
-        "PostCompact must NOT re-emit the predicated universal body: {ctx}"
-    );
-}
-
-#[test]
 fn hook_post_compact_resets_dedup_file() {
-    // Sibling to the predicated-universal hazard pin above. The R4 test
-    // covers the rendered-context filter; this one pins the orthogonal
-    // contract that PostCompact also truncates the per-session dedup file
-    // (so post-compaction tool calls re-inject patterns the agent saw before
-    // the compaction event). Without this assertion, a refactor that drops
-    // `reset_dedup` from `handle_post_compact` would not be caught by any
-    // of the existing PostCompact tests — they only inspect the system
-    // message payload.
+    // PostCompact's load-bearing contract. The handler produces no hook
+    // output (covered by `hook_post_compact_produces_no_output`), so this is
+    // the only externally observable behaviour that matters: the per-session
+    // dedup file must be truncated so the next PreToolUse re-injects
+    // patterns the agent saw before compaction. A refactor that drops
+    // `reset_dedup` from `handle_post_compact` would otherwise pass every
+    // remaining PostCompact test in this file.
     let (_tmp, config_path) = setup_with_predicated_and_unpredicated_universals();
     let session_id = format!("test-track-1b-post-compact-truncate-{}", std::process::id());
     let dedup_path = lore::hook::dedup_file_path(&session_id);
@@ -1565,7 +1457,7 @@ fn hook_session_start_truncates_pinned_section_at_render_budget() {
     assert!(
         ctx.contains("_[pinned conventions truncated at 32768 bytes"),
         "expected truncation marker once cumulative body crossed 32 KB; \
-         got {} bytes of systemMessage starting {:?}",
+         got {} bytes of additionalContext starting {:?}",
         ctx.len(),
         &ctx.chars().take(200).collect::<String>(),
     );
@@ -1794,7 +1686,7 @@ fn hook_pre_tool_use_universal_persists_after_post_compact_truncation() {
             .success();
     }
 
-    // PostCompact (truncates dedup, re-emits SessionStart content)
+    // PostCompact (truncates dedup; emits no hook output)
     let post_compact = serde_json::json!({
         "hook_event_name": "PostCompact",
         "session_id": session_id,

@@ -4,6 +4,16 @@
 
 ## Future
 
+- [ ] PostCompact re-prime workaround — Claude Code's hook output validator rejects
+      `hookSpecificOutput` for the PostCompact event, leaving `systemMessage` as the only envelope
+      and the pinned-conventions tier unable to re-seed the model context after `/compact`. Options
+      to investigate: (a) wait for Claude Code to accept `additionalContext` for PostCompact; (b)
+      re-prime opportunistically on the first PreToolUse after compaction by detecting a truncated
+      dedup file and injecting the pinned tier as additionalContext alongside the normal search
+      results; (c) a `lore reprime`-style agent-callable surface the model can invoke when it
+      notices its context has been compacted. Surfaced in PR #N (SessionStart envelope fix); see
+      `docs/hook-pipeline-reference.md` for the limitation as it stands today.
+
 - [ ] Pre-release UX polish (deferred from edge-case-handling brainstorm) — friendlier
       empty-directory copy beyond the current tier-2 warning, empty-DB search hints, and a
       structured `SlugCollisionError` type (with `existing_path` / `existing_title` fields for
