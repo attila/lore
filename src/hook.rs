@@ -47,30 +47,54 @@ pub struct HookInput {
 
 /// Written to stdout as JSON.
 ///
-/// Every event uses the `hookSpecificOutput` envelope so the payload lands in
-/// the model's conversation context as a system reminder. The chip-only
-/// `systemMessage` envelope is intentionally not used: `SessionStart` and
-/// `PostCompact` exist to seed the model, not to notify the user, and the
-/// other events likewise need their content in context.
+/// Two envelopes are needed because Claude Code's hook output validator
+/// accepts different shapes for different events:
+///
+/// - `AdditionalContext` — `{"hookSpecificOutput": {"hookEventName": "<event>",
+///   "additionalContext": "..."}}`. Routed into the model's conversation as a
+///   system reminder. Used by `SessionStart`, `PreToolUse`, and `PostToolUse`.
+/// - `SystemMessage` — `{"systemMessage": "..."}`. Rendered as a transient
+///   terminal chip and not delivered to the model. Used by `PostCompact`
+///   because the validator rejects `hookSpecificOutput` for that event, so
+///   the chip channel is the only available delivery path even though it
+///   means the post-compaction re-prime never reaches the model context.
+///   See `docs/hook-pipeline-reference.md` for the known limitation and the
+///   roadmap item tracking a workaround.
 #[derive(Debug, Serialize)]
-pub struct HookOutput {
-    #[serde(rename = "hookSpecificOutput")]
-    pub hook_specific_output: HookSpecificOutput,
+#[serde(untagged)]
+pub enum HookOutput {
+    AdditionalContext {
+        #[serde(rename = "hookSpecificOutput")]
+        hook_specific_output: HookSpecificOutput,
+    },
+    SystemMessage {
+        #[serde(rename = "systemMessage")]
+        system_message: String,
+    },
 }
 
 impl HookOutput {
-    /// Build a `HookOutput` for the given event name and context payload.
-    pub fn new(hook_event_name: &str, additional_context: String) -> Self {
-        Self {
+    /// Build the `additionalContext` envelope for the given event.
+    pub fn additional_context(hook_event_name: &str, additional_context: String) -> Self {
+        Self::AdditionalContext {
             hook_specific_output: HookSpecificOutput {
                 hook_event_name: hook_event_name.to_string(),
                 additional_context,
             },
         }
     }
+
+    /// Build the `systemMessage` envelope. Renders as a terminal chip and does
+    /// not enter the model's context; reserved for events whose validator
+    /// rejects `hookSpecificOutput`.
+    pub fn system_message(message: String) -> Self {
+        Self::SystemMessage {
+            system_message: message,
+        }
+    }
 }
 
-/// The payload nested inside `HookOutput`.
+/// The payload nested inside `HookOutput::AdditionalContext`.
 #[derive(Debug, Serialize)]
 pub struct HookSpecificOutput {
     #[serde(rename = "hookEventName")]
@@ -163,7 +187,10 @@ fn handle_session_start(
         }
     }
 
-    Ok(Some(HookOutput::new("SessionStart", context)))
+    Ok(Some(HookOutput::additional_context(
+        "SessionStart",
+        context,
+    )))
 }
 
 /// Handle `PreToolUse`: extract query, search, predicate-filter, dedup-filter,
@@ -340,7 +367,7 @@ fn handle_pre_tool_use(
     // 9. Format and emit.
     let context = format_imperative(&combined);
 
-    Ok(Some(HookOutput::new("PreToolUse", context)))
+    Ok(Some(HookOutput::additional_context("PreToolUse", context)))
 }
 
 /// Apply the universal-pattern predicate filter to a list of expanded chunks.
@@ -475,7 +502,12 @@ fn handle_post_compact(
         emit_post_compact_trace(session_id, start);
     }
 
-    Ok(Some(HookOutput::new("PostCompact", context)))
+    // Claude Code's hook output validator rejects `hookSpecificOutput` for
+    // `PostCompact`, so we fall back to the chip-only `systemMessage`
+    // envelope. The payload therefore renders as a transient terminal
+    // notification and does not enter the model's context after `/compact` —
+    // a harness limitation tracked in the roadmap.
+    Ok(Some(HookOutput::system_message(context)))
 }
 
 /// Handle `PostToolUse`: on Bash errors, search with stderr and return patterns.
@@ -560,7 +592,7 @@ fn handle_post_tool_use(
     }
 
     let context = format_imperative(&results);
-    Ok(Some(HookOutput::new("PostToolUse", context)))
+    Ok(Some(HookOutput::additional_context("PostToolUse", context)))
 }
 
 /// Apply the per-class relevance floor: universal chunks are filtered against

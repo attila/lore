@@ -367,14 +367,12 @@ fn hook_post_compact_returns_session_context() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
-    assert_eq!(
-        parsed["hookSpecificOutput"]["hookEventName"].as_str(),
-        Some("PostCompact"),
-        "PostCompact payload must carry hookEventName=PostCompact (not SessionStart) — mismatched event names are silently dropped by Claude Code"
-    );
-    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+    // PostCompact uses the chip-only `systemMessage` envelope because Claude
+    // Code's hook output validator rejects `hookSpecificOutput` for this
+    // event — see `HookOutput` doc comment in src/hook.rs.
+    let ctx = parsed["systemMessage"]
         .as_str()
-        .expect("PostCompact should return hookSpecificOutput.additionalContext");
+        .expect("PostCompact should return a top-level systemMessage");
     assert!(
         ctx.contains("lore for the author"),
         "should contain meta-instruction: {ctx}"
@@ -804,16 +802,17 @@ fn hook_session_start_and_post_compact_return_same_content() {
     assert!(!start_stdout.is_empty());
     assert!(!compact_stdout.is_empty());
 
-    // Both use hookSpecificOutput.additionalContext — content should be identical.
+    // SessionStart uses `hookSpecificOutput.additionalContext`; PostCompact
+    // uses `systemMessage` (see HookOutput doc). The payload string is built
+    // by the same `format_session_context` call in both handlers, so the
+    // content must match even though the envelopes differ.
     let start_parsed: serde_json::Value = serde_json::from_str(&start_stdout).unwrap();
     let compact_parsed: serde_json::Value = serde_json::from_str(&compact_stdout).unwrap();
 
     let start_ctx = start_parsed["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    let compact_ctx = compact_parsed["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let compact_ctx = compact_parsed["systemMessage"].as_str().unwrap();
     assert_eq!(
         start_ctx, compact_ctx,
         "SessionStart and PostCompact should return the same context content"
@@ -1077,9 +1076,7 @@ fn hook_post_compact_re_emits_pinned_section() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
 
     assert!(
         ctx.contains("## Pinned conventions"),
@@ -1307,9 +1304,7 @@ fn hook_post_compact_excludes_predicated_universal_from_pinned_section() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let ctx = parsed["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let ctx = parsed["systemMessage"].as_str().unwrap();
 
     assert!(
         ctx.contains("genuinely-universal-marker"),
