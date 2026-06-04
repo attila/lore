@@ -56,7 +56,12 @@ pub struct PullProgress {
 /// Variants distinguish failure modes that need different remediation —
 /// runner-failed vs timeout vs transport — so a slow disk does not get
 /// misdiagnosed as a runner-bundle bug.
+///
+/// Marked `#[non_exhaustive]` so future variants are not breaking changes for
+/// downstream `match` consumers. New variants should be added with a matching
+/// arm in `render_failure` so all rendering surfaces stay in sync.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ProbeError {
     /// HTTP 5xx from Ollama: the inference call reached the server but the
     /// runner subprocess failed. Verified shape for the broken-Homebrew
@@ -89,7 +94,11 @@ impl std::error::Error for ProbeError {}
 /// surface. Centralising the variant→strings match in `render_failure` keeps
 /// the four surfaces (status line, provision errors/actions, hook warning)
 /// in sync when the enum gains a variant.
+///
+/// Marked `#[non_exhaustive]` so adding a surface (additional field) later is
+/// not a breaking change to consumers that pattern-match or construct this.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RenderedFailure {
     /// Hook FTS-fallback warning short reason (e.g. `"inference error"`).
     pub short_reason: String,
@@ -178,7 +187,16 @@ pub fn classify_embed_response(
     };
 
     let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    // Read the body as bytes and decode lossily so a non-UTF-8 sequence
+    // doesn't collapse the entire diagnostic. Ollama emits UTF-8 in
+    // practice, but a misbehaving proxy or intercepting middleware might
+    // not. `from_utf8_lossy` preserves what's decodable and replaces
+    // invalid bytes with the U+FFFD replacement character.
+    let body = resp
+        .body_mut()
+        .read_to_vec()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
 
     if (200..300).contains(&status) {
         Ok(body)
@@ -381,6 +399,15 @@ impl OllamaClient {
             return Err(ProbeError::InferenceError { body });
         }
 
+        // Verify the response actually contains an embedding vector. A 2xx
+        // body of `{}` or `{"embeddings":[]}` would otherwise pass the probe
+        // without proving the runner ran.
+        let resp = serde_json::from_str::<EmbedResponse>(&body)
+            .map_err(|_| ProbeError::InferenceError { body: body.clone() })?;
+        if resp.embeddings.is_empty() {
+            return Err(ProbeError::InferenceError { body });
+        }
+
         Ok(())
     }
 }
@@ -409,11 +436,21 @@ impl Embedder for OllamaClient {
             return Err(anyhow::Error::new(ProbeError::InferenceError { body }));
         }
 
-        let resp: EmbedResponse = serde_json::from_str(&body)?;
+        // A 2xx body that doesn't deserialise as `EmbedResponse` (missing
+        // `embeddings` field, malformed shape) is itself an inference failure
+        // from our perspective — surface it as `ProbeError::InferenceError`
+        // so the hook downcast classifies it correctly instead of falling
+        // through to the generic "unreachable" label.
+        let resp: EmbedResponse = serde_json::from_str(&body)
+            .map_err(|_| anyhow::Error::new(ProbeError::InferenceError { body: body.clone() }))?;
+
         resp.embeddings
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+            // Empty `embeddings: []` is the same diagnostic-quality failure:
+            // Ollama responded successfully but produced no vector. Tag as
+            // InferenceError so callers see a classified failure.
+            .ok_or_else(|| anyhow::Error::new(ProbeError::InferenceError { body }))
     }
 
     fn dimensions(&self) -> usize {
@@ -587,5 +624,128 @@ mod tests {
         assert_eq!(p.status.as_deref(), Some("pulling"));
         assert_eq!(p.total, None);
         assert_eq!(p.completed, Some(50_000));
+    }
+
+    // ---- extract_body_message -----------------------------------------
+
+    #[test]
+    fn extract_body_message_returns_none_for_empty_input() {
+        assert_eq!(extract_body_message(""), None);
+        assert_eq!(extract_body_message("   \n\t"), None);
+    }
+
+    #[test]
+    fn extract_body_message_extracts_json_error_field() {
+        let body = r#"{"error":"llama runner process has terminated"}"#;
+        assert_eq!(
+            extract_body_message(body).as_deref(),
+            Some("llama runner process has terminated")
+        );
+    }
+
+    #[test]
+    fn extract_body_message_falls_back_to_first_line_for_non_json() {
+        let body = "first line\nsecond line\nthird";
+        assert_eq!(extract_body_message(body).as_deref(), Some("first line"));
+    }
+
+    #[test]
+    fn extract_body_message_replaces_control_chars_with_spaces() {
+        let body = "before\x07after";
+        assert_eq!(extract_body_message(body).as_deref(), Some("before after"));
+    }
+
+    #[test]
+    fn extract_body_message_truncates_with_ellipsis() {
+        let body = "x".repeat(300);
+        let msg = extract_body_message(&body).unwrap();
+        assert!(msg.chars().count() <= 240);
+        assert!(msg.ends_with('…'));
+    }
+
+    /// The truncation must land on a char boundary. Multi-byte codepoints
+    /// (CJK, emoji) sit at byte offsets that don't align with simple byte
+    /// slicing — `truncate_chars` uses `chars().take()` to avoid the
+    /// `byte_is_char_boundary` panic.
+    #[test]
+    fn extract_body_message_handles_multibyte_chars_at_truncation_boundary() {
+        let body = "あ".repeat(300);
+        let msg = extract_body_message(&body).unwrap();
+        assert!(msg.chars().count() <= 240);
+        // No panic. The byte length is ~720 (3 bytes per char) but the
+        // char count is bounded.
+    }
+
+    /// `error: null` is a real Ollama response shape (no error). Should
+    /// fall through to the line-based fallback rather than the JSON path.
+    #[test]
+    fn extract_body_message_json_with_null_error_falls_through() {
+        let body = r#"{"error":null}"#;
+        // The ErrorBody struct requires a `String`, so deserialise fails
+        // and we take the first-line path — the entire body becomes the
+        // message.
+        let msg = extract_body_message(body).unwrap();
+        assert_eq!(msg, r#"{"error":null}"#);
+    }
+
+    // ---- render_failure -----------------------------------------------
+
+    #[test]
+    fn render_failure_runner_failed_includes_body_in_status_line() {
+        let err = ProbeError::RunnerFailed {
+            status: 500,
+            body: r#"{"error":"runner crashed"}"#.to_string(),
+        };
+        let r = render_failure(&err);
+        assert_eq!(r.short_reason, "inference error");
+        assert!(r.status_line.contains("inference failed"));
+        assert!(r.status_line.contains("runner crashed"));
+    }
+
+    #[test]
+    fn render_failure_timeout_short_reason() {
+        let r = render_failure(&ProbeError::Timeout);
+        assert_eq!(r.short_reason, "timed out");
+        assert!(r.status_line.starts_with("inference timed out"));
+    }
+
+    #[test]
+    fn render_failure_transport_short_reason() {
+        let r = render_failure(&ProbeError::Transport("connection refused".to_string()));
+        assert_eq!(r.short_reason, "transport error");
+        assert!(r.status_line.contains("connection refused"));
+    }
+
+    #[test]
+    fn render_failure_http_status_short_reason() {
+        let r = render_failure(&ProbeError::HttpStatus {
+            status: 418,
+            body: String::new(),
+        });
+        assert_eq!(r.short_reason, "HTTP 418");
+        assert!(r.status_line.contains("418"));
+    }
+
+    #[test]
+    fn render_failure_inference_error_includes_body() {
+        let err = ProbeError::InferenceError {
+            body: r#"{"error":"context length exceeded"}"#.to_string(),
+        };
+        let r = render_failure(&err);
+        // InferenceError shares the rendering path with RunnerFailed.
+        assert_eq!(r.short_reason, "inference error");
+        assert!(r.status_line.contains("context length exceeded"));
+    }
+
+    /// `ProbeError` implements `std::error::Error` so it can be wrapped in
+    /// `anyhow::Error::new(...)`. The hook path depends on
+    /// `downcast_ref::<ProbeError>()` reaching the wrapped variant.
+    #[test]
+    fn probe_error_can_be_downcast_through_anyhow() {
+        let err = anyhow::Error::new(ProbeError::Timeout);
+        assert!(matches!(
+            err.downcast_ref::<ProbeError>(),
+            Some(ProbeError::Timeout)
+        ));
     }
 }

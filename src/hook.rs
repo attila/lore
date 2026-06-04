@@ -54,6 +54,10 @@ fn emit_embed_failure_warning(err: &anyhow::Error) {
         Err(poisoned) => poisoned.into_inner(),
     };
     if last.as_deref() == Some(short_reason.as_str()) {
+        // Suppressed because the previous warning had the same class.
+        // Leave a debug breadcrumb so an operator wondering "why didn't I
+        // see the warning?" has a thread to pull via `LORE_DEBUG=1`.
+        lore_debug!("hook: suppressed repeat Ollama-embed warning (class: {short_reason})");
         return;
     }
     *last = Some(short_reason.clone());

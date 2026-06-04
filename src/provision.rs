@@ -7,7 +7,11 @@ use std::time::{Duration, Instant};
 use crate::embeddings::{OllamaClient, ProbeError, render_failure};
 
 /// Outcome of the runtime probe that exercises Ollama inference.
+///
+/// Marked `#[non_exhaustive]` so future variants (e.g. `Cached`) are not
+/// breaking changes for downstream `match` consumers.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ProbeOutcome {
     /// Probe ran and the model returned a valid embedding.
     Ok,
@@ -265,9 +269,12 @@ pub fn check_status(ollama_host: &str, model: &str, full: bool) -> ProvisionResu
         return result;
     }
 
-    // `keep_alive: 0` — unload immediately after the probe so we don't pin
-    // ~270 MB of model in RAM after a single diagnostic call.
-    match client.probe(Some(0)) {
+    // `keep_alive: 30` — short enough that one-off `lore status --full`
+    // calls don't pin ~270 MB of model in RAM for the OLLAMA_KEEP_ALIVE
+    // default (5 minutes), long enough that a "fix Ollama then re-run
+    // --full" debug loop hits a warm cache on the second invocation
+    // instead of paying the 3–15 s cold load again.
+    match client.probe(Some(30)) {
         Ok(()) => result.runtime = ProbeOutcome::Ok,
         Err(err) => result.runtime = ProbeOutcome::Failed(err),
     }

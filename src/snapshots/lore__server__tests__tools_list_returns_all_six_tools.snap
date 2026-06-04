@@ -1,5 +1,6 @@
 ---
 source: src/server.rs
+assertion_line: 1849
 expression: resp
 ---
 {
@@ -178,7 +179,12 @@ expression: resp
           "properties": {
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, knowledge_dir_status (\"populated\", \"empty\", or \"missing\"), empty_knowledge_dir (bool), git_repository, last_ingested_commit, chunks_indexed, sources_indexed, languages_declared (token -> source-count map matching the `language:` frontmatter surface, e.g. `{\"rust\": 12, \"typescript\": 5}`; multi-language sources count in each declared bucket so the sum can exceed sources_indexed), languages_undeclared (integer count of sources with no `language:` declaration), languages_error (null in normal operation; carries the error message when the language aggregation query fails, so agents can distinguish a broken query from a genuinely empty knowledge base), inbox_workflow_configured, delta_ingest_available, loreignore_active, and universal_advisories (count, oversized bodies, near-miss tags from the most recent full or single-file ingest). The empty_knowledge_dir field reports on-disk state, distinct from sources_indexed (database state): when sources_indexed is 0 and empty_knowledge_dir is false, files exist but have not been ingested — run `lore ingest`. When empty_knowledge_dir is true, knowledge_dir_status discriminates further: \"empty\" calls for adding `.md` files or relaxing `.loreignore`; \"missing\" means the configured path doesn't exist or isn't a directory. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, knowledge_dir_status (\"populated\", \"empty\", or \"missing\"), empty_knowledge_dir (bool), git_repository, last_ingested_commit, chunks_indexed, sources_indexed, languages_declared (token -> source-count map matching the `language:` frontmatter surface, e.g. `{\"rust\": 12, \"typescript\": 5}`; multi-language sources count in each declared bucket so the sum can exceed sources_indexed), languages_undeclared (integer count of sources with no `language:` declaration), languages_error (null in normal operation; carries the error message when the language aggregation query fails, so agents can distinguish a broken query from a genuinely empty knowledge base), inbox_workflow_configured, delta_ingest_available, loreignore_active, universal_advisories (count, oversized bodies, near-miss tags from the most recent full or single-file ingest), and `ollama` (object with `installed`, `running`, `model_available`, `model`, and `runtime` — the latter is `{\"state\": \"not_checked\"}` by default, switching to `\"ok\"`, `\"skipped\"`, or `\"failed\"` with `short_reason` and `status_line` when probe_runtime is passed). The empty_knowledge_dir field reports on-disk state, distinct from sources_indexed (database state): when sources_indexed is 0 and empty_knowledge_dir is false, files exist but have not been ingested — run `lore ingest`. When empty_knowledge_dir is true, knowledge_dir_status discriminates further: \"empty\" calls for adding `.md` files or relaxing `.loreignore`; \"missing\" means the configured path doesn't exist or isn't a directory. Defaults to false.",
+              "type": "boolean"
+            },
+            "probe_runtime": {
+              "default": false,
+              "description": "When true, runs a runtime probe against Ollama (a minimal embed call) to verify inference actually works — equivalent to `lore status --full`. The result is exposed under `metadata.ollama.runtime`. Adds 3–15 seconds of latency on first call (cold model load); subsequent calls within 30 s are fast. Default false — agents calling lore_status as a routine health check should leave this off; agents debugging a silent FTS fallback should turn it on.",
               "type": "boolean"
             }
           },

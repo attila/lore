@@ -786,24 +786,35 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
 /// Render the `Runtime:` status line from a `ProbeOutcome`.
 ///
 /// - `NotChecked` → discoverability hint (default `lore status` path).
-/// - `Skipped` → omit the line; preceding `Model: ✗` already tells the story.
+/// - `Skipped` → only renders when `full` is true (user explicitly asked
+///   for a runtime check and deserves an acknowledgement that the probe
+///   was skipped because the prerequisite — the model manifest — wasn't
+///   available). Silent under default mode where Skipped should never
+///   occur anyway.
 /// - `Ok` → green check.
 /// - `Failed` → ✗ plus a variant-specific message from `render_failure`.
 ///
 /// Hint emits unconditionally even when preceding lines are ✗; the slight
 /// redundancy is accepted over branching complexity, and reminds the user the
 /// deeper check exists once upstream problems are fixed.
-fn render_runtime_line(outcome: &ProbeOutcome) {
+fn render_runtime_line(outcome: &ProbeOutcome, full: bool) {
     match outcome {
         ProbeOutcome::Ok => eprintln!("  Runtime:      ✓ inference OK"),
         ProbeOutcome::NotChecked => {
             eprintln!("  Runtime:      —  (run 'lore status --full' to verify inference)");
         }
-        ProbeOutcome::Skipped => {}
+        ProbeOutcome::Skipped => {
+            if full {
+                eprintln!("  Runtime:      — (skipped: model not available)");
+            }
+        }
         ProbeOutcome::Failed(err) => {
             let rendered = render_failure(err);
             eprintln!("  Runtime:      ✗ {}", rendered.status_line);
         }
+        // `ProbeOutcome` is `#[non_exhaustive]`; future variants render as
+        // a neutral em-dash until the renderer is updated.
+        _ => eprintln!("  Runtime:      —"),
     }
 }
 
@@ -814,7 +825,12 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
         process::exit(1);
     };
 
-    let status = provision::check_status(&config.ollama.host, &config.ollama.model, full);
+    // Run the cheap checks first (no probe) so the header lines print
+    // before any potentially-multi-second probe call. Without this, a
+    // `lore status --full` invocation against a slow or hung Ollama would
+    // show a blank terminal for up to 30 s before any output appears.
+    let mut status = provision::check_status(&config.ollama.host, &config.ollama.model, false);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
 
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
@@ -849,10 +865,25 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
         if status.model_available { "✓" } else { "✗" },
         config.ollama.model
     );
-    render_runtime_line(&status.runtime);
+
+    // Now run the probe under --full, with a visible "checking" line so
+    // the multi-second wait is not a frozen terminal. The probe re-uses
+    // the OllamaClient created above for its 30-second keep_alive
+    // request body.
+    if full {
+        if status.model_available {
+            eprintln!("  Verifying inference runtime (may take a few seconds)…");
+            status.runtime = match ollama.probe(Some(30)) {
+                Ok(()) => ProbeOutcome::Ok,
+                Err(err) => ProbeOutcome::Failed(err),
+            };
+        } else {
+            status.runtime = ProbeOutcome::Skipped;
+        }
+    }
+    render_runtime_line(&status.runtime, full);
     eprintln!("  sqlite-vec:   ✓ bundled");
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     if let Ok(db) = KnowledgeDB::open(&config.database, ollama.dimensions())
         && db.init().is_ok()
         && let Ok(stats) = db.stats()
