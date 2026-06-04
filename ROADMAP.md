@@ -56,6 +56,17 @@
 
 ## Completed
 
+- [x] Ollama inference runtime probe — `lore status --full` now issues a live `/api/embed` request
+      against the configured model to detect runner-subprocess failures that the cheap
+      binary/daemon/manifest checks miss (the Homebrew-formula breakage that prompted this work
+      reported healthy across all three legacy probes). Structured `ProbeError` discriminates
+      runner-failed / inference-error / timeout / transport / HTTP-status with a single
+      `render_failure` switchboard feeding the CLI status line, MCP `lore_status` metadata fence
+      (`ollama.runtime`), and the PreToolUse hook warning (rate-limited per process). Opt-in
+      `--full` flag keeps the default `lore status` cheap; rescue mechanisms surface the deeper
+      check via install-time auto-probe, hook warning, and a hint line. ureq 3.x's default-true
+      `http_status_as_error` is explicitly opted out so 5xx response bodies stay readable. See
+      `docs/plans/2026-06-04-001-feat-ollama-runtime-probe-plan.md`.
 - [x] Track 2 Observability — opt-in per-hook trace logging written as JSONL records under
       `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` (one file per session), plus
       `lore trace why <session>` query CLI and `lore trace prune` maintenance. Enables data-driven
