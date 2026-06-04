@@ -303,15 +303,21 @@ branch on it.
   `result.errors` and the remediation hint into `result.actions` (matching the existing split —
   `errors` is what went wrong, `actions` is what the user can do about it). U2 owns the exact
   strings; U1 only routes the variant into the two vectors.
-- **`lore init` continues to completion on probe failure; does not abort.** The probe failure
-  populates `result.errors` and `result.actions`, which `lore init` surfaces via its existing
-  result-printing block. The user sees the failure inline with the rest of the init output and can
-  act on it, but the database stays initialised and the manifest stays pulled — partial completion
-  is better than a half-provisioned rollback. This matches existing `provision()` semantics, which
-  already populates `errors` without short-circuiting. Exit code: `lore init` returns non-zero when
-  `result.errors` is non-empty (also existing behaviour), so CI pipelines that gate on init success
-  will see the probe failure as a failed init — which is correct: vector search would be silently
-  degraded if they proceeded.
+- **`lore init` aborts on probe failure (pre-existing `cmd_init` behaviour).** The probe failure
+  populates `result.errors` via `provision()`. The pre-existing `cmd_init` wrapper exits with status
+  1 whenever `result.errors` is non-empty, _before_ the ingest phase. This is the right behaviour
+  for probe-failure: letting init continue past a broken embedder would run `full_ingest`, fail
+  per-chunk on the embed call, and leave the user with a database of empty embeddings — silently
+  broken vector search. Aborting forces the user to fix the actual problem (the runner) and re-run
+  `lore init`; the manifest stays pulled so the re-run is fast.
+
+  Note: an earlier draft of this plan claimed `lore init` "continues to completion" on probe
+  failure. That claim was based on a misread of pre-existing `provision()` semantics — `provision()`
+  does populate `errors` without returning early, but the `cmd_init` wrapper has always
+  short-circuited on any non-empty `errors` (including the pre-existing "Ollama not installed" /
+  "model pull failed" cases). The probe failure is conceptually a recoverable error (FTS-only would
+  still work) but in practice creates a degraded init state that's worse than the explicit abort, so
+  the existing wrapper semantics are right.
 - **No `lore init --skip-probe` flag in this plan.** A user who needs to bootstrap with known-broken
   inference (e.g., reproducing a bug, CI with mocked Ollama) can set `OLLAMA_HOST` to an unreachable
   address, which will set `model_available = false` and skip the probe via the Skipped branch. If
