@@ -658,3 +658,28 @@ fn ollama_unreachable_returns_error() {
         "R8: chunks should still be created (with None embeddings)"
     );
 }
+
+/// Runtime probe succeeds against a working Ollama install.
+///
+/// This is the green-path proof for U1's `OllamaClient::probe`. On the
+/// currently-broken Homebrew bottle this test fails with a `RunnerFailed`
+/// error — exactly the signal that the probe correctly catches what
+/// `is_healthy` + `has_model` miss.
+///
+/// The probe uses `keep_alive: Some(0)` so it does not pin the model in RAM
+/// after the test, matching the `lore status --full` call site.
+#[test]
+#[ignore = "requires running Ollama instance"]
+fn probe_succeeds_against_real_ollama() {
+    let client = ollama_client();
+    match client.probe(Some(0)) {
+        Ok(()) => {}
+        Err(err) => {
+            panic!(
+                "probe failed against local Ollama — runner may be broken \
+                 (this is the broken-Homebrew-bottle case lore status --full \
+                 is designed to surface): {err}"
+            );
+        }
+    }
+}

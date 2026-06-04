@@ -8,10 +8,10 @@ use clap::{Parser, Subcommand};
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient, render_failure};
-use lore::provision::ProbeOutcome;
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
+use lore::provision::ProbeOutcome;
 use lore::status::format_languages_line;
 use lore::{git, ingest, provision, server};
 
@@ -796,9 +796,9 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
 fn render_runtime_line(outcome: &ProbeOutcome) {
     match outcome {
         ProbeOutcome::Ok => eprintln!("  Runtime:      ✓ inference OK"),
-        ProbeOutcome::NotChecked => eprintln!(
-            "  Runtime:      —  (run 'lore status --full' to verify inference)"
-        ),
+        ProbeOutcome::NotChecked => {
+            eprintln!("  Runtime:      —  (run 'lore status --full' to verify inference)");
+        }
         ProbeOutcome::Skipped => {}
         ProbeOutcome::Failed(err) => {
             let rendered = render_failure(err);

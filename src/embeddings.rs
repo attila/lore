@@ -131,8 +131,7 @@ pub fn render_failure(err: &ProbeError) -> RenderedFailure {
         }
         ProbeError::Timeout => RenderedFailure {
             short_reason: "timed out".to_string(),
-            status_line: "inference timed out (>30s) — check 'ollama serve' is healthy"
-                .to_string(),
+            status_line: "inference timed out (>30s) — check 'ollama serve' is healthy".to_string(),
             error_line: "Ollama inference call timed out (>30s)".to_string(),
             action_line: "Check 'ollama serve' is healthy and the model isn't loading \
                           from cold storage. If the host is responsive, the runner may be \
@@ -261,9 +260,17 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 impl OllamaClient {
     /// Creates a new `OllamaClient` with the given Ollama host URL and model name.
+    ///
+    /// The internal agent is configured with `http_status_as_error(false)` so
+    /// HTTP 4xx/5xx responses come back as `Ok(Response)` rather than
+    /// `Err(Error::StatusCode(_))`. The runtime probe and `Embedder::embed`
+    /// both need to read the response body on 5xx to surface Ollama's actual
+    /// diagnostic (`llama runner process has terminated: …`) — the error
+    /// variant in ureq 3 does not carry the body, only the status code.
     pub fn new(host: &str, model: &str) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
             .build();
         let agent = ureq::Agent::new_with_config(config);
 
@@ -274,18 +281,32 @@ impl OllamaClient {
         }
     }
 
-    /// Returns `true` if the Ollama server is reachable.
+    /// Returns `true` if the Ollama server is reachable AND answering 2xx.
+    ///
+    /// Since the agent is configured with `http_status_as_error(false)`, we
+    /// must check the status code manually — an HTTP 500 response from a
+    /// broken daemon would otherwise look "healthy".
     pub fn is_healthy(&self) -> bool {
-        self.agent.get(&self.host).call().is_ok()
+        self.agent
+            .get(&self.host)
+            .call()
+            .is_ok_and(|r| r.status().is_success())
     }
 
     /// Returns `true` if the configured model is available on the server.
+    ///
+    /// Checks the status code manually so a non-2xx response from `/api/show`
+    /// (model not found is typically HTTP 404) does not falsely look like
+    /// success under `http_status_as_error(false)`.
     pub fn has_model(&self) -> bool {
         let url = format!("{}/api/show", self.host);
         let req = ShowRequest {
             name: self.model.clone(),
         };
-        self.agent.post(&url).send_json(&req).is_ok()
+        self.agent
+            .post(&url)
+            .send_json(&req)
+            .is_ok_and(|r| r.status().is_success())
     }
 
     /// Pulls the configured model from Ollama, reporting progress via callback.
@@ -297,6 +318,14 @@ impl OllamaClient {
         };
 
         let mut resp = self.agent.post(&url).send_json(&req)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            // Agent is configured with `http_status_as_error(false)`, so a
+            // 5xx from /api/pull does not auto-fail through `?`. Bail
+            // explicitly with the body so callers see the real reason.
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            anyhow::bail!("Ollama /api/pull returned HTTP {status}: {body}");
+        }
         let reader = std::io::BufReader::new(resp.body_mut().as_reader());
 
         for line in reader.lines() {
