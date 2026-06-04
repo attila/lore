@@ -3182,8 +3182,11 @@ fn hook_transcript_tail_toggle_populates_field_when_enabled() {
     });
     // `validate_transcript_path` requires the canonicalised path to
     // live under $HOME — override HOME for the subprocess to match
-    // the tempdir so the transcript read isn't rejected.
-    let home_override = dir.to_str().unwrap();
+    // the tempdir so the transcript read isn't rejected. Canonicalise
+    // the tempdir path so the `startswith(HOME)` check survives macOS
+    // `/var` → `/private/var` symlink resolution.
+    let home_canonical = dir.canonicalize().unwrap();
+    let home_override = home_canonical.to_str().unwrap();
     invoke_hook_with_trace_dir(&config_path, &trace_dir, &input, &[("HOME", home_override)]);
 
     let lines = read_trace_lines(&trace_dir, "trace-transcript-tail-on");
