@@ -1,6 +1,6 @@
 ---
 title: "feat: probe Ollama runtime in `lore status`"
-status: active
+status: completed
 created: 2026-06-04
 type: feat
 depth: lightweight
@@ -261,7 +261,10 @@ branch on it.
      `error` field.
   2. Otherwise, take the first non-empty line of the trimmed body, replace control characters with
      spaces.
-  3. Truncate to 80 characters with an ellipsis if longer.
+  3. Truncate to 240 characters with an ellipsis if longer (bumped from the plan's original 80-char
+     draft during manual verification — 80 chars chopped Ollama's runner-not-found errors mid-path,
+     exactly where the diagnostic value lives; 240 fits multiple full Homebrew Cellar paths on
+     typical terminals while still bounding pathological multi-paragraph bodies).
   4. If the result is empty, fall back to `HTTP <status>` (or `<variant>` for the no-status
      variants) without a dash-body suffix. This rule lives in a small helper in `provision.rs` (or
      `embeddings.rs`) so both the status renderer and the `result.errors`/`result.actions` strings
@@ -559,6 +562,18 @@ the hook proceeds with vector results as before).
   than HTTP 5xx. U1's probe parses 2xx bodies for that case. If the broken-Homebrew integration test
   reveals a different shape (e.g., 200 with empty `embeddings` array), the body-parsing branch is
   extended to recognise it — does not require structural plan changes.
+
+### Discovered during implementation
+
+- **ureq 3.x `http_status_as_error` defaults to `true`.** The plan (and the feasibility reviewer's
+  Round 2 finding) asserted ureq 3 returned `Ok(Response)` for HTTP 5xx. Manual verification against
+  the broken Homebrew bottle revealed the opposite — 5xx came back as `Error::StatusCode(_)` without
+  the body, so the probe rendered `transport error — http status: 500` instead of Ollama's actual
+  diagnostic. Resolved by configuring `OllamaClient`'s agent with `http_status_as_error(false)` and
+  making `is_healthy` / `has_model` / `pull_model` check `response.status()` explicitly to preserve
+  their semantics. The `Out of Scope` guard ("Changing the existing `is_healthy` / `has_model`
+  semantics") still holds — public behaviour is identical, only the implementation reorganised to
+  let the probe path read 5xx bodies.
 
 ---
 

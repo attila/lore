@@ -211,7 +211,10 @@ struct EmbedErrorBody {
 /// 1. JSON `{ "error": "..." }` → use the error field.
 /// 2. Otherwise the first non-empty line of the trimmed body.
 /// 3. Control characters replaced with spaces; trimmed.
-/// 4. Truncated to 80 characters with `…` if longer.
+/// 4. Truncated to 240 characters with `…` if longer — generous enough to
+///    surface Ollama runner errors with full search paths
+///    (`/opt/homebrew/Cellar/ollama/.../runners/...`) on typical terminals,
+///    bounded enough to cap pathological multi-paragraph error bodies.
 /// 5. Empty → `None` (caller falls back to a variant-specific string without
 ///    the dash-body suffix).
 fn extract_body_message(body: &str) -> Option<String> {
@@ -219,6 +222,8 @@ fn extract_body_message(body: &str) -> Option<String> {
     struct ErrorBody {
         error: String,
     }
+
+    const MAX_BODY_CHARS: usize = 240;
 
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -228,7 +233,7 @@ fn extract_body_message(body: &str) -> Option<String> {
     if let Ok(parsed) = serde_json::from_str::<ErrorBody>(trimmed) {
         let cleaned = clean_for_one_line(&parsed.error);
         if !cleaned.is_empty() {
-            return Some(truncate_chars(&cleaned, 80));
+            return Some(truncate_chars(&cleaned, MAX_BODY_CHARS));
         }
     }
 
@@ -237,7 +242,7 @@ fn extract_body_message(body: &str) -> Option<String> {
     if cleaned.is_empty() {
         None
     } else {
-        Some(truncate_chars(&cleaned, 80))
+        Some(truncate_chars(&cleaned, MAX_BODY_CHARS))
     }
 }
 
