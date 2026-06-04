@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-04
+
+### Added
+
+- `lore status --full` now probes the Ollama inference runtime with a live `/api/embed` request,
+  catching runner-subprocess failures the binary/daemon/manifest checks miss. Failures render
+  through a single `render_failure` switchboard with structured `ProbeError` variants and feed the
+  CLI, MCP `lore_status` tool, and the post-install auto-probe identically. (#67)
+- `SessionStart` hook surfaces an actionable warning when the runtime probe fails, including a hint
+  line so the agent can suggest the right remedy without a full status dump. (#67)
+
 ## [0.4.1] - 2026-05-22
 
 ### Fixed
