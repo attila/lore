@@ -7,7 +7,8 @@ use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, OllamaClient};
+use lore::embeddings::{Embedder, OllamaClient, render_failure};
+use lore::provision::ProbeOutcome;
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -133,7 +134,17 @@ EXIT CODES:
     List,
 
     /// Check health of all components
-    Status,
+    Status {
+        /// Run a deeper check that exercises Ollama inference, not just the
+        /// daemon and model manifest. Catches "manifest present but runner
+        /// broken" cases (e.g. the current Homebrew bottle bug).
+        ///
+        /// Adds 3–15 s of cold-load latency on first invocation; subsequent
+        /// invocations may be faster if Ollama still has the model resident
+        /// from a recent call.
+        #[arg(long)]
+        full: bool,
+    },
 
     /// Inspect or maintain per-hook trace files.
     Trace {
@@ -222,7 +233,7 @@ fn main() {
         Commands::Hook => cmd_hook(&config_path),
         Commands::ExtractQueries => cmd_extract_queries(),
         Commands::List => cmd_list(&config_path, json),
-        Commands::Status => cmd_status(&config_path),
+        Commands::Status { full } => cmd_status(&config_path, full),
         Commands::Trace { action } => cmd_trace(&config_path, action, json),
     };
 
@@ -772,14 +783,38 @@ fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
+/// Render the `Runtime:` status line from a `ProbeOutcome`.
+///
+/// - `NotChecked` → discoverability hint (default `lore status` path).
+/// - `Skipped` → omit the line; preceding `Model: ✗` already tells the story.
+/// - `Ok` → green check.
+/// - `Failed` → ✗ plus a variant-specific message from `render_failure`.
+///
+/// Hint emits unconditionally even when preceding lines are ✗; the slight
+/// redundancy is accepted over branching complexity, and reminds the user the
+/// deeper check exists once upstream problems are fixed.
+fn render_runtime_line(outcome: &ProbeOutcome) {
+    match outcome {
+        ProbeOutcome::Ok => eprintln!("  Runtime:      ✓ inference OK"),
+        ProbeOutcome::NotChecked => eprintln!(
+            "  Runtime:      —  (run 'lore status --full' to verify inference)"
+        ),
+        ProbeOutcome::Skipped => {}
+        ProbeOutcome::Failed(err) => {
+            let rendered = render_failure(err);
+            eprintln!("  Runtime:      ✗ {}", rendered.status_line);
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
+fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     let Ok(config) = Config::load(config_path) else {
         eprintln!("✗ No config found. Run 'lore init' first.");
         process::exit(1);
     };
 
-    let status = provision::check_status(&config.ollama.host, &config.ollama.model);
+    let status = provision::check_status(&config.ollama.host, &config.ollama.model, full);
 
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
@@ -814,6 +849,7 @@ fn cmd_status(config_path: &Path) -> anyhow::Result<()> {
         if status.model_available { "✓" } else { "✗" },
         config.ollama.model
     );
+    render_runtime_line(&status.runtime);
     eprintln!("  sqlite-vec:   ✓ bundled");
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
