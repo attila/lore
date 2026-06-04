@@ -12,16 +12,62 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::chunking::AppliesWhen;
 use crate::config::{self, Config};
 use crate::database::{KnowledgeDB, SearchResult};
-use crate::embeddings::Embedder;
+use crate::embeddings::{Embedder, ProbeError, render_failure};
 use crate::engine::{self, CallContext};
 use crate::lore_debug;
 use crate::trace;
+
+/// Per-process state for the FTS-fallback warning rate limit.
+///
+/// Each `lore hook` invocation is typically its own process, so the in-memory
+/// state here only dedupes warnings within a single process — multiple embed
+/// calls in one hook (rare in current code, possible if the hook shape
+/// changes). Cross-process dedup would require persisted state and a TTL,
+/// deliberately deferred per the plan.
+static LAST_EMITTED_FAILURE_CLASS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Emit the FTS-fallback warning, classifying the error via `ProbeError` and
+/// rate-limiting by failure class so the same class within a process does not
+/// repeat the warning.
+///
+/// If the embed error is a `ProbeError` (the common case after U1 wired
+/// `Embedder::embed` through `classify_embed_response`), the warning's short
+/// reason comes from `render_failure`. Other `anyhow::Error` shapes (kept as a
+/// defensive fallback) map to `"unreachable"`.
+fn emit_embed_failure_warning(err: &anyhow::Error) {
+    let short_reason = err.downcast_ref::<ProbeError>().map_or_else(
+        || "unreachable".to_string(),
+        |p| render_failure(p).short_reason,
+    );
+
+    let mut last = match LAST_EMITTED_FAILURE_CLASS.lock() {
+        Ok(guard) => guard,
+        // Lock poisoning here only matters if another thread panicked while
+        // holding it — we still want to emit the warning, so recover.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last.as_deref() == Some(short_reason.as_str()) {
+        // Suppressed because the previous warning had the same class.
+        // Leave a debug breadcrumb so an operator wondering "why didn't I
+        // see the warning?" has a thread to pull via `LORE_DEBUG=1`.
+        lore_debug!("hook: suppressed repeat Ollama-embed warning (class: {short_reason})");
+        return;
+    }
+    *last = Some(short_reason.clone());
+    drop(last);
+
+    eprintln!(
+        "Warning: Ollama embed failed ({short_reason}); falling back to text search. \
+         Run 'lore status --full' for details."
+    );
+}
 
 /// Maximum bytes of a Bash command echoed in `predicate suppress:` debug
 /// lines. Predicate-suppression logs name the offending pattern source plus
@@ -673,7 +719,7 @@ pub fn search_with_threshold_gated(
                 Some(v)
             }
             Err(e) => {
-                eprintln!("Warning: Ollama unreachable ({e}), falling back to text search.");
+                emit_embed_failure_warning(&e);
                 lore_debug!("search: embedding failed: {e}");
                 embed_failed = true;
                 None

@@ -4,13 +4,34 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::embeddings::OllamaClient;
+use crate::embeddings::{OllamaClient, ProbeError, render_failure};
+
+/// Outcome of the runtime probe that exercises Ollama inference.
+///
+/// Marked `#[non_exhaustive]` so future variants (e.g. `Cached`) are not
+/// breaking changes for downstream `match` consumers.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ProbeOutcome {
+    /// Probe ran and the model returned a valid embedding.
+    Ok,
+    /// Probe was not requested — default `lore status` (no `--full`).
+    /// Renders as the discoverability hint line.
+    NotChecked,
+    /// Probe was requested but the prerequisite is missing (no model
+    /// manifest on disk). No point asking Ollama to embed without a model.
+    Skipped,
+    /// Probe ran and Ollama failed to produce an embedding. Carries the
+    /// classified error so consumers render a variant-specific message.
+    Failed(ProbeError),
+}
 
 /// Outcome of a provisioning or status-check run.
 pub struct ProvisionResult {
     pub ollama_installed: bool,
     pub ollama_running: bool,
     pub model_available: bool,
+    pub runtime: ProbeOutcome,
     pub errors: Vec<String>,
     pub actions: Vec<String>,
 }
@@ -23,6 +44,7 @@ pub fn provision(ollama_host: &str, model: &str, on_progress: &dyn Fn(&str)) -> 
         ollama_installed: false,
         ollama_running: false,
         model_available: false,
+        runtime: ProbeOutcome::NotChecked,
         errors: Vec::new(),
         actions: Vec::new(),
     };
@@ -97,6 +119,27 @@ pub fn provision(ollama_host: &str, model: &str, on_progress: &dyn Fn(&str)) -> 
         }
     }
     on_progress(&format!("  ✓ Model '{model}' available"));
+
+    // 4. Verify Ollama can actually run inference. `is_healthy` + `has_model`
+    //    only check that the daemon answers and the manifest is on disk —
+    //    neither exercises the runner subprocess. The probe loads the model
+    //    and runs a single embed against `"."`. `keep_alive: None` lets
+    //    Ollama keep the model resident for the default 5 minutes so the
+    //    ingest that typically follows `lore init` benefits from the warm
+    //    cache.
+    on_progress("Verifying inference runtime...");
+    match client.probe(None) {
+        Ok(()) => {
+            on_progress("  ✓ Inference runtime OK");
+            result.runtime = ProbeOutcome::Ok;
+        }
+        Err(err) => {
+            let rendered = render_failure(&err);
+            result.errors.push(rendered.error_line);
+            result.actions.push(rendered.action_line);
+            result.runtime = ProbeOutcome::Failed(err);
+        }
+    }
 
     result
 }
@@ -188,12 +231,22 @@ fn render_pull_throttled(
     }
 }
 
-/// Quick read-only health check without side effects.
-pub fn check_status(ollama_host: &str, model: &str) -> ProvisionResult {
+/// Quick health check without filesystem or config side effects.
+///
+/// When `full` is true, also runs `OllamaClient::probe(Some(0))` to verify
+/// the inference runtime — this triggers a model load and immediate unload
+/// in Ollama (the `keep_alive: 0` request body), so it has a side effect on
+/// Ollama state but not on the filesystem or config.
+///
+/// Every caller must pass `full` explicitly; there is intentionally no
+/// `Default` impl, so a future caller cannot accidentally default to `true`
+/// and silently probe on every default `lore status` invocation.
+pub fn check_status(ollama_host: &str, model: &str, full: bool) -> ProvisionResult {
     let mut result = ProvisionResult {
         ollama_installed: check_ollama_binary(),
         ollama_running: false,
         model_available: false,
+        runtime: ProbeOutcome::NotChecked,
         errors: Vec::new(),
         actions: Vec::new(),
     };
@@ -202,6 +255,28 @@ pub fn check_status(ollama_host: &str, model: &str) -> ProvisionResult {
     result.ollama_running = client.is_healthy();
     if result.ollama_running {
         result.model_available = client.has_model();
+    }
+
+    if !full {
+        // Default `lore status` — leave `runtime` as `NotChecked` so the
+        // renderer shows the discoverability hint pointing at `--full`.
+        return result;
+    }
+
+    if !result.model_available {
+        // No model — no point probing. Renders as omitted Runtime line.
+        result.runtime = ProbeOutcome::Skipped;
+        return result;
+    }
+
+    // `keep_alive: 30` — short enough that one-off `lore status --full`
+    // calls don't pin ~270 MB of model in RAM for the OLLAMA_KEEP_ALIVE
+    // default (5 minutes), long enough that a "fix Ollama then re-run
+    // --full" debug loop hits a warm cache on the second invocation
+    // instead of paying the 3–15 s cold load again.
+    match client.probe(Some(30)) {
+        Ok(()) => result.runtime = ProbeOutcome::Ok,
+        Err(err) => result.runtime = ProbeOutcome::Failed(err),
     }
 
     result
@@ -279,11 +354,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provision_result_defaults() {
+    fn provision_result_construction() {
         let result = ProvisionResult {
             ollama_installed: false,
             ollama_running: false,
             model_available: false,
+            runtime: ProbeOutcome::NotChecked,
             errors: Vec::new(),
             actions: Vec::new(),
         };
@@ -291,8 +367,31 @@ mod tests {
         assert!(!result.ollama_installed);
         assert!(!result.ollama_running);
         assert!(!result.model_available);
+        assert!(matches!(result.runtime, ProbeOutcome::NotChecked));
         assert!(result.errors.is_empty());
         assert!(result.actions.is_empty());
+    }
+
+    /// `check_status(.., full=false)` is the default `lore status` path. It
+    /// must leave `runtime` as `NotChecked` so the renderer shows the
+    /// discoverability hint pointing at `--full`. Uses an obviously-unreachable
+    /// host so the test does not depend on Ollama being installed.
+    #[test]
+    fn check_status_not_full_leaves_runtime_not_checked() {
+        let result = check_status("http://127.0.0.1:1", "nomic-embed-text", false);
+        assert!(matches!(result.runtime, ProbeOutcome::NotChecked));
+    }
+
+    /// `check_status(.., full=true)` against unreachable Ollama can't reach
+    /// the model manifest, so the probe is skipped — runtime becomes
+    /// `Skipped`, not `Failed`. Distinguishes "no model" from "model present
+    /// but runner broken" at the type level.
+    #[test]
+    fn check_status_full_with_unreachable_ollama_skips_probe() {
+        let result = check_status("http://127.0.0.1:1", "nomic-embed-text", true);
+        assert!(!result.ollama_running);
+        assert!(!result.model_available);
+        assert!(matches!(result.runtime, ProbeOutcome::Skipped));
     }
 
     #[test]

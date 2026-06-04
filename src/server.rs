@@ -14,10 +14,12 @@ use std::io::{self, BufRead, Write};
 use crate::config::Config;
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
+use crate::embeddings::render_failure;
 use crate::git;
 use crate::ingest;
 use crate::ingest::CommitStatus;
 use crate::lockfile::{WriteLock, lock_path_for};
+use crate::provision::{self, ProbeOutcome};
 
 // ---------------------------------------------------------------------------
 // Context
@@ -558,9 +560,14 @@ fn tool_definitions() -> Value {
                              so agents can distinguish a broken query from a genuinely \
                              empty knowledge base), \
                              inbox_workflow_configured, delta_ingest_available, \
-                             loreignore_active, and universal_advisories (count, \
+                             loreignore_active, universal_advisories (count, \
                              oversized bodies, near-miss tags from the most recent full or \
-                             single-file ingest). The empty_knowledge_dir field reports \
+                             single-file ingest), and `ollama` (object with \
+                             `installed`, `running`, `model_available`, `model`, and \
+                             `runtime` — the latter is `{\"state\": \"not_checked\"}` by \
+                             default, switching to `\"ok\"`, `\"skipped\"`, or \
+                             `\"failed\"` with `short_reason` and `status_line` when \
+                             probe_runtime is passed). The empty_knowledge_dir field reports \
                              on-disk state, distinct from sources_indexed (database state): \
                              when sources_indexed is 0 and empty_knowledge_dir is false, \
                              files exist but have not been ingested — run `lore ingest`. \
@@ -568,6 +575,19 @@ fn tool_definitions() -> Value {
                              discriminates further: \"empty\" calls for adding `.md` files \
                              or relaxing `.loreignore`; \"missing\" means the configured \
                              path doesn't exist or isn't a directory. Defaults to false.",
+                        "default": false
+                    },
+                    "probe_runtime": {
+                        "type": "boolean",
+                        "description":
+                            "When true, runs a runtime probe against Ollama (a minimal \
+                             embed call) to verify inference actually works — equivalent \
+                             to `lore status --full`. The result is exposed under \
+                             `metadata.ollama.runtime`. Adds 3–15 seconds of latency on \
+                             first call (cold model load); subsequent calls within 30 s \
+                             are fast. Default false — agents calling lore_status as a \
+                             routine health check should leave this off; agents \
+                             debugging a silent FTS fallback should turn it on.",
                         "default": false
                     }
                 },
@@ -1288,6 +1308,40 @@ fn handle_lore_status(
         .flatten()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
 
+    // Cheap Ollama state check — no probe (no runtime call). Mirrors the
+    // CLI `lore status` default-mode output. Agents that need the deeper
+    // runtime check can pass `probe_runtime: true` (see below) or shell
+    // out to `lore status --full`. Default-mode probe would add 3–15 s
+    // cold-load latency to every MCP `lore_status` call, which is the
+    // wrong default for a frequently-polled health endpoint.
+    let ollama_status =
+        provision::check_status(&ctx.config.ollama.host, &ctx.config.ollama.model, false);
+    let probe_runtime = args
+        .get("probe_runtime")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ollama_runtime = if probe_runtime {
+        let client =
+            crate::embeddings::OllamaClient::new(&ctx.config.ollama.host, &ctx.config.ollama.model);
+        if ollama_status.model_available {
+            match client.probe(Some(30)) {
+                Ok(()) => ProbeOutcome::Ok,
+                Err(err) => ProbeOutcome::Failed(err),
+            }
+        } else {
+            ProbeOutcome::Skipped
+        }
+    } else {
+        ProbeOutcome::NotChecked
+    };
+    let ollama_json = json!({
+        "installed": ollama_status.ollama_installed,
+        "running": ollama_status.ollama_running,
+        "model_available": ollama_status.model_available,
+        "model": ctx.config.ollama.model,
+        "runtime": runtime_outcome_to_json(&ollama_runtime),
+    });
+
     let mut metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
         "knowledge_dir_status": knowledge_dir_status,
@@ -1303,6 +1357,7 @@ fn handle_lore_status(
         "delta_ingest_available": delta_ingest_available,
         "loreignore_active": loreignore_active,
         "universal_advisories": universal_advisories,
+        "ollama": ollama_json,
     });
 
     // Track 2 Observability: surface trace state when tracing is on.
@@ -1361,6 +1416,31 @@ fn handle_lore_status(
 
     let summary_with_fence = maybe_append_lore_metadata_fence(summary, &metadata, include_metadata);
     text_response(req, &summary_with_fence)
+}
+
+/// Build the JSON value surfaced under `metadata.ollama.runtime` on the MCP
+/// `lore_status` tool. Mirrors the variant set of
+/// `crate::provision::ProbeOutcome` in machine-readable form:
+/// - `Ok` → `{ "state": "ok" }`
+/// - `NotChecked` → `{ "state": "not_checked" }` (no probe was requested)
+/// - `Skipped` → `{ "state": "skipped" }` (model manifest absent)
+/// - `Failed(err)` → `{ "state": "failed", "short_reason": "...", "status_line": "..." }`
+///   where the strings come from `render_failure(&err)` — the same source
+///   the CLI `lore status --full` Runtime line uses.
+fn runtime_outcome_to_json(outcome: &ProbeOutcome) -> Value {
+    match outcome {
+        ProbeOutcome::Ok => json!({ "state": "ok" }),
+        ProbeOutcome::NotChecked => json!({ "state": "not_checked" }),
+        ProbeOutcome::Skipped => json!({ "state": "skipped" }),
+        ProbeOutcome::Failed(err) => {
+            let rendered = render_failure(err);
+            json!({
+                "state": "failed",
+                "short_reason": rendered.short_reason,
+                "status_line": rendered.status_line,
+            })
+        }
+    }
 }
 
 /// Build the JSON value surfaced under `metadata.trace` on the MCP
