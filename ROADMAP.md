@@ -49,7 +49,12 @@
       `docs/plans/2026-05-08-001-feat-sessionstart-respect-applies-when-plan.md`.
 - [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
       `new_string` fields in Edit/Write tool input to improve search relevance
-- [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
+- [ ] Plugin distribution via Claude and Codex marketplaces — package the existing Claude Code
+      integration and the Codex integration for local marketplace testing first, with committed
+      in-repo dev manifests where the host supports them. Then decide whether public distribution
+      stays in this repo, moves to a dedicated marketplace catalog repo, or uses vendor-managed
+      marketplace publishing. Must cover versioning, binary-on-PATH assumptions, local UAT, and
+      install docs.
 - [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
 - [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
