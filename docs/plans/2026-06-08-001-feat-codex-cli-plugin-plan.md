@@ -1,7 +1,7 @@
 ---
 title: "feat: Codex CLI plugin"
 type: feat
-status: active
+status: blocked
 created: 2026-06-08
 origin: docs/brainstorms/2026-06-08-codex-plugin-requirements.md
 ---
@@ -21,6 +21,14 @@ adapter consumes them, so a third adapter (Cursor, opencode) inherits the same i
 Codex stdin captures land as test fixtures before the adapter is written, and shipping is gated on a
 model-side delivery check (asking a live Codex session to quote a SessionStart payload back), not on
 hook-exit-zero.
+
+**Status as of 2026-06-09:** implementation and local packaging are preserved on
+`feat/codex-plugin`, but shipping is blocked by Codex CLI UX/API behaviour. Codex renders
+`hookSpecificOutput.additionalContext` visibly in the terminal transcript. lore's hook product
+depends on full-fidelity, model-visible, operator-hidden context injection; replacing full pattern
+bodies with summaries would change the product rather than fix the integration. Until Codex exposes
+a model-visible hidden hook-context channel equivalent to Claude Code's behaviour, this adapter is
+experimental only. Upstream tracker: <https://github.com/openai/codex/issues/16933>.
 
 ---
 
@@ -562,6 +570,11 @@ The tree is a scope declaration. Per-unit `**Files:**` sections remain authorita
 
 ### Deferred to Follow-Up Work
 
+- **Codex hidden hook-context channel.** Local UAT on 2026-06-09 showed Codex rendering full
+  `additionalContext` hook injections directly in the terminal. This makes full-body lore pattern
+  injection unusable for operators, because pages of injected convention text are visually
+  indistinguishable from agent conversation. Do not ship Codex auto-injection until Codex provides a
+  model-visible, terminal-hidden context channel or an equivalent display-suppression control.
 - **Coverage-check skill: Codex-shape query simulation.** The skill currently simulates the Claude
   adapter's query construction. Codex's `apply_patch` produces different queries. File a follow-up
   issue: "Teach `/lore:coverage-check` the Codex adapter's query shape so coverage measurements stay

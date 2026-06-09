@@ -2,6 +2,15 @@
 
 ## Up Next
 
+- [ ] Codex hook UX unblocker — the local Codex plugin scaffold, fixtures, and experimental
+      `lore codex-hook` adapter exist on `feat/codex-plugin`, but shipping is blocked because Codex
+      renders `hookSpecificOutput.additionalContext` visibly in the terminal transcript. lore's
+      deterministic hook injection requires full pattern bodies to be model-visible and
+      operator-hidden, matching the Claude Code UX. Do not weaken this to summarized injections;
+      track upstream support for a hidden/model-only hook context channel instead. Upstream issue:
+      <https://github.com/openai/codex/issues/16933>. See
+      `docs/plans/2026-06-08-001-feat-codex-cli-plugin-plan.md`.
+
 ## Future
 
 - [ ] PostCompact re-prime workaround — Claude Code's hook output validator rejects

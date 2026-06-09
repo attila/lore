@@ -2,6 +2,13 @@
 
 _Brainstorm output, 2026-06-08. Standard scope, Lightweight artifact._
 
+**2026-06-09 outcome:** this remains a valid implementation direction for local experimentation, but
+public shipping is blocked. Codex CLI currently renders hook `hookSpecificOutput.additionalContext`
+visibly in the terminal transcript. lore's deterministic hook injection requires full pattern bodies
+to be model-visible while hidden from the operator's conversation view, as they are in Claude Code.
+A summarized or title-only Codex mode is not product equivalent. Upstream tracker:
+<https://github.com/openai/codex/issues/16933>.
+
 ## Why this work
 
 lore today ships a Claude Code plugin (`integrations/claude-code/`). Users on OpenAI's Codex CLI
