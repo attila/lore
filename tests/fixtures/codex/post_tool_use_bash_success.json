@@ -1,0 +1,15 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "turn_id": "00000000-0000-4000-8000-000000000101",
+  "transcript_path": "/Users/alice/.codex/sessions/2026/06/08/rollout-session.jsonl",
+  "cwd": "/workspace/lore",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.5",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf codex-bash-fixture"
+  },
+  "tool_response": "codex-bash-fixture",
+  "tool_use_id": "call_codex_bash_fixture"
+}

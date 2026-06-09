@@ -1,0 +1,21 @@
+{
+  "name": "lore-codex",
+  "version": "0.5.0",
+  "description": "Deterministic coding convention injection via lore knowledge base for Codex CLI",
+  "author": {
+    "name": "Attila Beregszaszi"
+  },
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["lore", "codex", "mcp", "hooks", "coding-conventions"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "lore",
+    "shortDescription": "Inject curated project conventions into Codex sessions.",
+    "longDescription": "lore exposes a local semantic knowledge base as MCP tools and deterministic Codex lifecycle hooks, so coding agents receive relevant project conventions before they edit or run commands.",
+    "developerName": "Attila Beregszaszi",
+    "category": "Coding",
+    "capabilities": ["MCP", "Hooks", "Skills"]
+  }
+}

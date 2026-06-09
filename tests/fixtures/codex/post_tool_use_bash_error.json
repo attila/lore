@@ -1,0 +1,15 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000002",
+  "turn_id": "00000000-0000-4000-8000-000000000102",
+  "transcript_path": "/Users/alice/.codex/sessions/2026/06/08/rollout-session.jsonl",
+  "cwd": "/workspace/lore",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.5",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "sh -c 'echo codex-fail-fixture >&2; exit 7'"
+  },
+  "tool_response": "codex-fail-fixture\n",
+  "tool_use_id": "call_codex_bash_error_fixture"
+}

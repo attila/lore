@@ -1,0 +1,7 @@
+{
+  "lore": {
+    "command": "lore",
+    "args": ["serve"],
+    "type": "stdio"
+  }
+}

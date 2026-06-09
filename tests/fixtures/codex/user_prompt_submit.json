@@ -1,0 +1,10 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "turn_id": "00000000-0000-4000-8000-000000000101",
+  "transcript_path": "/Users/alice/.codex/sessions/2026/06/08/rollout-session.jsonl",
+  "cwd": "/workspace/lore",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5.5",
+  "permission_mode": "bypassPermissions",
+  "prompt": "Use the shell to run: printf codex-bash-fixture. Then reply done."
+}

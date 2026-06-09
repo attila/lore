@@ -1,0 +1,14 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000003",
+  "turn_id": "00000000-0000-4000-8000-000000000103",
+  "transcript_path": "/Users/alice/.codex/sessions/2026/06/08/rollout-session.jsonl",
+  "cwd": "/workspace/lore",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-5.5",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "apply_patch",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Add File: tmp/codex-apply-patch-fixture.txt\n+codex apply patch fixture\n*** End Patch\n"
+  },
+  "tool_use_id": "call_codex_apply_patch_fixture"
+}
