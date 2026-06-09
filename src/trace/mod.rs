@@ -44,9 +44,9 @@ pub mod writer;
 pub use stats::{CapturePosture, TraceStats};
 
 pub use record::{
-    AGENT_CLAUDE_CODE, CallContextSnapshot, CandidateRecord, ConfigSnapshot, FullConfigSnapshot,
-    OllamaState, Phases, PostCompactRecord, PostToolUseRecord, PreToolUseRecord, PredicateOutcome,
-    SCHEMA_VERSION, SessionStartRecord, TraceRecord,
+    AGENT_CLAUDE_CODE, AGENT_CODEX, CallContextSnapshot, CandidateRecord, ConfigSnapshot,
+    FullConfigSnapshot, OllamaState, Phases, PostCompactRecord, PostToolUseRecord,
+    PreToolUseRecord, PredicateOutcome, SCHEMA_VERSION, SessionStartRecord, TraceRecord,
 };
 pub use writer::{append_record, trace_file_path};
 

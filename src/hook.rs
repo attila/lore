@@ -416,7 +416,10 @@ fn handle_pre_tool_use(
 ///   [`PREDICATE_LOG_CMD_HEAD_BYTES`] via [`engine::truncate_str`].
 /// * Aggregate: `predicate: N before -> M after (K suppressed)` once at the
 ///   end.
-fn apply_predicate_filter(chunks: Vec<SearchResult>, cc: &CallContext) -> Vec<SearchResult> {
+pub(crate) fn apply_predicate_filter(
+    chunks: Vec<SearchResult>,
+    cc: &CallContext,
+) -> Vec<SearchResult> {
     let before = chunks.len();
     let mut suppressed: usize = 0;
 
@@ -486,7 +489,7 @@ fn apply_predicate_filter(chunks: Vec<SearchResult>, cc: &CallContext) -> Vec<Se
 /// source files (e.g. if Error Handling matched, also inject Functions and
 /// Naming from the same document). Falls back to the original slice when
 /// the database query fails.
-fn expand_to_siblings(db: &KnowledgeDB, seeds: &[SearchResult]) -> Vec<SearchResult> {
+pub(crate) fn expand_to_siblings(db: &KnowledgeDB, seeds: &[SearchResult]) -> Vec<SearchResult> {
     if seeds.is_empty() {
         return Vec::new();
     }
@@ -589,13 +592,9 @@ fn handle_post_tool_use(
     }
 
     // Use stderr as a search query (clean it into terms).
-    let terms = engine::split_into_words(stderr);
-    let cleaned = engine::clean_terms(&terms);
-    if cleaned.is_empty() {
+    let Some(query) = engine::query_from_error_text(stderr) else {
         return Ok(None);
-    }
-
-    let query = cleaned.join(" OR ");
+    };
     lore_debug!("PostToolUse: error query: {query}");
     let (results, phases) = search_with_threshold(db, embedder, config, &query)?;
 
@@ -635,7 +634,7 @@ fn handle_post_tool_use(
 ///
 /// Pure on `Vec<SearchResult>` so unit tests can exercise the branching logic
 /// without standing up a real `KnowledgeDB` and `Embedder`.
-fn apply_relevance_thresholds(
+pub(crate) fn apply_relevance_thresholds(
     results: Vec<SearchResult>,
     min_relevance: f64,
     universal_floor: f64,
@@ -824,7 +823,10 @@ pub fn search_with_threshold_gated(
 /// to decide whether to inject the git advisory paragraph. `SessionStart` and
 /// `PostCompact` are infrequent events, so the per-call subprocess cost is
 /// acceptable.
-fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Result<String> {
+pub(crate) fn format_session_context(
+    db: &KnowledgeDB,
+    knowledge_dir: &Path,
+) -> anyhow::Result<String> {
     let patterns = db.list_patterns()?;
 
     let mut out = String::from(
@@ -956,7 +958,7 @@ fn render_pinned_conventions(db: &KnowledgeDB, _knowledge_dir: &Path) -> anyhow:
 
 /// Derive the dedup file path from the session ID in the input.
 /// Returns `None` if no session ID is present.
-fn session_dedup_path(input: &HookInput) -> Option<PathBuf> {
+pub(crate) fn session_dedup_path(input: &HookInput) -> Option<PathBuf> {
     input.session_id.as_deref().map(dedup_file_path)
 }
 
@@ -1024,7 +1026,7 @@ pub fn reset_dedup(path: &Path) -> anyhow::Result<()> {
 /// faithful "what was injected this session" log, and the read-side
 /// exemption is the defensive choice per
 /// `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`.
-fn dedup_filter_and_record(
+pub(crate) fn dedup_filter_and_record(
     path: &Path,
     results: &[SearchResult],
 ) -> anyhow::Result<Vec<SearchResult>> {
@@ -1121,6 +1123,7 @@ impl HookInput {
             command: tool_input_str(self, "command"),
             file_path: tool_input_str(self, "file_path"),
             description: tool_input_str(self, "description"),
+            prompt: None,
             transcript_tail,
         }
     }
@@ -1128,12 +1131,12 @@ impl HookInput {
 
 /// Returns `true` if the agent type is read-only and should not receive
 /// pattern injection (e.g. Explore, Plan subagents).
-fn skip_agent(input: &HookInput) -> bool {
+pub(crate) fn skip_agent(input: &HookInput) -> bool {
     matches!(input.agent_type.as_deref(), Some("Explore" | "Plan"))
 }
 
 /// Extract a string field from `tool_input` by key.
-fn tool_input_str(input: &HookInput, key: &str) -> Option<String> {
+pub(crate) fn tool_input_str(input: &HookInput, key: &str) -> Option<String> {
     input
         .tool_input
         .as_ref()?
@@ -1147,7 +1150,7 @@ fn tool_input_str(input: &HookInput, key: &str) -> Option<String> {
 /// Returns `Some(canonical_path)` if valid, `None` if the path is outside
 /// `$HOME`, doesn't exist, or `$HOME` is not set. Consistent with the
 /// existing fallthrough where `last_user_message` returns `None`.
-fn validate_transcript_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn validate_transcript_path(path: &Path) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let home = PathBuf::from(home);
     let canonical = path.canonicalize().ok()?;
@@ -1167,7 +1170,7 @@ const TRANSCRIPT_TAIL_BYTES: usize = 32_768;
 
 /// Read the last ~32KB of a transcript JSONL file in reverse to find the
 /// last user message. Bounds the read to prevent OOM on large transcripts.
-fn last_user_message(path: &Path) -> Option<String> {
+pub(crate) fn last_user_message(path: &Path) -> Option<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let mut file = std::fs::File::open(path).ok()?;
@@ -1273,7 +1276,10 @@ fn resolve_trace_dir() -> Option<PathBuf> {
 
 /// Capture the verbatim `CallContextSnapshot` from a [`CallContext`], honouring
 /// the `[trace] include_full_command` / `include_transcript_tail` toggles.
-fn snapshot_call_context(cc: &CallContext, config: &Config) -> trace::CallContextSnapshot {
+pub(crate) fn snapshot_call_context(
+    cc: &CallContext,
+    config: &Config,
+) -> trace::CallContextSnapshot {
     let command_head = cc
         .command
         .as_deref()
@@ -1301,7 +1307,7 @@ fn snapshot_call_context(cc: &CallContext, config: &Config) -> trace::CallContex
 }
 
 /// Build a [`trace::ConfigSnapshot`] from the active [`Config`].
-fn snapshot_search_config(config: &Config) -> trace::ConfigSnapshot {
+pub(crate) fn snapshot_search_config(config: &Config) -> trace::ConfigSnapshot {
     trace::ConfigSnapshot {
         hybrid: config.search.hybrid,
         top_k: config.search.top_k,
@@ -1312,7 +1318,7 @@ fn snapshot_search_config(config: &Config) -> trace::ConfigSnapshot {
 }
 
 /// Build the full configuration snapshot recorded once at `SessionStart`.
-fn snapshot_full_config(config: &Config) -> trace::FullConfigSnapshot {
+pub(crate) fn snapshot_full_config(config: &Config) -> trace::FullConfigSnapshot {
     trace::FullConfigSnapshot {
         knowledge_dir: config.knowledge_dir.display().to_string(),
         database: config.database.display().to_string(),
@@ -1371,7 +1377,7 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 
 /// Emit a `PreToolUse` trace record. Fire-and-forget; gated upstream.
 #[allow(clippy::too_many_arguments)]
-fn emit_pre_tool_use_trace(
+pub(crate) fn emit_pre_tool_use_trace(
     config: &Config,
     session_id: &str,
     cc: &CallContext,
@@ -1406,7 +1412,7 @@ fn emit_pre_tool_use_trace(
 
 /// Emit a `PostToolUse` trace record. Fire-and-forget; gated upstream.
 #[allow(clippy::too_many_arguments)]
-fn emit_post_tool_use_trace(
+pub(crate) fn emit_post_tool_use_trace(
     config: &Config,
     session_id: &str,
     cc: &CallContext,
@@ -1437,7 +1443,11 @@ fn emit_post_tool_use_trace(
 }
 
 /// Emit a `SessionStart` trace record. Fire-and-forget; gated upstream.
-fn emit_session_start_trace(config: &Config, session_id: &str, start: std::time::Instant) {
+pub(crate) fn emit_session_start_trace(
+    config: &Config,
+    session_id: &str,
+    start: std::time::Instant,
+) {
     let Some(trace_dir) = resolve_trace_dir() else {
         return;
     };
@@ -1453,7 +1463,7 @@ fn emit_session_start_trace(config: &Config, session_id: &str, start: std::time:
 }
 
 /// Emit a `PostCompact` trace record. Fire-and-forget; gated upstream.
-fn emit_post_compact_trace(session_id: &str, start: std::time::Instant) {
+pub(crate) fn emit_post_compact_trace(session_id: &str, start: std::time::Instant) {
     let Some(trace_dir) = resolve_trace_dir() else {
         return;
     };
@@ -1770,6 +1780,7 @@ mod tests {
             command: Some(command.to_string()),
             file_path: None,
             description: None,
+            prompt: None,
             transcript_tail: None,
         }
     }

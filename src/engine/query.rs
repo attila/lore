@@ -29,10 +29,11 @@ use std::path::{Component, Path};
 
 use crate::engine::call_context::CallContext;
 use crate::engine::languages::{
-    languages_for_command_keyword, languages_for_directory_hint, languages_for_extension,
-    languages_for_marker_filename,
+    is_known_token, languages_for_command_keyword, languages_for_directory_hint,
+    languages_for_extension, languages_for_marker_filename,
 };
 use crate::engine::text::{split_into_words, truncate_str};
+use crate::lore_debug;
 
 /// Tool-name string the Bash branch keys off.
 const TOOL_BASH: &str = "Bash";
@@ -108,6 +109,23 @@ pub fn assemble_fts_query(inferred: &[String], cleaned: &[String]) -> Option<Str
     assemble_query(inferred, cleaned)
 }
 
+/// Build an FTS5 query from tool error text.
+///
+/// Post-tool error lookup intentionally has no structural language anchor:
+/// stderr often names the failing binary, path, or message rather than a
+/// source-language signal. Keep the cleaning path shared with regular hook
+/// extraction so sibling adapters do not duplicate the old inline
+/// `split_into_words` -> `clean_terms` -> `join(" OR ")` pipeline.
+pub fn query_from_error_text(stderr: &str) -> Option<String> {
+    let terms = split_into_words(stderr);
+    let cleaned = clean_terms(&terms);
+    let query = assemble_fts_query(&[], &cleaned);
+    if query.is_none() {
+        lore_debug!("PostToolUse: error text produced no query terms");
+    }
+    query
+}
+
 /// Returns the set of inferred languages for a [`CallContext`].
 ///
 /// File-path signals chain by priority — marker filename > extension >
@@ -151,6 +169,10 @@ pub fn infer_languages(ctx: &CallContext) -> Vec<String> {
         extend_unique(&mut out, language_from_bash(description_text));
     }
 
+    if let Some(prompt) = ctx.prompt.as_deref() {
+        extend_unique(&mut out, language_from_prompt(prompt));
+    }
+
     out
 }
 
@@ -186,6 +208,10 @@ fn harvest_terms(ctx: &CallContext) -> Vec<String> {
         if let Some(description) = ctx.description.as_deref() {
             terms.extend(split_into_words(description));
         }
+    }
+
+    if let Some(prompt) = ctx.prompt.as_deref() {
+        terms.extend(split_into_words(prompt));
     }
 
     if let Some(transcript_tail) = ctx.transcript_tail.as_deref() {
@@ -290,6 +316,23 @@ pub fn language_from_bash(command: &str) -> Vec<String> {
             .unwrap_or(raw);
         let lower = basename.to_lowercase();
         extend_unique(&mut out, languages_for_command_keyword(&lower));
+    }
+    out
+}
+
+/// Infer languages from free-form prompt text.
+///
+/// Prompt text is prose, not a shell command, so canonical language names
+/// such as `typescript` and `rust` count as direct signals. Command-keyword
+/// matching is still useful for prompts like "help me with cargo test", but
+/// unlike predicates this is retrieval-only and does not grant Bash semantics.
+fn language_from_prompt(prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in split_into_words(prompt) {
+        if is_known_token(&raw) {
+            extend_unique(&mut out, vec![raw.clone()]);
+        }
+        extend_unique(&mut out, languages_for_command_keyword(&raw));
     }
     out
 }
@@ -438,6 +481,49 @@ mod tests {
             query.contains("email"),
             "should have filename term: {query}"
         );
+    }
+
+    #[test]
+    fn query_from_error_text_returns_terms() {
+        let query = query_from_error_text("error: failed to compile foo.rs at line 42").unwrap();
+        assert!(query.contains("failed"), "missing failed: {query}");
+        assert!(query.contains("compile"), "missing compile: {query}");
+        assert!(query.contains("foo"), "missing foo: {query}");
+    }
+
+    #[test]
+    fn query_from_error_text_empty_returns_none() {
+        assert_eq!(query_from_error_text(""), None);
+    }
+
+    #[test]
+    fn query_from_error_text_stop_words_returns_none() {
+        assert_eq!(query_from_error_text("the and for with from"), None);
+    }
+
+    #[test]
+    fn extract_query_prompt_harvests_terms() {
+        let ctx = CallContext {
+            prompt: Some("help me refactor rust hook code".to_string()),
+            ..CallContext::empty()
+        };
+
+        let (_langs, terms) = extract_query(&ctx).unwrap();
+
+        assert!(terms.contains(&"refactor".to_string()), "{terms:?}");
+        assert!(terms.contains(&"rust".to_string()), "{terms:?}");
+    }
+
+    #[test]
+    fn infer_languages_reads_prompt_text() {
+        let ctx = CallContext {
+            prompt: Some("rewrite this in TypeScript".to_string()),
+            ..CallContext::empty()
+        };
+
+        let langs = infer_languages(&ctx);
+
+        assert!(langs.contains(&"typescript".to_string()), "{langs:?}");
     }
 
     #[test]

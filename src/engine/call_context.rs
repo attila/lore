@@ -3,7 +3,8 @@
 //! [`CallContext`] is the input contract every engine function speaks. It
 //! carries the pre-extracted strings an adapter (Claude Code's `src/hook.rs`,
 //! a future Cursor adapter, ...) hands the engine: the tool name, the Bash
-//! command (when applicable), the file path / description (for non-Bash
+//! command (when applicable), user prompt text (when the host exposes a
+//! prompt-submission event), the file path / description (for non-Bash
 //! tools), and the eagerly-read transcript tail. All fields are owned
 //! `String`s — one allocation per field, called once per `PreToolUse`, so
 //! borrow lifetimes would buy nothing here. Simple beats clever.
@@ -21,7 +22,7 @@
 ///
 /// Every field is `Option<String>` so adapters can populate only what their
 /// agent harness exposes. The Claude Code adapter (U5) will populate all
-/// five from a single `HookInput` event.
+/// five from a single `HookInput` event and leaves `prompt` empty.
 #[derive(Debug, Clone)]
 pub struct CallContext {
     /// Tool name as the adapter reports it (case-sensitive, matched against
@@ -37,6 +38,11 @@ pub struct CallContext {
     pub file_path: Option<String>,
     /// Free-form description argument (`Task`, `TodoWrite`, ...).
     pub description: Option<String>,
+    /// User prompt text exposed by hosts with a prompt-submission hook.
+    /// Unlike Bash command signals, prompt text is harvested
+    /// unconditionally for retrieval and language inference, but must not
+    /// satisfy Bash-specific predicates.
+    pub prompt: Option<String>,
     /// Trailing snippet of the user's transcript, read eagerly by the
     /// adapter and capped at 32 KB. The engine treats this as opaque text
     /// — no I/O happens here.
@@ -55,6 +61,7 @@ impl CallContext {
             command: None,
             file_path: None,
             description: None,
+            prompt: None,
             transcript_tail: None,
         }
     }

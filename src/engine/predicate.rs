@@ -409,6 +409,17 @@ mod tests {
         assert!(!evaluate_applies_when(&predicate, &ctx));
     }
 
+    #[test]
+    fn prompt_text_does_not_trip_bash_prefix_predicate() {
+        let predicate = aw(None, Some(&["git"]));
+        let ctx = CallContext {
+            prompt: Some("run git status".to_string()),
+            ..CallContext::empty()
+        };
+
+        assert!(!evaluate_applies_when(&predicate, &ctx));
+    }
+
     // -----------------------------------------------------------------
     // AE2 (engine side): predicate suppresses unrelated Bash invocations
     // -----------------------------------------------------------------

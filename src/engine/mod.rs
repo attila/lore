@@ -32,7 +32,7 @@ pub use predicate::{command_matches_with_wrappers, evaluate_applies_when};
 pub use query::{
     assemble_fts_query, clean_terms, extract_query, filename_terms, infer_languages,
     language_from_bash, language_from_directory_hint, language_from_extension,
-    language_from_marker_filename,
+    language_from_marker_filename, query_from_error_text,
 };
 pub use text::{split_into_words, truncate_str};
 

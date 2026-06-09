@@ -20,10 +20,13 @@ use serde::{Deserialize, Serialize};
 /// tolerate the older shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Canonical agent identifier for the Claude Code adapter. Future adapters
-/// (Cursor, opencode, …) ride into the same trace directory under their own
-/// agent string and are disambiguated by the `lore trace why --agent` filter.
+/// Canonical agent identifier for the Claude Code adapter. Sibling adapters
+/// ride into the same trace directory under their own agent string and are
+/// disambiguated by the `lore trace why --agent` filter.
 pub const AGENT_CLAUDE_CODE: &str = "claude-code";
+
+/// Canonical agent identifier for the Codex CLI adapter.
+pub const AGENT_CODEX: &str = "codex";
 
 /// A single per-event trace record. Tagged on `event` so the canonical
 /// taxonomy lives in the JSON shape, not in caller-side discrimination.
@@ -359,6 +362,19 @@ mod tests {
     #[test]
     fn agent_accessor_returns_per_variant_agent() {
         assert_eq!(sample_pre_tool_use().agent(), AGENT_CLAUDE_CODE);
+    }
+
+    #[test]
+    fn codex_agent_round_trips() {
+        let TraceRecord::PreToolUse(mut record) = sample_pre_tool_use() else {
+            panic!("sample should be PreToolUse");
+        };
+        record.agent = AGENT_CODEX.to_string();
+
+        let json = serde_json::to_string(&TraceRecord::PreToolUse(record)).unwrap();
+        let parsed: TraceRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.agent(), AGENT_CODEX);
     }
 
     #[test]
