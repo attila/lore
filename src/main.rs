@@ -8,11 +8,11 @@ use clap::{Parser, Subcommand};
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{Embedder, OllamaClient, render_failure};
-use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
 use lore::provision::ProbeOutcome;
 use lore::status::format_languages_line;
+use lore::{codex_hook, hook};
 use lore::{git, ingest, provision, server};
 
 #[derive(Parser)]
@@ -111,6 +111,9 @@ NOTES:
 
     /// Process a Claude Code lifecycle hook (reads JSON from stdin)
     Hook,
+
+    /// Process an OpenAI Codex CLI lifecycle hook (reads JSON from stdin)
+    CodexHook,
 
     /// Simulate hook query extraction for a synthetic tool call.
     ///
@@ -231,6 +234,7 @@ fn main() {
             cmd_search(&config_path, &query.join(" "), top_k, json)
         }
         Commands::Hook => cmd_hook(&config_path),
+        Commands::CodexHook => cmd_codex_hook(&config_path),
         Commands::ExtractQueries => cmd_extract_queries(),
         Commands::List => cmd_list(&config_path, json),
         Commands::Status { full } => cmd_status(&config_path, full),
@@ -713,6 +717,40 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
     db.init()?;
 
     if let Some(output) = hook::handle_hook(&input, &db, &ollama, &config)? {
+        let json = serde_json::to_string(&output)?;
+        println!("{json}");
+    }
+
+    Ok(())
+}
+
+/// Process an OpenAI Codex CLI lifecycle hook.
+///
+/// Mirrors `cmd_hook`: hooks must never break the agent, so all errors are
+/// swallowed after a stderr diagnostic.
+#[allow(clippy::unnecessary_wraps)]
+fn cmd_codex_hook(config_path: &Path) -> anyhow::Result<()> {
+    if let Err(e) = cmd_codex_hook_inner(config_path) {
+        eprintln!("lore codex-hook: {e}");
+        lore_debug!("codex hook pipeline error (swallowed): {e:#}");
+    }
+    Ok(())
+}
+
+fn cmd_codex_hook_inner(config_path: &Path) -> anyhow::Result<()> {
+    let input = codex_hook::read_input()?;
+    lore_debug!(
+        "codex hook stdin: event={} tool={}",
+        input.hook_event_name,
+        input.tool_name.as_deref().unwrap_or("none"),
+    );
+
+    let config = Config::load(config_path)?;
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    db.init()?;
+
+    if let Some(output) = codex_hook::handle_hook(&input, &db, &ollama, &config)? {
         let json = serde_json::to_string(&output)?;
         println!("{json}");
     }

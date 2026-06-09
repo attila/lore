@@ -1,4 +1,5 @@
 pub mod chunking;
+pub mod codex_hook;
 pub mod config;
 pub mod database;
 pub mod debug;
