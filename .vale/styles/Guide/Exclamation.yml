@@ -1,0 +1,7 @@
+# No exclamation marks.
+extends: existence
+message: "Exclamation mark. End the sentence with a full stop."
+level: error
+nonword: true
+tokens:
+  - "!"

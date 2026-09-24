@@ -1,6 +1,6 @@
 ---
 name: coverage-check
-description: Audit a pattern file's vocabulary coverage by simulating the PreToolUse hook's query extraction on synthetic tool calls, ingesting the file, and reporting which queries surface it. Catches paraphrase gaps in pattern wording. Not a quality gate — see the limit disclosure below.
+description: Audit a pattern file's vocabulary coverage by simulating the PreToolUse hook's query extraction on synthetic tool calls, ingesting the file, and reporting which queries surface it. Catches paraphrase gaps in pattern wording. Not a quality gate. See the limit disclosure below.
 disable-model-invocation: true
 user-invocable: true
 ---
@@ -15,7 +15,7 @@ file, search for each query in parallel, score per-query coverage, suggest concr
 gaps, and iterate until convergence.
 
 Invoke as `/lore:coverage-check <pattern-file-path>` with a path relative to the configured
-`knowledge_dir` (the knowledge directory that lore is configured to index — see step 2 for how the
+`knowledge_dir` (the knowledge directory that lore is configured to index, see step 2 for how the
 skill resolves this from the `lore_status` MCP tool). The path argument is `$ARGUMENTS`.
 
 **Quoting discipline (do not skip):** every Bash invocation in this skill that interpolates
@@ -46,10 +46,10 @@ Rules:
   line.
 - Use consecutive uppercase letters starting from `A`. No numbered lists, no `y/N`, no free-form
   prose choices.
-- Each option is a single line and an imperative verb phrase — "Accept all edits", not "You can
+- Each option is a single line and an imperative verb phrase: "Accept all edits", not "You can
   accept all edits if you want".
 - If an option needs a payload from the author (a list of numbers, a corrected tool-call list),
-  accept it on the **same reply** when the author prefixes the payload with the letter — e.g.
+  accept it on the **same reply** when the author prefixes the payload with the letter, e.g.
   `B: 1, 3, 4`. If the letter arrives without the payload, the skill prompts once more for the
   payload. Never guess a default.
 - Do not add a footer explaining how to reply. The format is self-evident.
@@ -65,10 +65,9 @@ This skill catches **vocabulary gaps** between a pattern's wording and the queri
 PreToolUse hook actually synthesizes from agent tool calls. It is not a production coverage proof,
 but it is stronger than a paraphrase check: the candidate queries are produced by the same
 `extract_query` code path the hook uses at runtime, not by the LLM paraphrasing the pattern body.
-Residual bias comes from the tool-call inference step — the agent picks which synthetic tool calls
-to simulate based on the pattern's tags, headings, and code fences — but the query strings
-themselves are deterministic hook output. Treat the report as a strong baseline check, not a quality
-gate.
+Residual bias comes from the tool-call inference step (the agent picks which synthetic tool calls to
+simulate based on the pattern's tags, headings, and code fences) but the query strings themselves
+are deterministic hook output. Treat the report as a strong baseline check, not a quality gate.
 
 ## Interaction hazard (do not skip)
 
@@ -85,8 +84,8 @@ plain `lore ingest` at all while this skill is iterating.
 
 Run `command -v lore` via Bash. If it exits non-zero, halt with:
 
-> Coverage check requires the `lore` CLI on PATH. Plugin installation does not guarantee this —
-> install lore separately (see the project README) and retry.
+> Coverage check requires the `lore` CLI on PATH. Plugin installation does not guarantee this.
+> Install lore separately (see the project README) and retry.
 
 Do not proceed to step 2.
 
@@ -97,7 +96,7 @@ This is a fast-path heuristic, not a guarantee. The authoritative containment ch
 fail fast on the obvious cases before any embedder work.
 
 > **Why the `include_metadata: true` parameter?** Claude Code's MCP client strips the
-> `result.metadata` sibling from tool responses before surfacing them to the agent — only the
+> `result.metadata` sibling from tool responses before surfacing them to the agent. Only the
 > `content[]` array reaches the model. Lore's MCP tools therefore carry structured metadata in a
 > fenced `lore-metadata` code block embedded in `content[0].text` rather than as a sibling field on
 > `result`. The fenced block is opt-in because it bloats the response for callers that only need the
@@ -113,7 +112,7 @@ Steps:
    because GNU `readlink -f` is not present on those systems by default. Always quote the path
    argument when invoking either form.
 2. Call the `lore_status` MCP tool with `{"include_metadata": true}`. The `include_metadata`
-   parameter is **required** — without it, the server returns only the prose summary, and the
+   parameter is **required**: without it, the server returns only the prose summary, and the
    structured `knowledge_dir` field the skill needs for deterministic path resolution is
    inaccessible from inside Claude Code's MCP client (see the background note below).
 3. Extract the structured metadata from the tool response. The response's `content[0].text` ends
@@ -144,7 +143,7 @@ Steps:
       `T="$(readlink -f -- "$KD/$ARGUMENTS")"`. On macOS/BSD:
       `T="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' -- "$KD/$ARGUMENTS")"`.
       This guarantees the target resolves against the knowledge directory, not the agent's current
-      working directory — the agent may be invoked from any folder.
+      working directory. The agent may be invoked from any folder.
 5. Check that the canonical target path `T` starts with the canonical `knowledge_dir` `KD` followed
    by `/` (string-prefix check, with the trailing `/` so that `KD = /foo` does not match
    `T = /foobar/x.md`).
@@ -212,7 +211,7 @@ issue when this pattern applies. Use the following tag-driven heuristics as a st
 | `testing`                   | `Edit <test-file-matching-language>`, `Bash <test-runner>`             |
 
 Concrete filenames named in the pattern body (e.g. `deny.toml`, `justfile`, `rust-toolchain.toml`)
-take precedence over inferred ones — add an `Edit <that-file>` call verbatim. Verbs named in fenced
+take precedence over inferred ones: add an `Edit <that-file>` call verbatim. Verbs named in fenced
 code blocks (e.g. `cargo deny check` in a fenced sh block) should become `Bash` calls with that
 exact command.
 
@@ -251,9 +250,9 @@ prints the resulting FTS5 query to stdout (or emits nothing if no terms survive 
 each non-empty stdout line as one candidate query.
 
 **Empty stdout is diagnostic, not an error.** It means the hook would not inject any pattern context
-for that tool call at all — discoverability via that route is structurally zero. Examples:
+for that tool call at all: discoverability via that route is structurally zero. Examples:
 `Bash just ci` (`just` is a stop-word, `ci` is < 3 chars) or `Bash gh pr view` (similarly stripped).
-If any of your inferred tool calls return empty, record the fact and move on — the remaining
+If any of your inferred tool calls return empty, record the fact and move on. The remaining
 non-empty queries form the candidate set.
 
 ### Degenerate case: zero candidate queries
@@ -268,7 +267,7 @@ If **every** tool call yields empty output, halt with:
 
 ### Render the materialized query set
 
-Print the final non-empty query set to chat — one query per line — before step 5 so the author sees
+Print the final non-empty query set to chat (one query per line) before step 5 so the author sees
 the exact strings that will be searched. Unlike v0's LLM-brainstormed list, these are **hook
 output**: byte-for-byte what the agent session would see when it triggered the corresponding tool
 calls.
@@ -285,7 +284,7 @@ Run `lore ingest --file <target>` via Bash, **without** `--force` initially. Cap
   whether the target's `source_file` appears in `metadata.results`. If it does not, the file is
   `.loreignore`-excluded.
 
-  Prompt the author with explicit consequences (do not abbreviate this prompt — the author needs to
+  Prompt the author with explicit consequences (do not abbreviate this prompt: the author needs to
   understand what `--force` actually does before saying yes):
 
   > `<target>` is excluded by `.loreignore`. Forcing the ingest will write the file's chunks into
@@ -309,10 +308,10 @@ Run `lore ingest --file <target>` via Bash, **without** `--force` initially. Cap
 ## 6. Cascade detection and search-mode pre-flight (do not skip)
 
 Before the main parallel search batch, issue **one extra** `search_patterns` call with a query
-constructed from a distinctive token in the pattern body — the agent picks a unique-looking word
-from the body that satisfies the FTS5 rubric (≥3 alphabetic characters, not a stop-word). **The call
-must pass `include_metadata: true`** in the arguments so the response carries the fenced
-`lore-metadata` block the skill reads below.
+constructed from a distinctive token in the pattern body: the agent picks a unique-looking word from
+the body that satisfies the FTS5 rubric (≥3 alphabetic characters, not a stop-word). **The call must
+pass `include_metadata: true`** in the arguments so the response carries the fenced `lore-metadata`
+block the skill reads below.
 
 ```json
 {
@@ -333,9 +332,9 @@ triple-backtick fence with language tag `lore-metadata`, advance past it, read u
 closing triple-backtick fence, parse as JSON). Read the `mode` field from the parsed object. The
 lore MCP server reports one of three values:
 
-- **`"hybrid"`** — full hybrid search (Ollama embedder + FTS combined via reciprocal-rank fusion).
+- **`"hybrid"`**: full hybrid search (Ollama embedder + FTS combined via reciprocal-rank fusion).
   Proceed to (b) below.
-- **`"fts_only"`** — the lore deployment is configured for FTS-only search via
+- **`"fts_only"`**: the lore deployment is configured for FTS-only search via
   `config.search.hybrid = false` in the lore configuration file. The embedder was never attempted.
   Halt the iteration immediately with:
 
@@ -343,15 +342,15 @@ lore MCP server reports one of three values:
   > (`config.search.hybrid =
   > false` in `~/.config/lore/lore.toml`). The coverage-check skill
   > requires hybrid mode (Ollama embedder + FTS combined via reciprocal-rank fusion) because
-  > FTS-only ranks (BM25) are not comparable to hybrid ranks across queries — the per-query coverage
+  > FTS-only ranks (BM25) are not comparable to hybrid ranks across queries: the per-query coverage
   > scoring would be meaningless. Set `hybrid = true` in `~/.config/lore/lore.toml` and retry.
-- **`"fts_fallback"`** — the lore deployment is configured for hybrid mode but the embedder (Ollama)
+- **`"fts_fallback"`**: the lore deployment is configured for hybrid mode but the embedder (Ollama)
   was unreachable for this query, so the search fell back to FTS-only. The parallel query batch in
   step 7 would also fall back, producing a fully-degraded report. Halt the iteration immediately
   with:
 
   > Coverage check halted: the lore embedder (Ollama) is unreachable. The cascade-detection query
-  > fell back to FTS-only, and the parallel coverage queries that follow would do the same —
+  > fell back to FTS-only, and the parallel coverage queries that follow would do the same:
   > producing a report whose ranks are not comparable across queries. Restart Ollama and retry the
   > skill.
 
@@ -394,7 +393,7 @@ queries.
 ```
 
 **Wait for all parallel calls to settle** before scoring per-query state in step 8. v1 commits no
-per-query timeout — one slow Ollama query holds up the report. There is no Bash fallback: if
+per-query timeout. One slow Ollama query holds up the report. There is no Bash fallback: if
 `search_patterns` is unavailable, halt with "Coverage check halted: `search_patterns` MCP tool
 unavailable. Restart the Claude Code session."
 
@@ -404,10 +403,10 @@ For each query response, extract the fenced `lore-metadata` JSON from `content[0
 same extraction recipe described in step 2 and applied in step 6. Then classify the target pattern
 into exactly one of four states:
 
-- **errored: `<reason>`** — the JSON-RPC `error` field on the response is non-null. Read the error
+- **errored: `<reason>`**: the JSON-RPC `error` field on the response is non-null. Read the error
   message and surface it. When the error field is set, there is no `content` array and no fenced
   block to parse; branch on `resp["error"].is_null()` first.
-- **degraded: fts_fallback** — the response succeeded but the extracted metadata's `mode` field is
+- **degraded: fts_fallback**: the response succeeded but the extracted metadata's `mode` field is
   `"fts_fallback"`. The embedder was unreachable for this individual query, falling back to FTS-only
   mid-batch. This state is **rare in practice** because step 6's pre-flight already aborted the
   iteration if the cascade-detection query reported `fts_fallback`. It can still happen if the
@@ -416,16 +415,16 @@ into exactly one of four states:
   for this query. Note: `mode == "fts_only"` is **structurally impossible** at this step because
   step 6 catches the FTS-only deployment and aborts the iteration before the parallel batch ever
   runs.
-- **surfaced (rank: N)** — the target's canonical `source_file` (relative to `knowledge_dir`)
-  appears in any row of the extracted metadata's `results` array. Compute N as the **minimum**
-  `rank` value across all matching rows (a single source file may produce multiple chunk rows; the
-  lowest rank wins).
-- **not_present** — no row's `source_file` matches the target.
+- **surfaced (rank: N)**: the target's canonical `source_file` (relative to `knowledge_dir`) appears
+  in any row of the extracted metadata's `results` array. Compute N as the **minimum** `rank` value
+  across all matching rows (a single source file may produce multiple chunk rows; the lowest rank
+  wins).
+- **not_present**: no row's `source_file` matches the target.
 
 **Universal-tag annotation.** If any matching row has `is_universal: true` in the metadata, append
 `[universal — bypasses PreToolUse dedup]` to the per-query state line in the report. Universal
 patterns re-inject on every relevant tool call regardless of the dedup filter, so a coverage score
-on them is informative about lexical matching but not about runtime discoverability — the marker
+on them is informative about lexical matching but not about runtime discoverability: the marker
 prevents authors from chasing low coverage scores on patterns that always re-inject.
 
 ## 9. Coverage ratio refusal on degraded queries
@@ -459,7 +458,7 @@ not group, do not annotate the queries inside the code fence.
 After the four sections, print:
 
 - Coverage ratio: `<surfaced-count>` of `<successful-query-count>` queries (computed against
-  successfully-executed hybrid queries only — guaranteed all queries hybrid by the step 9
+  successfully-executed hybrid queries only, guaranteed all queries hybrid by the step 9
   short-circuit)
 - Errored count (if any), surfaced separately
 
@@ -478,8 +477,8 @@ and `<N>` is the current iteration number (1-indexed).
 The runtime directory is **deliberately ephemeral**: `XDG_RUNTIME_DIR` is wiped on logout/reboot on
 systemd systems, and the `/tmp/lore-$(id -u)` fallback is wiped at next boot on most distros. The
 skill writes its iteration state and the JSONL session log under the same root so neither artefact
-persists across reboots — pattern body content, brainstormed queries, and accepted edits never end
-up in long-lived storage like `~/.cache` where backup tools or cloud sync would pick them up.
+persists across reboots: pattern body content, brainstormed queries, and accepted edits never end up
+in long-lived storage like `~/.cache` where backup tools or cloud sync would pick them up.
 Same-session inspection still works: the files are readable for the lifetime of the session, just
 not beyond.
 
@@ -495,7 +494,7 @@ iteration state to `<path>`."
 ## 12. Append the JSONL session log (R10)
 
 Pin the cache path with this exact shell recipe (the agent runs it once at session start, before
-step 5). The `umask 077` at the top and the `chmod 700` on the runtime root are load-bearing — they
+step 5). The `umask 077` at the top and the `chmod 700` on the runtime root are load-bearing: they
 ensure every file and directory the skill creates is owner-readable only, even when the fallback
 `/tmp/lore-$(id -u)` lands inside a world-readable `/tmp`:
 
@@ -528,7 +527,7 @@ After every iteration, append one JSON line to `$log_file` recording:
 
 Skip the entire log step if `LORE_NO_QA_LOG=1` is set in the environment. The log is opt-out for
 authors who want zero trace even within the session, but the default behaviour is already secure by
-construction — the log lives in an ephemeral runtime directory that does not survive reboot and is
+construction: the log lives in an ephemeral runtime directory that does not survive reboot and is
 not picked up by backup or cloud sync tools. There is no need to set `LORE_NO_QA_LOG=1` to protect
 against persistent leakage of pattern body content; that risk is structurally eliminated by the
 runtime-directory location.
@@ -578,7 +577,7 @@ C: Skip (no edits applied, exit cleanly)
 If any edits were applied:
 
 1. If the iteration counter exceeds 3, halt with "Coverage check ceiling reached at 3 iterations.
-   Remaining gaps: `<list>`. Re-invoke the skill to start a fresh counter — the ceiling exists to
+   Remaining gaps: `<list>`. Re-invoke the skill to start a fresh counter: the ceiling exists to
    prevent pathological oscillation within one invocation, not to cap total effort."
 2. Otherwise loop back to **step 5** (re-ingest), then through steps 6 (cascade detection), 7
    (parallel search), 8 (score), 9 (degraded refusal), 10 (render), 11 (persist), 13 (suggest).
@@ -617,6 +616,6 @@ After the loop terminates (converged, ceiling, skip, or any halt condition):
 
 2. Clean up the per-iteration temp files:
    `rm -f "${XDG_RUNTIME_DIR:-/tmp/lore-$(id -u)}/lore/coverage-check/<session>-iter-"*.txt`. The
-   JSONL log file is **not** explicitly cleaned up by this skill — it lives in the same ephemeral
+   JSONL log file is **not** explicitly cleaned up by this skill: it lives in the same ephemeral
    runtime root and is wiped automatically at next reboot or logout (depending on the platform), so
    no audit-trail accumulation problem exists.

@@ -1,9 +1,9 @@
 # Hook Pipeline and Plugin Reference
 
 Lore integrates with Claude Code through two mechanisms. **Hooks** inject pattern context at key
-moments during a session, and an **MCP server** exposes search and pattern management as callable
-tools. The MCP server works with any MCP-compatible client, but the hook integration is currently
-Claude Code-specific.
+moments during a session, and a **Model Context Protocol (MCP) server** exposes search and pattern
+management as callable tools. The MCP server works with any MCP-compatible client, but the hook
+integration is currently Claude Code-specific.
 
 This document explains the hook lifecycle, the plugin structure, and how to tune injection
 behaviour. For the full search pipeline internals, see the
@@ -64,12 +64,13 @@ hook:
    infers the applicable language set from file extensions, marker filenames, directory hints, and
    bash command keywords
 2. Searches the knowledge directory for matching patterns through three independently-ranked
-   branches. An FTS fallback covers patterns without a `language:` declaration. An FTS structural
-   branch covers patterns whose declared `language:` intersects the inferred set. A vector branch
-   oversample-and-filters by the same membership predicate. The three lists fuse via RRF before
-   partitioning the result into universal (uncapped, additive) and ranked (capped at `top_k`)
-   slices. See [Structural Language Gate](search-mechanics.md#structural-language-gate) for the
-   algorithmic detail.
+   branches. A Full-Text Search (FTS) fallback covers patterns without a `language:` declaration. An
+   FTS structural branch covers patterns whose declared `language:` intersects the inferred set. A
+   vector branch oversample-and-filters by the same membership predicate. The three lists fuse via
+   Reciprocal Rank Fusion (RRF) before partitioning the result into universal (uncapped, additive)
+   and ranked (capped at `top_k`) slices. See
+   [Structural Language Gate](search-mechanics.md#structural-language-gate) for the algorithmic
+   detail.
 3. Expands each slice independently to include sibling chunks from matched source files
 4. **Predicate filter.** For every universal chunk that carries an `applies_when` predicate, the
    filter evaluates the predicate against the current call. Suppressed chunks are dropped from the
@@ -119,22 +120,25 @@ agent saw before compaction.
 The handler produces no hook output. Claude Code's validator rejects `hookSpecificOutput` for
 PostCompact, and the alternate `systemMessage` envelope would render as a long terminal chip that
 never reaches the model. That is pure noise with no audience. Suppressing the output keeps the
-terminal clean and is honest about the harness limitation. The always-on pinned-conventions tier
-cannot be re-seeded after compaction with the channels currently available. On-demand injection via
-PreToolUse continues to work normally.
+terminal clean and is honest about the harness limitation.
+
+The always-on pinned-conventions tier cannot be re-seeded after compaction with the channels
+currently available. On-demand injection via PreToolUse continues to work.
 
 The handler is retained as an extension point. When Claude Code accepts `additionalContext` for
 PostCompact, this is where it plugs in. The same applies when a different re-prime mechanism becomes
-feasible. Candidates include a `lore reprime` agent-callable surface, an opportunistic re-seed on
-the first PreToolUse after a truncated deduplication file is observed, or a similar mechanism. See
-the corresponding roadmap entry.
+possible.
+
+Candidates include a `lore reprime` agent-callable surface, an opportunistic re-seed on the first
+PreToolUse after a truncated deduplication file is observed, or a similar mechanism. See the
+corresponding roadmap entry.
 
 ## Engine and Adapter
 
 The hook code is split between an agent-agnostic **engine** and a Claude-Code-specific **adapter**.
 The split keeps query extraction, predicate evaluation, and pure-string helpers reusable for future
-agent integrations (Cursor, opencode) without dragging Claude Code's `HookInput` shape across the
-boundary.
+agent integrations (Cursor, opencode). It works without dragging Claude Code's `HookInput` shape
+across the boundary.
 
 - **`src/engine/`**: agent-agnostic engine module. Owns the `CallContext` struct (the minimal,
   pre-extracted view of a tool call: `tool_name`, `command`, `file_path`, `description`,
@@ -153,7 +157,7 @@ A future agent integration writes its own adapter (mapping its native event form
 
 ### Eager transcript-tail read
 
-`HookInput::to_call_context()` reads the transcript tail eagerly. When `transcript_path` is present
+`HookInput::to_call_context()` reads the transcript tail up front. When `transcript_path` is present
 and validates against `$HOME`, the adapter reads up to the documented byte cap and stores the result
 on the `CallContext`. The engine's `extract_query` then reads `cc.transcript_tail` directly without
 touching the filesystem.
@@ -180,8 +184,8 @@ All agent types receive the pattern index from SessionStart. They know which pat
 their tags. However, PreToolUse injection is skipped for Explore and Plan subagents because they are
 read-only and do not edit files.
 
-If you need a subagent to consult specific patterns (for example, a Plan subagent drafting an
-implementation approach), prompt it to use the `search_patterns` MCP tool directly. The tool is
+Sometimes a subagent needs to consult specific patterns, for example a Plan subagent drafting an
+implementation approach. Prompt it to use the `search_patterns` MCP tool directly. The tool is
 available to all agent types regardless of hook filtering.
 
 ## Session Deduplication
@@ -193,25 +197,25 @@ that waste context window space.
 
 1. **SessionStart** creates or truncates the deduplication file at
    `lore-session-{fnv1a_hash(session_id)}` in the system temporary directory (`$TMPDIR` on macOS,
-   usually `/tmp` on Linux)
+   typically `/tmp` on Linux)
 2. **PreToolUse** reads the file to check which chunk IDs have been injected, filters them from the
-   current results, then appends the newly injected IDs
+   current results, then appends the IDs injected in this call
 3. **PostCompact** truncates the file, allowing all patterns to be re-injected after context
    compression
 
 The read-filter-write sequence is protected by an exclusive advisory file lock to prevent concurrent
 hook invocations from losing writes.
 
-**Important:** Deduplication is gated on file existence. If no SessionStart has run (for example,
-during manual `lore hook` invocations from the command line), the deduplication file does not exist
-and deduplication is skipped entirely.
+**Important:** Deduplication is gated on file existence. If no SessionStart has run, for example
+during manual `lore hook` invocations from the command line, the deduplication file does not exist.
+Deduplication is skipped entirely in that case.
 
 ## Error Contract
 
 The hook must never break the agent. `lore hook` catches all errors, logs them to stderr, and exits
 with status code 0 regardless. If the search engine fails, if the knowledge directory is
-unavailable, or if the deduplication file is locked, the hook exits silently and the agent continues
-unimpeded.
+unavailable, or if the deduplication file is locked, the hook exits without surfacing an error. The
+agent continues unimpeded.
 
 ## Plugin Structure
 
@@ -272,9 +276,9 @@ Each hook definition specifies the command, timeout, and an optional matcher:
 }
 ```
 
-Hooks fork a fresh process for every event, so they always use the latest `lore` binary on PATH. If
-you run `just install` to update the binary, hooks pick up the new version immediately. No session
-restart is required.
+Hooks fork a fresh process for every event, so they always use the latest `lore` binary on `PATH`.
+If you run `just install` to update the binary, hooks pick up the new version immediately. No
+session restart is required.
 
 ### MCP Server
 
@@ -309,11 +313,12 @@ The `coverage-check` skill (`/coverage-check <pattern-file-path>`) audits a draf
 vocabulary coverage by automating the manual Vocabulary Coverage Technique from
 `docs/pattern-authoring-guide.md`. It infers 3-6 synthetic tool calls an agent would plausibly issue
 when the pattern applies. It pipes each call through the `lore extract-queries` subcommand to
-materialise the exact FTS5 query the PreToolUse hook would inject. It then runs those queries
-through `search_patterns` in parallel, and iterates on edit suggestions until the surfaced query set
-is stable. The subcommand `lore extract-queries` is a thin wrapper around the same `extract_query`
-logic the hook uses. As a result, the candidate queries are byte-for-byte identical to what the
-runtime hook would synthesise for the same tool calls.
+materialise the exact FTS5 query the PreToolUse hook would inject.
+
+It then runs those queries through `search_patterns` in parallel, and iterates on edit suggestions
+until the surfaced query set is stable. The subcommand `lore extract-queries` is a thin wrapper
+around the same `extract_query` logic the hook uses. As a result, the candidate queries are
+byte-for-byte identical to what the runtime hook would synthesise for the same tool calls.
 
 ## Query Extraction from the Agent's Perspective
 
@@ -354,10 +359,10 @@ FTS5 only, no threshold is applied.
 Default: unset (inherits `min_relevance`). A per-tier floor applied only to universal-tagged
 patterns at PreToolUse search time.
 
-Use this when universal patterns over-fire on weakly-related queries but you don't want to raise
-`min_relevance` across the board (which would also cull legitimate non-universal matches). Setting
-`min_relevance_universal = 0.75` while leaving `min_relevance = 0.6` raises the bar for the
-universal tier only.
+Use this when universal patterns over-fire on low-relevance queries but you do not want to raise
+`min_relevance` across the board. Raising it globally would also cull legitimate non-universal
+matches. Setting `min_relevance_universal = 0.75` while leaving `min_relevance = 0.6` raises the bar
+for the universal tier only.
 
 This knob is the numerical complement to the
 [`applies_when`](pattern-authoring-guide.md#toolcommand-predicate-applies_when) predicate. Reach for
@@ -367,10 +372,10 @@ business addressing). Reach for `min_relevance_universal` when over-firing is on
 
 ### Result Count (`search.top_k`)
 
-Default: `5`. Controls how many top results are considered before sibling expansion and
+Default: `5`. Controls the count of top results considered before sibling expansion and
 deduplication.
 
-More results mean more context injected per tool call, which increases the chance of surfacing a
+More results mean more context injected per tool call. That increases the chance of surfacing a
 relevant pattern but also consumes more of the agent's context window.
 
 ### Search Mode (`search.hybrid`)
@@ -422,10 +427,10 @@ ingestion and does not recreate the table.
    `--recent`. See [Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) in the
    Configuration Reference for the full setup.
 
-   This is the primary diagnostic for "why didn't this pattern surface?" It answers the question
-   across an entire session, not just the call you happen to be watching live. The trace tells you
-   whether the pattern was filtered by deduplication, dropped below the relevance threshold,
-   suppressed by `applies_when`, or never matched the query at all.
+   This is the primary diagnostic for the question of why a pattern did not surface. It answers that
+   question across an entire session, not only the call you happen to be watching live. The trace
+   tells you whether the pattern was filtered by deduplication, dropped below the relevance
+   threshold, suppressed by `applies_when`, or never matched the query at all.
 
 3. **Single-invocation real-time debug:**
 
@@ -435,8 +440,8 @@ ingestion and does not recreate the table.
 
    `LORE_DEBUG` writes ephemeral stderr output (prefixed `[lore debug]`). It is useful when you want
    to watch one hook fire in real time, but not for cross-session investigation. Reach for it when
-   the trace output above is missing because tracing wasn't enabled at the time. It is also useful
-   when you want to see live diagnostics from the hook adapter that don't land in trace records.
+   the trace output above is missing because tracing was not enabled at the time. It is also useful
+   when you want to see live diagnostics from the hook adapter that do not land in trace records.
 
 4. **Check deduplication:** If the pattern was injected earlier in the session, deduplication
    prevents re-injection. PostCompact resets deduplication, so patterns become available again after
@@ -451,5 +456,5 @@ restart MCP servers.
 
 ### Hook Errors
 
-Hooks never surface errors to the agent. If something goes wrong, the hook exits silently with
-status 0. Check stderr output with `LORE_DEBUG=1` to diagnose hook failures.
+Hooks never surface errors to the agent. If something goes wrong, the hook exits with status 0
+without noise. Check stderr output with `LORE_DEBUG=1` to diagnose hook failures.

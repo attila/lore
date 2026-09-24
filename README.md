@@ -2,10 +2,10 @@
 
 Your engineering wisdom, always in context.
 
-Lore is a local semantic search engine for your software patterns and conventions, exposed as an MCP
-tool for Claude Code. Your knowledge lives as markdown files in a git repository. Lore indexes them
-with hybrid full-text and vector search, then serves results over MCP so your AI coding agent
-consults your patterns before writing code.
+Lore is a local semantic search engine for your software patterns and conventions, exposed as a
+Model Context Protocol (MCP) tool for Claude Code. Your knowledge lives as markdown files in a git
+repository. Lore indexes them with hybrid full-text and vector search, then serves results over MCP
+so your AI coding agent consults your patterns before writing code.
 
 Single Rust binary. No external database. Only runtime dependency is [Ollama](https://ollama.com)
 for embeddings.
@@ -16,25 +16,24 @@ for embeddings.
 Markdown files (git repo, source of truth)
         │
         ▼  ingest
-┌──────────────┐     ┌──────────┐
-│    lore       │────▶│  Ollama  │  (embed chunks)
-│  (Rust binary)│◀────│  :11434  │
-└──────┬───────┘     └──────────┘
-       │
-       ▼
-┌──────────────┐
-│  SQLite      │  FTS5 (lexical) + sqlite-vec (vector)
-│  (single     │  both compiled into the binary
-│   .db file)  │
-└──────┬───────┘
-       │
-       ▼  MCP over stdio
-┌──────────────┐
-│  Claude Code │
-└──────────────┘
+┌───────────────┐       ┌──────────┐
+│     lore      │──────▶│  Ollama  │  (embed chunks)
+│ (Rust binary) │◀──────│  :11434  │
+└───────┬───────┘       └──────────┘
+        │
+        ▼
+┌───────────────┐
+│  SQLite       │  FTS5 (lexical) + sqlite-vec (vector)
+│ (single file) │  both compiled into the binary
+└───────┬───────┘
+        │
+        ▼  MCP over stdio
+┌───────────────┐
+│  Claude Code  │
+└───────────────┘
 ```
 
-## Quick Start
+## Install
 
 ### Prerequisites
 
@@ -43,7 +42,7 @@ Markdown files (git repo, source of truth)
 `lore init` needs Ollama running. After setup, if Ollama becomes unavailable, search falls back to
 keyword matching and warns that it has.
 
-### Install
+### Homebrew
 
 On macOS (Apple Silicon or Intel) and x86_64 Linux, install with [Homebrew](https://brew.sh):
 
@@ -54,11 +53,11 @@ brew install attila/tap/lore
 The formula installs the prebuilt release archive, verified against its published checksum, and is
 updated with every stable release. It does not install Ollama.
 
-#### Prebuilt archive
+### Prebuilt archive
 
 Prebuilt binaries are published with every tagged release on the
 [releases page](https://github.com/attila/lore/releases), accompanied by a `SHA256SUMS` file for
-integrity verification. Pick `VERSION` from the releases page and set `TARGET` to one of
+integrity verification. Pick `VERSION` from the releases page. Set `TARGET` to one of
 `x86_64-unknown-linux-gnu` (most Linux), `x86_64-unknown-linux-musl` (Alpine and musl distros),
 `aarch64-apple-darwin` (Apple Silicon), or `x86_64-apple-darwin` (Intel Mac):
 
@@ -80,22 +79,24 @@ sudo mv lore /usr/local/bin/
 > after extraction (or right-click → Open the first time). The binary is not Apple-notarized: that
 > requires a paid Developer ID certificate, which the project does not currently hold.
 
-#### Build from source
+### Build from source
 
 Building from source needs [Rust](https://rustup.rs/) (the version pinned in `rust-toolchain.toml`)
-and [just](https://github.com/casey/just) (`cargo install just`).
+and [`just`](https://github.com/casey/just) (`cargo install just`).
 
 ```sh
 just install
 ```
 
 This runs `cargo install --path .`, placing the `lore` binary in `~/.cargo/bin/` (which rustup adds
-to PATH during Rust installation). To build without installing:
+to `PATH` during Rust installation). To build without installing:
 
 ```sh
 cargo build --release
 # binary at ./target/release/lore
 ```
+
+## Quick Start
 
 ### Initialise and Use
 
@@ -122,7 +123,7 @@ Install the lore plugin to get the MCP server, lifecycle hooks, and the `/search
 claude --plugin-dir /path/to/lore/integrations/claude-code/
 ```
 
-The plugin assumes `lore` is on PATH and uses the default configuration
+The plugin assumes `lore` is on `PATH` and uses the default configuration
 (`~/.config/lore/lore.toml`). If you use a custom configuration path, either edit
 `integrations/claude-code/mcp.json` to add your `--config` flag, or add the MCP server manually:
 
@@ -134,11 +135,12 @@ claude mcp add --scope user --transport stdio lore -- \
 The manual approach gives only the MCP server. The plugin also includes hooks that inject relevant
 patterns before edits, a `/search` skill for on-demand queries, and a `/coverage-check` skill. The
 `/coverage-check` skill audits a draft pattern's vocabulary coverage by simulating the PreToolUse
-hook's own query extraction against synthetic tool calls. Patterns whose `tags:` frontmatter list
-contains `universal` opt into an always-on tier. Lore emits these in full at every SessionStart. It
-re-injects them on every relevant tool call, for process-level conventions like push discipline that
-need continuous reinforcement. See the "When to use the universal tag" section in the pattern
-authoring guide.
+hook's own query extraction against synthetic tool calls.
+
+Patterns whose `tags:` frontmatter list contains `universal` opt into an always-on tier. Lore emits
+these in full at every SessionStart. It re-injects them on every relevant tool call, for
+process-level conventions like push discipline that need continuous reinforcement. See the "When to
+use the universal tag" section in the pattern authoring guide.
 
 ## Commands
 
@@ -190,7 +192,7 @@ my-patterns/
 ```
 
 Only files with a `.md` or `.markdown` extension are ingested. Other files (`.txt`, `.mdx`, `.rst`,
-etc.) are silently skipped. They will not appear in search results.
+etc.) are skipped without a warning. They do not appear in search results.
 
 Git is recommended but not required. Lore works against a plain directory, but delta ingest, the
 inbox branch workflow, and version history are all unavailable without a git repository. See
@@ -220,13 +222,13 @@ Always use Result<T, E> for fallible operations...
 - **Hybrid** (default): Combines FTS5 lexical search and sqlite-vec vector similarity using
   Reciprocal Rank Fusion. Title and tag matches are weighted above body text, so domain-scoped
   queries return the right patterns first.
-- **FTS-only**: Set `hybrid = false` in `lore.toml` to skip Ollama at query time.
+- **Full-Text Search (FTS) only**: Set `hybrid = false` in `lore.toml` to skip Ollama at query time.
 
 ## Documentation
 
 | Guide                                                                 | Description                                                  |
 | --------------------------------------------------------------------- | ------------------------------------------------------------ |
-| [Pattern Authoring Guide](docs/pattern-authoring-guide.md)            | How to write patterns that agents actually follow            |
+| [Pattern Authoring Guide](docs/pattern-authoring-guide.md)            | How to write patterns that agents follow                     |
 | [Search Mechanics Reference](docs/search-mechanics.md)                | Full search pipeline internals for debugging discoverability |
 | [Hook Pipeline and Plugin Reference](docs/hook-pipeline-reference.md) | Hook lifecycle, plugin setup, and injection tuning           |
 | [Configuration Reference](docs/configuration.md)                      | `lore.toml` options, environment variables, CLI flags        |
@@ -236,7 +238,7 @@ Always use Result<T, E> for fallible operations...
 
 ### Prerequisites
 
-- [just](https://github.com/casey/just): task runner
+- [`just`](https://github.com/casey/just): task runner
 - [dprint](https://dprint.dev/install/): formatter
 - [cargo-deny](https://github.com/EmbarkStudios/cargo-deny): dependency auditor
 - [git-cliff](https://git-cliff.org): changelog generator

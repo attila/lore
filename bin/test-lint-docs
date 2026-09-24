@@ -1,0 +1,28 @@
+#!/bin/sh
+# Self-test for the document lint. Every rule in the Guide style must fire on
+# .vale/fixtures/violations.md, and Vale must exit non-zero on it.
+set -u
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root" || exit 1
+status=0
+
+# Vale matches its config globs against relative paths, so run from the root.
+check() { # style, fixture
+  if output=$(vale --config .vale.ini --output=line "$2"); then
+    echo "test: vale exited 0 on $2; it must fail" >&2
+    status=1
+  fi
+  for rule in .vale/styles/"$1"/*.yml; do
+    name=$(basename "$rule" .yml)
+    if printf '%s\n' "$output" | grep -q "$1\.$name"; then
+      echo "test: $1.$name fires"
+    else
+      echo "test: $1.$name is silent on $2" >&2
+      status=1
+    fi
+  done
+}
+
+check Guide .vale/fixtures/violations.md
+
+exit $status

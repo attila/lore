@@ -1,0 +1,9 @@
+# Present tense. "The file holds", not "the file will hold".
+extends: existence
+message: "'%s' is future tense. Write the present."
+level: warning
+ignorecase: true
+tokens:
+  - will
+  - will not
+  - going to

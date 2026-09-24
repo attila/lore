@@ -1,0 +1,19 @@
+# The style contract's banned category: changelog prose. The guide states the
+# present; history lives in commits.
+extends: existence
+message: "'%s' is changelog prose. State the present."
+level: error
+ignorecase: true
+tokens:
+  - previously
+  - now supports
+  - now includes
+  - updated to
+  - has been updated
+  - no longer
+  - used to be
+  - it used to
+  - they used to
+  - we used to
+  - recently
+  - newly

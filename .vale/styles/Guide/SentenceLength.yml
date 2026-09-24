@@ -1,0 +1,9 @@
+# One claim per sentence; twenty five words is the ceiling. Matches a
+# sentence of twenty six words or more.
+extends: existence
+message: "Sentence over 25 words. Split it."
+level: error
+scope: sentence
+nonword: true
+tokens:
+  - '^(?:\S+\s+){25,}\S+'

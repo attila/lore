@@ -17,9 +17,10 @@ serve agent context.
 **Sanctioned exception.** Ingest is the one sanctioned disk→DB pipeline. `full_ingest`,
 `delta_ingest`, `ingest_single_file`, and the write operations behind `add_pattern` /
 `update_pattern` / `append_to_pattern` all read markdown from disk and write to `knowledge.db`.
-Authoring writes to the knowledge directory via those three MCP tools are sanctioned _only_ when
-they end by re-ingesting the written file in the same call. A future authoring path that writes
-without re-ingesting would leave disk and DB out of sync and violate this clause.
+Authoring writes to the knowledge directory via those three Model Context Protocol (MCP) tools are
+sanctioned _only_ when they end by re-ingesting the written file. The re-ingest must happen in the
+same call. A future authoring path that writes without re-ingesting would leave disk and DB out of
+sync and violate this clause.
 
 **Out of scope.** The invariant is about _indexed content_, not about runtime I/O in general. The
 following are explicitly not covered and may read from disk at runtime without changing this rule:
@@ -35,20 +36,20 @@ following are explicitly not covered and may read from disk at runtime without c
   maintenance pass. Trace files are session-local state, not indexed content.
 
 **Trust boundary.** Any caller with DB write access (the ingest pipeline, and the three MCP write
-tools: `add_pattern` / `update_pattern` / `append_to_pattern`) is trusted to produce content that
-may render verbatim into agent context. Pattern-body content (chunks at every `PreToolUse`,
+tools: `add_pattern` / `update_pattern` / `append_to_pattern`) is trusted to produce content. That
+content may render verbatim into agent context. Pattern-body content (chunks at every `PreToolUse`,
 `raw_body` at every `SessionStart` / `PostCompact`) is never runtime-sanitised. User-authored
 markdown legitimately contains control characters, escape sequences, and code-block examples that
 must survive the round-trip. If an untrusted-MCP-agent threat model becomes relevant, the entire
-agent-context surface needs re-examination, not just the pinned render path.
+agent-context surface needs re-examination, not only the pinned render path.
 
 **Why this invariant exists.** The documented violation it corrects: PR #33 (universal patterns)
 shipped a `render_pinned_conventions` implementation that re-read source markdown at `SessionStart`
 to populate the `## Pinned conventions` section. Before #33, every runtime reader of indexed content
 (the MCP server, both hooks, every CLI subcommand) went through `knowledge.db` alone. Sandbox test
-drives surfaced the consequence immediately: the agent suddenly needed two read surfaces instead of
-one. The invariant is now enforced by the `patterns` table (authorial bodies live in the DB) and by
-the static-grep checks in `tests/invariants.rs`.
+drives surfaced the consequence immediately: the agent needed two read surfaces instead of one. The
+invariant is now enforced by the `patterns` table (authorial bodies live in the DB) and by the
+static-grep checks in `tests/invariants.rs`.
 
 **How to enforce / extend.**
 
@@ -58,8 +59,8 @@ the static-grep checks in `tests/invariants.rs`.
   aggregation over `chunks`"; the second pins "no unsanctioned `fs::read*` / `File::open` /
   `OpenOptions` in runtime modules" against a documented allow-list.
 - If you need to add a new runtime disk read, update the allow-list in `tests/invariants.rs` _and_
-  explain the carve-out here. Reviewers reading this doc will see the exception and its reason;
-  silent additions fail CI.
+  explain the carve-out here. Reviewers reading this doc see the exception and its reason; silent
+  additions fail CI.
 
 ---
 

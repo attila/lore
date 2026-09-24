@@ -1,0 +1,22 @@
+# Adopted from alphagov/gds-vale-styles (General/Contractions.yml) at commit 55fe037,
+# MIT, Copyright (c) 2019 Government Digital Service. See LICENCE-GDS.md.
+# Only the negative-contraction half is kept: the guide writes "it is" in full,
+# and GOV.UK style expands "don't" to "do not".
+extends: substitution
+message: Use '%s' instead of '%s.'
+level: warning
+ignorecase: true
+swap:
+  isn't: is not
+  aren't: are not
+  wasn't: was not
+  weren't: were not
+  haven't: have not
+  hasn't: has not
+  won't: will not
+  don't: do not
+  doesn't: does not
+  didn't: did not
+  can't: cannot
+  couldn't: could not
+  shouldn't: should not
