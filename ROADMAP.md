@@ -51,11 +51,13 @@
       `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
 - [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
-- [ ] Install on PATH without building from source (Homebrew tap or similar)
 - [ ] Absolute path output in `lore init` MCP config instructions
 
 ## Completed
 
+- [x] Install on PATH without building from source — `brew install attila/tap/lore` from the
+      `attila/homebrew-tap` tap; the release workflow bumps the formula on every stable release
+      (#72). The README lists Homebrew first.
 - [x] Ollama inference runtime probe — `lore status --full` now issues a live `/api/embed` request
       against the configured model to detect runner-subprocess failures that the cheap
       binary/daemon/manifest checks miss (the Homebrew-formula breakage that prompted this work

@@ -44,6 +44,17 @@ Markdown files (git repo, source of truth)
 
 ### Install
 
+On macOS (Apple Silicon or Intel) and x86_64 Linux, install with [Homebrew](https://brew.sh):
+
+```sh
+brew install attila/tap/lore
+```
+
+The formula installs the prebuilt release archive, verified against its published checksum, and is
+updated with every stable release. It does not install Ollama.
+
+#### Prebuilt archive
+
 Prebuilt binaries are published with every tagged release on the
 [releases page](https://github.com/attila/lore/releases), accompanied by a `SHA256SUMS` file for
 integrity verification. Pick `VERSION` from the releases page and set `TARGET` to one of
