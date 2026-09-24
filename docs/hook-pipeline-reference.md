@@ -193,7 +193,8 @@ that waste context window space.
 **Lifecycle:**
 
 1. **SessionStart** creates or truncates the deduplication file at
-   `/tmp/lore-session-{fnv1a_hash(session_id)}`
+   `lore-session-{fnv1a_hash(session_id)}` in the system temporary directory (`$TMPDIR` on macOS,
+   usually `/tmp` on Linux)
 2. **PreToolUse** reads the file to check which chunk IDs have been injected, filters them from the
    current results, then appends the newly injected IDs
 3. **PostCompact** truncates the file, allowing all patterns to be re-injected after context
