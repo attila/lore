@@ -38,7 +38,7 @@ Markdown files (git repo, source of truth)
 
 ### Prerequisites
 
-- [Ollama](https://ollama.com) — `brew install ollama` or see install options
+- [Ollama](https://ollama.com): `brew install ollama` or see install options
 
 `lore init` needs Ollama running. After setup, if Ollama becomes unavailable, search falls back to
 keyword matching and warns that it has.
@@ -74,11 +74,11 @@ sudo mv lore /usr/local/bin/
 # (no sudo? mkdir -p ~/.local/bin && mv lore ~/.local/bin/, then ensure ~/.local/bin is on PATH)
 ```
 
-> **macOS Gatekeeper note**: tarballs downloaded via `curl` run without further intervention. If you
-> download via a browser, macOS may attach the `com.apple.quarantine` extended attribute and refuse
-> to launch the binary. Clear it with `xattr -d com.apple.quarantine ./lore` after extraction (or
-> right-click → Open the first time). The binary is not Apple-notarized — that requires a paid
-> Developer ID certificate, which the project does not currently hold.
+> **Why does Gatekeeper block the binary?** Tarballs downloaded via `curl` run without further
+> intervention. If you download via a browser, macOS may attach the `com.apple.quarantine` extended
+> attribute and refuse to launch the binary. Clear it with `xattr -d com.apple.quarantine ./lore`
+> after extraction (or right-click → Open the first time). The binary is not Apple-notarized: that
+> requires a paid Developer ID certificate, which the project does not currently hold.
 
 #### Build from source
 
@@ -97,7 +97,7 @@ cargo build --release
 # binary at ./target/release/lore
 ```
 
-### Initialize and Use
+### Initialise and Use
 
 ```sh
 # Point lore at a directory of markdown files (git repository recommended)
@@ -122,9 +122,9 @@ Install the lore plugin to get the MCP server, lifecycle hooks, and the `/search
 claude --plugin-dir /path/to/lore/integrations/claude-code/
 ```
 
-The plugin assumes `lore` is on PATH and uses the default config (`~/.config/lore/lore.toml`). If
-you use a custom config path, either edit `integrations/claude-code/mcp.json` to add your `--config`
-flag, or add the MCP server manually:
+The plugin assumes `lore` is on PATH and uses the default configuration
+(`~/.config/lore/lore.toml`). If you use a custom configuration path, either edit
+`integrations/claude-code/mcp.json` to add your `--config` flag, or add the MCP server manually:
 
 ```sh
 claude mcp add --scope user --transport stdio lore -- \
@@ -132,30 +132,31 @@ claude mcp add --scope user --transport stdio lore -- \
 ```
 
 The manual approach gives only the MCP server. The plugin also includes hooks that inject relevant
-patterns before edits, a `/search` skill for on-demand queries, and a `/coverage-check` skill that
-audits a draft pattern's vocabulary coverage by simulating the PreToolUse hook's own query
-extraction against synthetic tool calls. Patterns whose `tags:` frontmatter list contains
-`universal` opt into an always-on tier — emitted in full at every SessionStart and re-injected on
-every relevant tool call — for process-level conventions like push discipline that need continuous
-reinforcement (see the "When to use the universal tag" section in the pattern authoring guide).
+patterns before edits, a `/search` skill for on-demand queries, and a `/coverage-check` skill. The
+`/coverage-check` skill audits a draft pattern's vocabulary coverage by simulating the PreToolUse
+hook's own query extraction against synthetic tool calls. Patterns whose `tags:` frontmatter list
+contains `universal` opt into an always-on tier. Lore emits these in full at every SessionStart. It
+re-injects them on every relevant tool call, for process-level conventions like push discipline that
+need continuous reinforcement. See the "When to use the universal tag" section in the pattern
+authoring guide.
 
 ## Commands
 
-| Command                     | Purpose                                                   |
-| --------------------------- | --------------------------------------------------------- |
-| `lore init --repo <path>`   | First-time setup: provision Ollama, create config, ingest |
-| `lore ingest`               | Re-index the knowledge base after editing markdown files  |
-| `lore ingest --file <path>` | Index a single file without requiring a git commit        |
-| `lore serve`                | Start the MCP server (stdio transport for Claude Code)    |
-| `lore search <query>`       | Search from the command line                              |
-| `lore extract-queries`      | Simulate the hook's FTS5 query extraction for a tool call |
-| `lore list`                 | List every indexed pattern                                |
-| `lore status`               | Check health of all components                            |
-| `lore trace why`            | Explain lore's injection decisions from its trace files   |
-| `lore trace prune`          | Compress and delete old trace files                       |
+| Command                     | Purpose                                                          |
+| --------------------------- | ---------------------------------------------------------------- |
+| `lore init --repo <path>`   | First-time setup: provision Ollama, create configuration, ingest |
+| `lore ingest`               | Re-index the knowledge directory after editing markdown files    |
+| `lore ingest --file <path>` | Index a single file without requiring a git commit               |
+| `lore serve`                | Start the MCP server (stdio transport for Claude Code)           |
+| `lore search <query>`       | Search from the command line                                     |
+| `lore extract-queries`      | Simulate the hook's FTS5 query extraction for a tool call        |
+| `lore list`                 | List every indexed pattern                                       |
+| `lore status`               | Check health of all components                                   |
+| `lore trace why`            | Explain lore's injection decisions from its trace files          |
+| `lore trace prune`          | Compress and delete old trace files                              |
 
 > **What if the knowledge directory is empty?** `lore ingest` and `lore serve` print a warning to
-> stderr ("Warning: knowledge directory is empty …") and continue — an empty directory is a legal
+> stderr ("Warning: knowledge directory is empty …") and continue. An empty directory is a legal
 > state, not an error, so the exit status stays `0`. Add a `.md` file or relax `.loreignore` to
 > populate the index. `lore status` reports the same state via its `Scan set:` line, and the MCP
 > `lore_status` tool exposes `empty_knowledge_dir: true` plus `knowledge_dir_status: "empty"` for
@@ -172,11 +173,11 @@ The server exposes six tools:
 | `update_pattern`    | Replace an existing pattern's content, re-index, and commit if git is in use    |
 | `append_to_pattern` | Add a section to an existing pattern, re-index, and commit if git is in use     |
 | `list_patterns`     | List every indexed pattern with its tags and whether it is universal            |
-| `lore_status`       | Report knowledge base health: git status, indexed counts, last commit           |
+| `lore_status`       | Report knowledge directory health: git status, indexed counts, last commit      |
 
-## Knowledge Base Format
+## Knowledge Directory Format
 
-Your knowledge base is a directory of markdown files. Any structure works:
+Your knowledge directory is a directory of markdown files. Any structure works:
 
 ```
 my-patterns/
@@ -189,15 +190,15 @@ my-patterns/
 ```
 
 Only files with a `.md` or `.markdown` extension are ingested. Other files (`.txt`, `.mdx`, `.rst`,
-etc.) are silently skipped — they will not appear in search results.
+etc.) are silently skipped. They will not appear in search results.
 
 Git is recommended but not required. Lore works against a plain directory, but delta ingest, the
 inbox branch workflow, and version history are all unavailable without a git repository. See
 [Configuration Reference → Git Integration](docs/configuration.md#git-integration) for the full
 picture.
 
-Files are chunked by heading — each `## Section` becomes a separate searchable unit. YAML
-frontmatter tags are extracted and searchable.
+Files are chunked by heading: each `## Section` becomes a separate searchable unit. YAML frontmatter
+tags are extracted and searchable.
 
 To exclude non-pattern files such as `README.md`, `CONTRIBUTING.md`, or a `drafts/` directory from
 indexing, place a `.loreignore` file at the repository root. The syntax matches `.gitignore` and
@@ -235,10 +236,10 @@ Always use Result<T, E> for fallible operations...
 
 ### Prerequisites
 
-- [just](https://github.com/casey/just) — task runner
-- [dprint](https://dprint.dev/install/) — formatter
-- [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) — dependency auditor
-- [git-cliff](https://git-cliff.org) — changelog generator
+- [just](https://github.com/casey/just): task runner
+- [dprint](https://dprint.dev/install/): formatter
+- [cargo-deny](https://github.com/EmbarkStudios/cargo-deny): dependency auditor
+- [git-cliff](https://git-cliff.org): changelog generator
 
 ### Commands
 

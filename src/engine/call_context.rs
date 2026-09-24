@@ -13,9 +13,6 @@
 //! before invoking any engine function. This keeps the
 //! `tests/invariants.rs` "no fs reads outside the allow-list" guard
 //! satisfied for the engine module.
-//!
-//! See `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-//! unit U3 for the engine/adapter split rationale.
 
 /// Pre-extracted call context the engine evaluates predicates against.
 ///

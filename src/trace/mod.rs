@@ -30,9 +30,6 @@
 //!   versioning, serde derives.
 //! - [`writer`] — append-only JSONL writer with `0o600` file / `0o700`
 //!   directory enforcement on Unix.
-//!
-//! See `docs/plans/2026-05-15-001-feat-track-2-observability-plan.md` for
-//! the design context and the full requirements trace.
 
 pub mod maintenance;
 pub mod query;

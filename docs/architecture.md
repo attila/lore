@@ -10,46 +10,45 @@ exceptions are, so edge cases can be judged without re-litigating the principle.
 
 ## `knowledge.db` is the sole runtime read surface for indexed content
 
-**Rule.** At runtime, `lore` reads indexed content — pattern bodies, chunks, titles, tags — from
-`knowledge.db` only. No runtime code path opens a markdown file from the patterns directory to serve
-agent context.
+**Rule.** At runtime, `lore` reads indexed content (pattern bodies, chunks, titles, tags) from
+`knowledge.db` only. No runtime code path opens a markdown file from the knowledge directory to
+serve agent context.
 
 **Sanctioned exception.** Ingest is the one sanctioned disk→DB pipeline. `full_ingest`,
 `delta_ingest`, `ingest_single_file`, and the write operations behind `add_pattern` /
 `update_pattern` / `append_to_pattern` all read markdown from disk and write to `knowledge.db`.
-Authoring writes to the patterns directory via those three MCP tools are sanctioned _only_ when they
-end by re-ingesting the written file in the same call — a future authoring path that writes without
-re-ingesting would leave disk and DB out of sync and violate this clause.
+Authoring writes to the knowledge directory via those three MCP tools are sanctioned _only_ when
+they end by re-ingesting the written file in the same call. A future authoring path that writes
+without re-ingesting would leave disk and DB out of sync and violate this clause.
 
 **Out of scope.** The invariant is about _indexed content_, not about runtime I/O in general. The
 following are explicitly not covered and may read from disk at runtime without changing this rule:
 
-- Session-local state: the dedup file (`lore-session-*` in the system temporary directory), the
-  lockfile.
+- Session-local state: the deduplication file (`lore-session-*` in the system temporary directory),
+  the lockfile.
 - Agent-harness inputs: the Claude Code transcript tail read by `last_user_message` in `src/hook.rs`
   to enrich `PreToolUse` queries.
 - Configuration: `lore.toml` loaded at CLI startup.
 - Git metadata: `git rev-parse` subprocess invocations to detect repository state.
 - Per-hook trace files (`$XDG_STATE_HOME/lore/traces/*.jsonl[.gz]`) and the throttle state file
-  (`.last_pruned_at`) — the hook trace writer, the `lore trace why` reader, and the lazy maintenance
-  pass. Trace files are session-local state, not indexed content.
+  (`.last_pruned_at`), read by the hook trace writer, the `lore trace why` reader, and the lazy
+  maintenance pass. Trace files are session-local state, not indexed content.
 
-**Trust boundary.** Any caller with DB write access — the ingest pipeline, and the three MCP write
-tools (`add_pattern` / `update_pattern` / `append_to_pattern`) — is trusted to produce content that
+**Trust boundary.** Any caller with DB write access (the ingest pipeline, and the three MCP write
+tools: `add_pattern` / `update_pattern` / `append_to_pattern`) is trusted to produce content that
 may render verbatim into agent context. Pattern-body content (chunks at every `PreToolUse`,
-`raw_body` at every `SessionStart` / `PostCompact`) is never runtime-sanitised: user-authored
+`raw_body` at every `SessionStart` / `PostCompact`) is never runtime-sanitised. User-authored
 markdown legitimately contains control characters, escape sequences, and code-block examples that
 must survive the round-trip. If an untrusted-MCP-agent threat model becomes relevant, the entire
-agent-context surface needs re-examination — not just the pinned render path.
+agent-context surface needs re-examination, not just the pinned render path.
 
 **Why this invariant exists.** The documented violation it corrects: PR #33 (universal patterns)
 shipped a `render_pinned_conventions` implementation that re-read source markdown at `SessionStart`
 to populate the `## Pinned conventions` section. Before #33, every runtime reader of indexed content
-— the MCP server, both hooks, every CLI subcommand — went through `knowledge.db` alone. Sandbox test
+(the MCP server, both hooks, every CLI subcommand) went through `knowledge.db` alone. Sandbox test
 drives surfaced the consequence immediately: the agent suddenly needed two read surfaces instead of
-one. See `docs/plans/2026-04-22-001-feat-db-sole-read-surface-plan.md` for the restoration plan. The
-invariant is now enforced by the `patterns` table (authorial bodies live in the DB) and by the
-static-grep checks in `tests/invariants.rs`.
+one. The invariant is now enforced by the `patterns` table (authorial bodies live in the DB) and by
+the static-grep checks in `tests/invariants.rs`.
 
 **How to enforce / extend.**
 
@@ -75,4 +74,4 @@ New invariants follow the same shape:
 - How to enforce or extend.
 
 Append a bullet to the index at the top. The doc stays flat until the section count is awkward to
-navigate in one file — then consider splitting per invariant.
+navigate in one file. Then consider splitting per invariant.

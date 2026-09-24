@@ -38,7 +38,7 @@ struct Cli {
 enum Commands {
     /// Provision Ollama, pull model, create config, run first ingestion
     Init {
-        /// Path to your markdown knowledge base (git repo)
+        /// Path to your markdown knowledge directory (git repo)
         #[arg(long)]
         repo: PathBuf,
 
@@ -55,10 +55,10 @@ enum Commands {
         database: Option<PathBuf>,
     },
 
-    /// Re-index the knowledge base from markdown files
+    /// Re-index the knowledge directory from markdown files
     #[command(after_help = "EXAMPLES:
   lore ingest                          Delta ingest (only changed files since the last commit)
-  lore ingest --force                  Full re-index of the whole knowledge base
+  lore ingest --force                  Full re-index of the whole knowledge directory
   lore ingest --file patterns/foo.md   Index one file without a git commit
   lore ingest --file patterns/foo.md --force
                                        Index one file, overriding .loreignore
@@ -99,7 +99,7 @@ NOTES:
     /// `lore_status`.
     Serve,
 
-    /// Search the knowledge base from the command line
+    /// Search the knowledge directory from the command line
     Search {
         /// Search query
         query: Vec<String>,
@@ -130,7 +130,7 @@ EXIT CODES:
   1  Malformed JSON on stdin.")]
     ExtractQueries,
 
-    /// List all patterns in the knowledge base
+    /// List all patterns in the knowledge directory
     List,
 
     /// Check health of all components
@@ -311,7 +311,7 @@ fn cmd_init(
     }
 
     // run initial ingestion
-    eprintln!("\n--- Ingesting knowledge base ---\n");
+    eprintln!("\n--- Ingesting knowledge directory ---\n");
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
@@ -487,7 +487,7 @@ fn dispatch_ingest(
             on_progress,
         ))
     } else {
-        eprintln!("Ingesting knowledge base...\n");
+        eprintln!("Ingesting knowledge directory...\n");
         Ok(ingest::ingest(
             db,
             ollama,

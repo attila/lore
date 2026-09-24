@@ -339,7 +339,7 @@ pub fn is_known_token(token: &str) -> bool {
 /// Suitable for any surface that renders language tokens to operators.
 /// The fallback covers the case where a stored `language_json` array
 /// contains a token the table does not (yet) cover — for example, a
-/// knowledge base ingested while pinned to a newer language pack than
+/// knowledge directory ingested while pinned to a newer language pack than
 /// the running binary. Returning the raw token keeps the output
 /// legible rather than silently dropping it.
 ///

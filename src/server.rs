@@ -308,7 +308,7 @@ fn tool_definitions() -> Value {
         {
             "name": "search_patterns",
             "description":
-                "Search the knowledge base for software patterns, conventions, and preferences. \
+                "Search the knowledge directory for software patterns, conventions, and preferences. \
                  Use this before implementing new code to check for established patterns. \
                  Returns ranked results with source provenance.",
             "inputSchema": {
@@ -340,9 +340,9 @@ fn tool_definitions() -> Value {
         {
             "name": "add_pattern",
             "description":
-                "Create a new pattern in the knowledge base. Use only when the user explicitly \
+                "Create a new pattern in the knowledge directory. Use only when the user explicitly \
                  asks to save, record, or document a pattern. Creates a markdown file and indexes \
-                 it; the change is committed to git when the knowledge base is a git repository, \
+                 it; the change is committed to git when the knowledge directory is a git repository, \
                  otherwise the file is written without a commit. Pass `language` to opt the \
                  pattern into the structural retrieval gate (warn-and-proceed for unknown \
                  tokens).",
@@ -403,7 +403,7 @@ fn tool_definitions() -> Value {
             "description":
                 "Replace the content of an existing pattern. Use only when the user explicitly \
                  asks to update or rewrite a pattern. Overwrites the file and re-indexes; the \
-                 change is committed to git when the knowledge base is a git repository, \
+                 change is committed to git when the knowledge directory is a git repository, \
                  otherwise the file is written without a commit. `tags` and `language` share \
                  three-way semantics (preserve when omitted, clear with `[]`, replace with a \
                  non-empty value); unknown language tokens warn-and-proceed.",
@@ -466,7 +466,7 @@ fn tool_definitions() -> Value {
                 "Add a new section to an existing pattern without replacing it. Use when the user \
                  wants to add examples, edge cases, or notes to an existing pattern. Appends a \
                  heading and body and re-indexes; the change is committed to git when the \
-                 knowledge base is a git repository, otherwise the file is written without a commit. \
+                 knowledge directory is a git repository, otherwise the file is written without a commit. \
                  Does not accept a `language` argument — appends are body-only by definition; use \
                  `update_pattern` to change the frontmatter `language:` declaration.",
             "inputSchema": {
@@ -500,7 +500,7 @@ fn tool_definitions() -> Value {
         {
             "name": "list_patterns",
             "description":
-                "List every pattern indexed in the knowledge base: title, source file, \
+                "List every pattern indexed in the knowledge directory: title, source file, \
                  tags, whether the pattern is universal (always-on tier), and whether \
                  the pattern's frontmatter declares an `applies_when` predicate. \
                  Universal patterns without a predicate pin at every SessionStart and \
@@ -529,13 +529,13 @@ fn tool_definitions() -> Value {
         {
             "name": "lore_status",
             "description":
-                "Report knowledge base health: whether it is a git repository, the indexed \
+                "Report knowledge directory health: whether it is a git repository, the indexed \
                  chunk and source counts, the last ingested commit (if any), whether the \
                  inbox branch workflow is configured, whether a .loreignore file is active \
                  (filtering files out of the index), and whether the knowledge directory \
                  is effectively empty (no markdown files, or every file excluded by \
                  .loreignore). Use this before write operations to verify the knowledge \
-                 base is in the expected state, especially when the agent needs to know \
+                 directory is in the expected state, especially when the agent needs to know \
                  whether changes will be committed to git or whether files in a particular \
                  path are excluded from search.",
             "inputSchema": {
@@ -558,7 +558,7 @@ fn tool_definitions() -> Value {
                              languages_error (null in normal operation; carries the \
                              error message when the language aggregation query fails, \
                              so agents can distinguish a broken query from a genuinely \
-                             empty knowledge base), \
+                             empty knowledge directory), \
                              inbox_workflow_configured, delta_ingest_available, \
                              loreignore_active, universal_advisories (count, \
                              oversized bodies, near-miss tags from the most recent full or \
@@ -916,7 +916,7 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 .join("\n\n---\n\n");
 
             let summary = if results.is_empty() {
-                "No matching patterns found in the knowledge base."
+                "No matching patterns found in the knowledge directory."
             } else {
                 "Found matching patterns."
             };
@@ -1234,7 +1234,7 @@ fn handle_list_patterns(
     text_response(req, &response)
 }
 
-/// Report knowledge base health: git repository status, indexed counts, and
+/// Report knowledge directory health: git repository status, indexed counts, and
 /// inbox workflow configuration. Designed for agents that need to know whether
 /// pending writes will be committed before they call `add_pattern`,
 /// `update_pattern`, or `append_to_pattern`.
@@ -1256,7 +1256,7 @@ fn handle_lore_status(
     let sources = stats.as_ref().map(|s| s.sources);
     // Capture the result rather than `.ok()`-discarding it: agents
     // diagnosing why language coverage is missing need to distinguish
-    // an empty knowledge base (counts present, all-zero) from a broken
+    // an empty knowledge directory (counts present, all-zero) from a broken
     // query (counts absent, error attached).
     let language_counts_result = ctx.db.language_counts();
     // Token-keyed map (`{"rust": 12, "typescript": 5}`) matching the
@@ -1372,7 +1372,7 @@ fn handle_lore_status(
     }
 
     let summary = format!(
-        "Knowledge base: {} ({}) — {} {} across {} {}. Git repository: {}. \
+        "Knowledge directory: {} ({}) — {} {} across {} {}. Git repository: {}. \
          Delta ingest: {}. Inbox workflow: {}. .loreignore: {}.",
         ctx.config.knowledge_dir.display(),
         knowledge_dir_status,
@@ -1570,9 +1570,6 @@ impl SearchMode {
 /// that field has been removed because it was strictly derivable from
 /// `mode` (true iff `mode == "fts_fallback"`) and the redundancy created
 /// a maintenance hazard for clients that branched on either field.
-///
-/// See `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
-/// (Unit 2, "Approach" and "Test scenarios") for the full contract.
 fn build_search_metadata(
     query: &str,
     top_k: usize,
@@ -1652,8 +1649,7 @@ const LORE_METADATA_FENCE_TAG: &str = "lore-metadata";
 /// inside the JSON string.
 ///
 /// See `docs/solutions/best-practices/mcp-metadata-via-fenced-content-block-2026-04-07.md`
-/// for the design rationale and `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
-/// § 'Design pivot: layer 2 finding' for the history.
+/// for the design rationale.
 fn maybe_append_lore_metadata_fence(
     prose: String,
     metadata: &Value,
@@ -3225,7 +3221,7 @@ mod tests {
         // Prose summary is still present — the opt-out path does not
         // suppress the human-readable response.
         assert!(
-            text.contains("Knowledge base:"),
+            text.contains("Knowledge directory:"),
             "prose summary should still be present, got: {text}"
         );
     }

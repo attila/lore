@@ -2,7 +2,7 @@
 
 //! `.loreignore` file parsing and matching.
 //!
-//! Provides gitignore-style file exclusion for pattern repositories. A
+//! Provides gitignore-style file exclusion for knowledge directories. A
 //! `.loreignore` file at the repository root specifies files and directories
 //! to exclude from indexing during both full and delta ingest.
 //!

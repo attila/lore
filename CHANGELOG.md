@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- MCP tool descriptions, CLI output and the plugin skills name the pattern collection the "knowledge
+  directory", matching the `knowledge_dir` setting. (#75)
+
 ## [0.5.0] - 2026-06-04
 
 ### Added

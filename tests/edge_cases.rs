@@ -1,8 +1,7 @@
 //! End-to-end CLI integration tests for edge-case behaviours.
 //!
 //! Currently covers the effective-empty-knowledge-dir warning surfaced via
-//! `lore ingest` and `lore status` (units U1, U3.b in
-//! `docs/plans/2026-05-04-001-feat-empty-knowledge-dir-validation-plan.md`).
+//! `lore ingest` and `lore status`.
 //! Designed as a shared home for related edge-case CLI tests.
 
 use std::path::Path;

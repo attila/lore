@@ -291,7 +291,7 @@ fn hook_session_start_advertises_git_advisory_for_non_git_dir() {
 
     assert!(
         ctx.contains("not a git repository"),
-        "non-git knowledge base should advertise the git advisory: {ctx}"
+        "non-git knowledge directory should advertise the git advisory: {ctx}"
     );
     assert!(
         ctx.contains("delta ingest is unavailable"),
@@ -305,7 +305,7 @@ fn hook_session_start_advertises_git_advisory_for_non_git_dir() {
 
 #[test]
 fn hook_session_start_omits_git_advisory_for_git_dir() {
-    // When the knowledge base is a git repository, the SessionStart context
+    // When the knowledge directory is a git repository, the SessionStart context
     // should not contain the git advisory.
     let (tmp, config_path) = setup_test_env();
     let dir = tmp.path();
@@ -337,7 +337,7 @@ fn hook_session_start_omits_git_advisory_for_git_dir() {
 
     assert!(
         !ctx.contains("not a git repository"),
-        "git-initialised knowledge base should not show the advisory: {ctx}"
+        "git-initialised knowledge directory should not show the advisory: {ctx}"
     );
     // The original meta-instruction and pattern list must still be present.
     assert!(ctx.contains("Available patterns:"));
@@ -1532,7 +1532,7 @@ fn hook_session_start_renders_from_db_even_when_source_file_removed() {
     // This is a deliberate behavioural change from #33-era behaviour,
     // where the render path re-read source markdown at SessionStart and
     // would skip any file that had vanished. The new contract is: ingest
-    // writes, render reads DB — the patterns directory is no longer a
+    // writes, render reads DB — the knowledge directory is no longer a
     // runtime dependency.
     let tmp = tempdir().unwrap();
     let dir = tmp.path();

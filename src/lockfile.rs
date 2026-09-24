@@ -95,7 +95,7 @@ impl WriteLock {
 ///
 /// The lock file lives next to the database (`knowledge.db` →
 /// `knowledge.db.lock`), so it is naturally scoped to a single knowledge
-/// directory and never clutters the user's pattern repository.
+/// directory and never clutters the user's knowledge directory.
 pub fn lock_path_for(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_owned();
     path.push(".lock");

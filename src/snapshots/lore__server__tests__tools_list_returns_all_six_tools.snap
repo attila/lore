@@ -9,7 +9,7 @@ expression: resp
   "result": {
     "tools": [
       {
-        "description": "Search the knowledge base for software patterns, conventions, and preferences. Use this before implementing new code to check for established patterns. Returns ranked results with source provenance.",
+        "description": "Search the knowledge directory for software patterns, conventions, and preferences. Use this before implementing new code to check for established patterns. Returns ranked results with source provenance.",
         "inputSchema": {
           "properties": {
             "include_metadata": {
@@ -34,7 +34,7 @@ expression: resp
         "name": "search_patterns"
       },
       {
-        "description": "Create a new pattern in the knowledge base. Use only when the user explicitly asks to save, record, or document a pattern. Creates a markdown file and indexes it; the change is committed to git when the knowledge base is a git repository, otherwise the file is written without a commit. Pass `language` to opt the pattern into the structural retrieval gate (warn-and-proceed for unknown tokens).",
+        "description": "Create a new pattern in the knowledge directory. Use only when the user explicitly asks to save, record, or document a pattern. Creates a markdown file and indexes it; the change is committed to git when the knowledge directory is a git repository, otherwise the file is written without a commit. Pass `language` to opt the pattern into the structural retrieval gate (warn-and-proceed for unknown tokens).",
         "inputSchema": {
           "properties": {
             "body": {
@@ -81,7 +81,7 @@ expression: resp
         "name": "add_pattern"
       },
       {
-        "description": "Replace the content of an existing pattern. Use only when the user explicitly asks to update or rewrite a pattern. Overwrites the file and re-indexes; the change is committed to git when the knowledge base is a git repository, otherwise the file is written without a commit. `tags` and `language` share three-way semantics (preserve when omitted, clear with `[]`, replace with a non-empty value); unknown language tokens warn-and-proceed.",
+        "description": "Replace the content of an existing pattern. Use only when the user explicitly asks to update or rewrite a pattern. Overwrites the file and re-indexes; the change is committed to git when the knowledge directory is a git repository, otherwise the file is written without a commit. `tags` and `language` share three-way semantics (preserve when omitted, clear with `[]`, replace with a non-empty value); unknown language tokens warn-and-proceed.",
         "inputSchema": {
           "properties": {
             "body": {
@@ -128,7 +128,7 @@ expression: resp
         "name": "update_pattern"
       },
       {
-        "description": "Add a new section to an existing pattern without replacing it. Use when the user wants to add examples, edge cases, or notes to an existing pattern. Appends a heading and body and re-indexes; the change is committed to git when the knowledge base is a git repository, otherwise the file is written without a commit. Does not accept a `language` argument — appends are body-only by definition; use `update_pattern` to change the frontmatter `language:` declaration.",
+        "description": "Add a new section to an existing pattern without replacing it. Use when the user wants to add examples, edge cases, or notes to an existing pattern. Appends a heading and body and re-indexes; the change is committed to git when the knowledge directory is a git repository, otherwise the file is written without a commit. Does not accept a `language` argument — appends are body-only by definition; use `update_pattern` to change the frontmatter `language:` declaration.",
         "inputSchema": {
           "properties": {
             "body": {
@@ -159,7 +159,7 @@ expression: resp
         "name": "append_to_pattern"
       },
       {
-        "description": "List every pattern indexed in the knowledge base: title, source file, tags, whether the pattern is universal (always-on tier), and whether the pattern's frontmatter declares an `applies_when` predicate. Universal patterns without a predicate pin at every SessionStart and bypass PreToolUse deduplication; universal patterns with a predicate are deferred from SessionStart and re-inject only on matching PreToolUse calls. Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, universality, and predicate state.",
+        "description": "List every pattern indexed in the knowledge directory: title, source file, tags, whether the pattern is universal (always-on tier), and whether the pattern's frontmatter declares an `applies_when` predicate. Universal patterns without a predicate pin at every SessionStart and bypass PreToolUse deduplication; universal patterns with a predicate are deferred from SessionStart and re-inject only on matching PreToolUse calls. Use when an agent needs to enumerate available patterns without issuing a keyword search — the CLI equivalent is `lore list`. Useful before `update_pattern` to check current tags, universality, and predicate state.",
         "inputSchema": {
           "properties": {
             "include_metadata": {
@@ -174,12 +174,12 @@ expression: resp
         "name": "list_patterns"
       },
       {
-        "description": "Report knowledge base health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), whether the inbox branch workflow is configured, whether a .loreignore file is active (filtering files out of the index), and whether the knowledge directory is effectively empty (no markdown files, or every file excluded by .loreignore). Use this before write operations to verify the knowledge base is in the expected state, especially when the agent needs to know whether changes will be committed to git or whether files in a particular path are excluded from search.",
+        "description": "Report knowledge directory health: whether it is a git repository, the indexed chunk and source counts, the last ingested commit (if any), whether the inbox branch workflow is configured, whether a .loreignore file is active (filtering files out of the index), and whether the knowledge directory is effectively empty (no markdown files, or every file excluded by .loreignore). Use this before write operations to verify the knowledge directory is in the expected state, especially when the agent needs to know whether changes will be committed to git or whether files in a particular path are excluded from search.",
         "inputSchema": {
           "properties": {
             "include_metadata": {
               "default": false,
-              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, knowledge_dir_status (\"populated\", \"empty\", or \"missing\"), empty_knowledge_dir (bool), git_repository, last_ingested_commit, chunks_indexed, sources_indexed, languages_declared (token -> source-count map matching the `language:` frontmatter surface, e.g. `{\"rust\": 12, \"typescript\": 5}`; multi-language sources count in each declared bucket so the sum can exceed sources_indexed), languages_undeclared (integer count of sources with no `language:` declaration), languages_error (null in normal operation; carries the error message when the language aggregation query fails, so agents can distinguish a broken query from a genuinely empty knowledge base), inbox_workflow_configured, delta_ingest_available, loreignore_active, universal_advisories (count, oversized bodies, near-miss tags from the most recent full or single-file ingest), and `ollama` (object with `installed`, `running`, `model_available`, `model`, and `runtime` — the latter is `{\"state\": \"not_checked\"}` by default, switching to `\"ok\"`, `\"skipped\"`, or `\"failed\"` with `short_reason` and `status_line` when probe_runtime is passed). The empty_knowledge_dir field reports on-disk state, distinct from sources_indexed (database state): when sources_indexed is 0 and empty_knowledge_dir is false, files exist but have not been ingested — run `lore ingest`. When empty_knowledge_dir is true, knowledge_dir_status discriminates further: \"empty\" calls for adding `.md` files or relaxing `.loreignore`; \"missing\" means the configured path doesn't exist or isn't a directory. Defaults to false.",
+              "description": "When true, appends a `lore-metadata` fenced code block to the end of the response containing machine-readable JSON with knowledge_dir, knowledge_dir_status (\"populated\", \"empty\", or \"missing\"), empty_knowledge_dir (bool), git_repository, last_ingested_commit, chunks_indexed, sources_indexed, languages_declared (token -> source-count map matching the `language:` frontmatter surface, e.g. `{\"rust\": 12, \"typescript\": 5}`; multi-language sources count in each declared bucket so the sum can exceed sources_indexed), languages_undeclared (integer count of sources with no `language:` declaration), languages_error (null in normal operation; carries the error message when the language aggregation query fails, so agents can distinguish a broken query from a genuinely empty knowledge directory), inbox_workflow_configured, delta_ingest_available, loreignore_active, universal_advisories (count, oversized bodies, near-miss tags from the most recent full or single-file ingest), and `ollama` (object with `installed`, `running`, `model_available`, `model`, and `runtime` — the latter is `{\"state\": \"not_checked\"}` by default, switching to `\"ok\"`, `\"skipped\"`, or `\"failed\"` with `short_reason` and `status_line` when probe_runtime is passed). The empty_knowledge_dir field reports on-disk state, distinct from sources_indexed (database state): when sources_indexed is 0 and empty_knowledge_dir is false, files exist but have not been ingested — run `lore ingest`. When empty_knowledge_dir is true, knowledge_dir_status discriminates further: \"empty\" calls for adding `.md` files or relaxing `.loreignore`; \"missing\" means the configured path doesn't exist or isn't a directory. Defaults to false.",
               "type": "boolean"
             },
             "probe_runtime": {

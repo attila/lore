@@ -163,5 +163,4 @@ When the limitation is gone, every breadcrumb that explained it should also disa
 - ROADMAP entry on "Universal patterns via tag-based SessionStart injection" — captures a related
   but distinct failure mode where session deduplication, not reconciliation asymmetry, suppresses
   meta-rules
-- The lore PR that fixed this:
-  [`docs/plans/2026-04-06-001-feat-loreignore-plan.md`](../../plans/2026-04-06-001-feat-loreignore-plan.md)
+- The lore PR that fixed this: `docs/plans/2026-04-06-001-feat-loreignore-plan.md`
