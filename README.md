@@ -38,11 +38,23 @@ Markdown files (git repo, source of truth)
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (latest stable, pinned via `rust-toolchain.toml`)
-- [just](https://github.com/casey/just) — task runner (`cargo install just`)
 - [Ollama](https://ollama.com) — `brew install ollama` or see install options
 
+`lore init` needs Ollama running. After setup, if Ollama becomes unavailable, search falls back to
+keyword matching and warns that it has.
+
 ### Install
+
+On macOS (Apple Silicon or Intel) and x86_64 Linux, install with [Homebrew](https://brew.sh):
+
+```sh
+brew install attila/tap/lore
+```
+
+The formula installs the prebuilt release archive, verified against its published checksum, and is
+updated with every stable release. It does not install Ollama.
+
+#### Prebuilt archive
 
 Prebuilt binaries are published with every tagged release on the
 [releases page](https://github.com/attila/lore/releases), accompanied by a `SHA256SUMS` file for
@@ -69,6 +81,9 @@ sudo mv lore /usr/local/bin/
 > Developer ID certificate, which the project does not currently hold.
 
 #### Build from source
+
+Building from source needs [Rust](https://rustup.rs/) (the version pinned in `rust-toolchain.toml`)
+and [just](https://github.com/casey/just) (`cargo install just`).
 
 ```sh
 just install
@@ -134,7 +149,10 @@ reinforcement (see the "When to use the universal tag" section in the pattern au
 | `lore serve`                | Start the MCP server (stdio transport for Claude Code)    |
 | `lore search <query>`       | Search from the command line                              |
 | `lore extract-queries`      | Simulate the hook's FTS5 query extraction for a tool call |
+| `lore list`                 | List every indexed pattern                                |
 | `lore status`               | Check health of all components                            |
+| `lore trace why`            | Explain lore's injection decisions from its trace files   |
+| `lore trace prune`          | Compress and delete old trace files                       |
 
 > **What if the knowledge directory is empty?** `lore ingest` and `lore serve` print a warning to
 > stderr ("Warning: knowledge directory is empty …") and continue — an empty directory is a legal
@@ -145,7 +163,7 @@ reinforcement (see the "When to use the universal tag" section in the pattern au
 
 ## MCP Tools
 
-The server exposes five tools:
+The server exposes six tools:
 
 | Tool                | Purpose                                                                         |
 | ------------------- | ------------------------------------------------------------------------------- |
@@ -153,6 +171,7 @@ The server exposes five tools:
 | `add_pattern`       | Create a new pattern file, index it, and commit if the base is a git repository |
 | `update_pattern`    | Replace an existing pattern's content, re-index, and commit if git is in use    |
 | `append_to_pattern` | Add a section to an existing pattern, re-index, and commit if git is in use     |
+| `list_patterns`     | List every indexed pattern with its tags and whether it is universal            |
 | `lore_status`       | Report knowledge base health: git status, indexed counts, last commit           |
 
 ## Knowledge Base Format

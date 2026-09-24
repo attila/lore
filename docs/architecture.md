@@ -24,10 +24,11 @@ re-ingesting would leave disk and DB out of sync and violate this clause.
 **Out of scope.** The invariant is about _indexed content_, not about runtime I/O in general. The
 following are explicitly not covered and may read from disk at runtime without changing this rule:
 
-- Session-local state: the dedup file (`/tmp/lore-session-*`), the lockfile.
+- Session-local state: the dedup file (`lore-session-*` in the system temporary directory), the
+  lockfile.
 - Agent-harness inputs: the Claude Code transcript tail read by `last_user_message` in `src/hook.rs`
   to enrich `PreToolUse` queries.
-- Configuration: `knowledge.toml` loaded at CLI startup.
+- Configuration: `lore.toml` loaded at CLI startup.
 - Git metadata: `git rev-parse` subprocess invocations to detect repository state.
 - Per-hook trace files (`$XDG_STATE_HOME/lore/traces/*.jsonl[.gz]`) and the throttle state file
   (`.last_pruned_at`) — the hook trace writer, the `lore trace why` reader, and the lazy maintenance

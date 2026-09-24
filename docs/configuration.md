@@ -293,6 +293,7 @@ These flags apply to all commands:
 | `lore init`        | `--bind <addr>`     | Bind address (default: `localhost:3100`).                                                                                                                                                                                                                                                       |
 | `lore init`        | `--database <path>` | Database file path (overrides the XDG default).                                                                                                                                                                                                                                                 |
 | `lore ingest`      | `--force`           | Force full re-ingest: drops and recreates the FTS5 table, re-embeds all files. Required after schema changes such as tokeniser updates.                                                                                                                                                         |
+| `lore ingest`      | `--file <path>`     | Index a single markdown file without a git commit. Respects `.loreignore` unless `--force` is also passed, which overrides it for that file. Relative paths resolve against the current working directory.                                                                                      |
 | `lore search`      | `<query>`           | Search query (positional argument).                                                                                                                                                                                                                                                             |
 | `lore search`      | `--top-k <n>`       | Number of results to return (overrides configuration).                                                                                                                                                                                                                                          |
 | `lore trace why`   | `<session>`         | Session id to inspect (positional argument; optional when `--recent` is used). Reads from `$XDG_STATE_HOME/lore/traces/`; honours `--json` for raw JSONL pass-through.                                                                                                                          |
@@ -307,15 +308,16 @@ These flags apply to all commands:
 The MCP server enforces maximum sizes on tool arguments to prevent resource exhaustion. Oversized
 inputs are rejected with a JSON-RPC `-32000` error before any processing occurs.
 
-| Field               | Maximum size           |
-| ------------------- | ---------------------- |
-| `query`             | 1,024 bytes            |
-| `title`             | 512 bytes              |
-| `source_file`       | 512 bytes              |
-| `heading`           | 512 bytes              |
-| `body`              | 262,144 bytes (256 KB) |
-| `tags` (serialised) | 8,192 bytes (8 KB)     |
-| `top_k`             | 100                    |
+| Field                   | Maximum size           |
+| ----------------------- | ---------------------- |
+| `query`                 | 1,024 bytes            |
+| `title`                 | 512 bytes              |
+| `source_file`           | 512 bytes              |
+| `heading`               | 512 bytes              |
+| `body`                  | 262,144 bytes (256 KB) |
+| `tags` (serialised)     | 8,192 bytes (8 KB)     |
+| `language` (serialised) | 8,192 bytes (8 KB)     |
+| `top_k`                 | 100                    |
 
 ## Per-Hook Trace Logging
 

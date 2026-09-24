@@ -86,7 +86,7 @@ All extracted terms pass through a cleaning pipeline before query assembly:
    and "pr" (two characters) are invisible to search.
 3. **Filter hex-like strings.** Terms of six or more characters composed entirely of hexadecimal
    digits (`0-9`, `a-f`) are discarded. This prevents commit SHAs and UUIDs from polluting queries.
-4. **Remove stop words.** Sixty common English words are removed:
+4. **Remove stop words.** Fifty-seven common English words are removed:
 
    > the, and, for, with, from, into, that, this, then, when, will, has, have, was, are, not, but,
    > can, all, its, our, use, new, let, set, get, add, run, see, how, may, per, via, yet, also,
@@ -299,8 +299,9 @@ choice that are valuable in the same context.
 ## Session Deduplication
 
 To prevent the same pattern from being injected repeatedly within a session, lore maintains a
-per-session deduplication file at `/tmp/lore-session-{hash}`, where `{hash}` is a 16-character
-FNV-1a hash of the session ID.
+per-session deduplication file named `lore-session-{hash}` in the system temporary directory
+(`$TMPDIR` on macOS, usually `/tmp` on Linux), where `{hash}` is a 16-character FNV-1a hash of the
+session ID.
 
 The deduplication lifecycle:
 

@@ -146,9 +146,9 @@ Two filtering rules remove terms before they reach the search engine:
 (two characters) never reaches the search engine, and a pattern about `just ci` must contain longer
 synonyms such as "continuous integration" or "quality gate."
 
-**Stop words are filtered.** Sixty common English words are removed from queries, including `just`,
-`use`, `new`, `run`, `get`, `set`, `add`, and `all`. If your pattern's key concept is also a stop
-word, ensure the body contains alternative vocabulary.
+**Stop words are filtered.** Fifty-seven common English words are removed from queries, including
+`just`, `use`, `new`, `run`, `get`, `set`, `add`, and `all`. If your pattern's key concept is also a
+stop word, ensure the body contains alternative vocabulary.
 
 The full stop word list:
 
@@ -268,7 +268,8 @@ the same mechanism: the `tags:` value is `universal`; the section header is `## 
   dedup had correctly suppressed the workflow pattern after its first appearance hours earlier.
 - The body is small enough to justify per-call re-injection. A 2 KB universal pattern matched 50
   times in a session adds 100 KB of repeated context. Lore emits a per-pattern advisory at ingest
-  time when any single universal body exceeds 1 KB.
+  time when any single universal body exceeds 1 KB, and rejects the file at ingest when its
+  universal body exceeds 8 KB.
 
 **Do not use `universal` for:**
 
@@ -350,7 +351,7 @@ not also pin at session start.
 This carries a small first-tool-call delay: the predicated pattern is visible to the agent on the
 first tool call where the predicate matches AND the search pipeline returns at least one result, not
 earlier. With the default `min_relevance_universal` (which inherits from `min_relevance` and is
-`0.0` out of the box) and the search-overfetch / universal-no-truncate behaviour in
+`0.6` out of the box) and the search-overfetch / universal-no-truncate behaviour in
 `search_with_threshold`, this is the realistic case. If you raise `min_relevance_universal` high
 enough to filter weak-keyword universals out, predicated patterns can be deferred across multiple
 tool calls — that is the cost of a strict universal floor and applies to every universal, not just
@@ -551,19 +552,40 @@ on the fallback retrieval path.
 
 ### Canonical tokens
 
-The initial recognised set covers the six languages lore detects today. Authors must declare the
-canonical token in the second column; the display column shows how lore refers to the language in
-prose and CLI output. The asymmetry is most visible for Go: the canonical token is `golang` because
-bare `go` collides with the English stop-word list and the FTS5 default tokeniser.
+Lore recognises the 27 languages below. Authors must declare the canonical token in the second
+column; the display column shows how lore refers to the language in prose and CLI output. The
+asymmetry is most visible for Go: the canonical token is `golang` because bare `go` collides with
+the English stop-word list and the FTS5 default tokeniser.
 
-| Display    | Canonical token |
-| ---------- | --------------- |
-| Rust       | `rust`          |
-| TypeScript | `typescript`    |
-| JavaScript | `javascript`    |
-| YAML       | `yaml`          |
-| Python     | `python`        |
-| Go         | `golang`        |
+| Display     | Canonical token |
+| ----------- | --------------- |
+| Rust        | `rust`          |
+| TypeScript  | `typescript`    |
+| JavaScript  | `javascript`    |
+| YAML        | `yaml`          |
+| Python      | `python`        |
+| Go          | `golang`        |
+| Shell       | `bash`          |
+| C           | `clang`         |
+| Clojure     | `clojure`       |
+| C++         | `cpp`           |
+| C#          | `csharp`        |
+| Dart        | `dart`          |
+| Elixir      | `elixir`        |
+| Groovy      | `groovy`        |
+| Haskell     | `haskell`       |
+| Java        | `java`          |
+| Kotlin      | `kotlin`        |
+| Lua         | `lua`           |
+| Nix         | `nix`           |
+| Objective-C | `objectivec`    |
+| Perl        | `perl`          |
+| PHP         | `php`           |
+| Ruby        | `ruby`          |
+| Scala       | `scala`         |
+| Swift       | `swift`         |
+| Terraform   | `terraform`     |
+| Zig         | `zig`           |
 
 Authors typing `language: go` will see a tier-2 warning at ingest naming the token as unknown; the
 pattern still ingests, but the structural gate will never match it.
