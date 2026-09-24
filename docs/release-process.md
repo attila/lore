@@ -67,9 +67,22 @@ One-time setup, performed by the repository owner:
    create` ran, so there is no github.com state to collide with). Removing or
    emptying the reviewers list collapses the security boundary — do not change without an explicit
    security review.
-2. **Local tooling**: `just`, `dprint`, `git-cliff`, and the GitHub CLI (`gh`) authenticated against
+2. **Homebrew tap App**. The publish job bumps the formula in `attila/homebrew-tap`, which
+   `GITHUB_TOKEN` cannot reach. Create a GitHub App with repository permission Contents: Read and
+   write and nothing else, install it on `attila/homebrew-tap` only, and generate a private key. On
+   the `release` Environment, add the App ID as the variable `TAP_APP_ID` and the key as the secret
+   `TAP_APP_PRIVATE_KEY`:
+
+   ```sh
+   gh variable set TAP_APP_ID --env release --repo attila/lore --body <app-id>
+   gh secret set TAP_APP_PRIVATE_KEY --env release --repo attila/lore < <key>.pem
+   ```
+
+   Without them, a stable release publishes but its tap step fails; see
+   [The Homebrew formula](#the-homebrew-formula) for recovery.
+3. **Local tooling**: `just`, `dprint`, `git-cliff`, and the GitHub CLI (`gh`) authenticated against
    the repo (`gh auth login`).
-3. **Clean working tree** before starting any release procedure.
+4. **Clean working tree** before starting any release procedure.
 
 ## Versioning rules pre-1.0
 
@@ -195,6 +208,37 @@ tar xzf lore-x86_64-unknown-linux-gnu.tar.gz
 
 Expected: SHA256 verification passes, binary executes, version string matches the tag.
 
+## The Homebrew formula
+
+The publish job bumps `Formula/lore.rb` in `attila/homebrew-tap` as its last step, so a stable
+release never leaves the tap on the previous version. Prereleases are skipped. The job runs
+[`scripts/bump-tap-formula.sh`](../scripts/bump-tap-formula.sh), which rewrites the tag and the
+version in every download URL and the checksum beside each, then commits through the GitHub API with
+the tap App's token. Its header says why neither `GITHUB_TOKEN` nor a git push would do.
+
+The script refuses rather than guesses. It fails on a missing checksum, an archive name without the
+old version in it, a URL left on the old version, or a checksum absent from the release. Rerunning
+it on a current formula does nothing and exits cleanly.
+
+If the bump step fails after the release is published, do not re-run the workflow (see failure mode
+5). Fix the cause, then run the script by hand against the published release, with `GH_TOKEN` set to
+an installation token for the tap App. Your own token will not do: GitHub signs an API commit only
+for an App or a bot, and the tap rejects an unsigned one.
+
+```sh
+gh release download vX.Y.Z --repo attila/lore --pattern SHA256SUMS --dir /tmp/lore-sums
+GH_TOKEN=<installation-token> VERSION=vX.Y.Z SUMS=/tmp/lore-sums/SHA256SUMS \
+    scripts/bump-tap-formula.sh
+```
+
+Verify on a clean machine:
+
+```sh
+brew update
+brew upgrade attila/tap/lore || brew install attila/tap/lore
+lore --version
+```
+
 ## Hotfix path
 
 Hotfixes follow the same merge-then-tag flow as regular releases, with one constraint: the hotfix
@@ -317,7 +361,8 @@ Update `CHANGELOG.md` retroactively only if the defect introduced a security or 
 
 Release writes via `GITHUB_TOKEN` are logged in repository audit logs. A suspicious release can be
 traced to the workflow run that created it by cross-referencing the run ID with the release creation
-timestamp.
+timestamp. The one write outside this repository is the formula bump, which lands in the tap's
+history attributed to the tap App.
 
 ## Why these choices
 

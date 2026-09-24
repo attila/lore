@@ -177,6 +177,7 @@ jobs:
           if [[ "$VERSION" == *-alpha* || "$VERSION" == *-beta* || "$VERSION" == *-rc* ]]; then
             prerelease=true
           fi
+          echo "PRERELEASE=${prerelease}" >> "$GITHUB_ENV"
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file /tmp/release-body.md \
@@ -193,3 +194,27 @@ jobs:
             dist/*.tar.gz \
             dist/SHA256SUMS \
             --repo "${{ github.repository }}"
+
+      # The tap is a separate repository, so `GITHUB_TOKEN` cannot reach it. An
+      # installation token from a GitHub App on the tap can, and a commit made
+      # with one through the API carries GitHub's signature, which the tap's
+      # default branch requires. See "The Homebrew formula" in
+      # docs/release-process.md for the App setup.
+      - name: Mint a token for the tap
+        if: env.PRERELEASE == 'false'
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: attila
+          repositories: homebrew-tap
+
+      # Prereleases are skipped deliberately: `brew install` must not hand
+      # people a release that was never meant to be the current one.
+      - name: Bump the Homebrew formula
+        if: env.PRERELEASE == 'false'
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          VERSION: ${{ github.ref_name }}
+        run: scripts/bump-tap-formula.sh
