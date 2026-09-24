@@ -230,9 +230,7 @@ fn ingest_force_completes_on_old_schema_db() {
 - Fix commit: `e2741bf` (clear_all rebuild + open_skipping_schema_check + should_skip_schema_probe
   helper)
 - Regression-test commit: `cda011b` (composition test + `should_skip_schema_probe` matrix)
-- Plan:
-  [`docs/plans/2026-04-20-001-feat-universal-patterns-plan.md`](../../plans/2026-04-20-001-feat-universal-patterns-plan.md)
-  — Post-review changes section
+- Plan: `docs/plans/2026-04-20-001-feat-universal-patterns-plan.md` — Post-review changes section
 - Related: `composition-cascades-new-write-paths-can-be-silently-undone-2026-04-06.md`,
   `filter-changes-in-delta-pipelines-need-bidirectional-reconciliation-2026-04-06.md`,
   `reload-plugins-does-not-restart-mcp-servers-2026-04-03.md`

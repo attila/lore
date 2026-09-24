@@ -7,10 +7,10 @@ post-release verification, hotfixes, failure recovery, and yank/rollback.
 
 Releases are triggered by pushing a `v*` tag from `main`. The
 [`release.yml`](../.github/workflows/release.yml) workflow runs the project quality gates
-(`just ci`), cross-compiles four binary targets via `cargo-zigbuild`, computes a `SHA256SUMS` file,
-and publishes a GitHub Release with the matching CHANGELOG section as the body. The publish step is
-gated by a `release` GitHub Environment that requires owner approval — push permission alone cannot
-ship a release.
+(`just ci`) and cross-compiles four binary targets via `cargo-zigbuild`. It then computes a
+`SHA256SUMS` file and publishes a GitHub Release with the matching CHANGELOG section as the body.
+The publish step is gated by a `release` GitHub Environment that requires owner approval. Push
+permission alone cannot ship a release.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ One-time setup, performed by the repository owner:
 
 1. **GitHub Environment**. The `release` Environment with a required-reviewers list AND a deployment
    branches/tags policy is the security boundary that prevents push-only contributors from shipping
-   a release. Both halves are required — reviewers gate the publish step, and the deployment policy
+   a release. Both halves are required: reviewers gate the publish step, and the deployment policy
    gates which refs are allowed to request the gate at all.
 
    **Required reviewers**: Settings → Environments → New environment → name it `release` → enable
@@ -32,13 +32,13 @@ One-time setup, performed by the repository owner:
    ```
 
    **Deployment branches and tags**: still in the `release` Environment, enable "Deployment branches
-   and tags" → "Selected branches and tags" → add a rule with name `v*` and type `Tag`. Without
-   this, the first tag push fails immediately with
+   and tags" → "Selected branches and tags". Add a rule with name `v*` and type `Tag`. Without this,
+   the first tag push fails immediately with
    `Tag X is not allowed to deploy to
-   release due to environment protection rules` because the
-   GitHub default of "no rule" rejects tag-ref deployments. The default rule the UI suggests (`main`
-   branch) does not apply — this project deploys from tag refs, not branches. The equivalent `gh`
-   API calls:
+   release due to environment protection rules`. This happens
+   because the GitHub default of "no rule" rejects tag-ref deployments. The default rule the UI
+   suggests (`main` branch) does not apply: this project deploys from tag refs, not branches. The
+   equivalent `gh` API calls:
 
    ```sh
    gh api -X PUT /repos/<owner>/<repo>/environments/release \
@@ -60,13 +60,13 @@ One-time setup, performed by the repository owner:
    ```
 
    Without reviewers, the publish job pauses indefinitely (recoverable: configure reviewers, then
-   approve the still-pending deployment retroactively — no re-tag needed). Without the deployment
-   tag rule, the publish job fails fast at the gate (recoverable: add the tag rule, then
-   `gh run rerun <run-id> --failed` — safe in this specific failure mode because no
+   approve the still-pending deployment retroactively, no re-tag needed). Without the deployment tag
+   rule, the publish job fails fast at the gate (recoverable: add the tag rule, then run
+   `gh run rerun <run-id> --failed`). This is safe in this specific failure mode because no
    `gh release
-   create` ran, so there is no github.com state to collide with). Removing or
-   emptying the reviewers list collapses the security boundary — do not change without an explicit
-   security review.
+   create` ran, so there is no github.com state to collide with. Removing or emptying
+   the reviewers list collapses the security boundary. Do not change without an explicit security
+   review.
 2. **Homebrew tap App**. The publish job bumps the formula in `attila/homebrew-tap`, which
    `GITHUB_TOKEN` cannot reach. Create a GitHub App with repository permission Contents: Read and
    write and nothing else, install it on `attila/homebrew-tap` only, and generate a private key. On
@@ -81,7 +81,7 @@ One-time setup, performed by the repository owner:
    Without them, a stable release publishes but its tap step fails; see
    [The Homebrew formula](#the-homebrew-formula) for recovery.
 3. **Local tooling**: `just`, `dprint`, `git-cliff`, and the GitHub CLI (`gh`) authenticated against
-   the repo (`gh auth login`).
+   the repository (`gh auth login`).
 4. **Clean working tree** before starting any release procedure.
 
 ## Versioning rules pre-1.0
@@ -108,9 +108,9 @@ CHANGELOG with their breaking notices intact.
 
 ## Cadence guidance
 
-Solo-maintainer cadence — batch CHANGELOG entries to feature-completion boundaries, not per-PR.
-Avoid a fixed weekly cadence; release-noise pressure cuts against the "process maturity over user
-demand" framing this project was built on. Cut a release when there is something worth releasing.
+Solo-maintainer cadence: batch CHANGELOG entries to feature-completion boundaries, not per-PR. Avoid
+a fixed weekly cadence; release-noise pressure cuts against the "process maturity over user demand"
+framing this project was built on. Cut a release when there is something worth releasing.
 
 ## Cutting a release
 
@@ -119,18 +119,16 @@ demand" framing this project was built on. Cut a release when there is something
 2. **Curate `CHANGELOG.md`**. The `[Unreleased]` block accumulates entries from merged PRs.
    Hand-edit it before cutting:
 
-   - Confirm the format matches existing entries (Keep a Changelog 1.1.0 — see
+   - Confirm the format matches existing entries (Keep a Changelog 1.1.0, see
      <https://keepachangelog.com/en/1.1.0/>).
    - Add or refine breaking notices, upgrade instructions, and `--force` advisories. The v2 schema
      entries from PRs #33 and #34 in `CHANGELOG.md` are the canonical examples.
-   - **Do not run `just changelog`** — that recipe regenerates CHANGELOG from git-cliff and would
-     clobber hand-curated breaking notices. The deliberate decision is documented in the
-     release-process plan
-     ([`docs/plans/2026-04-30-001-feat-release-process-plan.md`](plans/2026-04-30-001-feat-release-process-plan.md)).
+   - **Do not run `just changelog`**: that recipe regenerates CHANGELOG from git-cliff and would
+     clobber hand-curated breaking notices.
 
 3. **Patch-vs-minor exception**: `release-prep` rotates the _entire_ `[Unreleased]` block. For a
-   hotfix patch where `[Unreleased]` contains entries unrelated to the hotfix, after running
-   `release-prep` hand-edit the rotated CHANGELOG to move non-hotfix entries back into a fresh
+   hotfix patch where `[Unreleased]` contains entries unrelated to the hotfix, run `release-prep`
+   first. Then hand-edit the rotated CHANGELOG to move non-hotfix entries back into a fresh
    `[Unreleased]` block before committing. Concretely:
 
    ```sh
@@ -152,7 +150,7 @@ demand" framing this project was built on. Cut a release when there is something
 
 5. **Open a release-prep PR**. Use the `chore:` conventional-commit type for the message. The
    branch-prefix allowlist (`workflows/git-branch-pr.md`, injected universal pattern) covers
-   `feat/`, `fix/`, `refactor/`, `doc/`, `ci/`, `deps/` — `chore/` is not on the list, so name the
+   `feat/`, `fix/`, `refactor/`, `doc/`, `ci/`, `deps/`. `chore/` is not on the list, so name the
    branch with the `ci/` prefix (release plumbing is closest to CI):
 
    ```sh
@@ -174,14 +172,14 @@ demand" framing this project was built on. Cut a release when there is something
    git push origin v0.1.0-alpha.1
    ```
 
-   Tagging from any other branch is forbidden — see Failure Modes §1 for why.
+   Tagging from any other branch is forbidden: see Failure Modes §1 for why.
 
 7. **Approve the publish job**. The workflow runs `verify` and `build` automatically. When the
    matrix completes, `publish` pauses for owner approval at the `release` Environment gate. Open the
    workflow run in the GitHub Actions UI and click "Review deployments → Approve".
 
    The `gh` API equivalent (only members of the `release` Environment's required-reviewers list can
-   use it — that is the security boundary):
+   use it: that is the security boundary):
 
    ```sh
    RUN_ID=<workflow-run-id>
@@ -203,7 +201,7 @@ curl -LO https://github.com/attila/lore/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 tar xzf lore-x86_64-unknown-linux-gnu.tar.gz
 ./lore --version
-./lore status   # against an existing knowledge base
+./lore status   # against an existing knowledge directory
 ```
 
 Expected: SHA256 verification passes, binary executes, version string matches the tag.
@@ -212,13 +210,13 @@ Expected: SHA256 verification passes, binary executes, version string matches th
 
 The publish job bumps `Formula/lore.rb` in `attila/homebrew-tap` as its last step, so a stable
 release never leaves the tap on the previous version. Prereleases are skipped. The job runs
-[`scripts/bump-tap-formula.sh`](../scripts/bump-tap-formula.sh), which rewrites the tag and the
-version in every download URL and the checksum beside each, then commits through the GitHub API with
-the tap App's token. Its header says why neither `GITHUB_TOKEN` nor a git push would do.
+[`scripts/bump-tap-formula.sh`](../scripts/bump-tap-formula.sh). It rewrites the tag and the version
+in every download URL and the checksum beside each, then commits through the GitHub API with the tap
+App's token. Its header says why neither `GITHUB_TOKEN` nor a git push would do.
 
 The script refuses rather than guesses. It fails on a missing checksum, an archive name without the
-old version in it, a URL left on the old version, or a checksum absent from the release. Rerunning
-it on a current formula does nothing and exits cleanly.
+old version in it, or a URL left on the old version. It also fails on a checksum absent from the
+release. Rerunning it on a current formula does nothing and exits cleanly.
 
 If the bump step fails after the release is published, do not re-run the workflow (see failure mode
 5). Fix the cause, then run the script by hand against the published release, with `GH_TOKEN` set to
@@ -241,7 +239,7 @@ lore --version
 
 ## Hotfix path
 
-Hotfixes follow the same merge-then-tag flow as regular releases, with one constraint: the hotfix
+Hotfixes follow the same merge-then-tag flow as regular releases, with one constraint. The hotfix
 branches off the _tagged commit_ (not main HEAD), then merges to main, then is tagged from main.
 
 ```sh
@@ -258,7 +256,7 @@ git commit -am 'chore(release): cut v0.1.1'
 # ... PR + merge + tag from main as usual ...
 ```
 
-Never tag directly from a hotfix branch — every released SHA must be reachable from `main`. If the
+Never tag directly from a hotfix branch: every released SHA must be reachable from `main`. If the
 hotfix conflicts with main HEAD beyond a clean cherry-pick, escalate to a regular minor bump rather
 than forcing a hotfix.
 
@@ -266,7 +264,7 @@ than forcing a hotfix.
 
 When stabilising an alpha/beta/rc into a stable release (e.g. `v0.1.0` after `v0.1.0-rc.2`):
 
-- Do **not** delete or demote the prior prerelease tags. They are the public record of the
+- Do _not_ delete or demote the prior prerelease tags. They are the public record of the
   stabilisation arc.
 - The `latest` pointer automatically jumps to the new stable release because GitHub filters
   prereleases out of `latest`.
@@ -281,7 +279,7 @@ will be cut from the wrong tree. Recovery follows the same procedure as §4 belo
 
 ### 2. `verify` fails on the tagged commit
 
-`just ci` failed against the tagged commit. Do **not** retag the same version. Open a fix PR against
+`just ci` failed against the tagged commit. Do _not_ retag the same version. Open a fix PR against
 `main`, merge it, bump the patch (`vX.Y.Z+1`), and re-cut. Cleanup commands:
 
 ```sh
@@ -294,9 +292,9 @@ git tag -d v0.1.0-alpha.1                    # delete local tag
 Two recovery options, with the trade-off named:
 
 - **Ship a 3-target release**: edit the workflow `matrix.target` list on a follow-up commit to skip
-  the broken target, document the gap in CHANGELOG (e.g. "macOS arm64 binary not available for
-  v0.1.0, see v0.1.1"), bump to `vX.Y.Z+1` and re-cut. Affected users are gracefully steered to the
-  next release.
+  the broken target. Document the gap in CHANGELOG (e.g. "macOS arm64 binary not available for
+  v0.1.0, see v0.1.1"), then bump to `vX.Y.Z+1` and re-cut. Affected users are gracefully steered to
+  the next release.
 - **Block the release until fixed**: delete the partial release + tag (commands below), fix the
   cross-compile in a PR, re-cut against the new patch version.
 
@@ -322,24 +320,24 @@ git tag -d v0.1.0-alpha.1
 ```
 
 **Never re-tag the same version.** The retag-fails-fast policy exists precisely because
-retag-without-thinking is how broken artifacts ship.
+retag-without-thinking is how broken artefacts ship.
 
 ### 5. Workflow re-run vs. retag
 
-Do **not** re-run a failed `release.yml` workflow — neither via the GitHub UI's "re-run failed jobs"
+Do _not_ re-run a failed `release.yml` workflow: neither via the GitHub UI's "re-run failed jobs"
 button nor via `gh run rerun --failed`. The first run already created (or partially created) state
 at github.com that the re-run will collide with. Always: delete release + tag, bump version, re-cut.
-Re-running is safe for `ci.yml`; it is **unsafe** for `release.yml`.
+Re-running is safe for `ci.yml`; it is _unsafe_ for `release.yml`.
 
 ## Yank / rollback
 
-A release is "yanked" when a defect is discovered after publication. The mechanic is non-destructive
-— artifacts stay on the release page (preserving checksum audit trail) but GitHub's `latest` pointer
-skips them.
+A release is "yanked" when a defect is discovered after publication. The mechanic is
+non-destructive: artefacts stay on the release page (preserving checksum audit trail) but GitHub's
+`latest` pointer skips them.
 
 ```sh
-# 1. Demote the bad release from `latest`. Prerelease is the lighter touch than draft —
-#    artifacts remain visible, but `latest` skips it.
+# 1. Demote the bad release from `latest`. Prerelease is the lighter touch than draft,
+#    artefacts remain visible, but `latest` skips it.
 gh release edit v0.1.0 --prerelease
 
 # 2. Append a yank notice to the bad release body, pointing at the replacement.
@@ -351,7 +349,7 @@ gh release edit v0.1.0 --notes-file /tmp/yanked-notice.md
 ```
 
 After yanking, `releases/latest/download/...` URLs in README install snippets resolve to the
-previous good release automatically. No README update required for a yank — only for the new fix
+previous good release automatically. No README update required for a yank, only for the new fix
 release, which doesn't change the snippet shape because it uses `releases/latest/`.
 
 Update `CHANGELOG.md` retroactively only if the defect introduced a security or data safety risk
@@ -366,21 +364,31 @@ history attributed to the tap App.
 
 ## Why these choices
 
-The deliberate design decisions behind this process — single-runner zigbuild, no GPG signing, no
-git-cliff round-trip, retag-fails-fast, owner-approval Environment gate — are documented in
-[`docs/plans/2026-04-30-001-feat-release-process-plan.md`](plans/2026-04-30-001-feat-release-process-plan.md).
-Read that plan if you need to understand _why_ before changing the workflow.
+Read these reasons before you change the workflow.
+
+- **One Linux runner builds all four targets with `cargo-zigbuild`.** A per-platform matrix adds
+  slower macOS runners and a second toolchain setup, and lore has no native dependency that needs
+  one.
+- **No GPG or Sigstore signing.** `SHA256SUMS` served over HTTPS from GitHub covers the current
+  threat model. Signing adds key custody and rotation, and only helps against a compromised GitHub
+  or release credential.
+- **The release body comes from the hand-curated changelog, not from `git-cliff`.** Breaking notices
+  and `--force` advisories must reach the release page word for word.
+- **A retag fails.** The workflow refuses to overwrite an existing release, so a broken release is
+  deleted and the version bumped. This pause stops a hasty retag from shipping broken binaries.
+- **Publishing waits for the owner's approval.** The `publish` job runs in the `release`
+  environment, so push access alone cannot ship a release.
 
 ## Known cross-compile workarounds
 
-Two solution docs cover gotchas the release pipeline encountered. If a future maintainer hits the
-same surface — locally or in CI — start here:
+Two solution documents cover gotchas the release pipeline encountered. If a future maintainer hits
+the same surface (locally or in CI), start here:
 
-- [`solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md`](solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md)
-  — sqlite-vec 0.1.7 fails on `x86_64-unknown-linux-musl` because of BSD-style typedefs absent from
-  musl libc. Workaround is encoded in `.cargo/config.toml [env]` and applies automatically; the doc
-  explains the why and the drop condition.
-- [`solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md`](solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md)
-  — `taiki-e/install-action` does not ship `zig` itself; install via `mlugg/setup-zig`. Already
-  applied in `release.yml` and `ci.yml`; the doc explains the failure mode if anyone tries to
+- [`solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md`](solutions/build-errors/sqlite-vec-musl-cross-compile-u_int8_t-typedef-2026-05-01.md):
+  sqlite-vec 0.1.7 fails on `x86_64-unknown-linux-musl` because of BSD-style typedefs absent from
+  musl libc. Workaround is encoded in `.cargo/config.toml [env]` and applies automatically; the
+  document explains the why and the drop condition.
+- [`solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md`](solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md):
+  `taiki-e/install-action` does not ship `zig` itself; install via `mlugg/setup-zig`. Already
+  applied in `release.yml` and `ci.yml`; the document explains the failure mode if anyone tries to
   consolidate the install steps later.

@@ -28,11 +28,10 @@ tags:
 > (a `metadata` sibling on `result`) does not work inside Claude Code.** Claude Code's MCP client
 > forwards only the `content[]` array to the agent; the `metadata` sibling is stripped before the
 > agent sees it. Real-run testing of the coverage-check skill surfaced this during PR #32 (see
-> [`docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`](../../plans/2026-04-07-001-feat-coverage-check-skill-plan.md)
-> § 'Design pivot: layer 2 finding'). The wire format described in this learning is correct — unit
-> tests that dispatch directly through `handle_request` still read `resp["result"]["metadata"]`
-> successfully, and external MCP clients that surface the sibling work fine. But the primary target
-> (Claude Code agents) cannot read it.
+> `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md` § 'Design pivot: layer 2 finding').
+> The wire format described in this learning is correct — unit tests that dispatch directly through
+> `handle_request` still read `resp["result"]["metadata"]` successfully, and external MCP clients
+> that surface the sibling work fine. But the primary target (Claude Code agents) cannot read it.
 >
 > **For new MCP tools, use the fenced content block pattern instead.** See the superseding learning
 > at

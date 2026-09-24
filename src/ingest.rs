@@ -216,7 +216,7 @@ pub struct WriteResult {
 // Directory ingest (delta and full)
 // ---------------------------------------------------------------------------
 
-/// Ingest the knowledge base, using delta mode when possible.
+/// Ingest the knowledge directory, using delta mode when possible.
 ///
 /// Tries to detect changes via `git diff --name-status` against the last
 /// successfully ingested commit. Falls back to a full re-index when:
@@ -1825,8 +1825,7 @@ fn index_single_file(
     enforce_universal_body_cap(&rel_path, &chunks)?;
 
     // Compute embeddings BEFORE opening the outer transaction so the SQLite
-    // write lock is never held across Ollama HTTP round-trips. R4b in
-    // `docs/plans/2026-04-22-001-feat-db-sole-read-surface-plan.md`.
+    // write lock is never held across Ollama HTTP round-trips.
     // Collecting into a Vec materialises all embed calls up front; the
     // transaction block below contains only in-memory DB work.
     let mut embedding_failures = 0_usize;
@@ -3762,11 +3761,11 @@ mod tests {
     // -- inbox branch workflow against non-git directories ---------------
     //
     // The inbox branch workflow (Some(prefix)) calls git unconditionally to
-    // create and push per-submission branches. When the knowledge base is not
+    // create and push per-submission branches. When the knowledge directory is not
     // a git repository, every variant must surface a hard error rather than
     // silently writing the file or no-oping. These tests pin the documented
     // contract from `docs/configuration.md` ("Omit the `[git]` section
-    // entirely when the knowledge base is not a git repository").
+    // entirely when the knowledge directory is not a git repository").
 
     #[test]
     fn add_pattern_with_inbox_prefix_fails_on_non_git_dir() {

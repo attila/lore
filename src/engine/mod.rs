@@ -15,10 +15,6 @@
 //! static-grep keeps adapter-only filesystem access pinned to its
 //! existing allow-list; the engine simply has no `std::fs::*` references
 //! and never grows any.
-//!
-//! See `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`
-//! for the full engine/adapter split rationale and the Track 1 boundary
-//! diagram.
 
 pub mod call_context;
 pub mod languages;

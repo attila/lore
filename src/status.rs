@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn format_languages_line_unknown_token_falls_back_to_raw_token() {
-        // A token not in LANGUAGES (e.g. a knowledge base ingested with
+        // A token not in LANGUAGES (e.g. a knowledge directory ingested with
         // a newer pack than the binary covers) renders as-is. `matlab`
         // is the still-unknown canary now that `kotlin` is a known
         // token (MATLAB is the deferred `.m` contestation owner).

@@ -838,10 +838,10 @@ fn format_session_context(db: &KnowledgeDB, knowledge_dir: &Path) -> anyhow::Res
 
     if !crate::git::is_git_repo(knowledge_dir) {
         out.push_str(
-            "\nNote: this knowledge base is not a git repository. Pattern \
+            "\nNote: this knowledge directory is not a git repository. Pattern \
              writes via add_pattern, update_pattern, and append_to_pattern \
              will not be committed, delta ingest is unavailable, and there \
-             is no version history. Run `git init` in the knowledge base \
+             is no version history. Run `git init` in the knowledge directory \
              directory to enable these features. Use the lore_status tool \
              to inspect this state at any time.\n",
         );

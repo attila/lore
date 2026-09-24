@@ -273,9 +273,8 @@ the drop condition.
 - Adjacent CI/build-error pattern:
   [`rust-toolchain-action-does-not-read-toml.md`](rust-toolchain-action-does-not-read-toml.md) —
   same problem class (silent toolchain assumption that breaks one specific environment).
-- Origin plan:
-  [`docs/plans/2026-04-30-001-feat-release-process-plan.md`](../../plans/2026-04-30-001-feat-release-process-plan.md)
-  — the release-pipeline work that surfaced this bug in PR #35.
+- Origin plan: `docs/plans/2026-04-30-001-feat-release-process-plan.md` — the release-pipeline work
+  that surfaced this bug in PR #35.
 - Maintainer runbook: [`docs/release-process.md`](../../release-process.md) — the broader
   cross-compile pipeline this fix unblocked.
 - Upstream issue: <https://github.com/asg017/sqlite-vec/issues/156>

@@ -125,7 +125,7 @@ pub struct LanguageCount {
 
 /// Per-language source counts plus the count of sources with no
 /// `language:` declaration. Returned by [`KnowledgeDB::language_counts`]
-/// and rendered by `lore status` to show how much of the knowledge base
+/// and rendered by `lore status` to show how much of the knowledge directory
 /// participates in the structural language gate.
 ///
 /// `declared` holds [`LanguageCount`] entries as returned by SQL.

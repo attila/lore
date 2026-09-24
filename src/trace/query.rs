@@ -114,9 +114,7 @@ pub fn collect_with_diagnostics(
 /// Consequence: `lore trace why` may surface sessions that
 /// `lore status` does not count. That asymmetry is small and
 /// acknowledged; a future contributor "unifying" the walk should
-/// re-read this comment and the plan at
-/// `docs/plans/2026-05-16-001-feat-trace-walk-predicate-plan.md`
-/// before changing it.
+/// re-read this comment before changing it.
 fn list_trace_files_newest_first(trace_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     if !trace_dir.exists() {
         return Ok(Vec::new());

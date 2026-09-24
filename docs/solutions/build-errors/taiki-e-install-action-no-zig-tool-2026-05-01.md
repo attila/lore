@@ -126,9 +126,8 @@ The two failure modes have different debug paths and the timing is the cheapest 
 - Adjacent CI/build-action gotcha:
   [`rust-toolchain-action-does-not-read-toml.md`](rust-toolchain-action-does-not-read-toml.md) —
   same problem class (CI action's behaviour silently differs from assumed contract).
-- Origin plan:
-  [`docs/plans/2026-04-30-001-feat-release-process-plan.md`](../../plans/2026-04-30-001-feat-release-process-plan.md)
-  — the deepening pass that hallucinated install-action's zig support.
+- Origin plan: `docs/plans/2026-04-30-001-feat-release-process-plan.md` — the deepening pass that
+  hallucinated install-action's zig support.
 - mlugg/setup-zig: <https://github.com/mlugg/setup-zig>
 - taiki-e/install-action TOOLS.md (canonical list of supported tools):
   <https://github.com/taiki-e/install-action/blob/main/TOOLS.md>

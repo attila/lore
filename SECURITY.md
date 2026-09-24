@@ -2,7 +2,7 @@
 
 ## Threat Model
 
-Lore is a **local single-user CLI tool** and MCP server. It runs under the invoking user's
+Lore is a _local single-user CLI tool_ and MCP server. It runs under the invoking user's
 permissions, communicates over stdio (not network sockets), and connects only to a localhost Ollama
 instance for embeddings. There is no authentication, no remote API surface, and no multi-user
 access.
@@ -16,15 +16,15 @@ The primary threats are:
 
 ## Trust Boundaries
 
-| Input Surface              | Trust Level                            | Validation                                                               |
-| -------------------------- | -------------------------------------- | ------------------------------------------------------------------------ |
-| CLI arguments              | Trusted (user-invoked)                 | Clap argument parsing                                                    |
-| MCP tool arguments (stdio) | Partially trusted                      | Input length limits per field, path validation via `validate_within_dir` |
-| Hook input (agent payload) | Partially trusted                      | Session ID hashed for filenames, transcript path validated under `$HOME` |
-| Transcript file content    | Partially trusted                      | Bounded tail-read (last 32KB), lossy UTF-8 conversion                    |
-| Markdown knowledge files   | Trusted (user-controlled, git-tracked) | Extension filter (`.md`/`.markdown` only)                                |
-| Ollama API responses       | Trusted (localhost)                    | Error handling on malformed responses                                    |
-| Config file (`lore.toml`)  | Trusted (user-authored)                | TOML parsing via `serde`                                                 |
+| Input Surface                    | Trust Level                            | Validation                                                               |
+| -------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ |
+| CLI arguments                    | Trusted (user-invoked)                 | Clap argument parsing                                                    |
+| MCP tool arguments (stdio)       | Partially trusted                      | Input length limits per field, path validation via `validate_within_dir` |
+| Hook input (agent payload)       | Partially trusted                      | Session ID hashed for filenames, transcript path validated under `$HOME` |
+| Transcript file content          | Partially trusted                      | Bounded tail-read (last 32KB), lossy UTF-8 conversion                    |
+| Markdown knowledge files         | Trusted (user-controlled, git-tracked) | Extension filter (`.md`/`.markdown` only)                                |
+| Ollama API responses             | Trusted (localhost)                    | Error handling on malformed responses                                    |
+| Configuration file (`lore.toml`) | Trusted (user-authored)                | TOML parsing via `serde`                                                 |
 
 ## Security Measures
 
@@ -62,9 +62,8 @@ The primary threats are:
 
 - `unsafe_code = "deny"` enforced globally (one justified exception for sqlite-vec FFI registration
   in `src/database.rs`)
-- All SQL uses parameterised queries — no string concatenation
-- All subprocess calls use `std::process::Command` with explicit argument lists — no shell
-  invocation
+- All SQL uses parameterised queries: no string concatenation
+- All subprocess calls use `std::process::Command` with explicit argument lists: no shell invocation
 - Dependencies audited via `cargo-deny` in CI (advisories, licenses, bans)
 - Clippy pedantic lints enabled at warn level
 
@@ -75,7 +74,7 @@ The primary threats are:
 - Agent hook callers (Claude Code, Cursor, Opencode) provide legitimate `transcript_path` values
   under `$HOME`. The path validation is a defence-in-depth check, not a primary security boundary.
 - Ollama runs on localhost. Non-localhost Ollama configurations are not security-hardened.
-- The MCP transport is stdio — there is no network listener.
+- The MCP transport is stdio. There is no network listener.
 
 ## Reporting Vulnerabilities
 

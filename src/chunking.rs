@@ -118,10 +118,7 @@ pub struct Chunk {
     pub is_universal: bool,
     /// JSON-serialised `applies_when` predicate from the pattern's
     /// frontmatter, or `None` when no predicate is set. When `Some`, gates
-    /// re-injection of universal chunks at the `PreToolUse` predicate filter
-    /// (see U5 in `docs/plans/2026-05-07-001-feat-universal-pattern-predicate-plan.md`).
-    /// U1 introduces the field with explicit `None` at every construction
-    /// site; U7 plumbs real values from the frontmatter parser.
+    /// re-injection of universal chunks at the `PreToolUse` predicate filter.
     pub applies_when_json: Option<String>,
     /// JSON-serialised list of canonical language tokens declared via
     /// the pattern's `language:` frontmatter field, or `None` when no
@@ -1492,7 +1489,7 @@ Body text that is definitely long enough for a chunk.
     fn frontmatter_near_miss_tags_does_not_flag_unrelated_unicode_tags() {
         // Legitimate non-ASCII tags with different character counts must
         // pass through silently — we don't want spurious warnings on every
-        // non-English-tag knowledge base.
+        // non-English-tag knowledge directory.
         let md = "---\ntags: [résumé, emoji-🚀, universal]\n---\n\n# Hello\nBody.\n";
         let near = frontmatter_near_miss_tags(md, "universal");
         assert!(near.is_empty(), "got: {near:?}");

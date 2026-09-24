@@ -2,7 +2,7 @@
 
 This document describes the full search pipeline that determines which patterns surface during agent
 sessions. It is a reference for power users who need to understand why a specific pattern does or
-does not appear in search results, and how to diagnose discoverability issues.
+does not appear in search results. It also explains how to diagnose discoverability issues.
 
 For practical guidance on writing patterns that surface reliably, see the
 [Pattern Authoring Guide](pattern-authoring-guide.md).
@@ -69,9 +69,9 @@ lowercased and added to the term pool.
 
 ### Transcript Tail
 
-If the hook input includes a `transcript_path`, the hook reads the last 32 KB of the file, finds the
-most recent user message in the JSONL stream, and extracts up to 200 bytes of content. These words
-are added to the term pool as additional context.
+If the hook input includes a `transcript_path`, the hook reads the last 32 KB of the file. It then
+finds the most recent user message in the JSONL stream, and extracts up to 200 bytes of content.
+These words are added to the term pool as additional context.
 
 The transcript path must resolve under `$HOME`; paths outside the home directory are silently
 skipped.
@@ -109,9 +109,8 @@ assembled into one of these query shapes:
 | Not inferred    | Empty                | No query (search skipped)                              | —                                       |
 
 The single-inferred case is the most common during normal agent sessions. The multi-inferred case
-arises when a signal legitimately fires for several languages — `npm test` accumulates
-`{javascript,
-typescript}` because both entries register `npm` as a command keyword. The OR-grouped
+arises when a signal legitimately fires for several languages. `npm test` accumulates
+`{javascript, typescript}` because both entries register `npm` as a command keyword. The OR-grouped
 language anchor preserves the AND-with-terms structure so retrieval ranking remains predictable.
 
 ## Structural Language Gate
@@ -123,46 +122,46 @@ candidate lists fed to RRF. Patterns may declare their applicable languages via 
 pipeline applies a structural gate using SQLite's `json_each()` over the persisted `language_json`
 column:
 
-1. **FTS-fallback** — `MATCH "{lang} AND ({terms})"` with `WHERE c.language_json IS NULL`. Patterns
-   without a `language:` declaration reach retrieval through this branch; the language anchor
+1. **FTS-fallback**: `MATCH "{lang} AND ({terms})"` with `WHERE c.language_json IS NULL`. Patterns
+   without a `language:` declaration reach retrieval through this branch. The language anchor
    appears in the FTS predicate so the body must contain the canonical token to match. When the
    inferred-language set is empty, the MATCH collapses to terms-only and the `IS NULL` filter still
    applies.
-2. **FTS-structural** — `MATCH "({terms})"` with
+2. **FTS-structural**: `MATCH "({terms})"` with
    `WHERE EXISTS (SELECT 1 FROM json_each(c.language_json) WHERE value IN (?inferred_langs...))`.
    Patterns with a declared `language:` that intersects the inferred set reach retrieval through
-   this branch; the body anchor is waived because the declaration itself is the structural
+   this branch. The body anchor is waived because the declaration itself is the structural
    eligibility signal. Skipped entirely when the inferred set is empty (nothing to gate against).
-3. **Vector (oversample-and-filter)** — `vec0 MATCH ?embedding AND k = ?(top_k * N)`
-   `ORDER BY v.distance` fetches `N`-times-`top_k` nearest neighbours (initial multiplier `N = 3`),
-   then filters in code by the same `language_json IS NULL OR EXISTS json_each ...` predicate the
+3. **Vector (oversample-and-filter)**: `vec0 MATCH ?embedding AND k = ?(top_k * N)`
+   `ORDER BY v.distance` fetches `N`-times-`top_k` nearest neighbours (initial multiplier `N = 3`).
+   It then filters in code by the same `language_json IS NULL OR EXISTS json_each ...` predicate the
    FTS branches use. Take the top `top_k` after filtering. This preserves the structural gate's
    guarantee that wrong-language-labelled patterns cannot sneak in via semantic similarity. When the
-   inferred set is empty the filter degenerates to no filter — terms-only retrieval per the "no
+   inferred set is empty, the filter degenerates to no filter: terms-only retrieval per the "no
    declaration, match on body keywords" fallback rule.
 
-The two FTS branches are **disjoint by predicate**: a chunk has `language_json IS NULL` xor
+The two FTS branches are _disjoint by predicate_: a chunk has `language_json IS NULL` xor
 `language_json` containing the inferred lang. No pattern double-counts across the two FTS branches.
 RRF sees at most one FTS rank and one vector rank per pattern; the three-list count is a
 code-organisation choice, not an arithmetic inflation. Each FTS branch carries its own internally
-consistent BM25 weighting against its own MATCH terms; RRF uses positional rank from `enumerate`,
+consistent BM25 weighting against its own MATCH terms. RRF uses positional rank from `enumerate`,
 not raw BM25 score, so cross-branch score commensurability is not a concern.
 
 **Declaration is a gate, not a ranking signal.** The structural branch's MATCH expression contains
-only the enrichment terms — the inferred language tokens never enter the FTS predicate. A declared
-pattern is admitted regardless of body vocabulary, but its rank inside the structural branch is
-decided by how strongly the enrichment terms match the chunk's `title` (BM25 weight 10), `tags` (5),
-and `body` (1). A pattern declaring `language: rust` with prose like "Use anyhow for errors" can
-rank below an undeclared pattern whose heading reads `## Rust error handling` for the same query —
-the declaration ensures eligibility, not dominance. This is intentional: the gate's job is to
-prevent declared patterns from being filtered out by absence of a body keyword, not to override BM25
-ranking inside their branch.
+only the enrichment terms. The inferred language tokens never enter the FTS predicate. A declared
+pattern is admitted regardless of body vocabulary. Its rank inside the structural branch is decided
+by how strongly the enrichment terms match the chunk's `title` (BM25 weight 10), `tags` (5), and
+`body` (1). A pattern declaring `language: rust` with prose like "Use anyhow for errors" can rank
+below an undeclared pattern. The undeclared pattern's heading reads `## Rust error handling` for the
+same query. The declaration ensures eligibility, not dominance. This is intentional: the gate's job
+is to prevent declared patterns from being filtered out by absence of a body keyword, not to
+override BM25 ranking inside their branch.
 
 > **Why declare `language:`?** When a pattern's body uses prose that does not happen to repeat the
 > canonical language token, the FTS-fallback branch will miss it. Declaring `language: rust` lets
-> the pattern surface on every Rust tool call regardless of body vocabulary; without the declaration
-> the pattern relies on its body containing the canonical keyword — which works for patterns that
-> already mention the language in prose, and fails silently for the rest.
+> the pattern surface on every Rust tool call regardless of body vocabulary. Without the
+> declaration, the pattern relies on its body containing the canonical keyword. That works for
+> patterns that already mention the language in prose, and fails silently for the rest.
 
 ## FTS5 Search
 
@@ -184,9 +183,9 @@ merely mentions the phrase in passing.
 The FTS5 table uses the tokeniser `porter unicode61`, which applies porter stemming to both indexed
 content and search queries. Stemming reduces words to their root form:
 
-- "testing" and "test" both stem to "test" — they match each other
-- "fakes" and "fake" both stem to "fake" — they match each other
-- "creating" and "create" both stem to "creat" — they match each other
+- "testing" and "test" both stem to "test": they match each other
+- "fakes" and "fake" both stem to "fake": they match each other
+- "creating" and "create" both stem to "creat": they match each other
 
 Stemming handles morphological variants but not synonyms. "Edit" and "create" have different stems
 and do not match.
@@ -234,8 +233,8 @@ normalised_score = score / max_rrf
 ```
 
 A normalised score of 1.0 means the item ranked first in every list it appeared in. The three-list
-count is the typical hybrid path (FTS-fallback + FTS-structural + vector); when the embedding step
-is skipped or fails, RRF reduces to two lists; when the inferred-language set is empty, the
+count is the typical hybrid path (FTS-fallback + FTS-structural + vector). When the embedding step
+is skipped or fails, RRF reduces to two lists. When the inferred-language set is empty, the
 structural branch is skipped and RRF reduces accordingly.
 
 ### Inspecting Pre-Fusion Component Scores
@@ -243,20 +242,20 @@ structural branch is skipped and RRF reduces accordingly.
 Each candidate's per-branch scores are preserved through the fusion step and surface on three
 optional fields of the result row: `score_fts_fallback`, `score_fts_structural`, and `score_vector`.
 A field is present when the chunk appeared in the corresponding branch's input list and absent
-otherwise — so a chunk that surfaces only through the vector branch carries `score_vector` and
-`null` on the other two.
+otherwise. So a chunk that surfaces only through the vector branch carries `score_vector` and `null`
+on the other two.
 
 These fields are visible in two places:
 
-- **`lore trace why <session> --json`** — every candidate row in a PreToolUse or PostToolUse trace
+- **`lore trace why <session> --json`**: every candidate row in a PreToolUse or PostToolUse trace
   record carries the three fields alongside the post-fusion `score_combined`. Use this for
   after-the-fact diagnosis of why one pattern beat another. See
   [Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) for the trace setup.
-- **MCP `search_patterns` with `include_metadata: true`** — each result in the `lore-metadata`
-  fenced JSON block carries the same three fields, enabling agents to reason about per-branch
-  contributions without depending on the trace surface.
+- **MCP `search_patterns` with `include_metadata: true`**: each result in the `lore-metadata` fenced
+  JSON block carries the same three fields, enabling agents to reason about per-branch contributions
+  without depending on the trace surface.
 
-The post-fusion `score` is normalised to 0–1 (the field documented above); the pre-fusion scores
+The post-fusion `score` is normalised to 0–1 (the field documented above). The pre-fusion scores
 keep their native shapes (FTS BM25 values, which are typically negative; vector distances, which
 depend on the embedding metric). They are useful for relative comparison within a single result set,
 not for absolute thresholding.
@@ -276,12 +275,12 @@ because FTS5 BM25 scores use a different scale and are not directly comparable.
 ## Ingest-Time Filtering with `.loreignore`
 
 Search only sees what ingest indexed. A `.loreignore` file at the repository root excludes matching
-markdown files from the index entirely — they never reach the FTS5 or vector tables, so they cannot
+markdown files from the index entirely. They never reach the FTS5 or vector tables, so they cannot
 appear in results regardless of how the query is constructed.
 
 Filtering applies during both full ingest and delta ingest. When `.loreignore` changes, delta ingest
 detects the change via a content hash stored in `ingest_metadata` and runs a cumulative
-reconciliation pass: previously indexed files that now match an exclusion are removed, and files
+reconciliation pass. Previously indexed files that now match an exclusion are removed, and files
 that are no longer excluded are re-indexed from disk automatically.
 
 For the full syntax and behaviour, see the [Configuration Reference](configuration.md#loreignore).
@@ -299,9 +298,9 @@ choice that are valuable in the same context.
 ## Session Deduplication
 
 To prevent the same pattern from being injected repeatedly within a session, lore maintains a
-per-session deduplication file named `lore-session-{hash}` in the system temporary directory
-(`$TMPDIR` on macOS, usually `/tmp` on Linux), where `{hash}` is a 16-character FNV-1a hash of the
-session ID.
+per-session deduplication file named `lore-session-{hash}`. This file lives in the system temporary
+directory (`$TMPDIR` on macOS, usually `/tmp` on Linux), where `{hash}` is a 16-character FNV-1a
+hash of the session ID.
 
 The deduplication lifecycle:
 
@@ -403,7 +402,7 @@ same root as "creating."
 
 - "for", "with" → discarded (stop words)
 - "in" → discarded (two characters)
-- "don't-ask" splits on non-alphabetic boundaries into "don", "t", and "ask" — "t" is discarded (one
+- "don't-ask" splits on non-alphabetic boundaries into "don", "t", and "ask": "t" is discarded (one
   character), "don" survives (three characters), "ask" survives
 - Surviving terms: "error", "permission", "denied", "body", "heredoc", "don", "ask", "mode"
 

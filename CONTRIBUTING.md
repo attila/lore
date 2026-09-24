@@ -1,6 +1,6 @@
 # Contributing
 
-Lore is in active early development and is **not accepting external contributions** at this time.
+Lore is in active early development and is _not accepting external contributions_ at this time.
 
 This may change once the project reaches a stable release. If you have questions or feedback, please
 use [GitHub Discussions](https://github.com/attila/lore/discussions).
@@ -12,5 +12,5 @@ use [GitHub Discussions](https://github.com/attila/lore/discussions).
 
 Architectural rules that shape how the codebase is structured live in
 [`docs/architecture.md`](docs/architecture.md). Read it before introducing a new read surface, a new
-write path, or any runtime disk access — a few of the design choices look odd without the motivating
+write path, or any runtime disk access. A few of the design choices look odd without the motivating
 incidents.

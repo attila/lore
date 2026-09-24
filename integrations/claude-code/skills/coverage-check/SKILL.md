@@ -15,8 +15,8 @@ file, search for each query in parallel, score per-query coverage, suggest concr
 gaps, and iterate until convergence.
 
 Invoke as `/lore:coverage-check <pattern-file-path>` with a path relative to the configured
-`knowledge_dir` (the pattern repository root that lore is configured to index — see step 2 for how
-the skill resolves this from the `lore_status` MCP tool). The path argument is `$ARGUMENTS`.
+`knowledge_dir` (the knowledge directory that lore is configured to index — see step 2 for how the
+skill resolves this from the `lore_status` MCP tool). The path argument is `$ARGUMENTS`.
 
 **Quoting discipline (do not skip):** every Bash invocation in this skill that interpolates
 `$ARGUMENTS`, the canonical target path, or any agent-derived value MUST quote the value with double
@@ -143,7 +143,7 @@ Steps:
       with a path separator, then canonicalise the joined path. Concretely on Linux:
       `T="$(readlink -f -- "$KD/$ARGUMENTS")"`. On macOS/BSD:
       `T="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' -- "$KD/$ARGUMENTS")"`.
-      This guarantees the target resolves against the pattern repository, not the agent's current
+      This guarantees the target resolves against the knowledge directory, not the agent's current
       working directory — the agent may be invoked from any folder.
 5. Check that the canonical target path `T` starts with the canonical `knowledge_dir` `KD` followed
    by `/` (string-prefix check, with the trailing `/` so that `KD = /foo` does not match

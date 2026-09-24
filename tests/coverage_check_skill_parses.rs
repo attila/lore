@@ -21,9 +21,6 @@
 //! `src/server.rs::tests::tools_list_returns_all_five_tools`. If that test
 //! ever needs updating because the tool set has changed, this constant
 //! must be updated alongside it.
-//!
-//! Plan reference: `docs/plans/2026-04-07-001-feat-coverage-check-skill-plan.md`
-//! Unit 3, "Files" section.
 
 use std::fs;
 use std::path::PathBuf;
