@@ -1,0 +1,26 @@
+# The style contract's banned category: transition padding, reflexive
+# politeness and teasers.
+extends: existence
+message: "'%s' is padding. State the claim."
+level: error
+ignorecase: true
+tokens:
+  - furthermore
+  - moreover
+  - thus
+  - hence
+  - in conclusion
+  - worth noting
+  - that being said
+  - as mentioned
+  - as noted
+  - as discussed
+  - needless to say
+  - of course
+  - certainly
+  - feel free
+  - we hope
+  - please note
+  - don't worry
+  - do not worry
+  - please

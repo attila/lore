@@ -13,7 +13,7 @@ Use the `search_patterns` MCP tool to query lore. If the tool is not available, 
 `lore search "$ARGUMENTS"` via Bash instead.
 
 Apply ALL results as project conventions when writing code in this domain. These are the author's
-strong coding preferences — follow them unless they conflict with explicit project-level
+strong coding preferences: follow them unless they conflict with explicit project-level
 instructions.
 
 If results include conventions for the language or framework you are working in, apply them to all

@@ -1,0 +1,10 @@
+# No rhetorical questions. A heading or a sentence that asks is rewritten to
+# state. The one exception is a bold question, the label an aside opens with,
+# like "> **Why not semantic search?**".
+extends: existence
+message: "Question. The guide states; it does not ask."
+level: error
+nonword: true
+scope: ~strong
+tokens:
+  - '\?'

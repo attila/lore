@@ -9,6 +9,7 @@ Releases are triggered by pushing a `v*` tag from `main`. The
 [`release.yml`](../.github/workflows/release.yml) workflow runs the project quality gates
 (`just ci`) and cross-compiles four binary targets via `cargo-zigbuild`. It then computes a
 `SHA256SUMS` file and publishes a GitHub Release with the matching CHANGELOG section as the body.
+
 The publish step is gated by a `release` GitHub Environment that requires owner approval. Push
 permission alone cannot ship a release.
 
@@ -16,7 +17,7 @@ permission alone cannot ship a release.
 
 One-time setup, performed by the repository owner:
 
-1. **GitHub Environment**. The `release` Environment with a required-reviewers list AND a deployment
+1. **GitHub Environment**. The `release` Environment with a required-reviewers list and a deployment
    branches/tags policy is the security boundary that prevents push-only contributors from shipping
    a release. Both halves are required: reviewers gate the publish step, and the deployment policy
    gates which refs are allowed to request the gate at all.
@@ -109,8 +110,8 @@ CHANGELOG with their breaking notices intact.
 ## Cadence guidance
 
 Solo-maintainer cadence: batch CHANGELOG entries to feature-completion boundaries, not per-PR. Avoid
-a fixed weekly cadence; release-noise pressure cuts against the "process maturity over user demand"
-framing this project was built on. Cut a release when there is something worth releasing.
+a fixed seven-day cadence; release-noise pressure cuts against the "process maturity over user
+demand" framing this project was built on. Cut a release when there is something worth releasing.
 
 ## Cutting a release
 
@@ -210,9 +211,11 @@ Expected: SHA256 verification passes, binary executes, version string matches th
 
 The publish job bumps `Formula/lore.rb` in `attila/homebrew-tap` as its last step, so a stable
 release never leaves the tap on the previous version. Prereleases are skipped. The job runs
-[`scripts/bump-tap-formula.sh`](../scripts/bump-tap-formula.sh). It rewrites the tag and the version
-in every download URL and the checksum beside each, then commits through the GitHub API with the tap
-App's token. Its header says why neither `GITHUB_TOKEN` nor a git push would do.
+[`scripts/bump-tap-formula.sh`](../scripts/bump-tap-formula.sh).
+
+It rewrites the tag and the version in every download URL and the checksum beside each. It then
+commits through the GitHub API with the tap App's token. Its header says why neither `GITHUB_TOKEN`
+nor a git push would do.
 
 The script refuses rather than guesses. It fails on a missing checksum, an archive name without the
 old version in it, or a URL left on the old version. It also fails on a checksum absent from the
@@ -220,7 +223,7 @@ release. Rerunning it on a current formula does nothing and exits cleanly.
 
 If the bump step fails after the release is published, do not re-run the workflow (see failure mode
 5). Fix the cause, then run the script by hand against the published release, with `GH_TOKEN` set to
-an installation token for the tap App. Your own token will not do: GitHub signs an API commit only
+an installation token for the tap App. Your own token does not work: GitHub signs an API commit only
 for an App or a bot, and the tap rejects an unsigned one.
 
 ```sh
@@ -240,7 +243,8 @@ lore --version
 ## Hotfix path
 
 Hotfixes follow the same merge-then-tag flow as regular releases, with one constraint. The hotfix
-branches off the _tagged commit_ (not main HEAD), then merges to main, then is tagged from main.
+branches off the _tagged commit_ (not the `HEAD` of main), then merges to main, then is tagged from
+main.
 
 ```sh
 git checkout v0.1.0
@@ -257,8 +261,8 @@ git commit -am 'chore(release): cut v0.1.1'
 ```
 
 Never tag directly from a hotfix branch: every released SHA must be reachable from `main`. If the
-hotfix conflicts with main HEAD beyond a clean cherry-pick, escalate to a regular minor bump rather
-than forcing a hotfix.
+hotfix conflicts with the `HEAD` of main beyond a clean cherry-pick, escalate to a regular minor
+bump rather than forcing a hotfix.
 
 ## Prerelease promotion
 
@@ -268,14 +272,14 @@ When stabilising an alpha/beta/rc into a stable release (e.g. `v0.1.0` after `v0
   stabilisation arc.
 - The `latest` pointer automatically jumps to the new stable release because GitHub filters
   prereleases out of `latest`.
-- README install snippets continue to resolve correctly.
+- README install snippets continue to resolve.
 
 ## Failure modes
 
 ### 1. Tag pushed from a non-main commit
 
-The workflow runs against the SHA the tag points at, not `main`. If the SHA is wrong, the release
-will be cut from the wrong tree. Recovery follows the same procedure as §4 below.
+The workflow runs against the SHA the tag points at, not `main`. If the SHA is wrong, the release is
+cut from the wrong tree. Recovery follows the same procedure as §4 below.
 
 ### 2. `verify` fails on the tagged commit
 
@@ -293,8 +297,8 @@ Two recovery options, with the trade-off named:
 
 - **Ship a 3-target release**: edit the workflow `matrix.target` list on a follow-up commit to skip
   the broken target. Document the gap in CHANGELOG (e.g. "macOS arm64 binary not available for
-  v0.1.0, see v0.1.1"), then bump to `vX.Y.Z+1` and re-cut. Affected users are gracefully steered to
-  the next release.
+  v0.1.0, see v0.1.1"), then bump to `vX.Y.Z+1` and re-cut. Affected users are steered to the next
+  release.
 - **Block the release until fixed**: delete the partial release + tag (commands below), fix the
   cross-compile in a PR, re-cut against the new patch version.
 
@@ -303,8 +307,8 @@ realistic install path), prefer blocking. Otherwise the 3-target ship is accepta
 
 ### 4. `gh release create` fails because release exists
 
-A release with the tag already exists from a previous run (likely a partial-success retry). Delete
-the release and tag in one step, bump version, re-cut:
+A release with the tag already exists from a previous run (typically a partial-success retry).
+Delete the release and tag in one step, bump version, re-cut:
 
 ```sh
 gh release delete v0.1.0-alpha.1 --cleanup-tag --yes
@@ -326,7 +330,7 @@ retag-without-thinking is how broken artefacts ship.
 
 Do _not_ re-run a failed `release.yml` workflow: neither via the GitHub UI's "re-run failed jobs"
 button nor via `gh run rerun --failed`. The first run already created (or partially created) state
-at github.com that the re-run will collide with. Always: delete release + tag, bump version, re-cut.
+at github.com, and the re-run collides with it. Always: delete release + tag, bump version, re-cut.
 Re-running is safe for `ci.yml`; it is _unsafe_ for `release.yml`.
 
 ## Yank / rollback
@@ -350,7 +354,7 @@ gh release edit v0.1.0 --notes-file /tmp/yanked-notice.md
 
 After yanking, `releases/latest/download/...` URLs in README install snippets resolve to the
 previous good release automatically. No README update required for a yank, only for the new fix
-release, which doesn't change the snippet shape because it uses `releases/latest/`.
+release, which does not change the snippet shape because it uses `releases/latest/`.
 
 Update `CHANGELOG.md` retroactively only if the defect introduced a security or data safety risk
 (rare). Otherwise the yank notice on the release page is sufficient.
@@ -391,4 +395,4 @@ the same surface (locally or in CI), start here:
 - [`solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md`](solutions/build-errors/taiki-e-install-action-no-zig-tool-2026-05-01.md):
   `taiki-e/install-action` does not ship `zig` itself; install via `mlugg/setup-zig`. Already
   applied in `release.yml` and `ci.yml`; the document explains the failure mode if anyone tries to
-  consolidate the install steps later.
+  combine the install steps later.

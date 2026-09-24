@@ -1,0 +1,47 @@
+#!/bin/sh
+# Checks README.md and every document under docs/ against docs/budget.txt.
+# Fails when a document is over its budget or has no budget line, or a budget
+# line names no file.
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+budget="$root/docs/budget.txt"
+status=0
+seen=""
+
+while read -r file limit; do
+  case "$file" in ''|'#'*) continue ;; esac
+  case "$limit" in ''|*[!0-9]*)
+    echo "budget: $file has no numeric budget" >&2
+    status=1
+    continue
+    ;;
+  esac
+  seen="$seen $file"
+  path="$root/$file"
+  if [ ! -f "$path" ]; then
+    echo "budget: $file is listed but does not exist" >&2
+    status=1
+    continue
+  fi
+  words=$(wc -w < "$path" | tr -d ' ')
+  if [ "$words" -gt "$limit" ]; then
+    echo "budget: $file is $words words, budget $limit" >&2
+    status=1
+  else
+    echo "budget: $file $words/$limit"
+  fi
+done < "$budget"
+
+for path in "$root/README.md" "$root"/docs/*.md; do
+  [ -f "$path" ] || continue
+  file=${path#"$root/"}
+  case " $seen " in
+  *" $file "*) ;;
+  *)
+    echo "budget: $file has no line in docs/budget.txt" >&2
+    status=1
+    ;;
+  esac
+done
+
+exit $status

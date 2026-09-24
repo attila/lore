@@ -42,29 +42,29 @@ include_transcript_tail = false
 inbox_branch_prefix = "inbox/"
 ```
 
-### Field Reference
+## Field Reference
 
-#### Top-Level Fields
+### Top-Level Fields
 
-| Field           | Type   | Required | Default            | Description                                                                                                                 |
-| --------------- | ------ | -------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `knowledge_dir` | path   | Yes      | Set by `lore init` | Directory containing your markdown pattern files. A git repository is recommended; see [Git Integration](#git-integration). |
-| `database`      | path   | Yes      | Set by `lore init` | Path to the SQLite database file. This is a derived artefact, safe to delete and rebuild with `lore ingest --force`.        |
-| `bind`          | string | Yes      | `"localhost:3100"` | Bind address for future TCP transport (not yet implemented; MCP currently uses stdio).                                      |
+| Field           | Type   | Required | Default            | Description                                                                                                                     |
+| --------------- | ------ | -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge_dir` | path   | Yes      | Set by `lore init` | Directory containing your markdown pattern files. A git repository is recommended; see [Git Integration](#git-integration).     |
+| `database`      | path   | Yes      | Set by `lore init` | Path to the SQLite database file. This is a derived artefact, safe to delete and rebuild with `lore ingest --force`.            |
+| `bind`          | string | Yes      | `"localhost:3100"` | Bind address for a future TCP transport (not yet implemented; the Model Context Protocol (MCP) transport currently uses stdio). |
 
 Only files under `knowledge_dir` with a `.md` or `.markdown` extension are ingested. Other files
-(`.txt`, `.mdx`, `.rst`, etc.) are silently skipped. They will not appear in search results. This
-filter applies to both full and delta (git-based) ingest; for delta ingest, renaming a file across
-the extension boundary (e.g. `.md` → `.txt`) is treated as a deletion.
+(`.txt`, `.mdx`, `.rst`, and similar) are skipped without a warning, so they do not appear in search
+results. This filter applies to both full and delta (git-based) ingest. For delta ingest, renaming a
+file across the extension boundary, such as `.md` renamed to `.txt`, is treated as a deletion.
 
-#### `[ollama]` Section
+### `[ollama]` Section
 
 | Field   | Type   | Default                    | Description                                                                                                                                                     |
 | ------- | ------ | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `host`  | string | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host.                                                                                         |
 | `model` | string | `"nomic-embed-text"`       | Embedding model name. Must be available in Ollama. Other options include `mxbai-embed-large` (1024 dimensions) and `snowflake-arctic-embed2` (1024 dimensions). |
 
-#### `[search]` Section
+### `[search]` Section
 
 | Field                     | Type           | Default | Description                                                                                                                                                                                                                                                           |
 | ------------------------- | -------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -74,21 +74,21 @@ the extension boundary (e.g. `.md` → `.txt`) is treated as a deletion.
 | `min_relevance_universal` | optional float | unset   | Per-tier score floor applied to universal-tagged patterns at PreToolUse search time. When unset, the effective universal floor inherits from `min_relevance`. Non-universal results continue to be filtered against `min_relevance` regardless of this field's value. |
 
 The `min_relevance_universal` knob exists for tuning universal-pattern relevance independently when
-dogfooding shows over-firing on weakly-related queries. It is the numerical complement to the
-[`applies_when`](pattern-authoring-guide.md#toolcommand-predicate-applies_when) predicate, which
-gates universal injection categorically by tool class and Bash command prefix. Reach for the
-predicate when the over-firing is on a structural axis (the pattern fires on Bash calls it has no
-business addressing). Reach for `min_relevance_universal` when the over-firing is on a relevance
-axis (the pattern fires on calls in its tool class but with weak topical overlap).
+dogfooding shows over-firing on queries with marginal topical relevance. It is the numerical
+complement to the [`applies_when`](pattern-authoring-guide.md#toolcommand-predicate-applies_when)
+predicate, which gates universal injection categorically by tool class and Bash command prefix.
+Reach for the predicate when the over-firing is on a structural axis (the pattern fires on Bash
+calls it has no business addressing). Reach for `min_relevance_universal` when the over-firing is on
+a relevance axis (the pattern fires on calls in its tool class but with weak topical overlap).
 
-#### `[chunking]` Section
+### `[chunking]` Section
 
 | Field        | Type   | Default     | Description                                                                                                                   |
 | ------------ | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `strategy`   | string | `"heading"` | Chunking strategy. Currently only `"heading"` is implemented, which splits markdown files on headings (`#` through `######`). |
 | `max_tokens` | usize  | `1024`      | Maximum tokens per chunk. Reserved for future token-based limiting (not yet implemented).                                     |
 
-#### `[trace]` Section
+### `[trace]` Section
 
 Per-hook trace logging is disabled by default. Enable it persistently here, or per-process via the
 `LORE_TRACE` environment variable. See [Per-Hook Trace Logging](#per-hook-trace-logging) below for
@@ -97,19 +97,19 @@ the wider feature context: privacy posture, maintenance behaviour, and the trace
 | Field                     | Type    | Default | Description                                                                                                                                                                                             |
 | ------------------------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`                 | bool    | `false` | Master switch for per-hook trace logging. `LORE_TRACE=1` / `LORE_TRACE=0` overrides this value for a single process.                                                                                    |
-| `retain_days`             | integer | `30`    | Trace files older than this many days are deleted on the next maintenance pass. Set to `0` to disable deletion entirely.                                                                                |
-| `gzip_older_than_days`    | integer | `7`     | Trace files older than this many days are gzipped in place. Set to `0` to disable compression. Must be less than or equal to `retain_days` to be meaningful.                                            |
+| `retain_days`             | integer | `30`    | Trace files older than this number of days are deleted on the next maintenance pass. Set to `0` to disable deletion entirely.                                                                           |
+| `gzip_older_than_days`    | integer | `7`     | Trace files older than this number of days are gzipped in place. Set to `0` to disable compression. Must be less than or equal to `retain_days` to be meaningful.                                       |
 | `include_full_command`    | bool    | `false` | When `true`, captures the full Bash command body in each trace record. Default redaction stores only the first whitespace-delimited head (e.g. `git` rather than `git push origin --force-with-lease`). |
 | `include_transcript_tail` | bool    | `false` | When `true`, includes the eager transcript-tail read (already capped at 32 KB by the hook adapter). Privacy-sensitive: surfaces in the `lore status` Trace block as an audit warning when enabled.      |
 
-#### `[git]` Section (Optional)
+### `[git]` Section (Optional)
 
 This section is optional. When present, it enables the inbox branch workflow for pattern submissions
 via MCP tools.
 
 | Field                 | Type   | Default | Description                                                                                                                                                                      |
 | --------------------- | ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `inbox_branch_prefix` | string | —       | Branch name prefix for per-submission branches created by `add_pattern`, `update_pattern`, and `append_to_pattern`. Each submission creates a branch like `inbox/pattern-title`. |
+| `inbox_branch_prefix` | string | unset   | Branch name prefix for per-submission branches created by `add_pattern`, `update_pattern`, and `append_to_pattern`. Each submission creates a branch like `inbox/pattern-title`. |
 
 When the `[git]` section is absent, MCP write operations commit directly to the current branch. They
 skip the commit entirely if the knowledge directory is not a git repository. See
@@ -134,10 +134,10 @@ documentation.
 
 - **Delta ingest is unavailable.** Every `lore ingest` re-reads and re-embeds every markdown file in
   the knowledge directory. On a large corpus this is slower and multiplies the number of Ollama
-  embedding calls. Delta ingest uses `git diff` against the last successfully ingested commit SHA.
-  Without git, there is no baseline to diff against. `lore ingest --force` is the equivalent rebuild
-  path inside a git repository when the database needs to be regenerated from scratch.
-- **Inbox branch workflow breaks.** Setting `[git] inbox_branch_prefix` in `lore.toml` will cause
+  embedding calls. Delta ingest uses `git diff` against the last ingested commit SHA. Without git,
+  there is no baseline to diff against. `lore ingest --force` is the equivalent rebuild path inside
+  a git repository when the database needs to be regenerated from scratch.
+- **Inbox branch workflow breaks.** Setting `[git] inbox_branch_prefix` in `lore.toml` causes
   `add_pattern`, `update_pattern`, and `append_to_pattern` to fail, because these commands call
   `git` unconditionally to create and push per-submission branches. Omit the `[git]` section
   entirely when the knowledge directory is not a git repository.
@@ -196,7 +196,7 @@ repository root.
   are not supported.
 - **Cumulative reconciliation:** When `.loreignore` changes, the next ingest detects the change via
   a content hash and reconciles the database in both directions. Files that now match an exclusion
-  are removed; files that are no longer excluded are re-indexed automatically. Deleting
+  are removed; files that stop matching an exclusion are re-indexed automatically. Deleting
   `.loreignore` re-indexes every file that had been excluded.
 - **Bounded read:** `.loreignore` is limited to 64 KiB. Files exceeding this limit are rejected with
   a warning to stderr, and no filtering is applied.
@@ -220,14 +220,14 @@ checks performed during reconciliation. Both removals and re-indexes are logged.
 
 ## Environment Variables
 
-| Variable          | Purpose                                           | Values                                                          | Notes                                                                                                                                                                                                                                                                                                   |
-| ----------------- | ------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LORE_DEBUG`      | Enable verbose debug logging                      | `1`, `true`, or `yes` to enable                                 | Output writes to stderr with `[lore debug]` prefix. The value is read once on first check and cached for the process lifetime.                                                                                                                                                                          |
-| `LORE_TRACE`      | Override the `[trace] enabled` configuration flag | `1` / `true` / `yes` to enable; `0` / `false` / `no` to disable | Per-process override for the persistent configuration flag. Parsing is case-sensitive and limited to the listed tokens; any other value (including the empty string) silently falls through to `[trace] enabled`. See [Per-Hook Trace Logging](#per-hook-trace-logging) for the full feature reference. |
-| `XDG_CONFIG_HOME` | Override the configuration base directory         | Any absolute path                                               | Defaults to `$HOME/.config` when unset or empty.                                                                                                                                                                                                                                                        |
-| `XDG_DATA_HOME`   | Override the data base directory                  | Any absolute path                                               | Defaults to `$HOME/.local/share` when unset or empty.                                                                                                                                                                                                                                                   |
-| `XDG_STATE_HOME`  | Override the state base directory                 | Any absolute path                                               | Defaults to `$HOME/.local/state` when unset or empty. Trace files land under `$XDG_STATE_HOME/lore/traces/`.                                                                                                                                                                                            |
-| `HOME`            | Home directory (fallback for XDG)                 | Set by the operating system                                     | Required when XDG variables are not set. If absent, lore reports an error suggesting `--config`.                                                                                                                                                                                                        |
+| Variable          | Purpose                                           | Values                                                          | Notes                                                                                                                                                                                                                                                                                                            |
+| ----------------- | ------------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LORE_DEBUG`      | Enable verbose debug logging                      | `1`, `true`, or `yes` to enable                                 | Output writes to stderr with `[lore debug]` prefix. The value is read once on first check and cached for the process lifetime.                                                                                                                                                                                   |
+| `LORE_TRACE`      | Override the `[trace] enabled` configuration flag | `1` / `true` / `yes` to enable; `0` / `false` / `no` to disable | Per-process override for the persistent configuration flag. Parsing is case-sensitive and limited to the listed tokens; any other value (including the empty string) falls through without a warning to `[trace] enabled`. See [Per-Hook Trace Logging](#per-hook-trace-logging) for the full feature reference. |
+| `XDG_CONFIG_HOME` | Override the configuration base directory         | Any absolute path                                               | Defaults to `$HOME/.config` when unset or empty.                                                                                                                                                                                                                                                                 |
+| `XDG_DATA_HOME`   | Override the data base directory                  | Any absolute path                                               | Defaults to `$HOME/.local/share` when unset or empty.                                                                                                                                                                                                                                                            |
+| `XDG_STATE_HOME`  | Override the state base directory                 | Any absolute path                                               | Defaults to `$HOME/.local/state` when unset or empty. Trace files land under `$XDG_STATE_HOME/lore/traces/`.                                                                                                                                                                                                     |
+| `HOME`            | Home directory (fallback for XDG)                 | Set by the operating system                                     | Required when XDG variables are not set. If absent, lore reports an error suggesting `--config`.                                                                                                                                                                                                                 |
 
 ## File Paths
 
@@ -270,7 +270,7 @@ The `~` notation here represents `$HOME`. These are not valid TOML values. Use a
 
 If `$HOME` is not set and no XDG variable is provided, lore exits with an error message:
 
-> Cannot determine config directory: $HOME is not set. Use --config to specify a path.
+> Cannot determine config directory: `$HOME` is not set. Use --config to specify a path.
 
 ## CLI Flags
 
@@ -305,7 +305,7 @@ These flags apply to all commands:
 ## MCP Tool Input Limits
 
 The MCP server enforces maximum sizes on tool arguments to prevent resource exhaustion. Oversized
-inputs are rejected with a JSON-RPC `-32000` error before any processing occurs.
+inputs are rejected with a `JSON-RPC` `-32000` error before any processing occurs.
 
 | Field                   | Maximum size           |
 | ----------------------- | ---------------------- |
@@ -337,8 +337,8 @@ the operational surfaces that those knobs control.
 ### `LORE_TRACE` Parsing
 
 Truthy values: `1`, `true`, `yes`. Falsy values: `0`, `false`, `no`. All parsing is
-_case-sensitive_. Any other value, including the empty string, is treated as unset and silently
-falls through to `[trace] enabled`, matching the `LORE_DEBUG` fail-soft convention.
+_case-sensitive_. Any other value, including the empty string, is treated as unset and falls through
+without a warning to `[trace] enabled`, matching the `LORE_DEBUG` fail-soft convention.
 
 See
 [`docs/solutions/conventions/env-var-plus-config-flag-coexistence-2026-05-15.md`](solutions/conventions/env-var-plus-config-flag-coexistence-2026-05-15.md)
@@ -352,7 +352,7 @@ manually for an unbounded pass. Both writers bump the `.last_pruned_at` state fi
 stays honest.
 
 At the default knobs (`retain_days = 30`, `gzip_older_than_days = 7`) a heavy operator session-load
-produces roughly 30–60 MB of post-gzip trace data per operator. Tighten `retain_days` to budget
+produces around 30 to 60 MB of post-gzip trace data per operator. Tighten `retain_days` to budget
 less; widen it to retain more history for analysis.
 
 ### Privacy Posture
@@ -376,7 +376,8 @@ surprised by world-readable trace content.
 
 Trace files are appended without locking; the per-write atomicity guarantee relies on POSIX
 `O_APPEND`. On NFS-mounted home directories and other filesystems that do not enforce `O_APPEND`
-atomicity, two concurrent hook invocations can interleave bytes and produce a torn JSON line. The
-reader recovers: malformed lines are skipped with a `LORE_DEBUG`-gated warning, but the
+atomicity, two concurrent hook invocations can interleave bytes. The result is a torn JSON line.
+
+The reader recovers: malformed lines are skipped with a `LORE_DEBUG`-gated warning, but the
 corresponding record is lost. Point the trace directory at local storage when running lore on NFS or
 SMB-backed home directories.

@@ -78,10 +78,10 @@ carries more weight than an abstract best practice.
 **With incident context:**
 
 > Use `--body-file /tmp/pr-body.md` instead of `--body` with inline strings or heredocs. Inline and
-> heredoc approaches get blocked by don't-ask mode permission settings.
+> heredoc approaches get blocked by `don't-ask` mode permission settings.
 
 The second version explains _why_: the agent now understands the consequence of violating the rule,
-not just the rule itself.
+not only the rule itself.
 
 Not every pattern originates from a failure, and you should not fabricate incident context where
 none exists. A configuration reference such as "enable clippy pedantic at warn level" does not need
@@ -89,9 +89,9 @@ a failure story. Use incident grounding when you have it; omit it when you do no
 
 ### Discoverable Vocabulary
 
-A pattern that the search engine cannot find is a pattern that does not exist. Lore uses FTS5
-full-text search with porter stemming. That means the words in your pattern's title, tags, and body
-determine whether it surfaces for a given query.
+A pattern that the search engine cannot find is a pattern that does not exist. Lore's search engine
+is FTS5, a Full-Text Search (FTS) engine, and it applies porter stemming. That means the words in
+your pattern's title, tags, and body determine whether it surfaces for a given query.
 
 **The vocabulary gap in practice:**
 
@@ -152,10 +152,12 @@ stop word, ensure the body contains alternative vocabulary.
 
 The full stop word list:
 
-> the, and, for, with, from, into, that, this, then, when, will, has, have, was, are, not, but, can,
-> all, its, our, use, new, let, set, get, add, run, see, how, may, per, via, yet, also, just, some,
-> been, were, what, they, each, which, their, there, about, would, could, should, these, those,
-> other, than, them, your, does, here
+```text
+the, and, for, with, from, into, that, this, then, when, will, has, have, was, are, not, but, can,
+all, its, our, use, new, let, set, get, add, run, see, how, may, per, via, yet, also, just, some,
+been, were, what, they, each, which, their, there, about, would, could, should, these, those,
+other, than, them, your, does, here
+```
 
 ### Porter Stemming
 
@@ -164,13 +166,13 @@ Lore uses porter stemming, which reduces words to their root form during both in
 "testing." Similarly, "fakes" matches "fake," and "creating" matches "create."
 
 Stemming helps with morphological variants, but it does not help with synonyms. "Edit" does not stem
-to "create," so a pattern that says "creating" will not match a query containing "edit."
+to "create," so a pattern that says "creating" does not match a query containing "edit."
 
 ## Vocabulary Coverage Technique
 
 Before finalising a pattern, audit its term coverage. Use `lore ingest --file` to index the draft
-without committing it: the full edit → ingest → search loop runs against your working tree, no WIP
-commit required.
+without committing it. The full edit → ingest → search loop runs against your working tree, so no
+Work In Progress (WIP) commit is required.
 
 1. List the verbs and nouns an agent would use when the pattern should surface. For a pattern about
    pull request workflows, this might include: create, edit, update, merge, push, branch, PR, pull
@@ -200,13 +202,13 @@ Single-file ingest does not touch delta-ingest state, so the next `lore ingest` 
 repository) still sees real git changes. It also respects `.loreignore` by default; pass `--force`
 alongside `--file` to index a file that is otherwise excluded.
 
-**Interaction hazard: `lore ingest` can wipe chunks you just upserted.** Single-file ingest is
-orthogonal to git state, but walk-based delta ingest is not. If you single-file-ingest a file that
-was deleted in git history between the last walk-based ingest and `HEAD`, the next `lore ingest`
-will observe the deletion in `git diff`. It will then remove the chunks you just added. Concrete
-example: you `git rm draft.md` and commit, then recreate `draft.md` in the working tree and run
-`lore ingest --file draft.md`. The single-file ingest lands. Running `lore ingest` afterwards will
-silently undo it. The safe workflow is to finish iterating with `lore ingest --file`, commit the
+**Interaction hazard: `lore ingest` can wipe chunks you upserted.** Single-file ingest is orthogonal
+to git state, but walk-based delta ingest is not. Suppose you single-file-ingest a file that was
+deleted in git history between the last walk-based ingest and `HEAD`. The next `lore ingest`
+observes the deletion in `git diff`. It then removes the chunks you added. Concrete example: you
+`git rm draft.md` and commit, then recreate `draft.md` in the working tree and run
+`lore ingest --file draft.md`. The single-file ingest lands. Running `lore ingest` afterwards undoes
+it, with no warning. The safe workflow is to finish iterating with `lore ingest --file`, commit the
 file to git, and only then run `lore ingest`.
 
 **Automating this loop with the `/coverage-check` skill.** If you are authoring patterns inside a
@@ -216,7 +218,7 @@ hook's own query extraction on synthetic tool calls (via the `lore extract-queri
 then ingests the draft via `lore ingest --file`, searches in parallel, and scores per-query
 coverage. It suggests concrete edits to close gaps and iterates until the surfaced-query set
 stabilises. Because the queries are hook output rather than author paraphrase, the report
-approximates production discoverability more closely than the manual loop. See
+approximates production discoverability better than the manual loop. See
 `integrations/claude-code/skills/coverage-check/SKILL.md` for the full contract.
 
 ## Tag Strategy
@@ -225,8 +227,9 @@ Tags appear in YAML frontmatter and are indexed as a separate FTS5 column with f
 of body text. Use them to boost discoverability for terms that do not appear naturally in the body.
 
 **Tags are useful when** they add vocabulary the body lacks. If your pattern about error handling
-also applies to "anyhow" and "result types," adding those as tags ensures the pattern surfaces for
-queries containing those terms. This holds even if the body text uses different phrasing.
+also applies to "anyhow" and "result types," add those as tags. Doing so ensures the pattern
+surfaces for queries containing those terms. This holds even if the body text uses different
+phrasing.
 
 **Tags are redundant when** they duplicate terms already prominent in the title or body. Adding
 `tags: [error, handling]` to a pattern titled "Error Handling" and containing the phrase "error
@@ -265,8 +268,7 @@ the same mechanism: the `tags:` value is `universal`; the section header is `## 
   etiquette, code review process). These rules need continuous reinforcement throughout a session,
   not one-shot relevance.
 - One reminder is not enough. The motivating example was a `git push` failure mid-session because
-  deduplication had correctly suppressed the workflow pattern after its first appearance hours
-  earlier.
+  deduplication had suppressed the workflow pattern after its first appearance hours earlier.
 - The body is small enough to justify per-call re-injection. A 2 KB universal pattern matched 50
   times in a session adds 100 KB of repeated context. Lore emits a per-pattern advisory at ingest
   time when any single universal body exceeds 1 KB, and rejects the file at ingest when its
@@ -275,8 +277,7 @@ the same mechanism: the `tags:` value is `universal`; the section header is `## 
 **Do not use `universal` for:**
 
 - Code-style conventions whose authority is naturally scoped to specific file types or tool calls
-  (Rust naming, TypeScript imports). The PreToolUse hook surfaces these correctly without the
-  always-on cost.
+  (Rust naming, TypeScript imports). The PreToolUse hook surfaces these without the always-on cost.
 - Reference material the agent reads once at the top of a session and remembers (terminology,
   architecture overviews). The standard pattern index handles these.
 - Long-form documentation. Universal bodies should be short and directive. If your pattern needs
@@ -300,7 +301,7 @@ the same mechanism: the `tags:` value is `universal`; the section header is `## 
 A `universal` tag opts a pattern into always-on injection, but always-on can mean too-on. A workflow
 pattern about `git push` re-injects on every `Bash` call, including `ls`, `wc -l`, and `grep` where
 its content has no relevance. The `applies_when` predicate gates re-injection on tool class and Bash
-command prefix. A universal pattern then fires only when the call is actually relevant to it.
+command prefix. A universal pattern then fires only when the call is relevant to it.
 
 The predicate is whole-file: it lives in the pattern's frontmatter, and every chunk of the pattern
 shares it. There are no per-section predicates.
@@ -327,13 +328,13 @@ Both keys are optional, and `applies_when` itself is optional. A universal patte
 - `applies_when.tools`: list of tool-class names (e.g. `Bash`, `Edit`, `Write`). Matches when the
   current tool name is in the list. Case-sensitive.
 - `applies_when.bash_command_starts_with`: list of Bash command tokens (e.g. `git`, `gh`, `cargo`).
-  Matches when the call is `Bash` AND the command starts with one of the listed tokens (after the
+  Matches when the call is `Bash` `AND` the command starts with one of the listed tokens (after the
   smart-prefix matcher walks past common wrappers; see below).
 
 ### Semantics
 
 - **OR within each list.** Any one entry matching is enough.
-- **AND across keys.** If both `tools` and `bash_command_starts_with` are set, both must match.
+- **`AND` across keys.** If both `tools` and `bash_command_starts_with` are set, both must match.
 - A missing key is unconstrained (does not narrow the match). A pattern with only
   `bash_command_starts_with: [git]` and no `tools` key implicitly requires `Bash` because the
   command-prefix check only meaningfully runs on `Bash` calls.
@@ -342,26 +343,28 @@ Both keys are optional, and `applies_when` itself is optional. A universal patte
 
 The mere presence of an `applies_when` block, regardless of which keys it carries, opts a universal
 pattern out of the SessionStart pinned-conventions block. It also opts it out of the PostCompact
-re-emit, which shares the same code path. The reasoning is symmetrical to the predicate's own
-declaration: a pattern with a predicate is conditionally relevant. Pinning it unconditionally at
-session start would contradict that scope. Predicated universals are therefore deferred to their
-PreToolUse path and re-inject on every matching tool call, just as the predicate specifies. They do
-not also pin at session start.
+re-emit, which shares the same code path.
 
-This carries a small first-tool-call delay. The predicated pattern is visible to the agent on the
-first tool call where the predicate matches AND the search pipeline returns at least one result, not
-earlier. With the default `min_relevance_universal` (which inherits from `min_relevance` and is
-`0.6` out of the box) and the search-overfetch / universal-no-truncate behaviour in
-`search_with_threshold`, this is the realistic case. If you raise `min_relevance_universal` high
-enough to filter weak-keyword universals out, predicated patterns can be deferred across multiple
-tool calls. That is the cost of a strict universal floor, and it applies to every universal, not
-just predicated ones.
+The reasoning is symmetrical to the predicate's own declaration: a pattern with a predicate is
+conditionally relevant. Pinning it unconditionally at session start would contradict that scope.
+Predicated universals are therefore deferred to their PreToolUse path and re-inject on every
+matching tool call, as the predicate specifies. They do not also pin at session start.
+
+This carries a small first-tool-call delay. The predicated pattern becomes visible to the agent on
+the first tool call that satisfies two conditions. The predicate must match, and the search pipeline
+must return at least one result. It is not visible earlier.
+
+By default, `min_relevance_universal` inherits from `min_relevance` and is `0.6`. Combined with the
+search-overfetch and universal-no-truncate behaviour in `search_with_threshold`, this is the
+realistic case. If you raise `min_relevance_universal` high enough to filter weak-keyword universals
+out, predicated patterns can be deferred across multiple tool calls. That is the cost of a strict
+universal floor, and it applies to every universal, not only predicated ones.
 
 ### Smart-prefix matcher behaviour
 
 `bash_command_starts_with` does not require a literal first-token match. The matcher walks past
 common wrappers before checking the prefix, so a pattern declaring `bash_command_starts_with: [git]`
-fires on all of these:
+fires on all these:
 
 - `git status`
 - `git status`: leading whitespace is trimmed
@@ -382,7 +385,7 @@ The matcher operates on the raw command string. It never passes through the FTS-
 short tokens, so two-character commands like `gh` survive intact.
 
 **Documented limitations.** The matcher unwraps at most one outer `sudo` scope, any number of nested
-`env` scopes, and one outer `bash -c` / `sh -c` scope. The following do NOT fire on
+`env` scopes, and one outer `bash -c` / `sh -c` scope. The following do `NOT` fire on
 `bash_command_starts_with: [git]`:
 
 - `bash -c "echo \"git status\""`: nested-quote / escaped-quote handling inside `bash -c` is not
@@ -431,8 +434,10 @@ are both supported and parse identically.
 You can attach `applies_when` to a non-universal pattern, but it is dormant in this release. The
 ingest layer parses and persists it, but the PreToolUse evaluator only consults it for chunks that
 also carry the `universal` tag. Ingest emits an info-level advisory naming the file so the
-discrepancy is visible. A future track will extend evaluation to non-universal patterns and
-introduce additional keys (`environments`). The `language:` key documented in
+discrepancy is visible.
+
+A future track extends evaluation to non-universal patterns and introduces additional keys
+(`environments`). The `language:` key documented in
 [Pattern language declaration](#pattern-language-declaration) below is the first such addition; it
 is orthogonal to `applies_when` and gates retrieval rather than evaluation.
 
@@ -492,11 +497,10 @@ infers `{rust}`, an `npm test` Bash command infers `{javascript, typescript}`, a
 declare a language matching the inferred set (structural gate). It also admits patterns that have no
 declaration and whose body coincidentally matches the canonical token (the fallback path).
 
-Declaring `language:` is the durable way to participate in the structural gate. A pattern about Rust
-error handling can use prose like "Use anyhow for errors" without the word "rust" anywhere in the
-body, and it still surfaces on a Rust file edit. Authors with patterns that already mention the
-canonical token in prose can skip the declaration; lore will continue to find them through the
-fallback path.
+Declaring `language:` is the durable way to enter the structural gate. A pattern about Rust error
+handling can use prose like "Use anyhow for errors" without the word "rust" anywhere in the body. It
+still surfaces on a Rust file edit. Authors with patterns that already mention the canonical token
+in prose can skip the declaration; lore continues to find them through the fallback path.
 
 ### Declaration is for eligibility, not ranking
 
@@ -512,7 +516,7 @@ land:
 - Words in the _body_ carry the least
 
 So a pattern with `language: rust` and a generic heading like "Use anyhow for application errors"
-will surface on every Rust tool call. It might still rank below an undeclared pattern whose heading
+surfaces on every Rust tool call. It might still rank below an undeclared pattern whose heading
 reads `## Rust error handling` for the same query.
 
 **Practical advice.** Treat the declaration and the heading/tags as separate levers:
@@ -554,7 +558,7 @@ on the fallback retrieval path.
 
 Lore recognises the 27 languages below. Authors must declare the canonical token in the second
 column; the display column shows how lore refers to the language in prose and CLI output. The
-asymmetry is most visible for Go: the canonical token is `golang` because bare `go` collides with
+asymmetry is most visible for Go. The canonical token is `golang` because bare `go` collides with
 the English stop-word list and the FTS5 default tokeniser.
 
 | Display     | Canonical token |
@@ -587,8 +591,8 @@ the English stop-word list and the FTS5 default tokeniser.
 | Terraform   | `terraform`     |
 | Zig         | `zig`           |
 
-Authors typing `language: go` will see a tier-2 warning at ingest naming the token as unknown. The
-pattern still ingests, but the structural gate will never match it.
+Authors typing `language: go` see a tier-2 warning at ingest naming the token as unknown. The
+pattern still ingests, but the structural gate never matches it.
 
 ### When to declare a single token
 
@@ -599,17 +603,17 @@ single token. Applying it to any other language would be wrong.
 ### When to declare a multi-value list
 
 Use the list form when the pattern's content genuinely applies to a small set of languages, even if
-the worked examples come from one ecosystem. A pattern that explains "validate at the boundary, not
-in the middle" applies equally to TypeScript and JavaScript. A pattern about JSON-LD framing applies
-to whichever ecosystem the consumer happens to use. The list captures applicability, not provenance:
-it is not a place to enumerate languages the pattern's examples happen to mention.
+the worked examples come from one language. A pattern that explains "validate at the boundary, not
+in the middle" applies to both TypeScript and JavaScript. A pattern about JSON-LD framing applies to
+whichever language the consumer happens to use. The list captures applicability, not provenance: it
+is not a place to list languages the pattern's examples happen to mention.
 
 ### When to omit the field
 
-Omit `language:` when the pattern applies to too many languages to enumerate. Also omit it when the
-content is language-agnostic (cross-cutting concerns like git workflow, code review etiquette,
-accessibility heuristics). Retrieval falls back to body-keyword matching: if the body contains
-relevant vocabulary, lore will still surface the pattern.
+Omit `language:` when the pattern spans more languages than it is practical to list. Also omit it
+when the content is language-agnostic (cross-cutting concerns like git workflow, code review
+etiquette, accessibility heuristics). Retrieval falls back to body-keyword matching: if the body
+contains relevant vocabulary, lore still surfaces the pattern.
 
 ### Composition with `applies_when` and `universal`
 
@@ -627,9 +631,11 @@ tag.
 ### Validation behaviour
 
 Unknown tokens trigger a tier-2 warn-and-proceed at ingest time. The pattern still ingests with the
-offending token persisted verbatim, but the structural retrieval gate will never match it (the gate
-compares against the canonical-token list above). Lore aggregates per-token across the whole ingest
-run. A 50-pattern repository that all share the same typo surfaces as one warning line, not fifty.
+offending token persisted verbatim, but the structural retrieval gate never matches it. The gate
+compares against the canonical-token list above.
+
+Lore aggregates per-token across the whole ingest run. A 50-pattern repository that all share the
+same typo surfaces as one warning line, not fifty.
 
 ### Worked examples
 
@@ -682,7 +688,7 @@ rather than a fragment. But it has a direct consequence for how you organise you
 
 **Group by domain, not by convenience.** Each file should contain sections that belong together. A
 file about "Git Workflow" with sections on branching, commits, and pull requests is cohesive. When
-one section matches, the others are almost certainly relevant too. A file that covers "Git Workflow"
+one section matches, the others are almost always relevant too. A file that covers "Git Workflow"
 and "YAML Formatting" in the same document is not. A YAML edit would drag in git conventions,
 wasting context window space on irrelevant content.
 
@@ -696,8 +702,8 @@ one coherent domain in enough depth to be useful as a group, typically three to 
 - Split a file when sections serve different audiences or trigger on different queries
 - Merge files when you find yourself duplicating context across several tiny patterns about the same
   topic
-- A good test: if the agent is editing a Rust file and one section matches, would the other sections
-  in this file also be useful? If not, they belong in a separate file
+- A good test: if the agent is editing a Rust file and one section matches, the other sections in
+  this file should also be useful. If not, they belong in a separate file
 
 ### Excluding non-pattern files with `.loreignore`
 
@@ -733,10 +739,10 @@ supported. Patterns support bare filenames, trailing-slash directories, wildcard
 negation (`!`).
 
 When you add or modify `.loreignore`, run `lore ingest` afterwards. The next ingest detects the
-change and reconciles the database in both directions. Files that newly match an exclusion are
-removed, and files that are no longer excluded are re-indexed automatically. The same applies when
-you delete `.loreignore` entirely: every file that had been excluded comes back into the index on
-the next `lore ingest`.
+change and reconciles the database in both directions. Files that start matching an exclusion are
+removed, and files that stop being excluded are re-indexed automatically. The same applies when you
+delete `.loreignore` entirely: every file that had been excluded comes back into the index on the
+next `lore ingest`.
 
 > **Why is `.loreignore` opt-in?** Without a `.loreignore` file, every markdown file in the
 > repository is indexed, exactly as before. The feature is purely additive: you only encounter it
@@ -748,15 +754,15 @@ the next `lore ingest`.
 
 A pattern that reads like a README section, describing what exists without stating what to do.
 
-**Example:** "dprint is the single formatter for all file types" tells the agent what dprint is, but
-not that it must run `dprint check` or `just fmt` before every commit.
+**Example:** "dprint is the single formatter for all file types" tells the agent what dprint is. It
+does not say that `dprint check` or `just fmt` must run before every commit.
 
 **Fix:** Add the behavioural mandate. State the action, the trigger, and the consequence of omitting
 it.
 
 ### The Vocabulary Island
 
-A pattern that uses narrow terminology, missing the words agents actually search for.
+A pattern that uses narrow terminology, missing the words agents search for.
 
 **Example:** A pattern about "creating PRs" that never mentions "editing" or "updating." When an
 agent edits a PR, the hook extracts "edit" (a term the pattern does not contain), and the pattern
@@ -770,15 +776,15 @@ verify each appears in the body or tags.
 A pattern whose key concept is invisible to search because critical terms are stop words or too
 short.
 
-**Example:** A pattern about `just ci` where "just" is a stop word and "ci" is only two characters.
+**Example:** A pattern about `just ci` where `just` is a stop word and `ci` is only two characters.
 When an agent runs `just ci`, the hook extracts zero queryable terms, and no search occurs for that
 tool call.
 
 **What helps:** Include terms that surface the pattern through adjacent queries. "Quality gate,"
 "continuous integration," and "pre-commit check" give the search engine vocabulary to find the
 pattern. It surfaces when the agent edits a file, runs a related command, or when the user's message
-provides context. The pattern will not surface specifically during a `just ci` invocation (that is a
-pipeline limitation), but it will surface during the surrounding workflow.
+provides context. The pattern does not surface specifically during a `just ci` invocation (that is a
+pipeline limitation), but it surfaces during the surrounding workflow.
 
 ### The Kitchen Sink File
 
@@ -822,10 +828,12 @@ lore trace why --recent 20 --event PreToolUse            # across sessions
 ```
 
 Each record captures the extracted query and every candidate considered, with its pre-fusion
-component scores (FTS-fallback, FTS-structural, vector) and post-RRF combined score. It also
-captures the predicate outcome, the deduplication decision, the final `injected` set, and per-phase
-timing. Records persist until the retention horizon (default 30 days), so you can investigate "why
-didn't my pattern surface on the call three minutes ago" without rerunning anything. See
+component scores (FTS-fallback, FTS-structural, vector). It also captures the combined score after
+Reciprocal Rank Fusion (RRF), the predicate outcome, the deduplication decision, the final
+`injected` set, and per-phase timing.
+
+Records persist until the retention horizon (default 30 days). You can investigate why your pattern
+did not surface on the call three minutes ago, without rerunning anything. See
 [Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) in the Configuration Reference for
 the full setup.
 
@@ -836,33 +844,34 @@ LORE_DEBUG=1 claude
 ```
 
 Writes diagnostic lines to stderr with the prefix `[lore debug]` as the hook runs. Use this when you
-want to watch one hook fire live, or when tracing wasn't enabled at the time of interest. The same
+want to watch one hook fire live, or when tracing was not enabled at the time of interest. The same
 information ends up in trace records (and more), so prefer trace records for after-the- fact
 investigation.
 
 ### What the diagnostics tell you
 
-Either surface answers the same question: is the problem an _injection gap_ (the query did not
-produce terms that match your pattern) or a _compliance gap_ (the pattern was injected but the agent
-did not follow it)? Injection gaps are solved by improving vocabulary coverage. Compliance gaps are
-solved by strengthening imperative voice and incident grounding.
+Either surface answers the same question: which kind of gap you have. An _injection gap_ means the
+query did not produce terms that match your pattern. A _compliance gap_ means the pattern was
+injected but the agent did not follow it.
+
+Injection gaps are solved by improving vocabulary coverage. Compliance gaps are solved by
+strengthening imperative voice and incident grounding.
 
 ## Pattern Review Checklist
 
 Run through these checks before committing a new or updated pattern:
 
-- [ ] **Imperative voice.** Does the pattern state what to do and what not to do? Would an agent
-      reading it know exactly how to act?
-- [ ] **Vocabulary coverage.** Do the title, body, and tags contain the terms an agent would use
-      when this pattern should surface? Have you tested with `lore search`?
-- [ ] **Stop-word avoidance.** Are key concepts expressed with terms longer than two characters and
-      not in the stop-word list? If a critical term is a stop word, have you included a longer
-      synonym?
-- [ ] **Incident grounding.** If this rule exists because of a past failure, does the pattern
-      explain what happened and why? (Skip this check for patterns without incident history.)
-- [ ] **Tag relevance.** Do the tags add vocabulary that the body lacks, rather than duplicating
-      prominent terms?
-- [ ] **Stemming awareness.** Are you relying on exact word matches where stemming would help?
-      "Testing" and "test" share a stem, but "edit" and "create" do not.
-- [ ] **Actionable structure.** Does every section pass the "so what?" test: can a reader act on it
-      immediately?
+- [ ] **Imperative voice.** The pattern states what to do and what not to do. An agent reading it
+      knows exactly how to act.
+- [ ] **Vocabulary coverage.** The title, body, and tags contain the terms an agent would use when
+      this pattern should surface. Test with `lore search`.
+- [ ] **Stop-word avoidance.** Key concepts are expressed with terms longer than two characters and
+      not in the stop-word list. If a critical term is a stop word, include a longer synonym.
+- [ ] **Incident grounding.** If this rule exists because of a past failure, the pattern explains
+      what happened and why. (Skip this check for patterns without incident history.)
+- [ ] **Tag relevance.** The tags add vocabulary that the body lacks, rather than duplicating
+      prominent terms.
+- [ ] **Stemming awareness.** Check whether you are relying on exact word matches where stemming
+      would help. "Testing" and "test" share a stem, but "edit" and "create" do not.
+- [ ] **Actionable structure.** Every section passes the "so what" test: a reader can act on it
+      immediately.

@@ -1,0 +1,33 @@
+# The style contract's banned category: corporate and generated vocabulary.
+extends: existence
+message: "'%s' is jargon. Use the everyday word."
+level: error
+ignorecase: true
+tokens:
+  - leverage
+  - leverages
+  - leveraging
+  - utilise
+  - utilize
+  - utilising
+  - utilizing
+  - streamline
+  - streamlines
+  - facilitate
+  - facilitates
+  - delve
+  - delves
+  - foster
+  - fosters
+  - holistic
+  - cutting-edge
+  - realm
+  - ecosystem
+  - synergy
+  - empower
+  - empowers
+  - paradigm
+  - landscape
+  - journey
+  - unlock
+  - unlocks

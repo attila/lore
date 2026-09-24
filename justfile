@@ -54,9 +54,21 @@ changelog:
 release-prep VERSION:
     bash scripts/release-prep.sh {{ VERSION }}
 
+# Lint the human-facing documents
+vale:
+    vale README.md CONTRIBUTING.md SECURITY.md ROADMAP.md docs/*.md
+
+# Check every document against its word budget
+budget:
+    bin/lint-docs-budget
+
+# Prove every prose rule fires on its fixture
+test-lint:
+    bin/test-lint-docs
+
 # Run integration tests that require Ollama
 test-integration:
     cargo test --features test-support -- --ignored
 
 # Run the full CI pipeline
-ci: fmt clippy test deny doc
+ci: fmt clippy test deny doc vale budget test-lint

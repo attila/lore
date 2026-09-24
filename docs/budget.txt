@@ -1,0 +1,10 @@
+# Word budget per document, counted by `wc -w` over the whole file, paths from
+# the repository root. The only place a ceiling lives. Raise a line in a commit
+# that says why.
+README.md 1500
+docs/architecture.md 700
+docs/configuration.md 3200
+docs/hook-pipeline-reference.md 3300
+docs/pattern-authoring-guide.md 6300
+docs/release-process.md 2600
+docs/search-mechanics.md 2900

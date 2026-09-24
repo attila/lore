@@ -4,7 +4,7 @@
 
 ## Future
 
-- [ ] PostCompact re-prime workaround — Claude Code's hook output validator rejects
+- [ ] PostCompact re-prime workaround: Claude Code's hook output validator rejects
       `hookSpecificOutput` for the PostCompact event, leaving `systemMessage` as the only envelope
       and the pinned-conventions tier unable to re-seed the model context after `/compact`. Options
       to investigate: (a) wait for Claude Code to accept `additionalContext` for PostCompact; (b)
@@ -14,37 +14,37 @@
       notices its context has been compacted. Surfaced in PR #N (SessionStart envelope fix); see
       `docs/hook-pipeline-reference.md` for the limitation as it stands today.
 
-- [ ] Pre-release UX polish (deferred from edge-case-handling brainstorm) — friendlier
+- [ ] Pre-release UX polish (deferred from edge-case-handling brainstorm): friendlier
       empty-directory copy beyond the current tier-2 warning, empty-DB search hints, and a
       structured `SlugCollisionError` type (with `existing_path` / `existing_title` fields for
       programmatic downcast) to replace the prose error currently returned by `add_pattern`. Parked
-      until a concrete user report or MCP-agent retry loop justifies the additional test cost.
-- [ ] Lossy-only HEAD-gate special-case — a single non-UTF-8 filename currently blocks
+      until a concrete user report or a Model Context Protocol (MCP) agent retry loop justifies the
+      additional test cost.
+- [ ] Lossy-only `HEAD`-gate special-case: a single non-UTF-8 filename currently blocks
       `META_LAST_COMMIT` recording, forcing every subsequent `lore ingest` into full mode until the
       file is renamed. The loud warning is the recovery signal, but a large knowledge directory pays
-      a permanent full-walk cost. A future special-case could record HEAD when the only entries on
+      a permanent full-walk cost. A future special-case could record `HEAD` when the only entries on
       `result.errors` are lossy-path warnings (recoverable filesystem state, not DB-consistency
-      state). Surfaced in slice D code review (REL-02); kept out of slice D scope to respect the
+      state). Surfaced in slice D code review (`REL-02`); kept out of slice D scope to respect the
       brainstorm's channel-choice directive.
-- [ ] Evaluate transcript tail truncation limit — currently 200 bytes, which often cuts
-      mid-sentence. Increasing to 400-500 bytes may improve search recall for longer user
-      instructions without adding excessive noise. Use `LORE_DEBUG` traces to measure what gets
-      truncated in practice
-- [ ] Cycle-based deduplication TTL — re-inject a pattern after N tool call cycles since last
-      injection, so long sessions don't bury early conventions deep in context
-- [ ] Deny-first-touch mode — block the first Edit/Write per domain with conventions as the deny
+- [ ] Evaluate transcript tail truncation limit: currently 200 bytes, which often cuts mid-sentence.
+      Increasing to 400-500 bytes may improve search recall for longer user instructions without
+      adding excessive noise. Use `LORE_DEBUG` traces to measure what gets truncated in practice
+- [ ] Cycle-based deduplication Time to Live (TTL): re-inject a pattern after N tool call cycles
+      since last injection, so long sessions do not bury early conventions deep in context
+- [ ] Deny-first-touch mode: block the first Edit/Write per domain with conventions as the deny
       reason, forcing Claude to retry with conventions visible. Requires solid deduplication to
       avoid infinite loops (see
       `docs/solutions/logic-errors/session-dedup-lifecycle-and-deny-first-touch-2026-04-02.md`)
-- [ ] Predicated-universal deduplication behaviour — revisit `src/hook.rs`'s
+- [ ] Predicated-universal deduplication behaviour: revisit `src/hook.rs`'s
       `r.is_universal || !seen.contains(&r.id)` filter in `dedup_filter_and_record` once Track 2
-      observability data is in. Track 1B deliberately kept the bypass for predicated universals as a
+      observability data is in. Track 1B kept the bypass for predicated universals by design, as a
       Key Technical Decision (intent: re-inject on every matching call), but ~45 KB/session of
       repeated injection for `agents/unattended-work.md` has been flagged as a real cost. One-line
       override: `(r.is_universal && r.applies_when_json.is_none()) || !seen.contains(&r.id)`.
       Deferred until observability data quantifies whether per-call reminders change agent
       behaviour.
-- [ ] Code content analysis for query enrichment — extract meaningful terms from `content` /
+- [ ] Code content analysis for query enrichment: extract meaningful terms from `content` /
       `new_string` fields in Edit/Write tool input to improve search relevance
 - [ ] Plugin marketplace distribution (Claude Code marketplace or self-hosted)
 - [ ] Additional agent integrations (Cursor, opencode) under `integrations/`
@@ -52,10 +52,10 @@
 
 ## Completed
 
-- [x] Install on PATH without building from source — `brew install attila/tap/lore` from the
+- [x] Install on `PATH` without building from source: `brew install attila/tap/lore` from the
       `attila/homebrew-tap` tap; the release workflow bumps the formula on every stable release
       (#72). The README lists Homebrew first.
-- [x] Ollama inference runtime probe — `lore status --full` now issues a live `/api/embed` request
+- [x] Ollama inference runtime probe: `lore status --full` now issues a live `/api/embed` request
       against the configured model to detect runner-subprocess failures that the cheap
       binary/daemon/manifest checks miss (the Homebrew-formula breakage that prompted this work
       reported healthy across all three legacy probes). Structured `ProbeError` discriminates
@@ -65,58 +65,57 @@
       `--full` flag keeps the default `lore status` cheap; rescue mechanisms surface the deeper
       check via install-time auto-probe, hook warning, and a hint line. ureq 3.x's default-true
       `http_status_as_error` is explicitly opted out so 5xx response bodies stay readable.
-- [x] Track 2 Observability — opt-in per-hook trace logging written as JSONL records under
+- [x] Track 2 Observability: opt-in per-hook trace logging written as JSONL records under
       `$XDG_STATE_HOME/lore/traces/<session-id>.jsonl` (one file per session), plus
       `lore trace why <session>` query CLI and `lore trace prune` maintenance. Enables data-driven
       decisions on threshold tuning, refactor validation, debug, and continuous dogfooding. Builds
-      on `default_trace_dir()` from the etcetera refactor (PR #52) and the three-list RRF pipeline
-      from language detection (PR #50).
-- [x] Accept `language` on the `add_pattern` and `update_pattern` MCP tools — `inputSchema` now
+      on `default_trace_dir()` from the etcetera refactor (PR #52) and the three-list Reciprocal
+      Rank Fusion (RRF) pipeline from language detection (PR #50).
+- [x] Accept `language` on the `add_pattern` and `update_pattern` MCP tools: `inputSchema` now
       declares the field (`oneOf [string, array<string>]`), the handler coerces scalar input to an
       array at the boundary, and ingest renders a canonical `language: [...]` flow-list line into
       the file's frontmatter. `update_pattern` mirrors `tags`'s three-way semantics (omit preserves,
-      `[]` clears, non-empty replaces) so body-only rewrites do not silently de-language a pattern.
-      Unknown tokens warn-and-proceed: every offending token reaches the caller via
+      `[]` clears, non-empty replaces) so body-only rewrites do not de-language a pattern without
+      warning. Unknown tokens warn-and-proceed: every offending token reaches the caller via
       `WriteResult.language_warnings` and the response's `lore-metadata` fence, including on the
-      inbox-branch short-circuit (which previously skipped indexing and silently dropped the
-      advisory). `append_to_pattern` deliberately does not accept `language` — appends are body-only
-      by definition, and Decision 3's regression pin in the schema tests fails fast if a future PR
-      adds the field.
-- [x] Hook-driven Bash language inference reads every signal — both `command` and `description` now
+      inbox-branch short-circuit, which skips indexing by design and still surfaces the advisory.
+      `append_to_pattern` does not accept `language`: appends are body-only by definition, and
+      Decision 3's regression pin in the schema tests fails fast if a future PR adds the field.
+- [x] Hook-driven Bash language inference reads every signal: both `command` and `description` now
       contribute to language detection (fixing the prior bug where a populated `description`
-      silently shadowed the `command`), and path-prefixed invocations like `./gradlew`,
+      shadowed the `command` without warning), and path-prefixed invocations like `./gradlew`,
       `/usr/local/bin/gradle`, and `~/.cargo/bin/cargo` are basename-normalised before keyword
       matching. The expanded `LANGUAGES` table now fires for real production Bash tool calls instead
-      of silently no-op'ing. See
+      of no-op'ing without any signal. See
       `docs/solutions/best-practices/uat-through-real-binary-catches-inference-path-bugs-2026-05-19.md`.
-- [x] Extend the shared language table — added 21 new entries (Ruby, Java, C/C++, C#, PHP, Swift,
+- [x] Extend the shared language table: added 21 new entries (Ruby, Java, C/C++, C#, PHP, Swift,
       Kotlin, Shell, Objective-C, Scala, Elixir, Dart, Lua, Nix, Terraform, Haskell, Clojure, Zig,
       Perl, Groovy) and back-filled the existing six with missing version-pin markers and lockfiles,
       including the asymmetric `package-lock.json` on TypeScript that PR #50 left out. R5 contested
       signals resolved: `.h` shared between `clang` and `cpp` (R5 multi-entry), `.m` single-owner to
       `objectivec`.
-- [x] Language coverage in `lore status` — new `Languages:` line in the CLI status output reports
+- [x] Language coverage in `lore status`: new `Languages:` line in the CLI status output reports
       per-language source counts (rendered via `LANGUAGES.display_name`) plus an `undeclared`
       bucket, built on the `language_json` column from #50. The same breakdown is exposed to agents
       through the MCP `lore_status` tool's metadata fence as `languages_declared` /
       `languages_undeclared` / `languages_error`. Defence-in-depth hardening: subquery dedup of
       per-source tokens, empty-array rollup into `undeclared`, shared read transaction across the
       two count queries, and unknown-token sanitisation at both ingest and render.
-- [x] Replace hand-rolled XDG resolution with `etcetera` — `default_config_path` and
+- [x] Replace hand-rolled XDG resolution with `etcetera`: `default_config_path` and
       `default_database_path` now use `etcetera::base_strategy::Xdg`, making the XDG-everywhere
       macOS posture explicit at the call site rather than implicit in hand-rolled code. Adds
       `default_trace_dir()` returning `$XDG_STATE_HOME/lore/traces` (with
       `$HOME/.local/state/lore/traces` fallback) as quiet infrastructure for the forthcoming Track 2
       Observability work. No observable Linux or macOS behaviour change for the two existing
       helpers.
-- [x] Language detection architecture — refactored signal detection around a single shared
+- [x] Language detection architecture: refactored signal detection around a single shared
       declarative table (`src/engine/languages.rs`) covering extensions, command keywords, marker
       filenames, and directory hints. Word-boundary bash matcher replaces the prior substring
       contains check (no more `bundle install` matching `bun`). Added an optional `language:`
       frontmatter field that drives a structural retrieval gate via a new `language_json` column
-      (schema v4, additive). Retrieval now composes three independently-ranked lists fed to RRF:
-      FTS-fallback for undeclared patterns, FTS-structural for declared patterns, and
-      oversample-and-filter vector.
+      (schema v4, additive). Retrieval now composes three independently-ranked lists fed to RRF: a
+      Full-Text Search (FTS) fallback list for undeclared patterns, an FTS-structural list for
+      declared patterns, and an oversample-and-filter vector list.
 - [x] Release process (prebuilt binaries via `cargo-zigbuild`, GitHub releases). Tag-triggered
       `release.yml` cross-compiles four targets from a single Linux runner, packages tarballs +
       `SHA256SUMS`, publishes via `gh release create` behind an owner-approval Environment gate.
@@ -135,74 +134,75 @@
 - [x] MCP integration testing with Claude Code (tool discovery, invocation, edge cases)
 - [x] Ollama fallback warning and min_relevance threshold for search quality
 - [x] Search relevance boosting (FTS5 column weights + embedding enrichment)
-- [x] Score normalization (RRF scores mapped to 0–1 range)
-- [x] Agent integration — Claude Code plugin with deterministic pattern injection
-  - [x] Validation spike — confirmed `additionalContext` influences agent behavior
-  - [x] `lore hook` subcommand — unified hook handler for all lifecycle events
+- [x] Score normalization (RRF scores mapped to 0-1 range)
+- [x] Agent integration: Claude Code plugin with deterministic pattern injection
+  - [x] Validation spike: confirmed `additionalContext` influences agent behavior
+  - [x] `lore hook` subcommand: unified hook handler for all lifecycle events
   - [x] `lore list` subcommand + `--top-k` CLI flag + FTS5 query sanitization fix
   - [x] Plugin assembly (`integrations/claude-code/`)
   - [x] SessionStart priming, session deduplication, PostCompact reset, error hook
   - [x] Hook unit tests + search relevance regression tests (CI)
-- [x] Delta ingest via git diff — only re-index changed, added, moved, and deleted files instead of
+- [x] Delta ingest via git diff: only re-index changed, added, moved, and deleted files instead of
       full re-embed. Use `git diff --name-status` against the last-ingested commit to detect
       changes. Eliminates the Ollama round-trip penalty for unchanged files.
-- [x] Dogfooding fixes — FTS5 hyphen crash, frontmatter chunk noise.
+- [x] Dogfooding fixes: FTS5 hyphen crash, frontmatter chunk noise.
 - [x] `LORE_DEBUG=1` verbose logging and `--json` structured output.
 - [x] FTS5 porter stemming for improved search recall.
-- [x] Security hardening — input limits, transcript path validation under `$HOME`, bounded tail-read
-      (32KB), deduplication file locking (`fd-lock`) with FNV-1a hashing, `SECURITY.md`.
-- [x] Product documentation — pattern authoring guide, search mechanics reference, hook pipeline and
+- [x] Security hardening: input limits, transcript path validation under `$HOME`, bounded tail-read
+      (32KB), deduplication file locking (`fd-lock`) with `FNV-1a` hashing, `SECURITY.md`.
+- [x] Product documentation: pattern authoring guide, search mechanics reference, hook pipeline and
       plugin reference, configuration reference.
-- [x] Dogfooding deferred — search relevance regression tests (PR #24), pattern strengthening
+- [x] Dogfooding deferred: search relevance regression tests (PR #24), pattern strengthening
       (`rust/tooling.md`, `workflows/git-branch-pr.md`), memory→lore migration (3 memories retired).
-- [x] `.loreignore` — gitignore-style exclude file in knowledge directories. Filters files during
+- [x] `.loreignore`: gitignore-style exclude file in knowledge directories. Filters files during
       full and delta ingest, with reconciliation when the file changes. Supports negation patterns,
       directory globs, and recursive globs via the `ignore` crate.
-- [x] Single-file ingest (`lore ingest --file <path>`) — index one file without requiring a git
+- [x] Single-file ingest (`lore ingest --file <path>`): index one file without requiring a git
       commit, enabling the fast edit-ingest-search feedback loop for pattern authoring. Orthogonal
       to delta state, respects `.loreignore` with a `--force` override.
-- [x] Coverage-check skill (`/coverage-check`) — automates the Vocabulary Coverage Technique from
-      the pattern authoring guide by simulating the PreToolUse hook's own query extraction on
-      synthetic tool calls (via `lore extract-queries`), ingesting the draft, searching in parallel,
-      and iterating on edit suggestions until the surfaced-query set stabilises. Ships alongside the
+- [x] Coverage-check skill (`/coverage-check`): automates the Vocabulary Coverage Technique from the
+      pattern authoring guide by simulating the PreToolUse hook's own query extraction on synthetic
+      tool calls (via `lore extract-queries`), ingesting the draft, searching in parallel, and
+      iterating on edit suggestions until the surfaced-query set stabilises. Ships alongside the
       fenced `lore-metadata` content-block pivot for MCP tool responses.
-- [x] Edge case handling — Slices A + B (Unicode NFC normalisation in `slugify` and slug-collision
-      detection in `add_pattern`). NFC normalisation makes `café` (NFC) and `café` (NFD) produce
-      identical slugs. The collision discriminator distinguishes a real slug collision (two distinct
-      titles sharing a slug, tier-1 hard-fail) from intentional re-use (same title, pointed at
-      `update_pattern`); error names slug, filename, and existing title (or
-      `(no title
-      heading)`). Multi-reviewer pass added title sanitisation at the write
-      boundary (trim whitespace, reject embedded newlines) and graceful read fallback for
-      non-regular files at the slug path. R5 (NFD-on-disk vs NFC-incoming filename mismatch on
-      Mac→Linux sync) is documented as a deferred limitation. See
+- [x] Edge case handling: Slices A + B (Unicode Canonical Composition (NFC) normalisation in
+      `slugify` and slug-collision detection in `add_pattern`). NFC normalisation makes the Unicode
+      Canonical Decomposition (NFD) and NFC encodings of `café` produce identical slugs. The
+      collision discriminator distinguishes a real slug collision (two distinct titles sharing a
+      slug, tier-1 hard-fail) from intentional re-use (same title, pointed at `update_pattern`);
+      error names slug, filename, and existing title (or `(no title
+      heading)`). Multi-reviewer
+      pass added title sanitisation at the write boundary (trim whitespace, reject embedded
+      newlines) and graceful read fallback for non-regular files at the slug path. R5 (NFD-on-disk
+      vs NFC-incoming filename mismatch on Mac→Linux sync) is documented as a deferred limitation.
+      See
       `docs/solutions/design-patterns/round-trip-discriminator-canonicalise-both-sides-2026-05-10.md`.
-- [x] Edge case handling — Slice C (no-HEAD progress line on fresh `git init`). `ingest()` now emits
-      `No commits yet — HEAD will be recorded after your first commit.` when the knowledge directory
-      is a `git init` with zero commits, replacing the misleading
+- [x] Edge case handling: Slice C (no-`HEAD` progress line on fresh `git init`). `ingest()` now
+      emits `No commits yet — HEAD will be recorded after your first commit.` when the knowledge
+      directory is a `git init` with zero commits, replacing the misleading
       `No previous ingest recorded — running full ingest` wording for that case only. The other four
       full-mode fallback wordings (non-git, prev-commit-missing, head-resolve-failed,
       git-diff-failed) are unchanged. Discrimination uses `git symbolic-ref --quiet HEAD` plus
       `git rev-parse --verify` on the target via a new `is_unborn_head` helper in `src/git.rs`, so
       other `head_commit` failure modes keep surfacing as warnings. Tier-2 per the CLI behaviour
       ladder.
-- [x] Edge case handling — Slice E (missing-`git` binary regression test). Integration test in
+- [x] Edge case handling: Slice E (missing-`git` binary regression test). Integration test in
       `tests/edge_cases.rs` spawns `lore ingest` with `PATH` cleared on the child process only and
       asserts the missing-binary fallback fires the unique progress marker
       `Not a git repository —
       running full ingest` and exits 0. Codifies tier-3 silent
       fallback behaviour per the CLI behaviour ladder; no user-visible behaviour change.
-- [x] Edge case handling — Slice D (lossy-path warning during directory walk). `walk_md_files` now
+- [x] Edge case handling: Slice D (lossy-path warning during directory walk). `walk_md_files` now
       detects `Cow::Owned` from `to_string_lossy()` on relative paths and surfaces non-UTF-8
       filenames as warnings on `IngestResult::errors` rather than indexing them under a
-      U+FFFD-substituted source-file key. Wired through `discover_md_files` (full-ingest path) and
+      `U+FFFD`-substituted source-file key. Wired through `discover_md_files` (full-ingest path) and
       `ReconcileStats.lossy_warnings` (delta-reconcile path). Two accounting fixes ride along:
-      `discover_md_files` no longer blames `.loreignore` for lossy exclusions in its progress
-      message, and `effective_scan_state` routes all-lossy directories to `FilesystemEmpty` rather
-      than `AllIgnored`. R11.9's regression test plus four shadow-path tests pin the contract.
-      `cfg(unix)`-gated where `OsStr::from_bytes` is required. Closes the edge-case-handling roadmap
-      line entirely.
-- [x] Effective-empty knowledge directory warning — `lore ingest`, `lore serve`, and `lore_status`
+      `discover_md_files`'s progress message names the real cause of lossy exclusions instead of
+      blaming `.loreignore`, and `effective_scan_state` routes all-lossy directories to
+      `FilesystemEmpty` rather than `AllIgnored`. R11.9's regression test plus four shadow-path
+      tests pin the contract. `cfg(unix)`-gated where `OsStr::from_bytes` is required. Closes the
+      edge-case-handling roadmap line entirely.
+- [x] Effective-empty knowledge directory warning: `lore ingest`, `lore serve`, and `lore_status`
       surface when the knowledge directory's effective scan set is empty (filesystem-empty,
       all-ignored, or missing). Tier-2 per the project's CLI behaviour ladder: warning to stderr,
       exit 0, no opt-out flag. The MCP `lore_status` tool reports `empty_knowledge_dir` and
@@ -211,23 +211,23 @@
       edge-case-handling roadmap line; pivoted to a dedicated branch when the design crystallised
       the CLI behaviour ladder convention. See
       `docs/solutions/conventions/cli-behaviour-ladder-2026-05-10.md`.
-- [x] Universal patterns via tag-based SessionStart injection — patterns whose `tags:` frontmatter
+- [x] Universal patterns via tag-based SessionStart injection: patterns whose `tags:` frontmatter
       list contains `universal` get full body emitted in a `## Pinned conventions` section at every
-      SessionStart and PostCompact, AND bypass the PreToolUse dedup filter so they re-inject on
+      SessionStart and PostCompact, `AND` bypass the PreToolUse dedup filter so they re-inject on
       every relevant tool call (additively beyond `top_k`, with the relevance gate intact). Closes
       the always-on discoverability gap for process-level conventions like push discipline that the
       coverage-check skill cannot address. Schema change requires `lore ingest --force` once after
       upgrading; a startup `PRAGMA table_info` probe refuses to start with a friendly advisory
       otherwise.
-- [x] Universal-pattern predicate (`applies_when`) and engine/adapter split (Track 1) —
-      universal-tagged patterns may now carry a frontmatter `applies_when` block gating re-injection
-      by tool class and Bash command prefix (OR within keys, AND across), with
-      `min_relevance_universal` as a per-tier score floor under `[search]` (defaults to inherit
+- [x] Universal-pattern predicate (`applies_when`) and engine/adapter split (Track 1).
+      Universal-tagged patterns may now carry a frontmatter `applies_when` block gating re-injection
+      by tool class and Bash command prefix (OR within keys, `AND` across).
+      `min_relevance_universal` acts as a per-tier score floor under `[search]` (defaults to inherit
       `min_relevance`). Hook code is reorganised into an agent-agnostic `src/engine/` module
       operating on a `CallContext` plus a Claude-Code-specific `src/hook.rs` adapter, opening the
       door to future Cursor/opencode integrations. Ships alongside a one-way schema bump to v3 via a
-      forward-compatible ALTER TABLE migration.
-- [x] SessionStart pinning deferred for predicated universal patterns — a `universal`-tagged pattern
+      forward-compatible `ALTER TABLE` migration.
+- [x] SessionStart pinning deferred for predicated universal patterns: a `universal`-tagged pattern
       that also carries an `applies_when` predicate is conditionally relevant, so pinning its body
       at every SessionStart contradicted that scope. Such patterns are now excluded from the
       `## Pinned conventions` block at SessionStart and from the PostCompact re-emit (shared code

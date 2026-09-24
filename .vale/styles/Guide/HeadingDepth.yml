@@ -1,0 +1,8 @@
+# Headings go three levels deep at most.
+extends: existence
+message: "Heading deeper than three levels."
+level: error
+scope: raw
+nonword: true
+tokens:
+  - "(?m)^#{4,} "

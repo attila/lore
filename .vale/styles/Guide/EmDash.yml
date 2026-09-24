@@ -1,0 +1,10 @@
+# No em dashes, no en dashes as punctuation. Use a full stop, a comma or
+# brackets.
+extends: existence
+message: "Dash. Use a full stop, a comma or brackets."
+level: error
+nonword: true
+tokens:
+  - "—"
+  - "–"
+  - " -- "

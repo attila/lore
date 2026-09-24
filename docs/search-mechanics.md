@@ -73,8 +73,8 @@ If the hook input includes a `transcript_path`, the hook reads the last 32 KB of
 finds the most recent user message in the JSONL stream, and extracts up to 200 bytes of content.
 These words are added to the term pool as additional context.
 
-The transcript path must resolve under `$HOME`; paths outside the home directory are silently
-skipped.
+The transcript path must resolve under `$HOME`; paths outside the home directory are skipped without
+a warning.
 
 ## Term Cleaning
 
@@ -88,10 +88,12 @@ All extracted terms pass through a cleaning pipeline before query assembly:
    digits (`0-9`, `a-f`) are discarded. This prevents commit SHAs and UUIDs from polluting queries.
 4. **Remove stop words.** Fifty-seven common English words are removed:
 
-   > the, and, for, with, from, into, that, this, then, when, will, has, have, was, are, not, but,
-   > can, all, its, our, use, new, let, set, get, add, run, see, how, may, per, via, yet, also,
-   > just, some, been, were, what, they, each, which, their, there, about, would, could, should,
-   > these, those, other, than, them, your, does, here
+   ```text
+   the, and, for, with, from, into, that, this, then, when, will, has, have, was, are, not, but,
+   can, all, its, our, use, new, let, set, get, add, run, see, how, may, per, via, yet, also,
+   just, some, been, were, what, they, each, which, their, there, about, would, could, should,
+   these, those, other, than, them, your, does, here
+   ```
 
 5. **Deduplicate.** Duplicate terms are removed, preserving the order of first appearance.
 
@@ -106,18 +108,18 @@ assembled into one of these query shapes:
 | Multi inferred  | Present              | `({lang1} OR {lang2}) AND ({term1} OR {term2} OR ...)` | `(javascript OR typescript) AND (test)` |
 | Inferred        | Empty (all filtered) | `{lang}` or `({lang1} OR {lang2})`                     | `rust`                                  |
 | Not inferred    | Present              | `{term1} OR {term2} OR ...`                            | `create OR body OR file`                |
-| Not inferred    | Empty                | No query (search skipped)                              | —                                       |
+| Not inferred    | Empty                | No query (search skipped)                              | None                                    |
 
 The single-inferred case is the most common during normal agent sessions. The multi-inferred case
 arises when a signal legitimately fires for several languages. `npm test` accumulates
 `{javascript, typescript}` because both entries register `npm` as a command keyword. The OR-grouped
-language anchor preserves the AND-with-terms structure so retrieval ranking remains predictable.
+language anchor preserves the `AND`-with-terms structure so retrieval ranking remains predictable.
 
 ## Structural Language Gate
 
-In addition to the FTS string assembly above, retrieval composes as three independently-ranked
-candidate lists fed to RRF. Patterns may declare their applicable languages via the optional
-`language:` frontmatter field (see the
+In addition to the Full-Text Search (FTS) string assembly above, retrieval composes as three
+independently-ranked candidate lists fed to Reciprocal Rank Fusion (RRF). Patterns may declare their
+applicable languages via the optional `language:` frontmatter field (see the
 [pattern authoring guide](pattern-authoring-guide.md#pattern-language-declaration)). The retrieval
 pipeline applies a structural gate using SQLite's `json_each()` over the persisted `language_json`
 column:
@@ -125,8 +127,8 @@ column:
 1. **FTS-fallback**: `MATCH "{lang} AND ({terms})"` with `WHERE c.language_json IS NULL`. Patterns
    without a `language:` declaration reach retrieval through this branch. The language anchor
    appears in the FTS predicate so the body must contain the canonical token to match. When the
-   inferred-language set is empty, the MATCH collapses to terms-only and the `IS NULL` filter still
-   applies.
+   inferred-language set is empty, the `MATCH` collapses to terms-only and the `IS NULL` filter
+   still applies.
 2. **FTS-structural**: `MATCH "({terms})"` with
    `WHERE EXISTS (SELECT 1 FROM json_each(c.language_json) WHERE value IN (?inferred_langs...))`.
    Patterns with a declared `language:` that intersects the inferred set reach retrieval through
@@ -143,25 +145,27 @@ column:
 The two FTS branches are _disjoint by predicate_: a chunk has `language_json IS NULL` xor
 `language_json` containing the inferred lang. No pattern double-counts across the two FTS branches.
 RRF sees at most one FTS rank and one vector rank per pattern; the three-list count is a
-code-organisation choice, not an arithmetic inflation. Each FTS branch carries its own internally
-consistent BM25 weighting against its own MATCH terms. RRF uses positional rank from `enumerate`,
-not raw BM25 score, so cross-branch score commensurability is not a concern.
+code-organisation choice, not an arithmetic inflation.
 
-**Declaration is a gate, not a ranking signal.** The structural branch's MATCH expression contains
+Each FTS branch carries its own internally consistent BM25 weighting against its own `MATCH` terms.
+RRF uses positional rank from `enumerate`, not raw BM25 score, so cross-branch score
+commensurability is not a concern.
+
+**Declaration is a gate, not a ranking signal.** The structural branch's `MATCH` expression contains
 only the enrichment terms. The inferred language tokens never enter the FTS predicate. A declared
-pattern is admitted regardless of body vocabulary. Its rank inside the structural branch is decided
-by how strongly the enrichment terms match the chunk's `title` (BM25 weight 10), `tags` (5), and
-`body` (1). A pattern declaring `language: rust` with prose like "Use anyhow for errors" can rank
-below an undeclared pattern. The undeclared pattern's heading reads `## Rust error handling` for the
-same query. The declaration ensures eligibility, not dominance. This is intentional: the gate's job
-is to prevent declared patterns from being filtered out by absence of a body keyword, not to
-override BM25 ranking inside their branch.
+pattern is admitted regardless of body vocabulary. Its rank inside the structural branch depends on
+how strongly the enrichment terms match the chunk's `title` (BM25 weight 10) and `tags` (5). It also
+depends on how strongly the terms match `body` (weight 1). A pattern declaring `language: rust` with
+prose like "Use anyhow for errors" can rank below an undeclared pattern. The undeclared pattern's
+heading reads `## Rust error handling` for the same query. The declaration ensures eligibility, not
+dominance. This is intentional. The gate's job is to prevent declared patterns from being filtered
+out by absence of a body keyword. It is not to override BM25 ranking inside their branch.
 
 > **Why declare `language:`?** When a pattern's body uses prose that does not happen to repeat the
-> canonical language token, the FTS-fallback branch will miss it. Declaring `language: rust` lets
-> the pattern surface on every Rust tool call regardless of body vocabulary. Without the
-> declaration, the pattern relies on its body containing the canonical keyword. That works for
-> patterns that already mention the language in prose, and fails silently for the rest.
+> canonical language token, the FTS-fallback branch misses it. Declaring `language: rust` lets the
+> pattern surface on every Rust tool call regardless of body vocabulary. Without the declaration,
+> the pattern relies on its body containing the canonical keyword. That works for patterns that
+> already mention the language in prose, and fails without a warning for the rest.
 
 ## FTS5 Search
 
@@ -197,18 +201,18 @@ The following characters are stripped:
 
 > `. / \ : { } [ ] " ' * ^ -`
 
-Leading minus signs on terms are also stripped (FTS5 interprets them as the NOT operator).
+Leading minus signs on terms are also stripped (FTS5 interprets them as the `NOT` operator).
 
 Parentheses and the keywords `AND`, `OR`, and `NOT` are preserved, allowing the hook to construct
 structured queries such as `rust AND (validate OR email)`.
 
 ## Vector Search
 
-When hybrid mode is enabled and Ollama is reachable, the query is also embedded as a vector and
-compared against stored pattern embeddings using cosine distance via sqlite-vec.
+When hybrid mode is enabled and Ollama is reachable, the query is also embedded as a vector. The
+vector is compared against stored pattern embeddings using cosine distance via sqlite-vec.
 
 The embedding text for each chunk is constructed as: `{title}\n{tags}\n{body}`. This means tags and
-titles contribute to semantic similarity, not just lexical matching.
+titles contribute to semantic similarity, not only lexical matching.
 
 The default embedding model is `nomic-embed-text` (768 dimensions). Other models are supported by
 changing `ollama.model` in `lore.toml`.
@@ -224,8 +228,8 @@ FTS-structural, vector) merged using Reciprocal Rank Fusion (RRF) with a constan
 score(item) = Σ 1 / (k + rank_in_list_i)
 ```
 
-Each candidate list retrieves `top_k * 2` results independently, and the merged scores are
-normalised to a 0–1 range by dividing by the theoretical maximum across `N` input lists:
+Each candidate list retrieves `top_k * 2` results independently. The merged scores are normalised to
+a 0 to 1 range by dividing by the theoretical maximum across `N` input lists:
 
 ```
 max_rrf = N / (k + 1.0)
@@ -251,11 +255,11 @@ These fields are visible in two places:
   record carries the three fields alongside the post-fusion `score_combined`. Use this for
   after-the-fact diagnosis of why one pattern beat another. See
   [Per-Hook Trace Logging](configuration.md#per-hook-trace-logging) for the trace setup.
-- **MCP `search_patterns` with `include_metadata: true`**: each result in the `lore-metadata` fenced
-  JSON block carries the same three fields, enabling agents to reason about per-branch contributions
-  without depending on the trace surface.
+- **Model Context Protocol (MCP) `search_patterns`** with `include_metadata: true`: each result in
+  the `lore-metadata` fenced JSON block carries the same three fields, enabling agents to reason
+  about per-branch contributions without depending on the trace surface.
 
-The post-fusion `score` is normalised to 0–1 (the field documented above). The pre-fusion scores
+The post-fusion `score` is normalised to 0 to 1 (the field documented above). The pre-fusion scores
 keep their native shapes (FTS BM25 values, which are typically negative; vector distances, which
 depend on the embedding metric). They are useful for relative comparison within a single result set,
 not for absolute thresholding.
@@ -269,8 +273,8 @@ threshold is applied only when:
 - Embedding succeeded (Ollama returned a valid vector)
 - `min_relevance` is greater than zero
 
-When FTS5 is the sole search method (hybrid disabled or Ollama unreachable), no threshold is applied
-because FTS5 BM25 scores use a different scale and are not directly comparable.
+When FTS5 is the sole search method (hybrid disabled or Ollama unreachable), no threshold is
+applied. FTS5 BM25 scores use a different scale and are not directly comparable.
 
 ## Ingest-Time Filtering with `.loreignore`
 
@@ -280,8 +284,8 @@ appear in results regardless of how the query is constructed.
 
 Filtering applies during both full ingest and delta ingest. When `.loreignore` changes, delta ingest
 detects the change via a content hash stored in `ingest_metadata` and runs a cumulative
-reconciliation pass. Previously indexed files that now match an exclusion are removed, and files
-that are no longer excluded are re-indexed from disk automatically.
+reconciliation pass. Already-indexed files that now match an exclusion are removed, and files that
+stop matching an exclusion are re-indexed from disk automatically.
 
 For the full syntax and behaviour, see the [Configuration Reference](configuration.md#loreignore).
 
@@ -291,16 +295,16 @@ After the top results are selected, lore fetches all chunks from each matched so
 query matches the "Error Handling" section of a pattern file, every other section in that file is
 also included in the injection.
 
-This ensures agents receive the complete context of a pattern, not just the section that matched the
+This ensures agents receive the complete context of a pattern, not only the section that matched the
 query. A pattern about error handling may have related sections on testing strategy and library
 choice that are valuable in the same context.
 
 ## Session Deduplication
 
-To prevent the same pattern from being injected repeatedly within a session, lore maintains a
+To prevent the same pattern from being injected more than once within a session, lore maintains a
 per-session deduplication file named `lore-session-{hash}`. This file lives in the system temporary
-directory (`$TMPDIR` on macOS, usually `/tmp` on Linux), where `{hash}` is a 16-character FNV-1a
-hash of the session ID.
+directory (`$TMPDIR` on macOS, `/tmp` on Linux by default). `{hash}` is a 16-character
+Fowler-Noll-Vo (FNV) hash, the FNV-1a variant, of the session ID.
 
 The deduplication lifecycle:
 
@@ -341,8 +345,8 @@ not hex-like. They survive cleaning.
 
 **Query assembly:** `rust AND (validate OR email)`
 
-**FTS5 search:** Matches patterns with "rust" in the title or tags AND either "validate" or "email"
-in the body. A pattern titled "Error Handling" tagged with `[rust, error-handling, anyhow]`
+**FTS5 search:** Matches patterns with "rust" in the title or tags `AND` either "validate" or
+"email" in the body. A pattern titled "Error Handling" tagged with `[rust, error-handling, anyhow]`
 containing "validate" in its body would match.
 
 ### Example 2: Running a GitHub CLI Command
@@ -396,13 +400,13 @@ same root as "creating."
 
 1. Non-zero exit code triggers error-driven search
 2. Stderr text is split into words: "error", "permission", "denied", "for", "body", "with",
-   "heredoc", "in", "don't", "ask", "mode"
+   "heredoc", "in", `don't`, "ask", "mode"
 
 **Term cleaning:**
 
 - "for", "with" → discarded (stop words)
 - "in" → discarded (two characters)
-- "don't-ask" splits on non-alphabetic boundaries into "don", "t", and "ask": "t" is discarded (one
+- `don't-ask` splits on non-alphabetic boundaries into "don", "t", and "ask": "t" is discarded (one
   character), "don" survives (three characters), "ask" survives
 - Surviving terms: "error", "permission", "denied", "body", "heredoc", "don", "ask", "mode"
 

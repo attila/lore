@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  VALE_VERSION: 3.22.0
+  VALE_SHA256: 52f5cd0314a1b7384cac6aa102a68193977312f6ba9c9f3ae001b5deec8e3a10
 
 jobs:
   fmt:
@@ -106,15 +108,35 @@ jobs:
           tool: cargo-zigbuild@0.20.0
       - run: cargo zigbuild --release --target ${{ matrix.target }}
 
+  prose:
+    name: Prose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: just
+      - name: Install Vale
+        run: |
+          curl -fsSLo vale.tar.gz "https://github.com/vale-cli/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
+          echo "${VALE_SHA256}  vale.tar.gz" | sha256sum -c -
+          tar -xzf vale.tar.gz -C /usr/local/bin vale
+          vale --version
+      - run: just vale
+      - run: just budget
+        if: success() || failure()
+      - run: just test-lint
+        if: success() || failure()
+
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, deny, doc, cross-compile]
+    needs: [fmt, clippy, test, deny, doc, cross-compile, prose]
     if: always()
     steps:
       - name: Check all jobs
         run: |
-          results=("${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.deny.result }}" "${{ needs.doc.result }}" "${{ needs.cross-compile.result }}")
+          results=("${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.deny.result }}" "${{ needs.doc.result }}" "${{ needs.cross-compile.result }}" "${{ needs.prose.result }}")
           for r in "${results[@]}"; do
             if [[ "$r" != "success" ]]; then
               echo "Job failed with result: $r"

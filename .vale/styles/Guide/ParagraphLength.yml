@@ -1,0 +1,9 @@
+# A paragraph holds at most four sentences. Matches five or more sentence
+# terminators in one paragraph.
+extends: existence
+message: "Paragraph over four sentences. Split it."
+level: error
+scope: paragraph
+nonword: true
+tokens:
+  - '(?s)(?:[^.!?]+[.!?]["'')\]]?\s+){4,}[^.!?]+[.!?]'

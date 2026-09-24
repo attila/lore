@@ -1,0 +1,9 @@
+# Prose never enumerates with "first" and "second". Three or more items of
+# the same kind take a list.
+extends: existence
+message: "'%s' enumerates in prose. Use a list."
+level: error
+scope: sentence
+nonword: true
+tokens:
+  - "^(?:First|Second|Third|Fourth|Fifth|Firstly|Secondly|Thirdly|Lastly|Finally),"

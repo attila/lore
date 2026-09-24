@@ -1,0 +1,23 @@
+# The style contract's banned category: filler and intensifiers.
+extends: existence
+message: "'%s' is filler. Delete it."
+level: error
+ignorecase: true
+tokens:
+  - very
+  - really
+  - simply
+  - just
+  - easily
+  - seamlessly
+  - robust
+  - powerful
+  - comprehensive
+  - crucial
+  - vital
+  - essential
+  - actually
+  - basically
+  - truly
+  - highly
+  - extremely

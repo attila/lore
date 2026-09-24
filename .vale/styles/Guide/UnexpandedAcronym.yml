@@ -1,0 +1,46 @@
+# Adopted from alphagov/gds-vale-styles (General/UnexpandedAcronym.yml) at commit 55fe037,
+# MIT, Copyright (c) 2019 Government Digital Service. See LICENCE-GDS.md.
+# Exceptions extended with the acronyms the guide uses.
+extends: conditional
+message: "'%s' has no definition"
+level: warning
+first: \b([A-Z]{3,5})\b
+second: (?:\b[A-Z][a-z]+[']? )+\(([A-Z]{3,5})\)
+exceptions:
+  - ABC
+  - API
+  - CSS
+  - FIXME
+  - GNU
+  - ISO
+  - HTML
+  - HTTP
+  - HTTPS
+  - JSON
+  - MIT
+  - PDF
+  - REST
+  - RFC
+  - URL
+  - URI
+  - XML
+  - YYYY
+  - CLI
+  - GPG
+  - SHA
+  - SSH
+  - TOML
+  - YAML
+  - MAY
+  - MUST
+  - BSD
+  - JSONL
+  - NFS
+  - PHP
+  - POSIX
+  - RPC
+  - SMB
+  - SQL
+  - TCP
+  - UTF
+  - XDG
