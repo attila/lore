@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, OllamaClient, render_failure};
+use lore::embeddings::{OllamaClient, render_failure};
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -316,7 +316,6 @@ fn cmd_init(
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
-    db.ensure_vector_table(ollama.dimensions())?;
 
     eprintln!("Search mode: hybrid (FTS5 + vector)\n");
 
@@ -399,7 +398,6 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         KnowledgeDB::open(&config.database)?
     };
     db.init()?;
-    db.ensure_vector_table(ollama.dimensions())?;
 
     let on_progress = &|msg: &str| {
         eprintln!("{msg}");
@@ -438,6 +436,15 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         if matches!(result.mode, ingest::IngestMode::SingleFile { .. }) {
             anyhow::bail!("single-file ingest failed");
         }
+    }
+
+    if let ingest::IngestMode::SingleFile { path } = &result.mode
+        && matches!(db.vector_dimensions(), Ok(None))
+    {
+        eprintln!(
+            "Note: the index has no vectors, so {path} is searchable by text only. \
+             Run `lore ingest` while the embedding model is reachable to add them."
+        );
     }
 
     Ok(())
@@ -621,7 +628,6 @@ fn cmd_search(
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
-    db.ensure_vector_table(ollama.dimensions())?;
 
     let (results, _phases) = hook::search_with_threshold(&db, &ollama, &config, query)?;
     lore_debug!("search: {} results", results.len());
@@ -714,7 +720,6 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
-    db.ensure_vector_table(ollama.dimensions())?;
 
     if let Some(output) = hook::handle_hook(&input, &db, &ollama, &config)? {
         let json = serde_json::to_string(&output)?;
@@ -765,10 +770,8 @@ fn cmd_extract_queries() -> anyhow::Result<()> {
 
 fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
-    db.ensure_vector_table(ollama.dimensions())?;
 
     let patterns = db.list_patterns()?;
 
@@ -891,7 +894,6 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
 
     if let Ok(db) = KnowledgeDB::open(&config.database)
         && db.init().is_ok()
-        && db.ensure_vector_table(ollama.dimensions()).is_ok()
         && let Ok(stats) = db.stats()
     {
         eprintln!();

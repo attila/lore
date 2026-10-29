@@ -20,7 +20,7 @@ use crate::chunking::{
     chunk_as_document_with_advisories, chunk_by_heading_with_advisories, extract_title,
 };
 use crate::database::KnowledgeDB;
-use crate::embeddings::Embedder;
+use crate::embeddings::{Embedder, EmbeddingIdentity};
 use crate::git;
 use crate::lore_debug;
 use crate::loreignore;
@@ -926,14 +926,21 @@ pub fn full_ingest(
     // cases are covered there, so `full_ingest` does not need a redundant
     // emission for direct callers.
 
-    if let Err(e) = db.clear_all() {
+    let identity = match EmbeddingIdentity::measure(embedder) {
+        Ok(identity) => Some(identity),
+        Err(e) => {
+            lore_debug!("full ingest: no embedding model, building a text-only index: {e}");
+            None
+        }
+    };
+    if let Err(e) = db.clear_all(identity.as_ref()) {
         result.errors.push(format!("Failed to clear database: {e}"));
         return result;
     }
 
     // Store the .loreignore content hash so delta ingest can detect changes.
-    // clear_all() does not touch ingest_metadata, so a stale value from a
-    // previous ingest could survive — always write the current hash.
+    // clear_all() keeps every other ingest_metadata key, so a stale value
+    // from a previous ingest could survive — always write the current hash.
     if let Err(e) = db.set_metadata(META_LOREIGNORE_HASH, &loaded_ignore.hash) {
         on_progress(&format!("Warning: failed to record .loreignore hash: {e}"));
     }
@@ -1828,16 +1835,25 @@ fn index_single_file(
     // write lock is never held across Ollama HTTP round-trips.
     // Collecting into a Vec materialises all embed calls up front; the
     // transaction block below contains only in-memory DB work.
+    //
+    // A text-only index (no vector table) stores no vectors and counts no
+    // failures. A vector of a width the table cannot hold counts as an
+    // embedding failure so the chunk's text still lands.
+    let vector_dimensions = db.vector_dimensions()?;
     let mut embedding_failures = 0_usize;
     let chunks_with_embeddings: Vec<(Chunk, Option<Vec<f32>>)> = chunks
         .iter()
         .map(|chunk| {
-            let embedding = if let Ok(emb) = embedder.embed(&embed_text(chunk)) {
-                Some(emb)
-            } else {
-                embedding_failures += 1;
-                None
-            };
+            let embedding = vector_dimensions.and_then(|dims| {
+                let embedding = embedder
+                    .embed(&embed_text(chunk))
+                    .ok()
+                    .filter(|emb| emb.len() == dims);
+                if embedding.is_none() {
+                    embedding_failures += 1;
+                }
+                embedding
+            });
             (chunk.clone(), embedding)
         })
         .collect();
@@ -2213,6 +2229,138 @@ mod tests {
         assert_eq!(result.files_processed, 0);
         assert_eq!(result.chunks_created, 0);
         assert!(result.errors.is_empty());
+    }
+
+    // -- embedding identity ------------------------------------------------
+
+    fn ids_with_vectors(db: &KnowledgeDB, embedder: &FakeEmbedder, text: &str) -> Vec<String> {
+        let query = embedder.embed(text).unwrap();
+        db.search_vector(&query, 100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[test]
+    fn full_ingest_rebuilds_the_vector_table_when_the_model_width_changes() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        let db = memory_db();
+
+        let narrow = FakeEmbedder::new();
+        let result = full_ingest(&db, &narrow, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+
+        let wide = FakeEmbedder::with_model("mxbai-embed-large", 1024);
+        let result = full_ingest(&db, &wide, dir, "heading", &|_| {});
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(db.vector_dimensions().unwrap(), Some(1024));
+        assert_eq!(
+            db.get_metadata("embedding_model").unwrap().as_deref(),
+            Some("mxbai-embed-large")
+        );
+        assert_eq!(
+            db.get_metadata("embedding_dimensions").unwrap().as_deref(),
+            Some("1024")
+        );
+        assert!(!ids_with_vectors(&db, &wide, "Alpha").is_empty());
+    }
+
+    #[test]
+    fn full_ingest_measures_the_width_of_a_model_it_has_never_heard_of() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+
+        let embedder = FakeEmbedder::with_model("some-unlisted-model", 1024);
+        let result = full_ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(db.vector_dimensions().unwrap(), Some(1024));
+        assert_eq!(
+            db.get_metadata("embedding_provider").unwrap().as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            db.get_metadata("embedding_model").unwrap().as_deref(),
+            Some("some-unlisted-model")
+        );
+        let probe: Vec<f32> =
+            serde_json::from_str(&db.get_metadata("embedding_probe_vector").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            probe,
+            embedder.embed(crate::embeddings::PROBE_TEXT).unwrap()
+        );
+        assert!(!ids_with_vectors(&db, &embedder, "Alpha").is_empty());
+    }
+
+    #[test]
+    fn a_vector_of_the_wrong_width_is_an_embedding_failure_and_the_text_lands() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        let db = memory_db();
+        let recorded = FakeEmbedder::new();
+        full_ingest(&db, &recorded, dir, "heading", &|_| {});
+
+        fs::write(dir.join("beta.md"), "# Beta\n\nBeta body text.\n").unwrap();
+        let wider = FakeEmbedder::with_dimensions(1024);
+        let result = ingest_single_file(
+            &db,
+            &wider,
+            dir,
+            &dir.join("beta.md"),
+            "heading",
+            false,
+            &|_| {},
+        );
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("embedding failure(s) while indexing beta.md")),
+            "{:?}",
+            result.errors
+        );
+        let text_hits = db.search_fts("beta", 10).unwrap();
+        assert!(text_hits.iter().any(|r| r.source_file == "beta.md"));
+        let beta_ids: Vec<String> = text_hits.into_iter().map(|r| r.id).collect();
+        let vector_ids = ids_with_vectors(&db, &recorded, "Beta");
+        assert!(!vector_ids.is_empty(), "alpha keeps its vectors");
+        assert!(vector_ids.iter().all(|id| !beta_ids.contains(id)));
+    }
+
+    #[test]
+    fn full_ingest_without_a_reachable_model_builds_a_text_only_index() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        let db = memory_db();
+        full_ingest(&db, &FakeEmbedder::new(), dir, "heading", &|_| {});
+
+        let failing = crate::embeddings::FailingEmbedder::new(768);
+        let result = full_ingest(&db, &failing, dir, "heading", &|_| {});
+
+        assert_eq!(result.files_processed, 1);
+        assert!(result.chunks_created >= 1);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+        for key in [
+            "embedding_provider",
+            "embedding_model",
+            "embedding_dimensions",
+            "embedding_probe_vector",
+        ] {
+            assert_eq!(db.get_metadata(key).unwrap(), None, "{key} must be absent");
+        }
+        assert!(!db.search_fts("alpha", 10).unwrap().is_empty());
     }
 
     // -- effective-empty warning -------------------------------------------

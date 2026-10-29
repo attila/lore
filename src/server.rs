@@ -61,9 +61,9 @@ struct JsonRpcResponse {
 
 /// Start the MCP server on stdin/stdout.
 ///
-/// Opens the knowledge database and creates the vector table at `embedder`'s
-/// width, then enters a line-oriented JSON-RPC read loop. When the database open fails (most
-/// commonly on a schema-mismatch upgrade advisory), the server enters a
+/// Opens the knowledge database, then enters a line-oriented JSON-RPC read
+/// loop. When the database open fails (most commonly on a schema-mismatch
+/// upgrade advisory), the server enters a
 /// degraded mode: `initialize` and `tools/list` still respond so clients can
 /// negotiate and enumerate, but every `tools/call` returns a structured error
 /// carrying the underlying message. This surfaces the `lore ingest --force`
@@ -73,7 +73,6 @@ pub fn start_mcp_server(config: &Config, embedder: &dyn Embedder) -> anyhow::Res
     match KnowledgeDB::open(&config.database) {
         Ok(db) => {
             db.init()?;
-            db.ensure_vector_table(embedder.dimensions())?;
             // Tier-2 effective-empty warning, mirrored from `lore ingest`.
             // Gated on a successful DB open so that on the degraded path
             // the load-bearing schema-mismatch banner is the first signal
@@ -800,14 +799,19 @@ fn extract_languages_from_query_string(query: &str) -> Vec<String> {
 /// unrestricted hybrid path otherwise so plain-text queries keep
 /// today's behaviour.
 ///
-/// Returns the search result alongside a flag indicating whether the
-/// embedding step failed (the caller uses the flag to decide whether
-/// to apply the RRF-score relevance threshold).
+/// Returns the search result alongside two flags: whether the search ran
+/// without its vector half (the caller uses it to decide whether to apply
+/// the RRF-score relevance threshold), and whether that was because the
+/// embedder errored rather than because the index has no vector table.
 fn run_search(
     ctx: &ServerContext<'_>,
     query: &str,
     top_k: usize,
-) -> (anyhow::Result<Vec<crate::database::SearchResult>>, bool) {
+) -> (
+    anyhow::Result<Vec<crate::database::SearchResult>>,
+    bool,
+    bool,
+) {
     let inferred_langs = extract_languages_from_query_string(query);
     let cleaned_terms: Vec<String> = query
         .split_whitespace()
@@ -816,13 +820,20 @@ fn run_search(
         .collect();
 
     let mut embed_failed = false;
+    let mut embedder_errored = false;
     let results = if ctx.config.search.hybrid {
-        let query_embedding = match ctx.embedder.embed(query) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("[lore] Embedding failed, falling back to text search: {e}");
-                embed_failed = true;
-                None
+        let query_embedding = if matches!(ctx.db.vector_dimensions(), Ok(None)) {
+            embed_failed = true;
+            None
+        } else {
+            match ctx.embedder.embed(query) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("[lore] Embedding failed, falling back to text search: {e}");
+                    embed_failed = true;
+                    embedder_errored = true;
+                    None
+                }
             }
         };
         if inferred_langs.is_empty() {
@@ -841,7 +852,7 @@ fn run_search(
             .search_fts(query, top_k)
             .map(|r| r.into_iter().take(top_k).collect())
     };
-    (results, embed_failed)
+    (results, embed_failed, embedder_errored)
 }
 
 fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
@@ -871,7 +882,7 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Search: \"{query}\" (top_k={top_k})");
 
-    let (results, embed_failed) = run_search(ctx, query, top_k);
+    let (results, embed_failed, embedder_errored) = run_search(ctx, query, top_k);
 
     match results {
         Ok(results) => {
@@ -922,7 +933,7 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "Found matching patterns."
             };
 
-            let response = if embed_failed {
+            let response = if embedder_errored {
                 format!(
                     "Note: Ollama unreachable — results are from text search only.\n\n{summary}\n\n{formatted}"
                 )
@@ -2522,6 +2533,53 @@ mod tests {
             text.contains("Note: Ollama unreachable"),
             "prose body should still contain the Ollama-unreachable note, got: {text}"
         );
+    }
+
+    /// An index with no vector table searches text only without blaming
+    /// Ollama, even though the embedder itself works.
+    #[test]
+    fn search_patterns_on_text_only_index_falls_back_without_a_note() {
+        let tmp = tempdir().unwrap();
+        let embedder = FakeEmbedder::with_dimensions(4);
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+            is_universal: false,
+            applies_when_json: None,
+            language_json: None,
+        };
+        db.insert_chunk(&chunk, None).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":14,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check","include_metadata":true}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "fts_fallback");
+        assert_eq!(metadata["result_count"], 1);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Ollama unreachable"), "{text}");
     }
 
     /// FTS-only configured search (`config.search.hybrid = false`) flips

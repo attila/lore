@@ -5,7 +5,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, FakeEmbedder};
+use lore::embeddings::FakeEmbedder;
 use lore::ingest;
 use tempfile::tempdir;
 

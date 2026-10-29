@@ -5,7 +5,7 @@ use predicates::prelude::*;
 
 use lore::config::Config;
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, FakeEmbedder};
+use lore::embeddings::{FailingEmbedder, FakeEmbedder};
 use lore::ingest;
 
 /// Set up a temp directory with a config, database, and ingested test patterns.
@@ -362,6 +362,101 @@ fn search_top_k_zero_returns_no_results() {
         .assert()
         .success()
         .stderr(predicate::str::contains("No results found."));
+}
+
+/// Build an index with no vector table, configured against a host that
+/// refuses connections.
+fn text_only_index(tmp: &Path) -> (Config, std::path::PathBuf) {
+    let knowledge_dir = tmp.join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+    std::fs::write(
+        knowledge_dir.join("rust-testing.md"),
+        "# Rust Testing\n\nPrefer integration tests over mocks.\n",
+    )
+    .unwrap();
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    db.init().unwrap();
+    ingest::full_ingest(
+        &db,
+        &FailingEmbedder::new(768),
+        &knowledge_dir,
+        "heading",
+        &|_| {},
+    );
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+    (config, config_path)
+}
+
+#[test]
+fn search_on_text_only_index_returns_text_results_without_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+
+    // An embed attempt against the refusing host would also return text
+    // results, but with a warning; no warning proves the embedder was skipped.
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["search", "--config", config_path.to_str().unwrap(), "mocks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stderr(predicate::str::contains("Warning").not());
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["status", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(
+        db.vector_dimensions().unwrap(),
+        None,
+        "read paths must not create the vector table"
+    );
+}
+
+#[test]
+fn ingest_file_on_text_only_index_lands_text_and_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+    let draft = config.knowledge_dir.join("draft.md");
+    std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "ingest",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--file",
+            draft.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Done (single-file): draft.md"))
+        .stderr(predicate::str::contains("embedding failure").not())
+        .stderr(predicate::str::contains(
+            "Note: the index has no vectors, so draft.md is searchable by text only",
+        ))
+        .stderr(predicate::str::contains("Run `lore ingest`"));
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+    assert!(
+        db.search_fts("quokka", 10)
+            .unwrap()
+            .iter()
+            .any(|r| r.source_file == "draft.md")
+    );
 }
 
 // -- lore list --------------------------------------------------------------

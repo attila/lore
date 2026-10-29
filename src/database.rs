@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::chunking::{Chunk, PatternRow};
+use crate::embeddings::EmbeddingIdentity;
 
 // ---------------------------------------------------------------------------
 // sqlite-vec FFI registration
@@ -244,6 +245,12 @@ impl KnowledgeDB {
         Ok(())
     }
 
+    /// Width of the `patterns_vec` table, or `None` when the index has no
+    /// vector table and searches can only use text.
+    pub fn vector_dimensions(&self) -> anyhow::Result<Option<usize>> {
+        vector_table_dimensions(&self.conn)
+    }
+
     /// Drop and recreate all tables so that any column additions, index
     /// changes, or tokenizer updates in the DDL take effect. Used by
     /// `lore ingest --force` as the authoritative path back to a clean
@@ -253,15 +260,45 @@ impl KnowledgeDB {
     /// leave the old column list intact, so an old-schema database that
     /// somehow bypassed `check_schema_compatibility` would still reject
     /// subsequent inserts against the missing `is_universal` column.
-    pub fn clear_all(&self) -> anyhow::Result<()> {
+    ///
+    /// `patterns_vec` is recreated at `identity`'s measured width and the
+    /// identity is recorded in the same transaction. With no identity (the
+    /// embedding model could not be reached) the index is left without a
+    /// vector table and without a recorded identity.
+    pub fn clear_all(&self, identity: Option<&EmbeddingIdentity>) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
         tx.execute_batch(PATTERNS_FTS_DDL)?;
         tx.execute_batch("DROP TABLE IF EXISTS chunks")?;
         tx.execute_batch(CHUNKS_DDL)?;
-        tx.execute_batch("DELETE FROM patterns_vec")?;
+        tx.execute_batch("DROP TABLE IF EXISTS patterns_vec")?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns")?;
         tx.execute_batch(PATTERNS_DDL)?;
+        tx.execute(
+            "DELETE FROM ingest_metadata WHERE key IN (?1, ?2, ?3, ?4)",
+            params![
+                META_EMBEDDING_PROVIDER,
+                META_EMBEDDING_MODEL,
+                META_EMBEDDING_DIMENSIONS,
+                META_EMBEDDING_PROBE_VECTOR,
+            ],
+        )?;
+        if let Some(identity) = identity {
+            tx.execute_batch(&patterns_vec_ddl(identity.dimensions))?;
+            let dimensions = identity.dimensions.to_string();
+            let probe_vector = serde_json::to_string(&identity.probe_vector)?;
+            for (key, value) in [
+                (META_EMBEDDING_PROVIDER, identity.provider.as_str()),
+                (META_EMBEDDING_MODEL, identity.model.as_str()),
+                (META_EMBEDDING_DIMENSIONS, dimensions.as_str()),
+                (META_EMBEDDING_PROBE_VECTOR, probe_vector.as_str()),
+            ] {
+                tx.execute(
+                    "INSERT OR REPLACE INTO ingest_metadata (key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )?;
+            }
+        }
         // Keep the schema stamp in sync with the freshly recreated tables.
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1044,6 +1081,14 @@ const PATTERNS_FTS_DDL: &str = "\
 const INGEST_METADATA_DDL: &str =
     "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)";
 
+/// `ingest_metadata` keys recording the embedding model the vector table
+/// was built with. Written and removed together by `clear_all` only.
+pub(crate) const META_EMBEDDING_PROVIDER: &str = "embedding_provider";
+pub(crate) const META_EMBEDDING_MODEL: &str = "embedding_model";
+pub(crate) const META_EMBEDDING_DIMENSIONS: &str = "embedding_dimensions";
+/// JSON array of the vector for [`crate::embeddings::PROBE_TEXT`].
+pub(crate) const META_EMBEDDING_PROBE_VECTOR: &str = "embedding_probe_vector";
+
 /// Authoritative DDL for the `patterns` table. Stores one row per pattern
 /// file — the authorial view of an indexed document, complementary to the
 /// heading-split fragments in `chunks`.
@@ -1078,6 +1123,29 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
             embedding float[{dimensions}]
         )"
     )
+}
+
+/// Read the `patterns_vec` width from its stored DDL rather than from
+/// `embedding_dimensions`: an index with no recorded identity still has a
+/// vector table, and the DDL is the width the table accepts.
+fn vector_table_dimensions(conn: &Connection) -> anyhow::Result<Option<usize>> {
+    let Some(sql) = vector_table_sql(conn)? else {
+        return Ok(None);
+    };
+    sql.split_once("float[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(width, _)| width.trim().parse().ok())
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("cannot read the embedding width from patterns_vec: {sql}"))
+}
+
+fn vector_table_sql(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'patterns_vec'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Probe the on-disk `PRAGMA user_version` against [`SCHEMA_VERSION`].
@@ -1299,11 +1367,13 @@ pub fn delete_pattern_and_chunks_in_tx(
          (SELECT id FROM chunks WHERE source_file = ?1)",
         params![source_file],
     )?;
-    tx.execute(
-        "DELETE FROM patterns_vec WHERE id IN \
-         (SELECT id FROM chunks WHERE source_file = ?1)",
-        params![source_file],
-    )?;
+    if vector_table_sql(tx)?.is_some() {
+        tx.execute(
+            "DELETE FROM patterns_vec WHERE id IN \
+             (SELECT id FROM chunks WHERE source_file = ?1)",
+            params![source_file],
+        )?;
+    }
     tx.execute(
         "DELETE FROM chunks WHERE source_file = ?1",
         params![source_file],
@@ -1319,6 +1389,9 @@ pub fn delete_pattern_and_chunks_in_tx(
 /// tables, inside a caller-managed transaction. Counterpart to
 /// [`KnowledgeDB::insert_chunk`] for callers that need to compose multiple
 /// writes into one outer transaction (single-file ingest).
+///
+/// An embedding must match [`KnowledgeDB::vector_dimensions`]; the vector
+/// table rejects any other width and the whole transaction rolls back.
 pub fn insert_chunk_in_tx(
     tx: &Transaction<'_>,
     chunk: &Chunk,
@@ -1329,7 +1402,9 @@ pub fn insert_chunk_in_tx(
         "DELETE FROM patterns_fts WHERE chunk_id = ?1",
         params![chunk.id],
     )?;
-    tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
+    if vector_table_sql(tx)?.is_some() {
+        tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
+    }
 
     tx.execute(
         "INSERT OR REPLACE INTO chunks \
@@ -1773,11 +1848,147 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 2);
 
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 0);
         assert_eq!(stats.sources, 0);
+    }
+
+    fn identity(model: &str, dimensions: usize) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+            dimensions,
+            probe_vector: vec![0.5; dimensions],
+        }
+    }
+
+    #[test]
+    fn clear_all_recreates_the_vector_table_at_the_identity_width() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
+        db.insert_chunk(
+            &make_chunk("c1", "T1", "Body one", "a.md"),
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+
+        db.clear_all(Some(&identity("wider-model", 6))).unwrap();
+
+        assert_eq!(db.vector_dimensions().unwrap(), Some(6));
+        db.insert_chunk(
+            &make_chunk("c2", "T2", "Body two", "b.md"),
+            Some(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        let hits = db
+            .search_vector(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["c2"]
+        );
+
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_PROVIDER).unwrap().as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
+            Some("wider-model")
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_DIMENSIONS)
+                .unwrap()
+                .as_deref(),
+            Some("6")
+        );
+        let probe: Vec<f32> = serde_json::from_str(
+            &db.get_metadata(META_EMBEDDING_PROBE_VECTOR)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(probe, vec![0.5; 6]);
+    }
+
+    #[test]
+    fn clear_all_without_identity_leaves_no_vector_table_and_no_identity() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.clear_all(Some(&identity("nomic-embed-text", 4)))
+            .unwrap();
+
+        db.clear_all(None).unwrap();
+
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+        for key in [
+            META_EMBEDDING_PROVIDER,
+            META_EMBEDDING_MODEL,
+            META_EMBEDDING_DIMENSIONS,
+            META_EMBEDDING_PROBE_VECTOR,
+        ] {
+            assert_eq!(db.get_metadata(key).unwrap(), None, "{key} must be gone");
+        }
+    }
+
+    #[test]
+    fn clear_all_failure_keeps_the_vector_table_rows_and_identity() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.clear_all(Some(&identity("nomic-embed-text", 4)))
+            .unwrap();
+        db.insert_chunk(
+            &make_chunk("c1", "T1", "Body one", "a.md"),
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        // Fails the identity write, after the vector table was dropped and
+        // recreated at the new width.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_identity BEFORE INSERT ON ingest_metadata \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+
+        let err = db.clear_all(Some(&identity("wider-model", 6))).unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err:#}");
+
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+        assert_eq!(db.stats().unwrap().chunks, 1);
+        let hits = db.search_vector(&[1.0, 0.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["c1"]
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
+            Some("nomic-embed-text")
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_DIMENSIONS)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn text_only_index_accepts_writes_deletes_and_text_search() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+
+        seed_pattern_and_chunk(&db, &make_chunk("c1", "Alpha", "Alpha body", "a.md"), None);
+        db.insert_chunk(&make_chunk("c1", "Alpha", "Alpha body", "a.md"), None)
+            .unwrap();
+        assert_eq!(db.search_fts("alpha", 10).unwrap().len(), 1);
+
+        db.delete_by_source("a.md").unwrap();
+        assert_eq!(db.stats().unwrap().chunks, 0);
     }
 
     // -- delete_by_source -------------------------------------------------
@@ -3076,7 +3287,7 @@ mod tests {
         db.init().expect("init under skip-probe open must succeed");
         db.ensure_vector_table(4)
             .expect("failed to create vector table");
-        db.clear_all()
+        db.clear_all(None)
             .expect("clear_all must drop+recreate the old chunks table");
 
         // After clear_all the new schema is live — a re-open through the
@@ -3116,7 +3327,7 @@ mod tests {
             )
             .unwrap();
 
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let columns: Vec<String> = db
             .conn
@@ -3423,7 +3634,7 @@ mod tests {
         };
         db.insert_chunk(&chunk, None).unwrap();
 
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let chunk_columns: Vec<String> = db
             .conn
@@ -3906,7 +4117,7 @@ mod tests {
         let db = open_memory_db();
         db.init().unwrap();
         db.ensure_vector_table(4).unwrap();
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let chunk_columns: Vec<String> = db
             .conn

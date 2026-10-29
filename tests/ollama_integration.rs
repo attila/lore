@@ -16,6 +16,8 @@ use tempfile::tempdir;
 
 const OLLAMA_HOST: &str = "http://127.0.0.1:11434";
 const OLLAMA_MODEL: &str = "nomic-embed-text";
+/// Width of an `OLLAMA_MODEL` vector.
+const OLLAMA_DIMENSIONS: usize = 768;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -154,7 +156,7 @@ fn ollama_lifecycle() {
         .unwrap();
 
     let embedder = ollama_client();
-    let db = open_db(dir, embedder.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
 
     // -- Ingest ---------------------------------------------------------------
     let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
@@ -309,7 +311,7 @@ fn ollama_stale_embeddings_removed() {
     let dir = tmp.path();
 
     let embedder = ollama_client();
-    let db = open_db(dir, embedder.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
 
     // Seed two files with distinct content.
     fs::write(
@@ -385,7 +387,7 @@ fn ollama_mcp_subprocess_roundtrip() {
     {
         let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
-        db.ensure_vector_table(embedder.dimensions()).unwrap();
+        db.ensure_vector_table(OLLAMA_DIMENSIONS).unwrap();
         let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
         assert!(
             result.errors.is_empty(),
@@ -493,7 +495,7 @@ fn ingest_single_file_happy_path_with_real_embeddings() {
     .unwrap();
 
     let embedder = ollama_client();
-    let db = open_db(dir, embedder.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
 
     let result = ingest::ingest_single_file(
         &db,
@@ -573,8 +575,7 @@ fn ingest_file_happy_path_via_binary() {
 
     // Pre-create the DB so the CLI does not have to do first-time setup.
     {
-        let embedder = ollama_client();
-        let db = open_db(dir, embedder.dimensions());
+        let db = open_db(dir, OLLAMA_DIMENSIONS);
         // Drop closes the DB; the CLI will reopen it.
         drop(db);
     }
@@ -610,10 +611,9 @@ fn ingest_file_happy_path_via_binary() {
     // Reopen the DB and confirm the file is searchable by its distinctive
     // marker. This proves the binary actually persisted real chunks, not
     // just printed a success message.
-    let embedder = ollama_client();
     let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
-    db.ensure_vector_table(embedder.dimensions()).unwrap();
+    db.ensure_vector_table(OLLAMA_DIMENSIONS).unwrap();
     let hits = db.search_fts("xyzzysinglefile", 10).unwrap();
     assert!(
         hits.iter().any(|h| h.source_file == "draft.md"),
@@ -647,8 +647,7 @@ fn ollama_unreachable_returns_error() {
     )
     .unwrap();
 
-    // Use the dead client's dimensions (768 for nomic-embed-text).
-    let db = open_db(dir, dead_client.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
     let result = ingest::ingest(&db, &dead_client, dir, "heading", &|_| {});
 
     assert_eq!(result.files_processed, 1);

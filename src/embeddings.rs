@@ -6,7 +6,43 @@ use serde::{Deserialize, Serialize};
 /// Trait for producing embedding vectors from text.
 pub trait Embedder {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>>;
-    fn dimensions(&self) -> usize;
+    /// Backend name recorded with the index, such as `ollama`.
+    fn provider(&self) -> &str;
+    /// Model name recorded with the index.
+    fn model(&self) -> &str;
+}
+
+/// Text embedded once per index build. Changing it makes every recorded
+/// probe vector incomparable with a fresh one.
+pub const PROBE_TEXT: &str = "lore embedding identity probe";
+
+/// The embedding model an index was built with, measured rather than
+/// looked up: `dimensions` is the length of `probe_vector`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingIdentity {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub probe_vector: Vec<f32>,
+}
+
+impl EmbeddingIdentity {
+    /// Embed [`PROBE_TEXT`] and record who answered and how wide the vector is.
+    pub fn measure(embedder: &dyn Embedder) -> anyhow::Result<Self> {
+        let probe_vector = embedder.embed(PROBE_TEXT)?;
+        if probe_vector.is_empty() {
+            anyhow::bail!(
+                "embedding model {} returned an empty vector",
+                embedder.model()
+            );
+        }
+        Ok(Self {
+            provider: embedder.provider().to_string(),
+            model: embedder.model().to_string(),
+            dimensions: probe_vector.len(),
+            probe_vector,
+        })
+    }
 }
 
 /// Client for the Ollama embedding API.
@@ -453,15 +489,19 @@ impl Embedder for OllamaClient {
             .ok_or_else(|| anyhow::Error::new(ProbeError::InferenceError { body }))
     }
 
-    fn dimensions(&self) -> usize {
-        match self.model.as_str() {
-            "mxbai-embed-large" | "snowflake-arctic-embed2" => 1024,
-            "all-minilm" => 384,
-            // nomic-embed-text and anything unrecognized default to 768
-            _ => 768,
-        }
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 }
+
+/// Model name the test fakes report. Matches `Config::default_with`'s
+/// default so a fake-built index carries the configured identity.
+#[cfg(any(test, feature = "test-support"))]
+const FAKE_MODEL: &str = "nomic-embed-text";
 
 /// A deterministic fake embedder for use in tests.
 ///
@@ -470,17 +510,31 @@ impl Embedder for OllamaClient {
 #[cfg(any(test, feature = "test-support"))]
 pub struct FakeEmbedder {
     dims: usize,
+    model: String,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl FakeEmbedder {
     pub fn new() -> Self {
-        Self { dims: 768 }
+        Self::with_dimensions(768)
     }
 
     #[allow(dead_code)]
     pub fn with_dimensions(dims: usize) -> Self {
-        Self { dims }
+        Self::with_model(FAKE_MODEL, dims)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_model(model: &str, dims: usize) -> Self {
+        Self {
+            dims,
+            model: model.to_string(),
+        }
+    }
+
+    /// Width of every vector this fake produces.
+    pub fn dimensions(&self) -> usize {
+        self.dims
     }
 }
 
@@ -516,8 +570,12 @@ impl Embedder for FakeEmbedder {
         Ok(vec)
     }
 
-    fn dimensions(&self) -> usize {
-        self.dims
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -533,6 +591,11 @@ impl FailingEmbedder {
     pub fn new(dims: usize) -> Self {
         Self { dims }
     }
+
+    /// Width a test gives the vector table it builds alongside this fake.
+    pub fn dimensions(&self) -> usize {
+        self.dims
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -541,8 +604,12 @@ impl Embedder for FailingEmbedder {
         anyhow::bail!("Ollama is unreachable")
     }
 
-    fn dimensions(&self) -> usize {
-        self.dims
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn model(&self) -> &str {
+        FAKE_MODEL
     }
 }
 
@@ -574,21 +641,25 @@ mod tests {
     }
 
     #[test]
-    fn dimensions_returns_correct_values() {
-        let client = OllamaClient::new("http://localhost:11434", "nomic-embed-text");
-        assert_eq!(client.dimensions(), 768);
+    fn measure_records_provider_model_and_probe_width() {
+        let embedder = FakeEmbedder::with_model("some-unlisted-model", 1024);
+        let identity = EmbeddingIdentity::measure(&embedder).unwrap();
+        assert_eq!(identity.provider, "ollama");
+        assert_eq!(identity.model, "some-unlisted-model");
+        assert_eq!(identity.dimensions, 1024);
+        assert_eq!(identity.probe_vector, embedder.embed(PROBE_TEXT).unwrap());
+    }
 
-        let client = OllamaClient::new("http://localhost:11434", "mxbai-embed-large");
-        assert_eq!(client.dimensions(), 1024);
+    #[test]
+    fn measure_fails_when_the_embedder_fails() {
+        assert!(EmbeddingIdentity::measure(&FailingEmbedder::new(4)).is_err());
+    }
 
-        let client = OllamaClient::new("http://localhost:11434", "all-minilm");
-        assert_eq!(client.dimensions(), 384);
-
-        let client = OllamaClient::new("http://localhost:11434", "snowflake-arctic-embed2");
-        assert_eq!(client.dimensions(), 1024);
-
-        let client = OllamaClient::new("http://localhost:11434", "unknown-model");
-        assert_eq!(client.dimensions(), 768);
+    #[test]
+    fn ollama_client_reports_its_configured_model() {
+        let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model");
+        assert_eq!(client.provider(), "ollama");
+        assert_eq!(client.model(), "some-unlisted-model");
     }
 
     #[test]

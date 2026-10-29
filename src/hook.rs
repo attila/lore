@@ -709,7 +709,11 @@ pub fn search_with_threshold_gated(
     let mut phases = trace::Phases::default();
     let mut embed_failed = false;
 
-    let query_embedding = if config.search.hybrid {
+    let query_embedding = if config.search.hybrid && matches!(db.vector_dimensions(), Ok(None)) {
+        lore_debug!("search: index has no vector table, text search only");
+        embed_failed = true;
+        None
+    } else if config.search.hybrid {
         let t_embed = std::time::Instant::now();
         let outcome = embedder.embed(query);
         phases.embedding_ms = Some(elapsed_ms(t_embed));
