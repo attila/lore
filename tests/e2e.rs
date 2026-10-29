@@ -1,9 +1,15 @@
+use std::cell::RefCell;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use lore::config::Config;
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, FakeEmbedder};
+use lore::embeddings::{Embedder, FailingEmbedder, FakeEmbedder};
 use lore::ingest;
 use tempfile::tempdir;
 
@@ -317,4 +323,441 @@ fn ingest_replaces_stale_data() {
         "new content 'immutable' should be found after re-ingest"
     );
     assert_eq!(results[0].source_file, "beta.md");
+}
+
+// -- Missing vectors ----------------------------------------------------------
+
+/// Commit everything in `dir` and return the new HEAD.
+fn commit_all(dir: &Path) -> String {
+    for args in [vec!["add", "."], vec!["commit", "-m", "seed"]] {
+        Command::new("git")
+            .args(&args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8(head.stdout).unwrap().trim().to_string()
+}
+
+fn memory_db() -> KnowledgeDB {
+    let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+    db.init().unwrap();
+    db
+}
+
+/// Run a plain `lore ingest` against `db`, returning its result and every
+/// progress line.
+fn ingest_logged(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    dir: &Path,
+) -> (ingest::IngestResult, Vec<String>) {
+    let lines = RefCell::new(Vec::new());
+    let result = ingest::ingest(db, embedder, dir, "heading", &|m| {
+        lines.borrow_mut().push(m.to_string());
+    });
+    (result, lines.into_inner())
+}
+
+fn logged(lines: &[String], needle: &str) -> bool {
+    lines.iter().any(|l| l.contains(needle))
+}
+
+/// Embeds like [`FakeEmbedder`] but fails every text containing `refuse`.
+struct RefusingEmbedder {
+    inner: FakeEmbedder,
+    refuse: &'static str,
+}
+
+impl Embedder for RefusingEmbedder {
+    fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        if input.contains(self.refuse) {
+            anyhow::bail!("refused");
+        }
+        self.inner.embed(input)
+    }
+
+    fn provider(&self) -> &str {
+        self.inner.provider()
+    }
+
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+}
+
+#[test]
+fn a_chunk_that_failed_to_embed_gains_its_vector_on_the_next_ingest() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    let head = commit_all(dir);
+    let db = memory_db();
+
+    let refusing = RefusingEmbedder {
+        inner: FakeEmbedder::new(),
+        refuse: "snake_case",
+    };
+    let (result, _) = ingest_logged(&db, &refusing, dir);
+    assert_eq!(
+        result.errors,
+        ["1 embedding failure(s) while indexing naming-conventions.md"]
+    );
+    assert_eq!(
+        db.get_metadata("last_ingested_commit").unwrap(),
+        Some(head.clone()),
+        "an embedding failure must not hold back HEAD"
+    );
+    assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+
+    let (result, _) = ingest_logged(&db, &FailingEmbedder::new(768), dir);
+    assert_eq!(
+        result.errors,
+        [
+            "1 chunk(s) have no vector and the embedding model did not answer: \
+             Ollama is unreachable"
+        ]
+    );
+
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), dir);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(logged(&lines, "Embedded 1 chunk(s) that had no vector"));
+    assert!(logged(&lines, "Already up to date"), "{lines:?}");
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
+}
+
+#[test]
+fn a_delta_ingest_records_head_when_a_chunk_fails_to_embed() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &FakeEmbedder::new(), dir);
+
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    let head = commit_all(dir);
+    let refusing = RefusingEmbedder {
+        inner: FakeEmbedder::new(),
+        refuse: "stderr",
+    };
+    let (result, lines) = ingest_logged(&db, &refusing, dir);
+    assert!(
+        logged(&lines, "Delta ingest: 1 file(s) changed"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        result.errors,
+        [
+            "1 embedding failure(s) while indexing logging.md",
+            "1 embedding failure(s) while adding missing vectors"
+        ]
+    );
+    assert_eq!(
+        db.get_metadata("last_ingested_commit").unwrap(),
+        Some(head.clone()),
+        "an embedding failure must not hold back HEAD"
+    );
+    assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), dir);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(logged(&lines, "Already up to date"), "{lines:?}");
+    assert!(logged(&lines, "Embedded 1 chunk(s) that had no vector"));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
+}
+
+#[test]
+fn a_chunk_replaced_by_the_delta_is_not_embedded_first() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    let refusing = RefusingEmbedder {
+        inner: FakeEmbedder::new(),
+        refuse: "snake_case",
+    };
+    ingest_logged(&db, &refusing, dir);
+    assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+
+    fs::write(
+        dir.join("naming-conventions.md"),
+        "# Naming\n\nName things plainly.\n",
+    )
+    .unwrap();
+    commit_all(dir);
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(
+        logged(&lines, "Delta ingest: 1 file(s) changed"),
+        "{lines:?}"
+    );
+    assert!(!logged(&lines, "that have no vector"), "{lines:?}");
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+}
+
+#[test]
+fn a_text_only_index_gains_vectors_on_the_next_ingest_that_reaches_the_model() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    let head = commit_all(dir);
+    let db = memory_db();
+
+    let unanswered = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("Embedding model did not answer (Ollama is unreachable) — "))
+            .count()
+    };
+    let (result, lines) = ingest_logged(&db, &FailingEmbedder::new(768), dir);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(unanswered(&lines), 1, "{lines:?}");
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
+
+    let (result, lines) = ingest_logged(&db, &FailingEmbedder::new(768), dir);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(logged(&lines, "Already up to date"), "{lines:?}");
+    assert_eq!(unanswered(&lines), 1, "{lines:?}");
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+
+    let embedder = FakeEmbedder::with_model("some-unlisted-model", 1024);
+    let (result, lines) = ingest_logged(&db, &embedder, dir);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(logged(&lines, "Already up to date"), "{lines:?}");
+    assert_eq!(db.vector_dimensions().unwrap(), Some(1024));
+    assert_eq!(
+        db.get_metadata("embedding_model").unwrap().as_deref(),
+        Some("some-unlisted-model")
+    );
+    assert_eq!(
+        db.get_metadata("embedding_dimensions").unwrap().as_deref(),
+        Some("1024")
+    );
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    let query = embedder.embed("error propagation").unwrap();
+    assert_eq!(db.search_vector(&query, 10).unwrap().len(), 3);
+}
+
+#[test]
+fn a_text_only_index_with_new_commits_embeds_old_and_changed_files() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &FailingEmbedder::new(768), dir);
+
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    commit_all(dir);
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.files_processed, 1);
+    assert!(logged(&lines, "Embedding 4 chunk(s) that have no vector"));
+    assert!(logged(&lines, "Embedded 4 chunk(s) that had no vector"));
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.stats().unwrap().chunks, 4);
+}
+
+/// An index with a vector table but no recorded model, its chunks indexed
+/// without vectors and its HEAD recorded.
+fn unrecorded_index(dir: &Path, width: usize) -> KnowledgeDB {
+    seed_patterns(dir);
+    git_init(dir);
+    let head = commit_all(dir);
+    let db = memory_db();
+    db.ensure_vector_table(width).unwrap();
+    for name in [
+        "error-handling.md",
+        "naming-conventions.md",
+        "testing-strategy.md",
+    ] {
+        ingest::ingest_single_file(
+            &db,
+            &FailingEmbedder::new(width),
+            dir,
+            &dir.join(name),
+            "heading",
+            false,
+            &|_| {},
+        );
+    }
+    db.set_metadata("last_ingested_commit", &head).unwrap();
+    assert_eq!(db.chunks_without_vectors().unwrap().len(), 3);
+    db
+}
+
+#[test]
+fn an_index_without_a_recorded_model_is_backfilled_at_its_own_width() {
+    let tmp = tempdir().unwrap();
+    let db = unrecorded_index(tmp.path(), 768);
+
+    let embedder = FakeEmbedder::with_model("other-model", 768);
+    let (result, lines) = ingest_logged(&db, &embedder, tmp.path());
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(logged(&lines, "Embedded 3 chunk(s) that had no vector"));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert_eq!(db.get_metadata("embedding_model").unwrap(), None);
+}
+
+#[test]
+fn an_index_without_a_recorded_model_rejects_vectors_of_another_width() {
+    let tmp = tempdir().unwrap();
+    let db = unrecorded_index(tmp.path(), 4);
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), tmp.path());
+
+    assert_eq!(
+        result.errors,
+        [
+            "3 chunk(s) have no vector: the embedding model returns 768 dimensions, \
+             the index holds 4"
+        ]
+    );
+    assert_eq!(db.chunks_without_vectors().unwrap().len(), 3);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+    assert_eq!(db.get_metadata("embedding_model").unwrap(), None);
+}
+
+/// Answer `/api/embed` the way Ollama does, with [`FakeEmbedder`] vectors.
+/// Returns the base URL and a count of the requests served.
+fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    std::thread::spawn(move || {
+        let embedder = FakeEmbedder::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let vector = embedder
+                .embed(request["input"][0].as_str().unwrap())
+                .unwrap();
+            let response = serde_json::json!({ "embeddings": [vector] }).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (url, served)
+}
+
+fn lore() -> assert_cmd::Command {
+    assert_cmd::Command::cargo_bin("lore").unwrap()
+}
+
+#[test]
+fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir,
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    let text_only_note = "Note: the index has no vectors, so searches use text only. \
+                          Run `lore ingest` once the embedding model answers to add them.";
+    let cause = "Embedding model did not answer (";
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("running full ingest"))
+        .stderr(predicate::str::contains(cause).count(1))
+        .stderr(predicate::str::contains(text_only_note));
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Already up to date"))
+        .stderr(predicate::str::contains(cause).count(1))
+        .stderr(predicate::str::contains(text_only_note));
+
+    let (url, served) = serve_fake_ollama();
+    config.ollama.host = url;
+    config.save(&config_path).unwrap();
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Already up to date"))
+        .stderr(predicate::str::contains(
+            "Embedded 3 chunk(s) that had no vector",
+        ))
+        .stderr(predicate::str::contains("Note:").not())
+        .stderr(predicate::str::contains("Errors:").not());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+        assert_eq!(
+            db.get_metadata("embedding_model").unwrap().as_deref(),
+            Some("nomic-embed-text")
+        );
+    }
+
+    let before_search = served.load(Ordering::SeqCst);
+    lore()
+        .env("LORE_DEBUG", "1")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains(
+            "search: embedding succeeded (768 dims)",
+        ))
+        .stderr(predicate::str::contains("text search only").not());
+    assert_eq!(served.load(Ordering::SeqCst), before_search + 1);
 }

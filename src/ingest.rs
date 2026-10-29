@@ -20,7 +20,7 @@ use crate::chunking::{
     chunk_as_document_with_advisories, chunk_by_heading_with_advisories, extract_title,
 };
 use crate::database::KnowledgeDB;
-use crate::embeddings::{Embedder, EmbeddingIdentity};
+use crate::embeddings::{Embedder, EmbeddingIdentity, PROBE_TEXT};
 use crate::git;
 use crate::lore_debug;
 use crate::loreignore;
@@ -336,6 +336,9 @@ pub fn ingest(
     let reconcile_did_work = reconciled_removed > 0 || reconciled_added > 0;
 
     if changes.is_empty() {
+        // An index with missing vectors and no new commits must still gain
+        // them.
+        let vector_errors = add_missing_vectors(db, embedder, on_progress);
         if !reconcile_did_work && reconcile_errors.is_empty() {
             on_progress("Already up to date — no files changed since last ingest");
         } else {
@@ -351,6 +354,7 @@ pub fn ingest(
         result.reconciled_removed = reconciled_removed;
         result.reconciled_added = reconciled_added;
         result.errors = reconcile_errors;
+        result.errors.extend(vector_errors);
         return result;
     }
 
@@ -367,10 +371,104 @@ pub fn ingest(
     // Surface reconciliation errors and counts to the caller alongside delta
     // results.
     result.errors.extend(reconcile_errors);
+    result
+        .errors
+        .extend(add_missing_vectors(db, embedder, on_progress));
     result.reconciled_removed = reconciled_removed;
     result.reconciled_added = reconciled_added;
     result.chunks_created += reconcile_chunks;
     result
+}
+
+/// Add the vectors the index lacks, when the embedding model answers. A
+/// text-only index first gets its vector table, sized by a probe and
+/// recorded with the model's identity; then every chunk without a vector
+/// row is embedded. An existing table keeps its width, recorded or not.
+///
+/// Returns errors to report; none of them holds back the recorded HEAD.
+fn add_missing_vectors(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    on_progress: &dyn Fn(&str),
+) -> Vec<String> {
+    let (dimensions, probed) = match db.vector_dimensions() {
+        Ok(Some(dimensions)) => (dimensions, false),
+        Ok(None) => {
+            let identity = match EmbeddingIdentity::measure(embedder) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    on_progress(&format!(
+                        "Embedding model did not answer ({e}) — the index stays text-only"
+                    ));
+                    return Vec::new();
+                }
+            };
+            if let Err(e) = db.add_vector_table(&identity) {
+                return vec![format!("Failed to add the vector table: {e}")];
+            }
+            (identity.dimensions, true)
+        }
+        Err(e) => return vec![format!("Failed to read the vector table: {e}")],
+    };
+
+    let chunks = match db.chunks_without_vectors() {
+        Ok(chunks) => chunks,
+        Err(e) => return vec![format!("Failed to find chunks without a vector: {e}")],
+    };
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    // One probe costs an unreachable model a single timeout, not one per chunk.
+    if !probed {
+        match embedder.embed(PROBE_TEXT) {
+            Err(e) => {
+                return vec![format!(
+                    "{} chunk(s) have no vector and the embedding model did not answer: {e}",
+                    chunks.len()
+                )];
+            }
+            Ok(probe) if probe.len() != dimensions => {
+                return vec![format!(
+                    "{} chunk(s) have no vector: the embedding model returns {} dimensions, \
+                     the index holds {dimensions}",
+                    chunks.len(),
+                    probe.len()
+                )];
+            }
+            Ok(_) => {}
+        }
+    }
+
+    on_progress(&format!(
+        "Embedding {} chunk(s) that have no vector",
+        chunks.len()
+    ));
+    let vectors: Vec<(String, Vec<f32>)> = chunks
+        .iter()
+        .filter_map(|chunk| {
+            embedder
+                .embed(&embed_text(chunk))
+                .ok()
+                .filter(|emb| emb.len() == dimensions)
+                .map(|emb| (chunk.id.clone(), emb))
+        })
+        .collect();
+    if let Err(e) = db.insert_vectors(&vectors) {
+        return vec![format!("Failed to store missing vectors: {e}")];
+    }
+    if !vectors.is_empty() {
+        on_progress(&format!(
+            "Embedded {} chunk(s) that had no vector",
+            vectors.len()
+        ));
+    }
+    let failures = chunks.len() - vectors.len();
+    if failures > 0 {
+        return vec![format!(
+            "{failures} embedding failure(s) while adding missing vectors"
+        )];
+    }
+    Vec::new()
 }
 
 /// Run a reconciliation pass and update the stored content hash on success.
@@ -565,6 +663,7 @@ fn delta_ingest(
     on_progress(&format!("Delta ingest: {} file(s) changed", changes.len()));
 
     let mut result = IngestResult::with_mode(IngestMode::Delta { unchanged });
+    let mut embedding_errors = Vec::new();
 
     for change in changes {
         let processed = process_change(
@@ -576,18 +675,21 @@ fn delta_ingest(
             ignore_matcher,
             on_progress,
             &mut result,
+            &mut embedding_errors,
         );
         if processed {
             result.files_processed += 1;
         }
     }
 
-    // Record the pre-captured HEAD on success (no errors).
+    // Record the pre-captured HEAD unless a change failed to apply. Chunks
+    // that failed to embed do not hold it back: the next ingest embeds them.
     if result.errors.is_empty()
         && let Err(e) = db.set_metadata(META_LAST_COMMIT, head)
     {
         on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
+    result.errors.extend(embedding_errors);
 
     emit_language_warnings(&result, on_progress);
     emit_language_tally(&result, on_progress);
@@ -610,6 +712,7 @@ fn process_change(
     ignore_matcher: Option<&ignore::gitignore::Gitignore>,
     on_progress: &dyn Fn(&str),
     result: &mut IngestResult,
+    embedding_errors: &mut Vec<String>,
 ) -> bool {
     match change {
         git::FileChange::Added(path) | git::FileChange::Modified(path) => {
@@ -622,7 +725,7 @@ fn process_change(
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
                     if indexed.embedding_failures > 0 {
-                        result.errors.push(format!(
+                        embedding_errors.push(format!(
                             "{} embedding failure(s) while indexing {path}",
                             indexed.embedding_failures
                         ));
@@ -668,7 +771,7 @@ fn process_change(
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
                     if indexed.embedding_failures > 0 {
-                        result.errors.push(format!(
+                        embedding_errors.push(format!(
                             "{} embedding failure(s) while indexing {to}",
                             indexed.embedding_failures
                         ));
@@ -901,8 +1004,8 @@ pub fn empty_warning_message(knowledge_dir: &Path) -> Option<String> {
 
 /// Clear the database and re-index every markdown file from scratch.
 ///
-/// Records the current HEAD commit SHA on success so that subsequent
-/// [`ingest`] calls can use delta mode.
+/// Records the current HEAD commit SHA unless a file failed to index, so
+/// that subsequent [`ingest`] calls can use delta mode.
 pub fn full_ingest(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -929,7 +1032,9 @@ pub fn full_ingest(
     let identity = match EmbeddingIdentity::measure(embedder) {
         Ok(identity) => Some(identity),
         Err(e) => {
-            lore_debug!("full ingest: no embedding model, building a text-only index: {e}");
+            on_progress(&format!(
+                "Embedding model did not answer ({e}) — building a text-only index"
+            ));
             None
         }
     };
@@ -945,12 +1050,13 @@ pub fn full_ingest(
         on_progress(&format!("Warning: failed to record .loreignore hash: {e}"));
     }
 
+    let mut embedding_errors = Vec::new();
     for file_path in &md_files {
         match index_single_file(db, embedder, knowledge_dir, file_path, strategy) {
             Ok(indexed) => {
                 result.chunks_created += indexed.chunks_indexed;
                 if indexed.embedding_failures > 0 {
-                    result.errors.push(format!(
+                    embedding_errors.push(format!(
                         "{} embedding failure(s) while indexing {}",
                         indexed.embedding_failures, indexed.rel_path
                     ));
@@ -976,7 +1082,9 @@ pub fn full_ingest(
         }
     }
 
-    // Record the HEAD commit for future delta ingests.
+    // Record the HEAD commit for future delta ingests unless a file failed
+    // to index. Chunks that failed to embed do not hold it back: the next
+    // ingest embeds them.
     if result.errors.is_empty()
         && git::is_git_repo(knowledge_dir)
         && let Ok(head) = git::head_commit(knowledge_dir)
@@ -984,6 +1092,7 @@ pub fn full_ingest(
     {
         on_progress(&format!("Warning: failed to record commit SHA: {e}"));
     }
+    result.errors.extend(embedding_errors);
 
     emit_language_warnings(&result, on_progress);
     emit_language_tally(&result, on_progress);

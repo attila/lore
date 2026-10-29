@@ -438,12 +438,14 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         }
     }
 
-    if let ingest::IngestMode::SingleFile { path } = &result.mode
-        && matches!(db.vector_dimensions(), Ok(None))
-    {
+    if matches!(db.vector_dimensions(), Ok(None)) {
+        let text_only = match &result.mode {
+            ingest::IngestMode::SingleFile { path } => format!("{path} is searchable by text only"),
+            _ => "searches use text only".to_string(),
+        };
         eprintln!(
-            "Note: the index has no vectors, so {path} is searchable by text only. \
-             Run `lore ingest` while the embedding model is reachable to add them."
+            "Note: the index has no vectors, so {text_only}. \
+             Run `lore ingest` once the embedding model answers to add them."
         );
     }
 

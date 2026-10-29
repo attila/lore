@@ -251,6 +251,66 @@ impl KnowledgeDB {
         vector_table_dimensions(&self.conn)
     }
 
+    /// Give a text-only index its `patterns_vec` table at `identity`'s
+    /// measured width and record the identity, in one transaction. Errors
+    /// when the index already has a vector table, whose width and identity
+    /// only [`Self::clear_all`] may replace.
+    pub fn add_vector_table(&self, identity: &EmbeddingIdentity) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if vector_table_sql(&tx)?.is_some() {
+            anyhow::bail!("the index already has a vector table");
+        }
+        create_vector_table_with_identity(&tx, identity)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Chunks with no row in `patterns_vec`: their embedding failed, or they
+    /// were written while the index had no vector table. Empty when the
+    /// index still has no vector table.
+    pub fn chunks_without_vectors(&self) -> anyhow::Result<Vec<Chunk>> {
+        if vector_table_sql(&self.conn)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
+                    c.is_universal, c.applies_when_json, c.language_json
+             FROM chunks c
+             WHERE NOT EXISTS (SELECT 1 FROM patterns_vec v WHERE v.id = c.id)
+             ORDER BY c.id",
+        )?;
+        let chunks = stmt
+            .query_map([], |row| {
+                Ok(Chunk {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    tags: row.get(3)?,
+                    source_file: row.get(4)?,
+                    heading_path: row.get(5)?,
+                    is_universal: row.get::<_, i64>(6)? != 0,
+                    applies_when_json: row.get(7)?,
+                    language_json: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(chunks)
+    }
+
+    /// Store vectors for chunks that have none, keyed by chunk id, in one
+    /// transaction. Each vector must match [`Self::vector_dimensions`].
+    pub fn insert_vectors(&self, vectors: &[(String, Vec<f32>)]) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, embedding) in vectors {
+            tx.execute(
+                "INSERT INTO patterns_vec (id, embedding) VALUES (?1, ?2)",
+                params![id, vec_to_blob(embedding)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop and recreate all tables so that any column additions, index
     /// changes, or tokenizer updates in the DDL take effect. Used by
     /// `lore ingest --force` as the authoritative path back to a clean
@@ -284,20 +344,7 @@ impl KnowledgeDB {
             ],
         )?;
         if let Some(identity) = identity {
-            tx.execute_batch(&patterns_vec_ddl(identity.dimensions))?;
-            let dimensions = identity.dimensions.to_string();
-            let probe_vector = serde_json::to_string(&identity.probe_vector)?;
-            for (key, value) in [
-                (META_EMBEDDING_PROVIDER, identity.provider.as_str()),
-                (META_EMBEDDING_MODEL, identity.model.as_str()),
-                (META_EMBEDDING_DIMENSIONS, dimensions.as_str()),
-                (META_EMBEDDING_PROBE_VECTOR, probe_vector.as_str()),
-            ] {
-                tx.execute(
-                    "INSERT OR REPLACE INTO ingest_metadata (key, value) VALUES (?1, ?2)",
-                    params![key, value],
-                )?;
-            }
+            create_vector_table_with_identity(&tx, identity)?;
         }
         // Keep the schema stamp in sync with the freshly recreated tables.
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1082,7 +1129,8 @@ const INGEST_METADATA_DDL: &str =
     "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)";
 
 /// `ingest_metadata` keys recording the embedding model the vector table
-/// was built with. Written and removed together by `clear_all` only.
+/// was built with. Written only together with the vector table they
+/// describe, by `clear_all` or `add_vector_table`.
 pub(crate) const META_EMBEDDING_PROVIDER: &str = "embedding_provider";
 pub(crate) const META_EMBEDDING_MODEL: &str = "embedding_model";
 pub(crate) const META_EMBEDDING_DIMENSIONS: &str = "embedding_dimensions";
@@ -1123,6 +1171,30 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
             embedding float[{dimensions}]
         )"
     )
+}
+
+/// Create `patterns_vec` at the measured width and record `identity` beside
+/// it. The caller owns the transaction, so the table never exists without
+/// the identity that sized it.
+fn create_vector_table_with_identity(
+    tx: &Transaction<'_>,
+    identity: &EmbeddingIdentity,
+) -> anyhow::Result<()> {
+    tx.execute_batch(&patterns_vec_ddl(identity.dimensions))?;
+    let dimensions = identity.dimensions.to_string();
+    let probe_vector = serde_json::to_string(&identity.probe_vector)?;
+    for (key, value) in [
+        (META_EMBEDDING_PROVIDER, identity.provider.as_str()),
+        (META_EMBEDDING_MODEL, identity.model.as_str()),
+        (META_EMBEDDING_DIMENSIONS, dimensions.as_str()),
+        (META_EMBEDDING_PROBE_VECTOR, probe_vector.as_str()),
+    ] {
+        tx.execute(
+            "INSERT OR REPLACE INTO ingest_metadata (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+    }
+    Ok(())
 }
 
 /// Read the `patterns_vec` width from its stored DDL rather than from
@@ -1973,6 +2045,44 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("4")
+        );
+    }
+
+    #[test]
+    fn add_vector_table_records_the_identity_and_refuses_an_existing_table() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.insert_chunk(&make_chunk("c1", "T1", "Body one", "a.md"), None)
+            .unwrap();
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+        db.add_vector_table(&identity("nomic-embed-text", 4))
+            .unwrap();
+
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_DIMENSIONS)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+        let missing = db.chunks_without_vectors().unwrap();
+        assert_eq!(
+            missing.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["c1"]
+        );
+        db.insert_vectors(&[("c1".to_string(), vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+        let err = db
+            .add_vector_table(&identity("wider-model", 6))
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a vector table"));
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
+            Some("nomic-embed-text")
         );
     }
 
