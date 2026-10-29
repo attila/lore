@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::chunking::{Chunk, PatternRow};
-use crate::embeddings::EmbeddingIdentity;
+use crate::embeddings::{EmbeddingIdentity, RecordedModel};
 
 // ---------------------------------------------------------------------------
 // sqlite-vec FFI registration
@@ -249,6 +249,16 @@ impl KnowledgeDB {
     /// vector table and searches can only use text.
     pub fn vector_dimensions(&self) -> anyhow::Result<Option<usize>> {
         vector_table_dimensions(&self.conn)
+    }
+
+    /// Provider and model recorded with the vector table, or `None` when
+    /// the index records none, such as one built by an older lore.
+    pub fn recorded_embedding_model(&self) -> anyhow::Result<Option<RecordedModel>> {
+        let provider = self.get_metadata(META_EMBEDDING_PROVIDER)?;
+        let model = self.get_metadata(META_EMBEDDING_MODEL)?;
+        Ok(provider
+            .zip(model)
+            .map(|(provider, model)| RecordedModel { provider, model }))
     }
 
     /// Give a text-only index its `patterns_vec` table at `identity`'s
@@ -2083,6 +2093,24 @@ mod tests {
         assert_eq!(
             db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
             Some("nomic-embed-text")
+        );
+    }
+
+    #[test]
+    fn recorded_embedding_model_reads_the_identity_and_is_none_without_one() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
+        assert_eq!(db.recorded_embedding_model().unwrap(), None);
+
+        db.clear_all(Some(&identity("wider-model", 6))).unwrap();
+
+        assert_eq!(
+            db.recorded_embedding_model().unwrap(),
+            Some(RecordedModel {
+                provider: "ollama".to_string(),
+                model: "wider-model".to_string(),
+            })
         );
     }
 

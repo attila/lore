@@ -45,6 +45,104 @@ impl EmbeddingIdentity {
     }
 }
 
+/// Provider and model recorded with an index's vector table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedModel {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Why a query must skip the index's vectors and search text only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorMismatch {
+    /// The index records another provider or model than the one configured.
+    Model {
+        recorded: String,
+        configured: String,
+    },
+    /// The query vector is not as wide as the index's vectors. `recorded` is
+    /// `None` for an index that has no recorded model.
+    Width {
+        recorded: Option<String>,
+        configured: String,
+        index: usize,
+        query: usize,
+    },
+}
+
+impl VectorMismatch {
+    /// Compare the recorded model with `embedder` before embedding a query.
+    /// An index with no recorded model passes: only its width can tell.
+    pub fn of_model(recorded: Option<&RecordedModel>, embedder: &dyn Embedder) -> Option<Self> {
+        let recorded = recorded?;
+        let same = recorded.provider == embedder.provider()
+            && same_model(&recorded.provider, &recorded.model, embedder.model());
+        (!same).then(|| Self::Model {
+            recorded: recorded.model.clone(),
+            configured: embedder.model().to_string(),
+        })
+    }
+
+    /// Compare a query vector's width with the width of the index's vectors.
+    pub fn of_width(
+        recorded: Option<&RecordedModel>,
+        embedder: &dyn Embedder,
+        index: usize,
+        query: usize,
+    ) -> Option<Self> {
+        (index != query).then(|| Self::Width {
+            recorded: recorded.map(|r| r.model.clone()),
+            configured: embedder.model().to_string(),
+            index,
+            query,
+        })
+    }
+}
+
+/// Ollama resolves an untagged model name to its `:latest` tag, so the two
+/// spellings name the same model; any other tag is a different model.
+fn same_model(provider: &str, recorded: &str, configured: &str) -> bool {
+    fn untagged(model: &str) -> &str {
+        model.strip_suffix(":latest").unwrap_or(model)
+    }
+    if provider == "ollama" {
+        untagged(recorded) == untagged(configured)
+    } else {
+        recorded == configured
+    }
+}
+
+impl std::fmt::Display for VectorMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Model {
+                recorded,
+                configured,
+            } => write!(
+                f,
+                "the index was built with {recorded} but lore is configured for {configured}"
+            )?,
+            Self::Width {
+                recorded,
+                configured,
+                index,
+                query,
+            } => {
+                let from = recorded.as_deref().unwrap_or("an unrecorded model");
+                write!(
+                    f,
+                    "the index holds {index}-dimension vectors from {from} but {configured} \
+                     returns {query} dimensions"
+                )?;
+            }
+        }
+        write!(
+            f,
+            ", so searches use text only. Run 'lore ingest --force' to rebuild the index"
+        )
+    }
+}
+
 /// Client for the Ollama embedding API.
 pub struct OllamaClient {
     host: String,
@@ -653,6 +751,79 @@ mod tests {
     #[test]
     fn measure_fails_when_the_embedder_fails() {
         assert!(EmbeddingIdentity::measure(&FailingEmbedder::new(4)).is_err());
+    }
+
+    fn recorded(model: &str) -> RecordedModel {
+        RecordedModel {
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn of_model_flags_only_a_recorded_model_that_differs() {
+        let embedder = FakeEmbedder::new();
+        assert_eq!(VectorMismatch::of_model(None, &embedder), None);
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &embedder),
+            None
+        );
+        let mismatch =
+            VectorMismatch::of_model(Some(&recorded("mxbai-embed-large")), &embedder).unwrap();
+        assert_eq!(
+            mismatch.to_string(),
+            "the index was built with mxbai-embed-large but lore is configured for \
+             nomic-embed-text, so searches use text only. Run 'lore ingest --force' to \
+             rebuild the index"
+        );
+    }
+
+    #[test]
+    fn of_model_reads_an_untagged_ollama_model_as_its_latest_tag() {
+        let bare = FakeEmbedder::with_model("nomic-embed-text", 768);
+        let latest = FakeEmbedder::with_model("nomic-embed-text:latest", 768);
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text:latest")), &bare),
+            None
+        );
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &latest),
+            None
+        );
+        assert!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text:v1.5")), &bare).is_some()
+        );
+        let tagged = FakeEmbedder::with_model("nomic-embed-text:v1.5", 768);
+        assert!(VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &tagged).is_some());
+    }
+
+    #[test]
+    fn of_model_flags_a_different_provider() {
+        let other = RecordedModel {
+            provider: "other".to_string(),
+            model: "nomic-embed-text".to_string(),
+        };
+        assert!(VectorMismatch::of_model(Some(&other), &FakeEmbedder::new()).is_some());
+    }
+
+    #[test]
+    fn of_width_flags_only_a_width_that_differs() {
+        let embedder = FakeEmbedder::new();
+        assert_eq!(VectorMismatch::of_width(None, &embedder, 768, 768), None);
+        assert_eq!(
+            VectorMismatch::of_width(None, &embedder, 1024, 768)
+                .unwrap()
+                .to_string(),
+            "the index holds 1024-dimension vectors from an unrecorded model but \
+             nomic-embed-text returns 768 dimensions, so searches use text only. Run \
+             'lore ingest --force' to rebuild the index"
+        );
+        assert!(
+            VectorMismatch::of_width(Some(&recorded("nomic-embed-text")), &embedder, 4, 768)
+                .unwrap()
+                .to_string()
+                .starts_with("the index holds 4-dimension vectors from nomic-embed-text but")
+        );
     }
 
     #[test]

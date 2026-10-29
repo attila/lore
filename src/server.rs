@@ -14,6 +14,7 @@ use std::io::{self, BufRead, Write};
 use crate::config::Config;
 use crate::database::KnowledgeDB;
 use crate::embeddings::Embedder;
+use crate::embeddings::VectorMismatch;
 use crate::embeddings::render_failure;
 use crate::git;
 use crate::ingest;
@@ -799,10 +800,12 @@ fn extract_languages_from_query_string(query: &str) -> Vec<String> {
 /// unrestricted hybrid path otherwise so plain-text queries keep
 /// today's behaviour.
 ///
-/// Returns the search result alongside two flags: whether the search ran
-/// without its vector half (the caller uses it to decide whether to apply
-/// the RRF-score relevance threshold), and whether that was because the
-/// embedder errored rather than because the index has no vector table.
+/// Returns the search result alongside whether the search ran without its
+/// vector half (the caller uses it to decide whether to apply the RRF-score
+/// relevance threshold) and the note to prefix to the response when the
+/// reason is one the caller should hear about: the embedder errored, or the
+/// index was built with another model. An index with no vector table falls
+/// back without a note.
 fn run_search(
     ctx: &ServerContext<'_>,
     query: &str,
@@ -810,7 +813,7 @@ fn run_search(
 ) -> (
     anyhow::Result<Vec<crate::database::SearchResult>>,
     bool,
-    bool,
+    Option<String>,
 ) {
     let inferred_langs = extract_languages_from_query_string(query);
     let cleaned_terms: Vec<String> = query
@@ -820,18 +823,39 @@ fn run_search(
         .collect();
 
     let mut embed_failed = false;
-    let mut embedder_errored = false;
+    let mut note = None;
+    let mut mismatch_fallback = |mismatch: VectorMismatch| {
+        eprintln!("[lore] Warning: {mismatch}.");
+        note = Some(format!("{mismatch}."));
+    };
     let results = if ctx.config.search.hybrid {
-        let query_embedding = if matches!(ctx.db.vector_dimensions(), Ok(None)) {
+        let vector_width = ctx.db.vector_dimensions();
+        let recorded = ctx.db.recorded_embedding_model().ok().flatten();
+        let query_embedding = if matches!(vector_width, Ok(None)) {
+            embed_failed = true;
+            None
+        } else if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), ctx.embedder) {
+            mismatch_fallback(mismatch);
             embed_failed = true;
             None
         } else {
             match ctx.embedder.embed(query) {
-                Ok(v) => Some(v),
+                Ok(v) => {
+                    let width_mismatch = vector_width.ok().flatten().and_then(|width| {
+                        VectorMismatch::of_width(recorded.as_ref(), ctx.embedder, width, v.len())
+                    });
+                    if let Some(mismatch) = width_mismatch {
+                        mismatch_fallback(mismatch);
+                        embed_failed = true;
+                        None
+                    } else {
+                        Some(v)
+                    }
+                }
                 Err(e) => {
                     eprintln!("[lore] Embedding failed, falling back to text search: {e}");
                     embed_failed = true;
-                    embedder_errored = true;
+                    note = Some("Ollama unreachable — results are from text search only.".into());
                     None
                 }
             }
@@ -852,7 +876,7 @@ fn run_search(
             .search_fts(query, top_k)
             .map(|r| r.into_iter().take(top_k).collect())
     };
-    (results, embed_failed, embedder_errored)
+    (results, embed_failed, note)
 }
 
 fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> JsonRpcResponse {
@@ -882,7 +906,7 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
 
     eprintln!("[lore] Search: \"{query}\" (top_k={top_k})");
 
-    let (results, embed_failed, embedder_errored) = run_search(ctx, query, top_k);
+    let (results, embed_failed, note) = run_search(ctx, query, top_k);
 
     match results {
         Ok(results) => {
@@ -933,10 +957,8 @@ fn handle_search(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "Found matching patterns."
             };
 
-            let response = if embedder_errored {
-                format!(
-                    "Note: Ollama unreachable — results are from text search only.\n\n{summary}\n\n{formatted}"
-                )
+            let response = if let Some(note) = note {
+                format!("Note: {note}\n\n{summary}\n\n{formatted}")
             } else {
                 format!("{summary}\n\n{formatted}")
             };
@@ -2580,6 +2602,108 @@ mod tests {
         assert_eq!(metadata["result_count"], 1);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("Ollama unreachable"), "{text}");
+    }
+
+    /// Search `db` for the one chunk it holds with `embedder` and a
+    /// relevance floor no hybrid score reaches, so a result proves the
+    /// threshold was bypassed.
+    fn search_cargo_deny(db: &KnowledgeDB, embedder: &dyn Embedder) -> Value {
+        let tmp = tempdir().unwrap();
+        let mut config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        config.search.min_relevance = 1.5;
+        let chunk = crate::chunking::Chunk {
+            id: "c1".into(),
+            title: "Cargo Deny".into(),
+            body: "Run cargo deny check before every release.".into(),
+            tags: "rust".into(),
+            source_file: "rust/cargo-deny.md".into(),
+            heading_path: String::new(),
+            is_universal: false,
+            applies_when_json: None,
+            language_json: None,
+        };
+        let width = db.vector_dimensions().unwrap().unwrap();
+        db.insert_chunk(&chunk, Some(&vec![0.5; width])).unwrap();
+        dispatch_value(
+            db,
+            embedder,
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":15,"method":"tools/call",
+                "params":{
+                    "name":"search_patterns",
+                    "arguments":{"query":"cargo deny check","include_metadata":true}
+                }
+            }"#,
+        )
+    }
+
+    #[test]
+    fn search_patterns_searches_text_only_when_the_index_model_differs() {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity =
+            crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::with_model("other", 4))
+                .unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+
+        let resp = search_cargo_deny(&db, &FakeEmbedder::with_dimensions(4));
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "fts_fallback");
+        assert_eq!(metadata["result_count"], 1);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Note: the index was built with other but lore is configured for \
+                 nomic-embed-text, so searches use text only. Run 'lore ingest --force' \
+                 to rebuild the index.\n\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn search_patterns_searches_text_only_when_the_query_vector_width_differs() {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
+
+        let resp = search_cargo_deny(&db, &FakeEmbedder::new());
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "fts_fallback");
+        assert_eq!(metadata["result_count"], 1);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Note: the index holds 4-dimension vectors from an unrecorded model but \
+                 nomic-embed-text returns 768 dimensions"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn search_patterns_on_an_unrecorded_index_of_the_same_width_stays_hybrid() {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
+
+        let resp = search_cargo_deny(&db, &FakeEmbedder::with_model("any-model", 4));
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "hybrid");
+        assert_eq!(metadata["result_count"], 0);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.starts_with("Note:"), "{text}");
     }
 
     /// FTS-only configured search (`config.search.hybrid = false`) flips

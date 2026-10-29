@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
-use lore::embeddings::{OllamaClient, render_failure};
+use lore::embeddings::{OllamaClient, VectorMismatch, render_failure};
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -631,7 +631,11 @@ fn cmd_search(
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
-    let (results, _phases) = hook::search_with_threshold(&db, &ollama, &config, query)?;
+    let (results, _phases) = if json {
+        hook::search_with_threshold_quiet(&db, &ollama, &config, query)?
+    } else {
+        hook::search_with_threshold(&db, &ollama, &config, query)?
+    };
     lore_debug!("search: {} results", results.len());
 
     if json {
@@ -920,6 +924,11 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
             let short = git::short_sha(&config.knowledge_dir, &sha);
             eprintln!("  Last commit:  {short}");
+        }
+        if let Ok(recorded) = db.recorded_embedding_model()
+            && let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), &ollama)
+        {
+            eprintln!("  Index model:  ✗ {mismatch}");
         }
         eprintln!();
     }

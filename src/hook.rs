@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::chunking::AppliesWhen;
 use crate::config::{self, Config};
 use crate::database::{KnowledgeDB, SearchResult};
-use crate::embeddings::{Embedder, ProbeError, render_failure};
+use crate::embeddings::{Embedder, ProbeError, VectorMismatch, render_failure};
 use crate::engine::{self, CallContext};
 use crate::lore_debug;
 use crate::trace;
@@ -671,7 +671,18 @@ pub fn search_with_threshold(
     config: &Config,
     query: &str,
 ) -> anyhow::Result<(Vec<SearchResult>, trace::Phases)> {
-    search_with_threshold_gated(db, embedder, config, query, &[], &[])
+    search_pipeline(db, embedder, config, query, &[], &[], true)
+}
+
+/// [`search_with_threshold`] without the model-mismatch warning on stderr,
+/// for `lore search --json`.
+pub fn search_with_threshold_quiet(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+    query: &str,
+) -> anyhow::Result<(Vec<SearchResult>, trace::Phases)> {
+    search_pipeline(db, embedder, config, query, &[], &[], false)
 }
 
 /// U5-aware variant of [`search_with_threshold`] that passes an
@@ -696,6 +707,79 @@ pub fn search_with_threshold_gated(
     cleaned_terms: &[String],
     inferred_langs: &[String],
 ) -> anyhow::Result<(Vec<SearchResult>, trace::Phases)> {
+    search_pipeline(
+        db,
+        embedder,
+        config,
+        query,
+        cleaned_terms,
+        inferred_langs,
+        true,
+    )
+}
+
+/// The vector for the hybrid half of a search, or `None` when the search
+/// must use text only: the index has no vector table, records another model
+/// than the embedder's, the embedding fails, or the vector's width differs
+/// from the index's. `warn_on_mismatch` prints a model or width mismatch on
+/// stderr.
+fn query_vector(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    query: &str,
+    warn_on_mismatch: bool,
+    phases: &mut trace::Phases,
+) -> Option<Vec<f32>> {
+    let fallback = |mismatch: VectorMismatch| {
+        if warn_on_mismatch {
+            eprintln!("Warning: {mismatch}.");
+        }
+        lore_debug!("search: {mismatch}");
+    };
+
+    let vector_width = db.vector_dimensions();
+    if matches!(vector_width, Ok(None)) {
+        lore_debug!("search: index has no vector table, text search only");
+        return None;
+    }
+    let recorded = db.recorded_embedding_model().ok().flatten();
+    if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), embedder) {
+        fallback(mismatch);
+        return None;
+    }
+
+    let t_embed = std::time::Instant::now();
+    let outcome = embedder.embed(query);
+    phases.embedding_ms = Some(elapsed_ms(t_embed));
+    let v = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            emit_embed_failure_warning(&e);
+            lore_debug!("search: embedding failed: {e}");
+            return None;
+        }
+    };
+    lore_debug!("search: embedding succeeded ({} dims)", v.len());
+    if let Ok(Some(width)) = vector_width
+        && let Some(mismatch) =
+            VectorMismatch::of_width(recorded.as_ref(), embedder, width, v.len())
+    {
+        fallback(mismatch);
+        return None;
+    }
+    Some(v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_pipeline(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+    query: &str,
+    cleaned_terms: &[String],
+    inferred_langs: &[String],
+    warn_on_mismatch: bool,
+) -> anyhow::Result<(Vec<SearchResult>, trace::Phases)> {
     lore_debug!(
         "search: query={query:?} inferred={:?} hybrid={} top_k={} min_relevance={:.4} \
          min_relevance_universal={:.4}",
@@ -707,31 +791,12 @@ pub fn search_with_threshold_gated(
     );
 
     let mut phases = trace::Phases::default();
-    let mut embed_failed = false;
-
-    let query_embedding = if config.search.hybrid && matches!(db.vector_dimensions(), Ok(None)) {
-        lore_debug!("search: index has no vector table, text search only");
-        embed_failed = true;
-        None
-    } else if config.search.hybrid {
-        let t_embed = std::time::Instant::now();
-        let outcome = embedder.embed(query);
-        phases.embedding_ms = Some(elapsed_ms(t_embed));
-        match outcome {
-            Ok(v) => {
-                lore_debug!("search: embedding succeeded ({} dims)", v.len());
-                Some(v)
-            }
-            Err(e) => {
-                emit_embed_failure_warning(&e);
-                lore_debug!("search: embedding failed: {e}");
-                embed_failed = true;
-                None
-            }
-        }
+    let query_embedding = if config.search.hybrid {
+        query_vector(db, embedder, query, warn_on_mismatch, &mut phases)
     } else {
         None
     };
+    let embed_failed = config.search.hybrid && query_embedding.is_none();
 
     // Over-fetch by 10× so universal chunks scattered in the ranking still
     // surface — the additive promise only works if search sees the universal

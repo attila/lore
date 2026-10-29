@@ -459,6 +459,75 @@ fn ingest_file_on_text_only_index_lands_text_and_exits_zero() {
     );
 }
 
+#[test]
+fn search_on_an_index_of_another_model_warns_until_a_forced_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        ingest::full_ingest(
+            &db,
+            &FakeEmbedder::with_model("other-model", 768),
+            &config.knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+        assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    }
+    let config_arg = config_path.to_str().unwrap();
+    let warning = "Warning: the index was built with other-model but lore is configured for \
+                   nomic-embed-text, so searches use text only. Run 'lore ingest --force' to \
+                   rebuild the index.";
+
+    // The configured host refuses connections, so an embed attempt would
+    // add its own warning; its absence proves the embedder was skipped.
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["search", "--config", config_arg, "mocks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stderr(predicate::str::contains(warning))
+        .stderr(predicate::str::contains("Ollama embed failed").not());
+    let json = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["--json", "search", "--config", config_arg, "mocks"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let results: serde_json::Value = serde_json::from_slice(&json.get_output().stdout).unwrap();
+    assert_eq!(results[0]["title"], "Rust Testing");
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Index model:  ✗ the index was built with other-model but lore is configured \
+             for nomic-embed-text",
+        ));
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["search", "--config", config_arg, "mocks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stderr(predicate::str::contains("lore ingest --force").not());
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Index model:").not());
+}
+
 // -- lore list --------------------------------------------------------------
 
 #[test]
