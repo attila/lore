@@ -20,7 +20,7 @@ use crate::chunking::{
     chunk_as_document_with_advisories, chunk_by_heading_with_advisories, extract_title,
 };
 use crate::database::KnowledgeDB;
-use crate::embeddings::{Embedder, EmbeddingIdentity, PROBE_TEXT};
+use crate::embeddings::{Embedder, EmbeddingIdentity, VectorMismatch};
 use crate::git;
 use crate::lore_debug;
 use crate::loreignore;
@@ -127,6 +127,10 @@ pub struct IngestResult {
     /// from the database.
     pub reconciled_added: usize,
     pub errors: Vec<String>,
+    /// Set when the ingest wrote nothing because the configured embedding
+    /// model is not, or cannot be confirmed as, the one the index was built
+    /// with. Names the remedy.
+    pub refused: Option<String>,
     /// Distinct source files that ingested at least one chunk tagged
     /// `universal` in this run. Drives the always-on `Universal patterns: N`
     /// summary line and the >3 advisory.
@@ -210,6 +214,9 @@ pub struct WriteResult {
     /// [`crate::engine::is_known_token`]; never `None` so callers can
     /// always render the field as an array on a `lore-metadata` fence.
     pub language_warnings: Vec<String>,
+    /// Set when the pattern was indexed without vectors because the index
+    /// was built with another embedding model.
+    pub vectors_withheld: Option<VectorMismatch>,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +249,28 @@ pub fn ingest(
         on_progress(&msg);
     }
 
+    let (probe, rebuild_unrecorded) = match check_walk_model(db, embedder) {
+        Ok(WalkCheck::Proceed(probe)) => (probe, false),
+        Ok(WalkCheck::RebuildUnrecorded(identity)) => (Ok(identity), true),
+        Ok(WalkCheck::Refuse(mismatch)) => {
+            return IngestResult {
+                refused: Some(refusal(&mismatch)),
+                ..IngestResult::default()
+            };
+        }
+        Err(e) => {
+            return IngestResult {
+                refused: Some(unreadable_refusal(&e)),
+                ..IngestResult::default()
+            };
+        }
+    };
+    let rebuild = || full_ingest_probed(db, embedder, knowledge_dir, strategy, &probe, on_progress);
+
     // Not a git repo — full ingest is the only option.
     if !git::is_git_repo(knowledge_dir) {
         on_progress("Not a git repository — running full ingest");
-        return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+        return rebuild();
     }
 
     // No stored commit — first ingest, metadata cleared, or a fresh `git init`
@@ -260,13 +285,18 @@ pub fn ingest(
         } else {
             on_progress("No previous ingest recorded — running full ingest");
         }
-        return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+        return rebuild();
     };
 
     // Stored commit no longer exists (history rewrite, shallow clone, etc.).
     if !git::commit_exists(knowledge_dir, &last_commit) {
         on_progress("Previous commit not found in history — running full ingest");
-        return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+        return rebuild();
+    }
+
+    if rebuild_unrecorded {
+        on_progress("No embedding model recorded with the index — running full ingest");
+        return rebuild();
     }
 
     // Capture HEAD once to avoid TOCTOU between diff and recording.
@@ -276,7 +306,7 @@ pub fn ingest(
             on_progress(&format!(
                 "Failed to resolve HEAD ({e}) — running full ingest"
             ));
-            return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+            return rebuild();
         }
     };
 
@@ -285,7 +315,7 @@ pub fn ingest(
         Ok(c) => c,
         Err(e) => {
             on_progress(&format!("git diff failed ({e}) — running full ingest"));
-            return full_ingest(db, embedder, knowledge_dir, strategy, on_progress);
+            return rebuild();
         }
     };
 
@@ -338,7 +368,7 @@ pub fn ingest(
     if changes.is_empty() {
         // An index with missing vectors and no new commits must still gain
         // them.
-        let vector_errors = add_missing_vectors(db, embedder, on_progress);
+        let vector_errors = add_missing_vectors(db, embedder, &probe, on_progress);
         if !reconcile_did_work && reconcile_errors.is_empty() {
             on_progress("Already up to date — no files changed since last ingest");
         } else {
@@ -373,28 +403,141 @@ pub fn ingest(
     result.errors.extend(reconcile_errors);
     result
         .errors
-        .extend(add_missing_vectors(db, embedder, on_progress));
+        .extend(add_missing_vectors(db, embedder, &probe, on_progress));
     result.reconciled_removed = reconciled_removed;
     result.reconciled_added = reconciled_added;
     result.chunks_created += reconcile_chunks;
     result
 }
 
-/// Add the vectors the index lacks, when the embedding model answers. A
-/// text-only index first gets its vector table, sized by a probe and
-/// recorded with the model's identity; then every chunk without a vector
-/// row is embedded. An existing table keeps its width, recorded or not.
+/// The identity check before vectors are written, shared by every write
+/// path: `Some` when vectors from `embedder` must not enter the index. The
+/// recorded provider and model must match by name. Given the configured
+/// model's `probe`, its width must match the vector table's and its vector
+/// the recorded probe vector, which catches another model pulled under the
+/// same name; without one, the name alone decides.
+fn vector_write_mismatch(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    probe: Option<&EmbeddingIdentity>,
+) -> anyhow::Result<Option<VectorMismatch>> {
+    let recorded = db.recorded_embedding_model()?;
+    if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), embedder) {
+        return Ok(Some(mismatch));
+    }
+    let (Some(probe), Some(width)) = (probe, db.vector_dimensions()?) else {
+        return Ok(None);
+    };
+    if let Some(mismatch) =
+        VectorMismatch::of_width(recorded.as_ref(), embedder, width, probe.dimensions)
+    {
+        return Ok(Some(mismatch));
+    }
+    let Some(json) = db.get_metadata(crate::database::META_EMBEDDING_PROBE_VECTOR)? else {
+        return Ok(None);
+    };
+    let recorded_probe: Vec<f32> = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("malformed recorded probe vector: {e}"))?;
+    Ok(VectorMismatch::of_probe(
+        embedder,
+        &recorded_probe,
+        &probe.probe_vector,
+    ))
+}
+
+/// Probe the configured model before a write of one file, when the index
+/// has vectors and records no other model by name. `None` when there is
+/// nothing to compare or the model does not answer.
+fn probe_before_write(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+) -> anyhow::Result<Option<EmbeddingIdentity>> {
+    if db.vector_dimensions()?.is_none() || vector_write_mismatch(db, embedder, None)?.is_some() {
+        return Ok(None);
+    }
+    Ok(EmbeddingIdentity::measure(embedder).ok())
+}
+
+/// Check the configured model before `--file` writes: the probe to pass
+/// on, or the refusal to report.
+fn check_single_write(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+) -> Result<Option<EmbeddingIdentity>, String> {
+    let probe = probe_before_write(db, embedder).map_err(|e| unreadable_refusal(&e))?;
+    match vector_write_mismatch(db, embedder, probe.as_ref()) {
+        Ok(None) => Ok(probe),
+        Ok(Some(mismatch)) => Err(refusal(&mismatch)),
+        Err(e) => Err(unreadable_refusal(&e)),
+    }
+}
+
+const REMEDY: &str = "Run 'lore ingest --force' to rebuild the index";
+
+/// The message an ingest that refuses to write prints.
+fn refusal(mismatch: &VectorMismatch) -> String {
+    format!(
+        "refusing to ingest: {}, and vectors from two models cannot be searched together. \
+         {REMEDY}",
+        mismatch.cause()
+    )
+}
+
+/// The refusal when the index's embedding model cannot be read at all.
+fn unreadable_refusal(e: &anyhow::Error) -> String {
+    format!("refusing to ingest: cannot read the index's embedding model ({e}). {REMEDY}")
+}
+
+/// What a walk ingest does about the embedding model before writing. Each
+/// outcome that goes on carries the run's only probe of the model.
+enum WalkCheck {
+    Proceed(anyhow::Result<EmbeddingIdentity>),
+    /// The index has vectors but no recorded model, and the model answers:
+    /// rebuild in full so the identity gets recorded.
+    RebuildUnrecorded(EmbeddingIdentity),
+    Refuse(VectorMismatch),
+}
+
+/// Check the configured model against the index before a walk ingest
+/// writes anything. A name mismatch refuses without calling the model.
+fn check_walk_model(db: &KnowledgeDB, embedder: &dyn Embedder) -> anyhow::Result<WalkCheck> {
+    if let Some(mismatch) = vector_write_mismatch(db, embedder, None)? {
+        return Ok(WalkCheck::Refuse(mismatch));
+    }
+    let probe = EmbeddingIdentity::measure(embedder);
+    if let Ok(identity) = &probe
+        && db.vector_dimensions()?.is_some()
+        && db.recorded_embedding_model()?.is_none()
+    {
+        return Ok(WalkCheck::RebuildUnrecorded(identity.clone()));
+    }
+    if let Some(mismatch) = vector_write_mismatch(db, embedder, probe.as_ref().ok())? {
+        return Ok(WalkCheck::Refuse(mismatch));
+    }
+    Ok(WalkCheck::Proceed(probe))
+}
+
+/// Add the vectors the index lacks, when the embedding model answered
+/// `probe`. A text-only index first gets its vector table, sized by the
+/// probe and recorded with the model's identity; then every chunk without
+/// a vector row is embedded. An existing table keeps its width.
 ///
 /// Returns errors to report; none of them holds back the recorded HEAD.
 fn add_missing_vectors(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
+    probe: &anyhow::Result<EmbeddingIdentity>,
     on_progress: &dyn Fn(&str),
 ) -> Vec<String> {
-    let (dimensions, probed) = match db.vector_dimensions() {
-        Ok(Some(dimensions)) => (dimensions, false),
+    match vector_write_mismatch(db, embedder, probe.as_ref().ok()) {
+        Ok(None) => {}
+        Ok(Some(_)) => return Vec::new(),
+        Err(e) => return vec![format!("Failed to read the index's embedding model: {e}")],
+    }
+    let dimensions = match db.vector_dimensions() {
+        Ok(Some(dimensions)) => dimensions,
         Ok(None) => {
-            let identity = match EmbeddingIdentity::measure(embedder) {
+            let identity = match probe {
                 Ok(identity) => identity,
                 Err(e) => {
                     on_progress(&format!(
@@ -403,10 +546,10 @@ fn add_missing_vectors(
                     return Vec::new();
                 }
             };
-            if let Err(e) = db.add_vector_table(&identity) {
+            if let Err(e) = db.add_vector_table(identity) {
                 return vec![format!("Failed to add the vector table: {e}")];
             }
-            (identity.dimensions, true)
+            identity.dimensions
         }
         Err(e) => return vec![format!("Failed to read the vector table: {e}")],
     };
@@ -418,25 +561,11 @@ fn add_missing_vectors(
     if chunks.is_empty() {
         return Vec::new();
     }
-    // One probe costs an unreachable model a single timeout, not one per chunk.
-    if !probed {
-        match embedder.embed(PROBE_TEXT) {
-            Err(e) => {
-                return vec![format!(
-                    "{} chunk(s) have no vector and the embedding model did not answer: {e}",
-                    chunks.len()
-                )];
-            }
-            Ok(probe) if probe.len() != dimensions => {
-                return vec![format!(
-                    "{} chunk(s) have no vector: the embedding model returns {} dimensions, \
-                     the index holds {dimensions}",
-                    chunks.len(),
-                    probe.len()
-                )];
-            }
-            Ok(_) => {}
-        }
+    if let Err(e) = probe {
+        return vec![format!(
+            "{} chunk(s) have no vector and the embedding model did not answer: {e}",
+            chunks.len()
+        )];
     }
 
     on_progress(&format!(
@@ -602,12 +731,23 @@ fn reconcile_ignored(
     // database (using the pre-pass-1 snapshot, so files we just removed
     // are correctly excluded). The walk above already applied the ignore
     // matcher, so this loop only sees allowed files.
+    let mut warned_withheld = false;
     for (rel_path, full_path) in disk_files {
         if db_sources.contains(&rel_path) {
             continue;
         }
-        match index_single_file(db, embedder, knowledge_dir, &full_path, strategy) {
+        match index_single_file(db, embedder, knowledge_dir, &full_path, strategy, None) {
             Ok(indexed) => {
+                if let Some(mismatch) = &indexed.vectors_withheld
+                    && !warned_withheld
+                {
+                    warned_withheld = true;
+                    on_progress(&format!(
+                        "Warning: {}, so re-indexed files are searchable by text only. \
+                         Run 'lore ingest --force' to rebuild the index.",
+                        mismatch.cause()
+                    ));
+                }
                 stats.added += 1;
                 stats.chunks_added += indexed.chunks_indexed;
                 lore_debug!(
@@ -721,7 +861,7 @@ fn process_change(
                 return false;
             }
             let file_path = knowledge_dir.join(path);
-            match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
+            match index_single_file(db, embedder, knowledge_dir, &file_path, strategy, None) {
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
                     if indexed.embedding_failures > 0 {
@@ -767,7 +907,7 @@ fn process_change(
                 return true;
             }
             let file_path = knowledge_dir.join(to);
-            match index_single_file(db, embedder, knowledge_dir, &file_path, strategy) {
+            match index_single_file(db, embedder, knowledge_dir, &file_path, strategy, None) {
                 Ok(indexed) => {
                     result.chunks_created += indexed.chunks_indexed;
                     if indexed.embedding_failures > 0 {
@@ -1013,6 +1153,20 @@ pub fn full_ingest(
     strategy: &str,
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
+    let probe = EmbeddingIdentity::measure(embedder);
+    full_ingest_probed(db, embedder, knowledge_dir, strategy, &probe, on_progress)
+}
+
+/// [`full_ingest`] with the model already probed, so a walk ingest that
+/// falls back to it calls the model for the probe only once.
+fn full_ingest_probed(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    knowledge_dir: &Path,
+    strategy: &str,
+    probe: &anyhow::Result<EmbeddingIdentity>,
+    on_progress: &dyn Fn(&str),
+) -> IngestResult {
     let mut result = IngestResult::with_mode(IngestMode::Full);
 
     // Single read of .loreignore: matcher and hash come from the same bytes.
@@ -1029,7 +1183,7 @@ pub fn full_ingest(
     // cases are covered there, so `full_ingest` does not need a redundant
     // emission for direct callers.
 
-    let identity = match EmbeddingIdentity::measure(embedder) {
+    let identity = match probe {
         Ok(identity) => Some(identity),
         Err(e) => {
             on_progress(&format!(
@@ -1038,7 +1192,7 @@ pub fn full_ingest(
             None
         }
     };
-    if let Err(e) = db.clear_all(identity.as_ref()) {
+    if let Err(e) = db.clear_all(identity) {
         result.errors.push(format!("Failed to clear database: {e}"));
         return result;
     }
@@ -1052,7 +1206,7 @@ pub fn full_ingest(
 
     let mut embedding_errors = Vec::new();
     for file_path in &md_files {
-        match index_single_file(db, embedder, knowledge_dir, file_path, strategy) {
+        match index_single_file(db, embedder, knowledge_dir, file_path, strategy, None) {
             Ok(indexed) => {
                 result.chunks_created += indexed.chunks_indexed;
                 if indexed.embedding_failures > 0 {
@@ -1219,10 +1373,19 @@ pub fn ingest_single_file(
         }
     }
 
+    let checked = check_single_write(db, embedder);
+    let probe = match &checked {
+        Ok(probe) => probe.as_ref(),
+        Err(refused) => {
+            result.refused = Some(refused.clone());
+            return result;
+        }
+    };
+
     lore_debug!("ingest_single_file: {rel_path} (override={force_override_ignore})");
     on_progress(&format!("Single-file ingest: {rel_path}"));
 
-    match index_single_file(db, embedder, &canonical_dir, &canonical, strategy) {
+    match index_single_file(db, embedder, &canonical_dir, &canonical, strategy, probe) {
         Ok(indexed) => {
             result.files_processed = 1;
             result.chunks_created = indexed.chunks_indexed;
@@ -1352,6 +1515,7 @@ pub fn add_pattern(
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
             language_warnings,
+            vectors_withheld: None,
         });
     }
 
@@ -1396,12 +1560,21 @@ pub fn add_pattern(
 
     std::fs::write(&file_path, &content)?;
 
+    let probe = probe_before_write(db, embedder)?;
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        vectors_withheld,
         malformed_language,
         ..
-    } = index_single_file(db, embedder, knowledge_dir, &file_path, "heading")?;
+    } = index_single_file(
+        db,
+        embedder,
+        knowledge_dir,
+        &file_path,
+        "heading",
+        probe.as_ref(),
+    )?;
     let language_warnings = collect_language_warnings(&malformed_language, &filename);
 
     let commit_status = try_commit(
@@ -1416,6 +1589,7 @@ pub fn add_pattern(
         commit_status,
         embedding_failures,
         language_warnings,
+        vectors_withheld,
     })
 }
 
@@ -1539,17 +1713,27 @@ pub fn update_pattern(
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
             language_warnings,
+            vectors_withheld: None,
         });
     }
 
     std::fs::write(&canonical, &content)?;
 
+    let probe = probe_before_write(db, embedder)?;
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        vectors_withheld,
         malformed_language,
         ..
-    } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
+    } = index_single_file(
+        db,
+        embedder,
+        knowledge_dir,
+        &canonical,
+        "heading",
+        probe.as_ref(),
+    )?;
     let language_warnings = collect_language_warnings(&malformed_language, source_file);
 
     let commit_status = try_commit(
@@ -1564,6 +1748,7 @@ pub fn update_pattern(
         commit_status,
         embedding_failures,
         language_warnings,
+        vectors_withheld,
     })
 }
 
@@ -1629,17 +1814,27 @@ pub fn append_to_pattern(
             commit_status: CommitStatus::Pushed { branch },
             embedding_failures: 0,
             language_warnings,
+            vectors_withheld: None,
         });
     }
 
     std::fs::write(&canonical, &content)?;
 
+    let probe = probe_before_write(db, embedder)?;
     let IndexedFile {
         chunks_indexed: chunks,
         embedding_failures,
+        vectors_withheld,
         malformed_language,
         ..
-    } = index_single_file(db, embedder, knowledge_dir, &canonical, "heading")?;
+    } = index_single_file(
+        db,
+        embedder,
+        knowledge_dir,
+        &canonical,
+        "heading",
+        probe.as_ref(),
+    )?;
     let language_warnings = collect_language_warnings(&malformed_language, source_file);
 
     let commit_status = try_commit(
@@ -1654,6 +1849,7 @@ pub fn append_to_pattern(
         commit_status,
         embedding_failures,
         language_warnings,
+        vectors_withheld,
     })
 }
 
@@ -1844,6 +2040,9 @@ fn emit_language_tally(result: &IngestResult, on_progress: &dyn Fn(&str)) {
 struct IndexedFile {
     chunks_indexed: usize,
     embedding_failures: usize,
+    /// Set when the index was built with another embedding model, so the
+    /// file's chunks were stored without vectors.
+    vectors_withheld: Option<VectorMismatch>,
     rel_path: String,
     universal_metadata: UniversalMetadata,
     /// `applies_when` advisories from the U2 frontmatter parser, with
@@ -1868,13 +2067,16 @@ struct IndexedFile {
 /// Index (or re-index) a single file: delete old chunks, chunk, embed, insert.
 ///
 /// The `strategy` parameter selects the chunking approach (`"heading"` or
-/// `"document"`).
+/// `"document"`). `probe` is the configured model's answer to the identity
+/// probe; a walk ingest compares it once before its first file and passes
+/// `None`, leaving only the name to compare here.
 fn index_single_file(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     knowledge_dir: &Path,
     file_path: &Path,
     strategy: &str,
+    probe: Option<&EmbeddingIdentity>,
 ) -> anyhow::Result<IndexedFile> {
     let content = std::fs::read_to_string(file_path)?;
     // Canonicalise both sides so strip_prefix succeeds regardless of which
@@ -1945,10 +2147,14 @@ fn index_single_file(
     // Collecting into a Vec materialises all embed calls up front; the
     // transaction block below contains only in-memory DB work.
     //
-    // A text-only index (no vector table) stores no vectors and counts no
-    // failures. A vector of a width the table cannot hold counts as an
-    // embedding failure so the chunk's text still lands.
-    let vector_dimensions = db.vector_dimensions()?;
+    // A text-only index (no vector table), or one built with another
+    // embedding model, stores no vectors and counts no failures. A vector of
+    // a width the table cannot hold counts as an embedding failure so the
+    // chunk's text still lands.
+    let vectors_withheld = vector_write_mismatch(db, embedder, probe)?;
+    let vector_dimensions = db
+        .vector_dimensions()?
+        .filter(|_| vectors_withheld.is_none());
     let mut embedding_failures = 0_usize;
     let chunks_with_embeddings: Vec<(Chunk, Option<Vec<f32>>)> = chunks
         .iter()
@@ -2018,6 +2224,7 @@ fn index_single_file(
     Ok(IndexedFile {
         chunks_indexed: count,
         embedding_failures,
+        vectors_withheld,
         rel_path,
         universal_metadata,
         malformed_applies_when,
@@ -2420,24 +2627,11 @@ mod tests {
 
         fs::write(dir.join("beta.md"), "# Beta\n\nBeta body text.\n").unwrap();
         let wider = FakeEmbedder::with_dimensions(1024);
-        let result = ingest_single_file(
-            &db,
-            &wider,
-            dir,
-            &dir.join("beta.md"),
-            "heading",
-            false,
-            &|_| {},
-        );
+        let indexed =
+            index_single_file(&db, &wider, dir, &dir.join("beta.md"), "heading", None).unwrap();
 
-        assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.contains("embedding failure(s) while indexing beta.md")),
-            "{:?}",
-            result.errors
-        );
+        assert_eq!(indexed.embedding_failures, 1);
+        assert!(indexed.vectors_withheld.is_none());
         let text_hits = db.search_fts("beta", 10).unwrap();
         assert!(text_hits.iter().any(|r| r.source_file == "beta.md"));
         let beta_ids: Vec<String> = text_hits.into_iter().map(|r| r.id).collect();
@@ -2470,6 +2664,103 @@ mod tests {
             assert_eq!(db.get_metadata(key).unwrap(), None, "{key} must be absent");
         }
         assert!(!db.search_fts("alpha", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_refuses_an_index_whose_recorded_probe_cannot_be_read_until_a_rebuild() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        let db = memory_db();
+        let embedder = FakeEmbedder::new();
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        db.set_metadata(crate::database::META_EMBEDDING_PROBE_VECTOR, "[0.5,")
+            .unwrap();
+
+        let result = ingest(&db, &embedder, dir, "heading", &|_| {});
+
+        let refused = result.refused.expect("an unreadable probe must refuse");
+        assert!(
+            refused.starts_with(
+                "refusing to ingest: cannot read the index's embedding model (malformed \
+                 recorded probe vector:"
+            ),
+            "{refused}"
+        );
+        assert!(refused.ends_with(REMEDY), "{refused}");
+
+        full_ingest(&db, &embedder, dir, "heading", &|_| {});
+        assert_eq!(
+            ingest(&db, &embedder, dir, "heading", &|_| {}).refused,
+            None
+        );
+    }
+
+    fn index_of_another_model() -> KnowledgeDB {
+        let db = memory_db();
+        let identity =
+            EmbeddingIdentity::measure(&FakeEmbedder::with_model("other-model", 768)).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+        db
+    }
+
+    #[test]
+    fn reconciliation_on_an_index_of_another_model_saves_text_and_warns_once() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        fs::write(dir.join("beta.md"), "# Beta\n\nBeta body text.\n").unwrap();
+        let db = index_of_another_model();
+
+        let lines = std::cell::RefCell::new(Vec::new());
+        let (stats, _) = reconcile_ignored(&db, &FakeEmbedder::new(), dir, "heading", None, &|m| {
+            lines.borrow_mut().push(m.to_string());
+        });
+
+        assert_eq!(stats.unwrap().added, 2);
+        let lines = lines.into_inner();
+        let warned: Vec<&String> = lines.iter().filter(|l| l.starts_with("Warning")).collect();
+        assert_eq!(
+            warned,
+            [
+                "Warning: the index was built with other-model but lore is configured for \
+                 nomic-embed-text, so re-indexed files are searchable by text only. Run \
+                 'lore ingest --force' to rebuild the index."
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 2);
+        assert_eq!(db.search_fts("beta", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_vectors_are_not_added_to_an_index_of_another_model() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("alpha.md"), "# Alpha\n\nAlpha body text.\n").unwrap();
+        let db = index_of_another_model();
+        let indexed = index_single_file(
+            &db,
+            &FakeEmbedder::new(),
+            dir,
+            &dir.join("alpha.md"),
+            "heading",
+            None,
+        )
+        .unwrap();
+        assert!(indexed.vectors_withheld.is_some());
+        assert_eq!(indexed.embedding_failures, 0);
+
+        let lines = std::cell::RefCell::new(Vec::new());
+        let embedder = FakeEmbedder::new();
+        let probe = EmbeddingIdentity::measure(&embedder);
+        let errors = add_missing_vectors(&db, &embedder, &probe, &|m| {
+            lines.borrow_mut().push(m.to_string());
+        });
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(lines.into_inner().is_empty());
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
     }
 
     // -- effective-empty warning -------------------------------------------
@@ -3656,14 +3947,21 @@ mod tests {
             dir,
             &dir.join("multi.md"),
             "heading",
+            None,
         )
         .unwrap()
         .chunks_indexed;
 
-        let doc_count =
-            index_single_file(&db_doc, &embedder, dir, &dir.join("multi.md"), "document")
-                .unwrap()
-                .chunks_indexed;
+        let doc_count = index_single_file(
+            &db_doc,
+            &embedder,
+            dir,
+            &dir.join("multi.md"),
+            "document",
+            None,
+        )
+        .unwrap()
+        .chunks_indexed;
 
         // heading strategy should produce more chunks than document strategy.
         assert!(

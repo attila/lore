@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -575,66 +575,231 @@ fn a_text_only_index_with_new_commits_embeds_old_and_changed_files() {
     assert_eq!(db.stats().unwrap().chunks, 4);
 }
 
-/// An index with a vector table but no recorded model, its chunks indexed
-/// without vectors and its HEAD recorded.
-fn unrecorded_index(dir: &Path, width: usize) -> KnowledgeDB {
+/// An index as lore 0.5.0 left it: a vector for every chunk in a table of
+/// `width`, HEAD recorded, and no recorded embedding model.
+fn v0_5_index(tmp: &Path, width: usize) -> (PathBuf, KnowledgeDB) {
+    let dir = tmp.join("knowledge");
+    fs::create_dir_all(&dir).unwrap();
+    seed_patterns(&dir);
+    git_init(&dir);
+    let head = commit_all(&dir);
+    let db_path = tmp.join("knowledge.db");
+    {
+        let db = KnowledgeDB::open(&db_path).unwrap();
+        db.init().unwrap();
+        ingest::ingest(
+            &db,
+            &FakeEmbedder::with_dimensions(width),
+            &dir,
+            "heading",
+            &|_| {},
+        );
+    }
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "DELETE FROM ingest_metadata WHERE key LIKE 'embedding\\_%' ESCAPE '\\'",
+            [],
+        )
+        .unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
+    assert_eq!(db.recorded_embedding_model().unwrap(), None);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(width));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
+    (dir, db)
+}
+
+const REBUILD_UNRECORDED: &str = "No embedding model recorded with the index — running full ingest";
+
+fn rebuilds(lines: &[String]) -> usize {
+    lines.iter().filter(|l| *l == REBUILD_UNRECORDED).count()
+}
+
+#[test]
+fn an_index_without_a_recorded_model_is_rebuilt_once_then_ingested_by_delta() {
+    let tmp = tempdir().unwrap();
+    let (dir, db) = v0_5_index(tmp.path(), 768);
+
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), &dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.mode, ingest::IngestMode::Full);
+    assert_eq!(rebuilds(&lines), 1, "{lines:?}");
+    assert_eq!(
+        db.recorded_embedding_model().unwrap().unwrap().model,
+        "nomic-embed-text"
+    );
+    assert!(db.get_metadata("embedding_probe_vector").unwrap().is_some());
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    commit_all(&dir);
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), &dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.mode, ingest::IngestMode::Delta { unchanged: 3 });
+    assert_eq!(rebuilds(&lines), 0, "{lines:?}");
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+}
+
+#[test]
+fn an_index_without_a_recorded_model_is_rebuilt_at_the_measured_width() {
+    let tmp = tempdir().unwrap();
+    let (dir, db) = v0_5_index(tmp.path(), 4);
+
+    let embedder = FakeEmbedder::with_model("other-model", 768);
+    let (result, lines) = ingest_logged(&db, &embedder, &dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(rebuilds(&lines), 1, "{lines:?}");
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert_eq!(
+        db.recorded_embedding_model().unwrap().unwrap().model,
+        "other-model"
+    );
+    let query = embedder.embed("error propagation").unwrap();
+    assert_eq!(db.search_vector(&query, 10).unwrap().len(), 3);
+}
+
+#[test]
+fn an_index_without_a_recorded_model_keeps_its_vectors_while_the_model_is_silent() {
+    let tmp = tempdir().unwrap();
+    let (dir, db) = v0_5_index(tmp.path(), 768);
+
+    let (result, lines) = ingest_logged(&db, &FailingEmbedder::new(768), &dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(rebuilds(&lines), 0, "{lines:?}");
+    assert!(logged(&lines, "Already up to date"), "{lines:?}");
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.recorded_embedding_model().unwrap(), None);
+}
+
+/// Answers under [`FakeEmbedder`]'s name with vectors pointing the other
+/// way, as another model pulled under the same name would.
+struct SwappedEmbedder(FakeEmbedder);
+
+impl Embedder for SwappedEmbedder {
+    fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        Ok(self.0.embed(input)?.into_iter().map(|x| -x).collect())
+    }
+
+    fn provider(&self) -> &str {
+        self.0.provider()
+    }
+
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+}
+
+#[test]
+fn ingest_refuses_another_model_behind_the_recorded_name_and_writes_nothing() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
     seed_patterns(dir);
     git_init(dir);
     let head = commit_all(dir);
     let db = memory_db();
-    db.ensure_vector_table(width).unwrap();
-    for name in [
-        "error-handling.md",
-        "naming-conventions.md",
-        "testing-strategy.md",
-    ] {
-        ingest::ingest_single_file(
-            &db,
-            &FailingEmbedder::new(width),
-            dir,
-            &dir.join(name),
-            "heading",
-            false,
-            &|_| {},
-        );
-    }
-    db.set_metadata("last_ingested_commit", &head).unwrap();
-    assert_eq!(db.chunks_without_vectors().unwrap().len(), 3);
-    db
-}
+    ingest_logged(&db, &FakeEmbedder::new(), dir);
+    let loreignore_hash = db.get_metadata("loreignore_hash").unwrap();
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    fs::write(dir.join(".loreignore"), "naming-conventions.md\n").unwrap();
+    commit_all(dir);
+    let swapped = SwappedEmbedder(FakeEmbedder::new());
+    let probe_refusal = "refusing to ingest: nomic-embed-text is not the model that built the \
+                         index under that name: its vectors match the recorded ones at cosine \
+                         similarity -1.000, below 0.99";
 
-#[test]
-fn an_index_without_a_recorded_model_is_backfilled_at_its_own_width() {
-    let tmp = tempdir().unwrap();
-    let db = unrecorded_index(tmp.path(), 768);
+    let (result, lines) = ingest_logged(&db, &swapped, dir);
 
-    let embedder = FakeEmbedder::with_model("other-model", 768);
-    let (result, lines) = ingest_logged(&db, &embedder, tmp.path());
+    let refused = result.refused.expect("a swapped model must be refused");
+    assert!(refused.starts_with(probe_refusal), "{refused}");
+    assert!(refused.ends_with("Run 'lore ingest --force' to rebuild the index"));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+    assert_eq!(db.search_fts("abbreviations", 10).unwrap().len(), 1);
+    assert_eq!(db.get_metadata("loreignore_hash").unwrap(), loreignore_hash);
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
 
-    assert!(result.errors.is_empty(), "{:?}", result.errors);
-    assert!(logged(&lines, "Embedded 3 chunk(s) that had no vector"));
-    assert!(db.chunks_without_vectors().unwrap().is_empty());
-    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
-    assert_eq!(db.get_metadata("embedding_model").unwrap(), None);
-}
-
-#[test]
-fn an_index_without_a_recorded_model_rejects_vectors_of_another_width() {
-    let tmp = tempdir().unwrap();
-    let db = unrecorded_index(tmp.path(), 4);
-
-    let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), tmp.path());
-
-    assert_eq!(
-        result.errors,
-        [
-            "3 chunk(s) have no vector: the embedding model returns 768 dimensions, \
-             the index holds 4"
-        ]
+    let result = ingest::ingest_single_file(
+        &db,
+        &swapped,
+        dir,
+        &dir.join("logging.md"),
+        "heading",
+        false,
+        &|_| {},
     );
-    assert_eq!(db.chunks_without_vectors().unwrap().len(), 3);
-    assert_eq!(db.vector_dimensions().unwrap(), Some(4));
-    assert_eq!(db.get_metadata("embedding_model").unwrap(), None);
+    assert!(
+        result
+            .refused
+            .as_deref()
+            .is_some_and(|r| r.starts_with(probe_refusal)),
+        "{:?}",
+        result.refused
+    );
+    assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+
+    ingest::full_ingest(&db, &swapped, dir, "heading", &|_| {});
+    let (result, _) = ingest_logged(&db, &swapped, dir);
+    assert_eq!(result.refused, None);
+    assert_eq!(db.search_fts("stderr", 10).unwrap().len(), 1);
+    assert!(db.search_fts("abbreviations", 10).unwrap().is_empty());
+}
+
+#[test]
+fn ingest_refuses_a_model_of_another_width_behind_the_recorded_name() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &FakeEmbedder::new(), dir);
+    let wider = FakeEmbedder::with_dimensions(1024);
+    let width_refusal = "refusing to ingest: the index holds 768-dimension vectors from \
+                         nomic-embed-text but nomic-embed-text returns 1024 dimensions";
+
+    let (result, _) = ingest_logged(&db, &wider, dir);
+
+    assert!(
+        result
+            .refused
+            .as_deref()
+            .is_some_and(|r| r.starts_with(width_refusal)),
+        "{:?}",
+        result.refused
+    );
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    let result = ingest::ingest_single_file(
+        &db,
+        &wider,
+        dir,
+        &dir.join("logging.md"),
+        "heading",
+        false,
+        &|_| {},
+    );
+    assert!(
+        result
+            .refused
+            .as_deref()
+            .is_some_and(|r| r.starts_with(width_refusal)),
+        "{:?}",
+        result.refused
+    );
+    assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+
+    ingest::full_ingest(&db, &wider, dir, "heading", &|_| {});
+    let (result, _) = ingest_logged(&db, &wider, dir);
+    assert_eq!(result.refused, None);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(1024));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
 }
 
 /// Answer `/api/embed` the way Ollama does, with [`FakeEmbedder`] vectors.
@@ -760,4 +925,137 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
         ))
         .stderr(predicate::str::contains("text search only").not());
     assert_eq!(served.load(Ordering::SeqCst), before_search + 1);
+}
+
+#[test]
+fn ingest_force_rebuilds_an_index_of_another_model_with_the_configured_one() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let (url, served) = serve_fake_ollama();
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = url;
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest::ingest(
+            &db,
+            &FakeEmbedder::with_model("other-model", 1024),
+            &knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+    }
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "the index was built with other-model but lore is configured for \
+             nomic-embed-text",
+        ))
+        .stderr(predicate::str::contains(
+            "Run 'lore ingest --force' to rebuild the index",
+        ));
+    assert_eq!(served.load(Ordering::SeqCst), 0);
+
+    lore()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Errors:").not())
+        .stderr(predicate::str::contains("Note:").not());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+        assert_eq!(
+            db.recorded_embedding_model().unwrap().unwrap().model,
+            "nomic-embed-text"
+        );
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+    }
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Already up to date"));
+    lore()
+        .env("LORE_DEBUG", "1")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains(
+            "search: embedding succeeded (768 dims)",
+        ))
+        .stderr(predicate::str::contains("lore ingest --force").not());
+}
+
+#[test]
+fn ingest_refuses_an_unreadable_recorded_probe_until_a_forced_rebuild() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let (url, _) = serve_fake_ollama();
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = url;
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest::full_ingest(
+            &db,
+            &FakeEmbedder::new(),
+            &knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+        db.set_metadata("embedding_probe_vector", "[0.5,").unwrap();
+    }
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "Error: refusing to ingest: cannot read the index's embedding model",
+        ))
+        .stderr(predicate::str::contains(
+            "Run 'lore ingest --force' to rebuild the index",
+        ));
+
+    lore()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success();
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Already up to date"));
 }

@@ -69,7 +69,8 @@ EXIT CODES:
      .loreignore) prints a warning to stderr and still exits 0 — the empty state is legal.
   1  Single-file ingest failed (atomic), or an unrecoverable error (config, database,
      embedding service). Relative paths are resolved against the current working directory,
-     not the knowledge directory.
+     not the knowledge directory. Also exits 1, writing nothing, when the index was built
+     with another embedding model than the configured one; `lore ingest --force` rebuilds it.
 
 NOTES:
   - `--file` takes one path per invocation; globs are not expanded.
@@ -407,6 +408,9 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     let _lock_guard = write_lock.acquire()?;
 
     let result = dispatch_ingest(&db, &ollama, &config, force, file, on_progress)?;
+    if let Some(reason) = &result.refused {
+        anyhow::bail!("{reason}");
+    }
 
     lore_debug!(
         "ingest: processed={} chunks_created={} errors={}",

@@ -28,11 +28,20 @@ pub struct EmbeddingIdentity {
 
 impl EmbeddingIdentity {
     /// Embed [`PROBE_TEXT`] and record who answered and how wide the vector is.
+    /// A vector with no direction fails like a model that did not answer: no
+    /// later probe could match it.
     pub fn measure(embedder: &dyn Embedder) -> anyhow::Result<Self> {
         let probe_vector = embedder.embed(PROBE_TEXT)?;
         if probe_vector.is_empty() {
             anyhow::bail!(
                 "embedding model {} returned an empty vector",
+                embedder.model()
+            );
+        }
+        let norm: f64 = probe_vector.iter().map(|x| f64::from(*x).powi(2)).sum();
+        if !(norm.is_finite() && norm > 0.0) {
+            anyhow::bail!(
+                "embedding model {} returned a vector with no direction",
                 embedder.model()
             );
         }
@@ -52,8 +61,9 @@ pub struct RecordedModel {
     pub model: String,
 }
 
-/// Why a query must skip the index's vectors and search text only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why vectors from the configured model must not meet the index's: a
+/// query searches text only, and an ingest writes no vectors.
+#[derive(Debug, Clone, PartialEq)]
 pub enum VectorMismatch {
     /// The index records another provider or model than the one configured.
     Model {
@@ -68,7 +78,14 @@ pub enum VectorMismatch {
         index: usize,
         query: usize,
     },
+    /// The configured model answers [`PROBE_TEXT`] unlike the model that
+    /// built the index under the same name.
+    Probe { model: String, similarity: f64 },
 }
+
+/// Cosine similarity a fresh probe vector must reach against the recorded
+/// one for the configured model to count as the model that built the index.
+pub const PROBE_SIMILARITY_FLOOR: f64 = 0.99;
 
 impl VectorMismatch {
     /// Compare the recorded model with `embedder` before embedding a query.
@@ -97,6 +114,50 @@ impl VectorMismatch {
             query,
         })
     }
+
+    /// Compare a fresh [`PROBE_TEXT`] vector with the one recorded when the
+    /// index was built. Vectors of different widths never match.
+    pub fn of_probe(embedder: &dyn Embedder, recorded: &[f32], fresh: &[f32]) -> Option<Self> {
+        let similarity = cosine_similarity(recorded, fresh);
+        let same = similarity >= PROBE_SIMILARITY_FLOOR;
+        (!same).then(|| Self::Probe {
+            model: embedder.model().to_string(),
+            similarity,
+        })
+    }
+
+    /// What differs, without what it means for the caller.
+    pub fn cause(&self) -> String {
+        match self {
+            Self::Model {
+                recorded,
+                configured,
+            } => format!(
+                "the index was built with {recorded} but lore is configured for {configured}"
+            ),
+            Self::Width {
+                recorded,
+                configured,
+                index,
+                query,
+            } => {
+                let from = recorded.as_deref().unwrap_or("an unrecorded model");
+                format!(
+                    "the index holds {index}-dimension vectors from {from} but {configured} \
+                     returns {query} dimensions"
+                )
+            }
+            Self::Probe { model, similarity } => {
+                // Rounded down, so a value just below the floor never prints as the floor.
+                let shown = (similarity.clamp(-1.0, 1.0) * 1000.0).floor() / 1000.0;
+                format!(
+                    "{model} is not the model that built the index under that name: its \
+                     vectors match the recorded ones at cosine similarity {shown:.3}, below \
+                     {PROBE_SIMILARITY_FLOOR}"
+                )
+            }
+        }
+    }
 }
 
 /// Ollama resolves an untagged model name to its `:latest` tag, so the two
@@ -112,33 +173,33 @@ fn same_model(provider: &str, recorded: &str, configured: &str) -> bool {
     }
 }
 
+/// Zero for vectors of different widths or of zero length. Accumulates in
+/// f64 so rounding over a thousand dimensions cannot push a same-model probe
+/// below [`PROBE_SIMILARITY_FLOOR`].
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut norm_a, mut norm_b) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let norms = (norm_a * norm_b).sqrt();
+    if norms == 0.0 {
+        return 0.0;
+    }
+    dot / norms
+}
+
 impl std::fmt::Display for VectorMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Model {
-                recorded,
-                configured,
-            } => write!(
-                f,
-                "the index was built with {recorded} but lore is configured for {configured}"
-            )?,
-            Self::Width {
-                recorded,
-                configured,
-                index,
-                query,
-            } => {
-                let from = recorded.as_deref().unwrap_or("an unrecorded model");
-                write!(
-                    f,
-                    "the index holds {index}-dimension vectors from {from} but {configured} \
-                     returns {query} dimensions"
-                )?;
-            }
-        }
         write!(
             f,
-            ", so searches use text only. Run 'lore ingest --force' to rebuild the index"
+            "{}, so searches use text only. Run 'lore ingest --force' to rebuild the index",
+            self.cause()
         )
     }
 }
@@ -753,6 +814,31 @@ mod tests {
         assert!(EmbeddingIdentity::measure(&FailingEmbedder::new(4)).is_err());
     }
 
+    #[test]
+    fn measure_fails_when_the_probe_vector_has_no_direction() {
+        struct ConstantEmbedder(f32);
+        impl Embedder for ConstantEmbedder {
+            fn embed(&self, _input: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![self.0; 4])
+            }
+            fn provider(&self) -> &'static str {
+                "ollama"
+            }
+            fn model(&self) -> &'static str {
+                "zero-model"
+            }
+        }
+
+        for value in [0.0, f32::NAN] {
+            let err = EmbeddingIdentity::measure(&ConstantEmbedder(value)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "embedding model zero-model returned a vector with no direction"
+            );
+        }
+        assert!(EmbeddingIdentity::measure(&ConstantEmbedder(0.5)).is_ok());
+    }
+
     fn recorded(model: &str) -> RecordedModel {
         RecordedModel {
             provider: "ollama".to_string(),
@@ -823,6 +909,35 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .starts_with("the index holds 4-dimension vectors from nomic-embed-text but")
+        );
+    }
+
+    #[test]
+    fn of_probe_flags_a_probe_vector_below_the_similarity_floor() {
+        let embedder = FakeEmbedder::new();
+        let recorded = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            VectorMismatch::of_probe(&embedder, &recorded, &[2.0, 0.1, 0.0, 0.0]),
+            None
+        );
+        let mismatch =
+            VectorMismatch::of_probe(&embedder, &recorded, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            mismatch.cause(),
+            "nomic-embed-text is not the model that built the index under that name: its \
+             vectors match the recorded ones at cosine similarity 0.000, below 0.99"
+        );
+        assert!(VectorMismatch::of_probe(&embedder, &recorded, &[1.0, 0.0, 0.0]).is_some());
+        assert!(VectorMismatch::of_probe(&embedder, &recorded, &[f32::NAN; 4]).is_some());
+
+        let just_below =
+            VectorMismatch::of_probe(&embedder, &recorded, &[0.98996, 0.14135, 0.0, 0.0]).unwrap();
+        assert!(
+            just_below
+                .cause()
+                .ends_with("cosine similarity 0.989, below 0.99"),
+            "{}",
+            just_below.cause()
         );
     }
 

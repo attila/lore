@@ -528,6 +528,64 @@ fn search_on_an_index_of_another_model_warns_until_a_forced_rebuild() {
         .stderr(predicate::str::contains("Index model:").not());
 }
 
+#[test]
+fn ingest_and_ingest_file_refuse_an_index_of_another_model_and_write_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        ingest::full_ingest(
+            &db,
+            &FakeEmbedder::with_model("other-model", 768),
+            &config.knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+    }
+    let draft = config.knowledge_dir.join("draft.md");
+    std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    let refusal = "Error: refusing to ingest: the index was built with other-model but lore is \
+                   configured for nomic-embed-text, and vectors from two models cannot be \
+                   searched together. Run 'lore ingest --force' to rebuild the index";
+
+    for args in [
+        vec!["ingest", "--config", config_arg],
+        vec![
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+        ],
+        vec![
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+            "--force",
+        ],
+    ] {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(&args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(refusal))
+            .stderr(predicate::str::contains("Done").not());
+    }
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert!(db.search_fts("quokka", 10).unwrap().is_empty());
+    assert_eq!(db.stats().unwrap().sources, 1);
+    assert_eq!(
+        db.recorded_embedding_model().unwrap().unwrap().model,
+        "other-model"
+    );
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+}
+
 // -- lore list --------------------------------------------------------------
 
 #[test]

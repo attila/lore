@@ -1036,6 +1036,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
+            let withheld = withheld_vectors_note(result.vectors_withheld.as_ref());
             let metadata = json!({
                 "file_path": result.file_path,
                 "chunks_indexed": result.chunks_indexed,
@@ -1044,7 +1045,7 @@ fn handle_add(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) -> Js
                 "language_warnings": result.language_warnings,
             });
             let prose = format!(
-                "Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
+                "{withheld}Pattern \"{}\" saved to {} ({} chunks indexed{}{embed_note}).",
                 title, result.file_path, result.chunks_indexed, cn
             );
             let prose_with_fence =
@@ -1125,6 +1126,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
+            let withheld = withheld_vectors_note(result.vectors_withheld.as_ref());
             let metadata = json!({
                 "file_path": result.file_path,
                 "chunks_indexed": result.chunks_indexed,
@@ -1133,7 +1135,7 @@ fn handle_update(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "language_warnings": result.language_warnings,
             });
             let prose = format!(
-                "Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
+                "{withheld}Pattern {} updated ({} chunks re-indexed{}{embed_note}).",
                 result.file_path, result.chunks_indexed, cn
             );
             let prose_with_fence =
@@ -1189,6 +1191,7 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
         Ok(result) => {
             let cn = commit_note(&result.commit_status);
             let embed_note = embedding_note(result.embedding_failures);
+            let withheld = withheld_vectors_note(result.vectors_withheld.as_ref());
             let metadata = json!({
                 "file_path": result.file_path,
                 "chunks_indexed": result.chunks_indexed,
@@ -1197,7 +1200,7 @@ fn handle_append(req: &JsonRpcRequest, ctx: &ServerContext<'_>, args: &Value) ->
                 "language_warnings": result.language_warnings,
             });
             let prose = format!(
-                "Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
+                "{withheld}Section \"{}\" appended to {} ({} chunks re-indexed{}{embed_note}).",
                 heading, result.file_path, result.chunks_indexed, cn
             );
             let prose_with_fence =
@@ -1508,6 +1511,18 @@ fn build_trace_status_value(stats: &crate::trace::TraceStats) -> Value {
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
+
+/// Lead for a write tool's response when the pattern was saved without
+/// vectors because the index was built with another embedding model.
+fn withheld_vectors_note(mismatch: Option<&VectorMismatch>) -> String {
+    mismatch.map_or_else(String::new, |mismatch| {
+        format!(
+            "Warning: {}, so this pattern was saved without vectors and is found by text \
+             search only. Run 'lore ingest --force' to rebuild the index.\n\n",
+            mismatch.cause()
+        )
+    })
+}
 
 fn embedding_note(failures: usize) -> String {
     if failures > 0 {
@@ -2666,6 +2681,109 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn add_pattern_saves_text_without_vectors_and_warns_when_the_index_model_differs() {
+        let tmp = tempdir().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity =
+            crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::with_model("other", 4))
+                .unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &FakeEmbedder::with_dimensions(4),
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":16,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Quokka Care",
+                        "body":"Feed quokkas native leaves only.",
+                        "include_metadata":true
+                    }
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Warning: the index was built with other but lore is configured for \
+                 nomic-embed-text, so this pattern was saved without vectors and is found by \
+                 text search only. Run 'lore ingest --force' to rebuild the index.\n\n\
+                 Pattern \"Quokka Care\" saved to"
+            ),
+            "{text}"
+        );
+        assert_eq!(metadata_from_response(&resp)["embedding_failures"], 0);
+        assert_eq!(db.search_fts("quokkas", 10).unwrap().len(), 1);
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+        assert_eq!(
+            db.recorded_embedding_model().unwrap().unwrap().model,
+            "other"
+        );
+    }
+
+    #[test]
+    fn update_and_append_save_text_without_vectors_when_the_model_probe_differs() {
+        let tmp = tempdir().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        std::fs::write(tmp.path().join("quokka.md"), "# Quokka\n\nOld notes.\n").unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        crate::ingest::full_ingest(
+            &db,
+            &FakeEmbedder::with_dimensions(4),
+            tmp.path(),
+            "heading",
+            &|_| {},
+        );
+        let warning = "Warning: the index holds 4-dimension vectors from nomic-embed-text but \
+                       nomic-embed-text returns 8 dimensions, so this pattern was saved \
+                       without vectors and is found by text search only. Run 'lore ingest \
+                       --force' to rebuild the index.\n\n";
+
+        for (id, call) in [
+            (
+                17,
+                r#""name":"update_pattern","arguments":{"source_file":"quokka.md","body":"Feed quokkas native leaves only."}"#,
+            ),
+            (
+                18,
+                r#""name":"append_to_pattern","arguments":{"source_file":"quokka.md","heading":"Water","body":"Quokkas need little water."}"#,
+            ),
+        ] {
+            let resp = dispatch_value(
+                &db,
+                &FakeEmbedder::with_dimensions(8),
+                &config,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{call}}}}}"#
+                ),
+            );
+            assert!(resp["error"].is_null(), "{resp}");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with(warning), "{text}");
+        }
+
+        assert_eq!(db.search_fts("water", 10).unwrap().len(), 1);
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 2);
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
     }
 
     #[test]
