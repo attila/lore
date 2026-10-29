@@ -314,8 +314,9 @@ fn cmd_init(
     eprintln!("\n--- Ingesting knowledge directory ---\n");
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
+    db.ensure_vector_table(ollama.dimensions())?;
 
     eprintln!("Search mode: hybrid (FTS5 + vector)\n");
 
@@ -393,11 +394,12 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     // tables via `clear_all`, so the probe must not run first — otherwise
     // the very advisory it emits would never be actionable.
     let db = if should_skip_schema_probe(force, file) {
-        KnowledgeDB::open_skipping_schema_check(&config.database, ollama.dimensions())?
+        KnowledgeDB::open_skipping_schema_check(&config.database)?
     } else {
-        KnowledgeDB::open(&config.database, ollama.dimensions())?
+        KnowledgeDB::open(&config.database)?
     };
     db.init()?;
+    db.ensure_vector_table(ollama.dimensions())?;
 
     let on_progress = &|msg: &str| {
         eprintln!("{msg}");
@@ -617,8 +619,9 @@ fn cmd_search(
     );
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
+    db.ensure_vector_table(ollama.dimensions())?;
 
     let (results, _phases) = hook::search_with_threshold(&db, &ollama, &config, query)?;
     lore_debug!("search: {} results", results.len());
@@ -709,8 +712,9 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
 
     let config = Config::load(config_path)?;
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
+    db.ensure_vector_table(ollama.dimensions())?;
 
     if let Some(output) = hook::handle_hook(&input, &db, &ollama, &config)? {
         let json = serde_json::to_string(&output)?;
@@ -762,8 +766,9 @@ fn cmd_extract_queries() -> anyhow::Result<()> {
 fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
+    db.ensure_vector_table(ollama.dimensions())?;
 
     let patterns = db.list_patterns()?;
 
@@ -884,8 +889,9 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     render_runtime_line(&status.runtime, full);
     eprintln!("  sqlite-vec:   ✓ bundled");
 
-    if let Ok(db) = KnowledgeDB::open(&config.database, ollama.dimensions())
+    if let Ok(db) = KnowledgeDB::open(&config.database)
         && db.init().is_ok()
+        && db.ensure_vector_table(ollama.dimensions()).is_ok()
         && let Ok(stats) = db.stats()
     {
         eprintln!();

@@ -40,8 +40,9 @@ fn setup_populated_env(dir: &Path) -> std::path::PathBuf {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
 
     ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
 
@@ -264,8 +265,9 @@ fn status_renders_languages_line_for_mixed_declared_and_undeclared_kb() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
 
     let assert = Command::cargo_bin("lore")
@@ -295,8 +297,9 @@ fn status_suppresses_languages_line_on_empty_knowledge_dir() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     // No ingest call — DB stays empty.
 
     Command::cargo_bin("lore")
@@ -390,8 +393,9 @@ fn list_empty_database_exits_cleanly() {
 
     // Ensure the database tables exist (init creates them).
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     drop(db);
 
     Command::cargo_bin("lore")
@@ -536,8 +540,9 @@ fn search_json_includes_full_body() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
     drop(db);
 
@@ -750,8 +755,9 @@ fn list_json_empty_database() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     drop(db);
 
     let output = Command::cargo_bin("lore")

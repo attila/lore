@@ -61,8 +61,8 @@ struct JsonRpcResponse {
 
 /// Start the MCP server on stdin/stdout.
 ///
-/// Opens the knowledge database using dimensions from `embedder`, then enters
-/// a line-oriented JSON-RPC read loop. When the database open fails (most
+/// Opens the knowledge database and creates the vector table at `embedder`'s
+/// width, then enters a line-oriented JSON-RPC read loop. When the database open fails (most
 /// commonly on a schema-mismatch upgrade advisory), the server enters a
 /// degraded mode: `initialize` and `tools/list` still respond so clients can
 /// negotiate and enumerate, but every `tools/call` returns a structured error
@@ -70,9 +70,10 @@ struct JsonRpcResponse {
 /// advisory to the agent as a tool-call result rather than dying at handshake
 /// time with the message trapped on stderr that most MCP hosts discard.
 pub fn start_mcp_server(config: &Config, embedder: &dyn Embedder) -> anyhow::Result<()> {
-    match KnowledgeDB::open(&config.database, embedder.dimensions()) {
+    match KnowledgeDB::open(&config.database) {
         Ok(db) => {
             db.init()?;
+            db.ensure_vector_table(embedder.dimensions())?;
             // Tier-2 effective-empty warning, mirrored from `lore ingest`.
             // Gated on a successful DB open so that on the degraded path
             // the load-bearing schema-mismatch banner is the first signal
@@ -1723,8 +1724,9 @@ mod tests {
         fn new() -> Self {
             let tmp = tempdir().unwrap();
             let embedder = FakeEmbedder::with_dimensions(4);
-            let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+            let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
             db.init().unwrap();
+            db.ensure_vector_table(embedder.dimensions()).unwrap();
             let config = Config::default_with(
                 tmp.path().to_path_buf(),
                 tmp.path().join("lore-test.db"),
@@ -2179,8 +2181,9 @@ mod tests {
     ) {
         let tmp = tempdir().unwrap();
         let embedder = crate::embeddings::FailingEmbedder::new(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         let config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),
@@ -2393,8 +2396,9 @@ mod tests {
     fn search_patterns_response_metadata_multiple_chunks_same_source() {
         let tmp = tempdir().unwrap();
         let embedder = FakeEmbedder::with_dimensions(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),
@@ -2541,8 +2545,9 @@ mod tests {
     fn search_patterns_response_metadata_fts_only_when_hybrid_disabled() {
         let tmp = tempdir().unwrap();
         let embedder = FakeEmbedder::with_dimensions(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),
@@ -3859,8 +3864,9 @@ mod tests {
     fn search_fts_only_path() {
         let tmp = tempdir().unwrap();
         let embedder = FakeEmbedder::with_dimensions(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),
@@ -4330,8 +4336,9 @@ mod tests {
             .expect("push failed");
 
         let embedder = FakeEmbedder::with_dimensions(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         // Database is in-memory but the write-lock file lands beside the
         // configured database path. Point it inside the tempdir so the lock
         // is cleaned up automatically when the test exits.
@@ -4403,8 +4410,9 @@ mod tests {
     fn search_with_failing_embedder_shows_warning() {
         let tmp = tempdir().unwrap();
         let failing = crate::embeddings::FailingEmbedder::new(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), failing.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(failing.dimensions()).unwrap();
         let config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),
@@ -4580,8 +4588,9 @@ mod tests {
     fn search_fts_only_bypasses_threshold() {
         let tmp = tempdir().unwrap();
         let embedder = FakeEmbedder::with_dimensions(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),
@@ -4634,8 +4643,9 @@ mod tests {
     fn search_embed_failure_bypasses_threshold() {
         let tmp = tempdir().unwrap();
         let failing = crate::embeddings::FailingEmbedder::new(4);
-        let db = KnowledgeDB::open(Path::new(":memory:"), failing.dimensions()).unwrap();
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(failing.dimensions()).unwrap();
         let mut config = Config::default_with(
             tmp.path().to_path_buf(),
             tmp.path().join("lore-test.db"),

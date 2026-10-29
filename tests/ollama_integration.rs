@@ -45,8 +45,10 @@ fn git_init(dir: &Path) {
 /// Open an on-disk `KnowledgeDB` in the given directory.
 fn open_db(dir: &Path, dims: usize) -> KnowledgeDB {
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, dims).expect("failed to open DB");
+    let db = KnowledgeDB::open(&db_path).expect("failed to open DB");
     db.init().expect("failed to init DB");
+    db.ensure_vector_table(dims)
+        .expect("failed to create vector table");
     db
 }
 
@@ -381,8 +383,9 @@ fn ollama_mcp_subprocess_roundtrip() {
     let embedder = ollama_client();
     let db_path = dir.join("knowledge.db");
     {
-        let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
         assert!(
             result.errors.is_empty(),
@@ -608,8 +611,9 @@ fn ingest_file_happy_path_via_binary() {
     // marker. This proves the binary actually persisted real chunks, not
     // just printed a success message.
     let embedder = ollama_client();
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     let hits = db.search_fts("xyzzysinglefile", 10).unwrap();
     assert!(
         hits.iter().any(|h| h.source_file == "draft.md"),

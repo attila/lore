@@ -56,7 +56,6 @@ fn register_sqlite_vec() {
 /// Handle to the local knowledge database.
 pub struct KnowledgeDB {
     conn: Connection,
-    dimensions: usize,
 }
 
 /// A single search result returned by FTS, vector, or hybrid queries.
@@ -189,15 +188,14 @@ pub struct UniversalPattern {
 // ---------------------------------------------------------------------------
 
 impl KnowledgeDB {
-    /// Open (or create) a database at `db_path` configured for `dimensions`-wide
-    /// embeddings.
+    /// Open (or create) a database at `db_path`.
     ///
     /// Probes the `chunks` table for the `is_universal` column. If the table
     /// exists from a prior version of lore but lacks the column, returns a
     /// friendly upgrade-required error instead of letting individual SELECTs
     /// fail later with a confusing `no such column` message.
-    pub fn open(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
-        Self::open_inner(db_path, dimensions, true)
+    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, true)
     }
 
     /// Open the database without the schema-compatibility probe. Reserved for
@@ -205,11 +203,11 @@ impl KnowledgeDB {
     /// which drops and recreates the tables with the current DDL, so running
     /// the probe would block the only path that actually fixes the condition
     /// it warns about.
-    pub fn open_skipping_schema_check(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
-        Self::open_inner(db_path, dimensions, false)
+    pub fn open_skipping_schema_check(db_path: &Path) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, false)
     }
 
-    fn open_inner(db_path: &Path, dimensions: usize, check_schema: bool) -> anyhow::Result<Self> {
+    fn open_inner(db_path: &Path, check_schema: bool) -> anyhow::Result<Self> {
         register_sqlite_vec();
 
         let conn = Connection::open(db_path)?;
@@ -221,21 +219,28 @@ impl KnowledgeDB {
             check_schema_compatibility(&conn)?;
         }
 
-        Ok(Self { conn, dimensions })
+        Ok(Self { conn })
     }
 
-    /// Create all tables if they don't already exist, then stamp the schema
-    /// version so `check_schema_compatibility` can detect old databases with
-    /// a single-integer read instead of parsing `PRAGMA table_info` columns.
+    /// Create all text tables if they don't already exist, then stamp the
+    /// schema version so `check_schema_compatibility` can detect old databases
+    /// with a single-integer read instead of parsing `PRAGMA table_info`
+    /// columns. The `patterns_vec` table is created separately by
+    /// [`Self::ensure_vector_table`].
     pub fn init(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(PATTERNS_FTS_DDL)?;
         self.conn.execute_batch(CHUNKS_DDL)?;
-        self.conn
-            .execute_batch(&patterns_vec_ddl(self.dimensions))?;
         self.conn.execute_batch(INGEST_METADATA_DDL)?;
         self.conn.execute_batch(PATTERNS_DDL)?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Create the `patterns_vec` table for `dimensions`-wide embeddings if it
+    /// doesn't already exist. An existing table keeps its width.
+    pub fn ensure_vector_table(&self, dimensions: usize) -> anyhow::Result<()> {
+        self.conn.execute_batch(&patterns_vec_ddl(dimensions))?;
         Ok(())
     }
 
@@ -1555,9 +1560,9 @@ fn reciprocal_rank_fusion_n(lists: &[&[SearchResult]], limit: usize) -> Vec<Sear
 mod tests {
     use super::*;
 
-    /// Helper: open an in-memory `KnowledgeDB` with the given dimensions.
-    fn open_memory_db(dimensions: usize) -> KnowledgeDB {
-        KnowledgeDB::open(Path::new(":memory:"), dimensions).expect("failed to open in-memory DB")
+    /// Helper: open an in-memory `KnowledgeDB`.
+    fn open_memory_db() -> KnowledgeDB {
+        KnowledgeDB::open(Path::new(":memory:")).expect("failed to open in-memory DB")
     }
 
     /// Helper: build a non-universal `Chunk` for test use.
@@ -1613,7 +1618,7 @@ mod tests {
 
     #[test]
     fn sqlite_vec_ffi_creates_vec0_table() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.conn
             .execute_batch(
                 "CREATE VIRTUAL TABLE test_vec USING vec0(
@@ -1643,8 +1648,9 @@ mod tests {
 
     #[test]
     fn insert_and_fts_search() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -1665,8 +1671,9 @@ mod tests {
 
     #[test]
     fn insert_and_vector_search() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Vector Test", "Some body", "test.md");
         let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
@@ -1682,8 +1689,9 @@ mod tests {
 
     #[test]
     fn hybrid_search_combines_fts_and_vector() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Insert two chunks with different embeddings.
         let c1 = Chunk {
@@ -1725,8 +1733,9 @@ mod tests {
 
     #[test]
     fn hybrid_search_none_embedding_falls_back_to_fts() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -1746,8 +1755,9 @@ mod tests {
 
     #[test]
     fn clear_all_removes_all_data() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         db.insert_chunk(
             &make_chunk("c1", "T1", "Body one", "a.md"),
@@ -1774,8 +1784,9 @@ mod tests {
 
     #[test]
     fn delete_by_source_removes_only_that_file() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -1808,8 +1819,9 @@ mod tests {
 
     #[test]
     fn stats_returns_correct_counts() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 0);
@@ -1862,8 +1874,9 @@ mod tests {
 
     #[test]
     fn language_counts_empty_db_returns_zero_buckets() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let counts = db.language_counts().unwrap();
         assert!(counts.declared.is_empty());
@@ -1872,8 +1885,9 @@ mod tests {
 
     #[test]
     fn language_counts_single_language_sources_only() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -1901,8 +1915,9 @@ mod tests {
 
     #[test]
     fn language_counts_all_undeclared_sources() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(&db, &make_chunk("c1", "T1", "Body one", "a.md"), None);
         seed_pattern_and_chunk(&db, &make_chunk("c2", "T2", "Body two", "b.md"), None);
@@ -1914,8 +1929,9 @@ mod tests {
 
     #[test]
     fn language_counts_multi_language_source_counts_in_each_bucket() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // One source declaring two languages — should add +1 to each
         // bucket, so the bucket sum (2) exceeds the source count (1).
@@ -1939,8 +1955,9 @@ mod tests {
 
     #[test]
     fn language_counts_mixed_declared_and_undeclared() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -1971,8 +1988,9 @@ mod tests {
         // the inner SELECT DISTINCT, the json_each join would yield
         // two `(source, "rust")` rows and the outer COUNT would
         // double-count the source. Pin the dedup behaviour.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         db.upsert_pattern(&crate::chunking::PatternRow {
             source_file: "dup.md".to_string(),
@@ -1999,8 +2017,9 @@ mod tests {
         // json_each rows) and the undeclared bucket (`IS NULL` filter
         // misses it). Defence-in-depth: roll it into `undeclared` so
         // the operator still sees the source somewhere.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Seed via upsert_pattern directly so we can plant the exact
         // `'[]'` value the validator would normally reject.
@@ -2036,8 +2055,9 @@ mod tests {
 
     #[test]
     fn language_counts_reads_patterns_not_chunks() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Seed the patterns row for "a.md" once, then add a second chunk
         // pointing at the same source. The aggregate reads from
@@ -2064,8 +2084,9 @@ mod tests {
 
     #[test]
     fn source_files_returns_distinct_paths_in_sorted_order() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2092,8 +2113,9 @@ mod tests {
 
     #[test]
     fn source_files_returns_empty_vec_for_empty_database() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let files = db.source_files().unwrap();
         assert!(files.is_empty());
@@ -2101,8 +2123,9 @@ mod tests {
 
     #[test]
     fn source_files_excludes_files_after_delete_by_source() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2337,8 +2360,9 @@ mod tests {
         // AE3: a pattern declaring `language: rust` with a body that
         // does NOT contain "rust" still surfaces via the structural
         // branch when the inferred set is `{rust}` and the terms match.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let chunk = Chunk {
             id: "p1:Top".into(),
             title: "Error Handling".into(),
@@ -2364,8 +2388,9 @@ mod tests {
         // AE4 (FTS half): a `language: rust` pattern does NOT surface
         // through the structural branch when the inferred set is
         // `{python}`.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let chunk = Chunk {
             id: "p1:Top".into(),
             title: "Rust thing".into(),
@@ -2394,8 +2419,9 @@ mod tests {
         // `language:` declaration — declared patterns reach retrieval
         // through the structural branch, so the two FTS lists are
         // disjoint by `language_json IS NULL`.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let declared = Chunk {
             id: "decl:Top".into(),
             title: "Declared".into(),
@@ -2433,8 +2459,9 @@ mod tests {
 
     #[test]
     fn duplicate_insert_produces_single_fts_row() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "dup1",
@@ -2477,8 +2504,9 @@ mod tests {
 
     #[test]
     fn fts_title_match_ranks_above_body_match() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Chunk with "typescript" in title and tags.
         let tagged = Chunk {
@@ -2523,8 +2551,9 @@ mod tests {
 
     #[test]
     fn fts_empty_tags_still_works() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Error Handling", "Use anyhow for errors", "errors.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2593,8 +2622,9 @@ mod tests {
 
     #[test]
     fn fts_search_with_dots_does_not_crash() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Dotted", "Some dotted content", "a.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2607,8 +2637,9 @@ mod tests {
 
     #[test]
     fn fts_search_with_path_does_not_crash() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Path", "Some path content", "a.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2619,8 +2650,9 @@ mod tests {
 
     #[test]
     fn fts_search_with_hyphenated_term_does_not_crash() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -2641,8 +2673,9 @@ mod tests {
 
     #[test]
     fn fts_search_empty_after_sanitize_returns_empty() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Title", "Body content", "a.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2655,8 +2688,9 @@ mod tests {
 
     #[test]
     fn list_patterns_returns_one_per_source() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Two chunks from same source, one from another. `list_patterns`
         // reads the `patterns` table directly so tests must seed both.
@@ -2677,8 +2711,9 @@ mod tests {
 
     #[test]
     fn list_patterns_empty_db() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let patterns = db.list_patterns().unwrap();
         assert!(patterns.is_empty());
@@ -2686,8 +2721,9 @@ mod tests {
 
     #[test]
     fn fts_and_or_query_non_matching_returns_empty() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let c1 = Chunk {
             id: "c1".into(),
@@ -2727,8 +2763,9 @@ mod tests {
 
     #[test]
     fn fts_and_operator_requires_all_terms() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Rust Guide", "Ownership and borrowing", "rust.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2747,8 +2784,9 @@ mod tests {
 
     #[test]
     fn list_patterns_includes_tags() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = Chunk {
             id: "c1".into(),
@@ -2800,8 +2838,9 @@ mod tests {
 
     #[test]
     fn insert_and_select_chunk_round_trips_is_universal() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let universal =
             make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md");
@@ -2821,8 +2860,9 @@ mod tests {
 
     #[test]
     fn chunk_check_constraint_rejects_invalid_is_universal_value() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let result = db.conn.execute(
             "INSERT INTO chunks (id, title, body, source_file, is_universal) \
@@ -2837,8 +2877,9 @@ mod tests {
 
     #[test]
     fn universal_patterns_returns_only_universal_tagged() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2869,8 +2910,9 @@ mod tests {
 
     #[test]
     fn list_patterns_marks_universal_when_any_chunk_is_universal() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2899,8 +2941,9 @@ mod tests {
         // pinning matrix without re-reading source markdown. Build three
         // fixtures: an un-predicated universal, a predicated universal, and a
         // plain non-universal pattern.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2978,7 +3021,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = match KnowledgeDB::open(&db_path, 4) {
+        let err = match KnowledgeDB::open(&db_path) {
             Ok(_) => panic!("expected open to fail on old schema"),
             Err(e) => e.to_string(),
         };
@@ -2993,8 +3036,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("fresh.db");
         // Open a brand-new file: no chunks table yet, probe is satisfied.
-        let db = KnowledgeDB::open(&db_path, 4).expect("fresh DB should open cleanly");
+        let db = KnowledgeDB::open(&db_path).expect("fresh DB should open cleanly");
         db.init().expect("init should succeed");
+        db.ensure_vector_table(4)
+            .expect("failed to create vector table");
     }
 
     #[test]
@@ -3024,18 +3069,20 @@ mod tests {
             .unwrap();
         }
 
-        assert!(KnowledgeDB::open(&db_path, 4).is_err());
+        assert!(KnowledgeDB::open(&db_path).is_err());
 
-        let db = KnowledgeDB::open_skipping_schema_check(&db_path, 4)
+        let db = KnowledgeDB::open_skipping_schema_check(&db_path)
             .expect("skip-probe open must succeed on old schema");
         db.init().expect("init under skip-probe open must succeed");
+        db.ensure_vector_table(4)
+            .expect("failed to create vector table");
         db.clear_all()
             .expect("clear_all must drop+recreate the old chunks table");
 
         // After clear_all the new schema is live — a re-open through the
         // probe path succeeds, confirming the advertised remedy works.
         drop(db);
-        KnowledgeDB::open(&db_path, 4).expect("re-open after clear_all must pass the probe");
+        KnowledgeDB::open(&db_path).expect("re-open after clear_all must pass the probe");
     }
 
     #[test]
@@ -3045,8 +3092,9 @@ mod tests {
         // restores the expected column set.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("chunks_ddl.db");
-        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Forcibly swap the chunks table to the old shape — no `is_universal`.
         db.conn
@@ -3095,8 +3143,9 @@ mod tests {
 
     #[test]
     fn metadata_round_trip() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.set_metadata("last_commit", "abc123").unwrap();
         assert_eq!(
             db.get_metadata("last_commit").unwrap(),
@@ -3106,8 +3155,9 @@ mod tests {
 
     #[test]
     fn metadata_overwrite() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.set_metadata("key", "first").unwrap();
         db.set_metadata("key", "second").unwrap();
         assert_eq!(db.get_metadata("key").unwrap(), Some("second".to_string()));
@@ -3115,15 +3165,17 @@ mod tests {
 
     #[test]
     fn metadata_missing_key_returns_none() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         assert_eq!(db.get_metadata("nonexistent").unwrap(), None);
     }
 
     #[test]
     fn metadata_empty_value() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.set_metadata("key", "").unwrap();
         assert_eq!(db.get_metadata("key").unwrap(), Some(String::new()));
     }
@@ -3132,8 +3184,9 @@ mod tests {
 
     #[test]
     fn porter_stemming_matches_morphological_variants() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -3170,8 +3223,9 @@ mod tests {
     fn fresh_db_carries_applies_when_json_column_on_both_tables() {
         // Happy path: a freshly initialised DB has `applies_when_json` on
         // both `chunks` and `patterns` and is stamped at v3.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk_columns: Vec<String> = db
             .conn
@@ -3214,8 +3268,9 @@ mod tests {
         // Happy path: write two chunks (one with predicate JSON, one without),
         // confirm both shapes round-trip through the FTS, vector, and
         // `chunks_by_sources` SELECT sites.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let predicate_json =
             r#"{"tools":["Bash"],"bash_command_starts_with":["git","gh"]}"#.to_string();
@@ -3294,8 +3349,9 @@ mod tests {
         // mirroring the chunk-side persistence so MCP write paths can update
         // the column without re-deriving it from chunks (U7 plumbing
         // dependency).
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let predicate_json = r#"{"tools":["Bash"]}"#.to_string();
         db.upsert_pattern(&PatternRow {
@@ -3349,8 +3405,9 @@ mod tests {
         // `PATTERNS_DDL`, which now include `applies_when_json`. Confirm the
         // column is present after the drop+recreate (and PRAGMA user_version
         // is stamped at the current target).
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Seed a row with a predicate so we can confirm clear_all wipes it.
         let chunk = Chunk {
@@ -3489,7 +3546,7 @@ mod tests {
 
         // Open via the regular path — no `--force`. The probe must migrate
         // in place and return successfully.
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v2 → v3 additive migration must apply silently on KnowledgeDB::open");
 
         let user_version: u32 = db
@@ -3663,7 +3720,7 @@ mod tests {
 
         // Open via the regular path — no `--force`. The probe must migrate
         // in place and return successfully.
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v3 → v4 additive migration must apply silently on KnowledgeDB::open");
 
         let user_version: u32 = db
@@ -3736,8 +3793,9 @@ mod tests {
         // the idempotency guard regressed.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("v4.db");
-        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         drop(db);
 
         // Re-open — no migration runs because version is already at target,
@@ -3748,7 +3806,7 @@ mod tests {
             let conn = Connection::open(&db_path).unwrap();
             conn.pragma_update(None, "user_version", 3u32).unwrap();
         }
-        let _db = KnowledgeDB::open(&db_path, 4)
+        let _db = KnowledgeDB::open(&db_path)
             .expect("re-running v3 → v4 migration on an already-v4 schema must be idempotent");
     }
 
@@ -3811,7 +3869,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2u32).unwrap();
         }
 
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v2 → v4 single-pass migration must apply on KnowledgeDB::open");
 
         let user_version: u32 = db
@@ -3845,8 +3903,9 @@ mod tests {
         // now include `language_json`. Confirm the column is present
         // after the drop+recreate and PRAGMA user_version is stamped at
         // the current target.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.clear_all().unwrap();
 
         let chunk_columns: Vec<String> = db
@@ -3884,8 +3943,9 @@ mod tests {
 
     #[test]
     fn fresh_init_stamps_v4_user_version() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let user_version: u32 = db
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -3925,7 +3985,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1u32).unwrap();
         }
 
-        let Err(err) = KnowledgeDB::open(&db_path, 4) else {
+        let Err(err) = KnowledgeDB::open(&db_path) else {
             panic!("pre-v2 schema must hard-bail");
         };
         let msg = format!("{err}");
@@ -3943,8 +4003,9 @@ mod tests {
         // (U7's invariant) — but the DB layer just round-trips whatever was
         // written. Here we seed two chunks per source with matching JSON to
         // confirm the SELECT site preserves the column on every row.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let predicate_json = r#"{"tools":["Bash"]}"#.to_string();
         let chunks = vec![
@@ -4090,7 +4151,7 @@ mod tests {
 
         // Migrate via the regular open path; FTS5 / vec0 should survive.
         let db =
-            KnowledgeDB::open(&db_path, 4).expect("v2 → v3 additive migration must apply silently");
+            KnowledgeDB::open(&db_path).expect("v2 → v3 additive migration must apply silently");
 
         let user_version: u32 = db
             .conn
@@ -4183,7 +4244,7 @@ mod tests {
 
         // Open should succeed: chunks gets the new column, patterns is
         // absent so its branch is skipped, user_version stamps to v3.
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v2→v3 migration must succeed even without a patterns table");
 
         let user_version: u32 = db

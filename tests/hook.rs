@@ -44,8 +44,10 @@ max_tokens = 1024
 /// Open an on-disk `KnowledgeDB` in the given directory.
 fn open_db(dir: &Path, dims: usize) -> KnowledgeDB {
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, dims).expect("failed to open DB");
+    let db = KnowledgeDB::open(&db_path).expect("failed to open DB");
     db.init().expect("failed to init DB");
+    db.ensure_vector_table(dims)
+        .expect("failed to create vector table");
     db
 }
 
@@ -1384,8 +1386,9 @@ fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
     // Tamper a chunk row so its source_file points outside knowledge_dir.
@@ -1441,8 +1444,9 @@ fn hook_session_start_truncates_pinned_section_at_render_budget() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
     assert!(
         result.errors.is_empty(),
@@ -1489,8 +1493,9 @@ fn hook_session_start_renders_raw_body_control_chars_verbatim() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
     // Tamper: insert a `patterns` row whose `raw_body` carries raw ANSI
@@ -1550,8 +1555,9 @@ fn hook_session_start_renders_from_db_even_when_source_file_removed() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
     // Remove ghost.md from disk after ingest — its patterns row stays in
@@ -2486,8 +2492,9 @@ fn hook_pre_tool_use_predicate_parse_error_logs_and_falls_through() {
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
     {
-        let db = lore::database::KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+        let db = lore::database::KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
         // Inject malformed JSON directly into the persisted chunk row(s).
@@ -2563,8 +2570,9 @@ fn setup_min_relevance_universal_env()
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
     {
-        let db = lore::database::KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+        let db = lore::database::KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
     }
 
@@ -2594,7 +2602,7 @@ fn setup_min_relevance_universal_env()
 fn hook_search_path_min_relevance_universal_filters_universal_above_score() {
     let (_tmp, _db_path, mut config) = setup_min_relevance_universal_env();
     let embedder = FakeEmbedder::new();
-    let db = lore::database::KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = lore::database::KnowledgeDB::open(&config.database).unwrap();
 
     // Step 1: with floors at 0.0, the universal chunk is in the result set.
     config.search.min_relevance = 0.0;
@@ -2645,7 +2653,7 @@ fn hook_search_path_min_relevance_universal_filters_universal_above_score() {
 fn hook_search_path_min_relevance_universal_defaults_to_min_relevance() {
     let (_tmp, _db_path, mut config) = setup_min_relevance_universal_env();
     let embedder = FakeEmbedder::new();
-    let db = lore::database::KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = lore::database::KnowledgeDB::open(&config.database).unwrap();
 
     // Both floors raised together via min_relevance only — universal floor
     // inherits and filters the chunk.

@@ -85,8 +85,10 @@ fn setup_repo_with_remote(dir: &Path) -> tempfile::TempDir {
 
 fn open_db(dir: &Path, dims: usize) -> KnowledgeDB {
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, dims).expect("failed to open DB");
+    let db = KnowledgeDB::open(&db_path).expect("failed to open DB");
     db.init().expect("failed to init DB");
+    db.ensure_vector_table(dims)
+        .expect("failed to create vector table");
     db
 }
 
