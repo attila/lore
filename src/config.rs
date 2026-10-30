@@ -231,14 +231,16 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let contents = std::fs::read_to_string(path).map_err(|_| {
-            anyhow::anyhow!(
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
                 "Config not found at {}. Run 'lore init' first.",
                 path.display()
-            )
-        })?;
-        let config: Config = toml::from_str(&contents)?;
-        Ok(config)
+            ),
+            Err(e) => anyhow::bail!("Cannot read config at {}: {e}", path.display()),
+        };
+        toml::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("Cannot parse config at {}: {e}", path.display()))
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -369,6 +371,36 @@ mod tests {
             msg.contains("/tmp/nonexistent/lore.toml"),
             "error should include the path, got: {msg}"
         );
+    }
+
+    #[test]
+    fn load_malformed_file_names_it_and_the_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        std::fs::write(&path, "knowledge_dir = [unclosed\n").unwrap();
+
+        let msg = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            msg.contains(&format!("Cannot parse config at {}", path.display())),
+            "{msg}"
+        );
+        assert!(msg.contains("TOML parse error"), "{msg}");
+        assert!(!msg.contains("lore init"), "{msg}");
+    }
+
+    #[test]
+    fn load_directory_at_path_names_it_and_the_os_error() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let msg = Config::load(dir.path()).unwrap_err().to_string();
+
+        assert!(
+            msg.contains(&format!("Cannot read config at {}: ", dir.path().display())),
+            "{msg}"
+        );
+        assert!(msg.contains("os error"), "{msg}");
+        assert!(!msg.contains("lore init"), "{msg}");
     }
 
     // -- default_config_path / default_database_path (U2: etcetera swap) ----

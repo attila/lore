@@ -397,9 +397,8 @@ fn init_config(
     }
     let config = Config::load(config_path).map_err(|e| {
         anyhow::anyhow!(
-            "The existing config at {} could not be loaded and was left untouched. \
-             Fix it, or remove it to start fresh.\n{e}",
-            config_path.display()
+            "The existing config could not be loaded and was left untouched. \
+             Fix it, or remove it to start fresh.\n{e}"
         )
     })?;
 
@@ -962,9 +961,12 @@ fn render_runtime_line(outcome: &ProbeOutcome, full: bool) {
 
 #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
 fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
-    let Ok(config) = Config::load(config_path) else {
-        eprintln!("✗ No config found. Run 'lore init' first.");
-        process::exit(1);
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("✗ {e}");
+            process::exit(1);
+        }
     };
 
     // Run the cheap checks first (no probe) so the header lines print

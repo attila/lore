@@ -467,8 +467,123 @@ fn init_leaves_a_malformed_config_untouched() {
         "{stderr}"
     );
     assert!(stderr.contains("TOML parse error"), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches(existing.path.display().to_string().as_str())
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Config not found"), "{stderr}");
+    assert!(!stderr.contains("Run 'lore init' first"), "{stderr}");
     assert!(!stderr.contains("Provisioning"), "{stderr}");
     existing.assert_untouched();
+}
+
+#[test]
+fn init_with_a_directory_at_the_config_path_names_the_read_error() {
+    let existing = ExistingConfig::new();
+    std::fs::remove_file(&existing.path).unwrap();
+    std::fs::create_dir(&existing.path).unwrap();
+
+    let (code, stderr) = existing.init(&[]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Cannot read config at {}: ",
+            existing.path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Config not found"), "{stderr}");
+    assert!(!stderr.contains("Run 'lore init' first"), "{stderr}");
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    assert!(existing.path.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_with_an_unreadable_config_names_the_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let existing = ExistingConfig::new();
+    let set_mode = |mode| {
+        std::fs::set_permissions(&existing.path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o000);
+    // Root reads the file regardless of its mode, so there is nothing to test.
+    if std::fs::read(&existing.path).is_ok() {
+        return;
+    }
+
+    let (code, stderr) = existing.init(&[]);
+    set_mode(0o644);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Cannot read config at {}: ",
+            existing.path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("ermission denied"), "{stderr}");
+    assert!(!stderr.contains("Config not found"), "{stderr}");
+    assert!(!stderr.contains("Run 'lore init' first"), "{stderr}");
+    existing.assert_untouched();
+}
+
+#[test]
+fn status_reports_a_malformed_config_instead_of_a_missing_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("lore.toml");
+    std::fs::write(&config_path, "knowledge_dir = [unclosed\n").unwrap();
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "✗ Cannot parse config at {}: TOML parse error",
+            config_path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not found"), "{stderr}");
+    assert!(!stderr.contains("lore init"), "{stderr}");
+}
+
+#[test]
+fn hook_with_a_malformed_config_stays_silent_on_stdout_and_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("lore.toml");
+    std::fs::write(&config_path, "knowledge_dir = [unclosed\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "test-session"
+    });
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("hook")
+        .write_stdin(input.to_string())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(format!(
+            "lore hook: Cannot parse config at {}",
+            config_path.display()
+        )));
 }
 
 #[test]
