@@ -3,7 +3,7 @@
 # that says why.
 README.md 1550
 docs/architecture.md 700
-docs/configuration.md 3400
+docs/configuration.md 3450
 docs/embedding-servers.md 850
 docs/hook-pipeline-reference.md 3300
 docs/pattern-authoring-guide.md 6300

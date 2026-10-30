@@ -118,6 +118,9 @@ lore status
 The `init` command verifies Ollama is running, pulls the embedding model (`nomic-embed-text`,
 ~270MB), creates `lore.toml` and the knowledge database, and runs the first ingestion.
 
+For an OpenAI-compatible embedding server, add `--provider openai-compatible`, `--url` and
+`--model`, as [Embedding Servers](docs/embedding-servers.md) shows.
+
 ### Use with Claude Code
 
 Install the lore plugin to get the MCP server, lifecycle hooks, and the `/search` and
