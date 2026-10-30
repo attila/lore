@@ -6,10 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `[ollama] dimensions` pins the expected vector width, and ingest stops with exit 1 when the model
+  returns another width. (#78)
+
 ### Changed
 
 - MCP tool descriptions, CLI output and the plugin skills name the pattern collection the "knowledge
   directory", matching the `knowledge_dir` setting. (#75)
+- `lore init` leaves an existing config untouched and exits 1 when a flag contradicts it. (#78)
+
+### Fixed
+
+- Any Ollama embedding model now works at its own vector width, and after a model switch searches
+  fall back to text and name `lore ingest --force` instead of mixing vectors from two models. (#78)
 
 ### Security
 

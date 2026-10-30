@@ -1553,9 +1553,10 @@ fn commit_note(status: &CommitStatus) -> String {
 ///
 /// - `Hybrid`: full hybrid search with embedder + FTS combined via
 ///   reciprocal-rank fusion. Scores are comparable across queries.
-/// - `FtsFallback`: hybrid was attempted but the embedder was unreachable;
-///   silently fell back to FTS-only for this query. Scores use BM25
-///   rank, not comparable to `Hybrid`.
+/// - `FtsFallback`: hybrid is configured but this query fell back to
+///   FTS-only: the embedder was unreachable, the index was built with
+///   another model name or width, or there is no vector table yet.
+///   Scores use BM25 rank, not comparable to `Hybrid`.
 /// - `FtsOnly`: deployment is configured for FTS-only via
 ///   `config.search.hybrid = false`. The embedder was never attempted.
 ///   Scores use BM25 rank, not comparable to `Hybrid`.
@@ -1581,8 +1582,9 @@ impl SearchMode {
     /// runtime `embed_failed` flag observed by `handle_search`. The two
     /// inputs are orthogonal: `hybrid_enabled` is a configuration choice
     /// (FTS-only is a deliberate deployment decision); `embed_failed`
-    /// reflects whether the embedder was reachable for this specific
-    /// request.
+    /// reflects whether this request had no usable query vector: the
+    /// embedder was unreachable, the index was built with another model
+    /// name or width, or there is no vector table yet.
     fn from_search_state(hybrid_enabled: bool, embed_failed: bool) -> Self {
         if !hybrid_enabled {
             // Configured FTS-only — `handle_search` never attempts the
@@ -2873,8 +2875,9 @@ mod tests {
 
     /// FTS-only configured search (`config.search.hybrid = false`) flips
     /// `mode` to `"fts_only"`, distinct from both `"hybrid"` (full
-    /// embedder + FTS) and `"fts_fallback"` (embedder unreachable in a
-    /// hybrid-configured deployment).
+    /// embedder + FTS) and `"fts_fallback"` (embedder unreachable, index
+    /// built with another model name or width, or no vector table yet, in
+    /// a hybrid-configured deployment).
     ///
     /// This test pins the contract that `fts_only` is its own mode value,
     /// not aliased to `hybrid` or `fts_fallback`. The coverage-check skill

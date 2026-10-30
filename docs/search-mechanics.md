@@ -215,9 +215,12 @@ The embedding text for each chunk is constructed as: `{title}\n{tags}\n{body}`. 
 titles contribute to semantic similarity, not only lexical matching.
 
 The default embedding model is `nomic-embed-text` (768 dimensions). Other models are supported by
-changing `ollama.model` in `lore.toml`.
+changing `ollama.model` in `lore.toml`. The index records the embedding provider, model, width and
+the vector of a fixed probe text.
 
-If Ollama is unreachable or embedding fails, the search falls back to FTS5 only.
+If Ollama is unreachable or embedding fails, the search falls back to FTS5 only. So does an index
+built with another model name or width, with a warning to run `lore ingest --force`. `lore ingest`
+retries chunks left without a vector and rebuilds an index that records no model.
 
 ## Hybrid Merge: Reciprocal Rank Fusion
 
