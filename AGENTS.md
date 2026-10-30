@@ -10,8 +10,10 @@ The roadmap is the committed source of truth for status.
 ## Changelog
 
 Entries are user-facing only. One sentence per change, written in an assertive voice and ending in
-`(#N)`. Detail belongs in the pull request body, not here. Dependency bumps and internal refactors
-get no entry.
+`(#N)`. Detail belongs in the pull request body, not here. Vulnerability fixes go under
+`### Security`, whether the fix is in lore's own code or in a dependency, as long as the shipped
+binary reaches the vulnerable code in a supported setup; the entry says what changes for users, not
+which crate or version moved. Other dependency bumps and internal refactors get no entry.
 
 ## Roadmap upkeep
 

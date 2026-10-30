@@ -11,6 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - MCP tool descriptions, CLI output and the plugin skills name the pattern collection the "knowledge
   directory", matching the `knowledge_dir` setting. (#75)
 
+### Security
+
+- Connections to an Ollama server over HTTPS no longer accept certificates from distrusted emSign
+  authorities, and an attacker can no longer downgrade them to classical key exchange. (#77)
+
 ## [0.5.0] - 2026-06-04
 
 ### Added
