@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::embeddings::{OllamaClient, ProbeError, render_failure};
+use crate::openai_compatible::ServerError;
 
 /// Outcome of the runtime probe that exercises Ollama inference.
 ///
@@ -24,6 +25,9 @@ pub enum ProbeOutcome {
     /// Probe ran and Ollama failed to produce an embedding. Carries the
     /// classified error so consumers render a variant-specific message.
     Failed(ProbeError),
+    /// Probe ran and the OpenAI-compatible embedding server failed to
+    /// produce an embedding.
+    ServerFailed(ServerError),
 }
 
 /// Outcome of a provisioning or status-check run.

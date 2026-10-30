@@ -3,9 +3,10 @@
 ## Threat Model
 
 Lore is a _local single-user CLI tool_ and Model Context Protocol (MCP) server. It runs under the
-invoking user's permissions, communicates over stdio (not network sockets), and connects only to a
-localhost Ollama instance for embeddings. There is no authentication, no remote API surface, and no
-multi-user access.
+invoking user's permissions and serves its agent over stdio, not network sockets. For embeddings it
+connects to one embedding server: Ollama, on localhost by default, or the server in
+`[embedding] url`. Lore itself has no authentication, no remote API surface, and no multi-user
+access.
 
 The primary threats are:
 
@@ -16,15 +17,34 @@ The primary threats are:
 
 ## Trust Boundaries
 
-| Input Surface                    | Trust Level                            | Validation                                                               |
-| -------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ |
-| CLI arguments                    | Trusted (user-invoked)                 | Clap argument parsing                                                    |
-| MCP tool arguments (stdio)       | Partially trusted                      | Input length limits per field, path validation via `validate_within_dir` |
-| Hook input (agent payload)       | Partially trusted                      | Session ID hashed for filenames, transcript path validated under `$HOME` |
-| Transcript file content          | Partially trusted                      | Bounded tail-read (last 32KB), lossy UTF-8 conversion                    |
-| Markdown knowledge files         | Trusted (user-controlled, git-tracked) | Extension filter (`.md`/`.markdown` only)                                |
-| Ollama API responses             | Trusted (localhost)                    | Error handling on malformed responses                                    |
-| Configuration file (`lore.toml`) | Trusted (user-authored)                | TOML parsing via `serde`                                                 |
+| Input Surface                    | Trust Level                            | Validation                                                                                      |
+| -------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| CLI arguments                    | Trusted (user-invoked)                 | Clap argument parsing                                                                           |
+| MCP tool arguments (stdio)       | Partially trusted                      | Input length limits per field, path validation via `validate_within_dir`                        |
+| Hook input (agent payload)       | Partially trusted                      | Session ID hashed for filenames, transcript path validated under `$HOME`                        |
+| Transcript file content          | Partially trusted                      | Bounded tail-read (last 32KB), lossy UTF-8 conversion                                           |
+| Markdown knowledge files         | Trusted (user-controlled, git-tracked) | Extension filter (`.md`/`.markdown` only)                                                       |
+| Embedding server responses       | Untrusted when remote                  | Error text cut to 240 characters with control characters replaced; malformed responses rejected |
+| Configuration file (`lore.toml`) | Trusted (user-authored)                | TOML parsing via `serde`                                                                        |
+
+## Embedding Servers
+
+Every ingest sends your pattern text to the embedding server. Every hybrid search sends its query
+there too. With a URL on another machine, whoever runs that server can read both.
+
+Lore reads the API key from the environment variable that
+`[embedding] api_key_environment_variable_name` names. It never writes the key to the config file,
+`lore status` output, MCP metadata or trace files. They show only the variable's name and whether it
+is set.
+
+If a proxy variable is set, lore sends every request to the embedding server through that proxy. It
+reads `ALL_PROXY`, `HTTPS_PROXY`, then `HTTP_PROXY`, in upper or lower case, and uses the first one
+set. It does so for `http://` URLs too, and for loopback addresses unless `NO_PROXY` covers them. So
+over `http://`, that proxy can read the API key and the text lore sends.
+
+Lore never sends the API key on a redirect. A 301, 302 or 303 answer turns an embedding request into
+a `GET` without a body. Lore does not follow a 307 or 308 answer to an embedding request. So a
+redirect carries neither the key nor your pattern text.
 
 ## Security Measures
 
@@ -73,7 +93,7 @@ The primary threats are:
   access resources beyond what the user already has.
 - Agent hook callers (Claude Code, Cursor, Opencode) provide legitimate `transcript_path` values
   under `$HOME`. The path validation is a defence-in-depth check, not a primary security boundary.
-- Ollama runs on localhost. Non-localhost Ollama configurations are not security-hardened.
+- The user trusts the configured embedding server with pattern text, queries and the API key.
 - The MCP transport is stdio. There is no network listener.
 
 ## Reporting Vulnerabilities

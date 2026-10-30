@@ -5,7 +5,8 @@
 //! Stores markdown chunks in three tables:
 //! - `chunks` — relational metadata
 //! - `patterns_fts` — FTS5 full-text index
-//! - `patterns_vec` — vec0 vector index (cosine distance)
+//! - `patterns_vec` — vec0 vector index (L2 distance, which ranks only
+//!   unit-length vectors as cosine similarity does)
 //!
 //! Search supports full-text, vector, and hybrid (Reciprocal Rank Fusion).
 

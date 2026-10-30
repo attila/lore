@@ -212,7 +212,9 @@ fn init_help_restates_the_model_and_bind_defaults() {
         .args(["init", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[default: nomic-embed-text]"))
+        .stdout(predicate::str::contains(
+            "[default with Ollama: nomic-embed-text]",
+        ))
         .stdout(predicate::str::contains("[default: localhost:3100]"));
 }
 
@@ -395,7 +397,7 @@ fn first_init(flags: &[&str]) -> Config {
 fn first_init_saves_the_default_model_and_bind() {
     let config = first_init(&[]);
 
-    assert_eq!(config.ollama.model, "nomic-embed-text");
+    assert_eq!(config.ollama.unwrap().model, "nomic-embed-text");
     assert_eq!(config.bind, "localhost:3100");
 }
 
@@ -403,7 +405,7 @@ fn first_init_saves_the_default_model_and_bind() {
 fn first_init_saves_the_model_and_bind_flags() {
     let config = first_init(&["--model", "mxbai-embed-large", "--bind", "localhost:3200"]);
 
-    assert_eq!(config.ollama.model, "mxbai-embed-large");
+    assert_eq!(config.ollama.unwrap().model, "mxbai-embed-large");
     assert_eq!(config.bind, "localhost:3200");
 }
 
@@ -760,7 +762,7 @@ fn text_only_index(tmp: &Path) -> (Config, std::path::PathBuf) {
         tmp.join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = "http://127.0.0.1:1".to_string();
+    config.ollama.as_mut().unwrap().host = "http://127.0.0.1:1".to_string();
     let config_path = tmp.join("lore.toml");
     config.save(&config_path).unwrap();
 

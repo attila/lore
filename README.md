@@ -7,8 +7,9 @@ Model Context Protocol (MCP) tool for Claude Code. Your knowledge lives as markd
 repository. Lore indexes them with hybrid full-text and vector search, then serves results over MCP
 so your AI coding agent consults your patterns before writing code.
 
-Single Rust binary. No external database. Only runtime dependency is [Ollama](https://ollama.com)
-for embeddings.
+Single Rust binary. No external database. Only runtime dependency is an embedding server:
+[Ollama](https://ollama.com) by default, or an OpenAI-compatible embedding server such as
+`llama-server`.
 
 ## How It Works
 
@@ -39,8 +40,11 @@ Markdown files (git repo, source of truth)
 
 - [Ollama](https://ollama.com): `brew install ollama` or see install options
 
-`lore init` needs Ollama running. After setup, if Ollama becomes unavailable, search falls back to
-keyword matching and warns that it has.
+To use `llama-server`, LM Studio or a hosted service instead, see
+[Embedding Servers](docs/embedding-servers.md).
+
+`lore init` needs the embedding server running. After setup, if the server becomes unavailable,
+search falls back to keyword matching and warns that it has.
 
 ### Homebrew
 
@@ -113,6 +117,9 @@ lore status
 
 The `init` command verifies Ollama is running, pulls the embedding model (`nomic-embed-text`,
 ~270MB), creates `lore.toml` and the knowledge database, and runs the first ingestion.
+
+For an OpenAI-compatible embedding server, add `--provider openai-compatible`, `--url` and
+`--model`, as [Embedding Servers](docs/embedding-servers.md) shows.
 
 ### Use with Claude Code
 
@@ -222,7 +229,8 @@ Always use Result<T, E> for fallible operations...
 - **Hybrid** (default): Combines FTS5 lexical search and sqlite-vec vector similarity using
   Reciprocal Rank Fusion. Title and tag matches are weighted above body text, so domain-scoped
   queries return the right patterns first.
-- **Full-Text Search (FTS) only**: Set `hybrid = false` in `lore.toml` to skip Ollama at query time.
+- **Full-Text Search (FTS) only**: Set `hybrid = false` in `lore.toml` to skip the embedding server
+  at query time.
 
 ## Documentation
 
@@ -232,6 +240,7 @@ Always use Result<T, E> for fallible operations...
 | [Search Mechanics Reference](docs/search-mechanics.md)                | Full search pipeline internals for debugging discoverability |
 | [Hook Pipeline and Plugin Reference](docs/hook-pipeline-reference.md) | Hook lifecycle, plugin setup, and injection tuning           |
 | [Configuration Reference](docs/configuration.md)                      | `lore.toml` options, environment variables, CLI flags        |
+| [Embedding Servers](docs/embedding-servers.md)                        | Use an OpenAI-compatible embedding server instead of Ollama  |
 | [Release Process](docs/release-process.md)                            | Maintainer runbook for cutting releases                      |
 
 ## Development

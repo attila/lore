@@ -195,7 +195,7 @@ fn init_refuses_a_pinned_width_the_model_does_not_return() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.dimensions = lore::config::Dimensions::Fixed(7);
+    config.ollama.as_mut().unwrap().dimensions = lore::config::Dimensions::Fixed(7);
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
 

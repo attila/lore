@@ -4,8 +4,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use lore::config::Config;
 use lore::database::KnowledgeDB;
@@ -1065,10 +1065,30 @@ fn every_ingest_names_the_setting_when_a_pinned_width_meets_a_wider_model() {
 /// with an empty success. Returns the base URL and a count of the embed
 /// requests served.
 fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
+    let (url, served, _) = serve_fake_ollama_answering(EmbedAnswer::Vector);
+    (url, served)
+}
+
+/// How the server from [`serve_fake_ollama_answering`] answers `/api/embed`.
+#[derive(Clone, Copy)]
+enum EmbedAnswer {
+    /// A [`FakeEmbedder`] vector.
+    Vector,
+    /// HTTP 500 with the body Ollama sends when its model runner has crashed.
+    RunnerCrash,
+}
+
+/// [`serve_fake_ollama`] with a choice of embed answer. Also returns every
+/// embed input received.
+fn serve_fake_ollama_answering(
+    answer: EmbedAnswer,
+) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let served = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&served);
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&inputs);
     std::thread::spawn(move || {
         let embedder = FakeEmbedder::new();
         for stream in listener.incoming() {
@@ -1090,24 +1110,34 @@ fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let response = match request["input"][0].as_str() {
+            let (status, response) = match request["input"][0].as_str() {
                 Some(input) => {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    serde_json::json!({ "embeddings": [embedder.embed(input).unwrap()] })
+                    received.lock().unwrap().push(input.to_string());
+                    match answer {
+                        EmbedAnswer::Vector => (
+                            "200 OK",
+                            serde_json::json!({ "embeddings": [embedder.embed(input).unwrap()] }),
+                        ),
+                        EmbedAnswer::RunnerCrash => (
+                            "500 Internal Server Error",
+                            serde_json::json!({ "error": "llama runner process has terminated" }),
+                        ),
+                    }
                 }
-                None => serde_json::json!({}),
-            }
-            .to_string();
+                None => ("200 OK", serde_json::json!({})),
+            };
+            let response = response.to_string();
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
                 response.len()
             )
             .unwrap();
         }
     });
-    (url, served)
+    (url, served, inputs)
 }
 
 fn lore() -> assert_cmd::Command {
@@ -1129,7 +1159,7 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = "http://127.0.0.1:1".to_string();
+    config.ollama.as_mut().unwrap().host = "http://127.0.0.1:1".to_string();
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1153,7 +1183,7 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
         .stderr(predicate::str::contains(text_only_note));
 
     let (url, served) = serve_fake_ollama();
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     config.save(&config_path).unwrap();
 
     lore()
@@ -1191,6 +1221,61 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
 }
 
 #[test]
+fn search_json_writes_nothing_to_stderr_when_the_model_cannot_embed() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.as_mut().unwrap().host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &knowledge_dir);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    lore()
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains("Warning: Ollama embed failed"));
+    let output = lore()
+        .env_remove("LORE_DEBUG")
+        .args([
+            "search",
+            "--json",
+            "--config",
+            config_arg,
+            "error propagation",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    let results: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let results = results.as_array().unwrap();
+    assert!(
+        results.iter().any(|r| r["title"] == "Error Handling"),
+        "{results:?}"
+    );
+}
+
+#[test]
 fn ingest_file_says_the_text_was_saved_when_the_model_cannot_embed() {
     use predicates::prelude::*;
 
@@ -1205,7 +1290,7 @@ fn ingest_file_says_the_text_was_saved_when_the_model_cannot_embed() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = "http://127.0.0.1:1".to_string();
+    config.ollama.as_mut().unwrap().host = "http://127.0.0.1:1".to_string();
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1273,7 +1358,7 @@ fn ingest_file_names_ingest_force_when_a_probe_mismatch_is_recorded() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = "http://127.0.0.1:1".to_string();
+    config.ollama.as_mut().unwrap().host = "http://127.0.0.1:1".to_string();
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1316,7 +1401,7 @@ fn ingest_file_names_ingest_force_when_a_probe_mismatch_is_recorded() {
     }
 
     let (url, _) = serve_fake_ollama();
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     config.save(&config_path).unwrap();
     lore()
         .args(["ingest", "--force", "--config", config_arg])
@@ -1345,7 +1430,7 @@ fn ingest_force_rebuilds_an_index_of_another_model_with_the_configured_one() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1422,7 +1507,7 @@ fn ingest_force_clears_a_probe_mismatch_and_searches_return_to_hybrid() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = "http://127.0.0.1:1".to_string();
+    config.ollama.as_mut().unwrap().host = "http://127.0.0.1:1".to_string();
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1475,7 +1560,7 @@ fn ingest_force_clears_a_probe_mismatch_and_searches_return_to_hybrid() {
         )));
 
     let (url, served) = serve_fake_ollama();
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     config.save(&config_path).unwrap();
     lore()
         .args(["ingest", "--force", "--config", config_arg])
@@ -1518,7 +1603,7 @@ fn plain_ingest_clears_a_probe_mismatch_once_the_model_answers_as_recorded() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1598,7 +1683,7 @@ fn ingest_exits_1_when_the_model_width_is_not_the_configured_dimensions() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let saved = fs::read_to_string(&config_path).unwrap();
@@ -1663,7 +1748,7 @@ fn ingest_refuses_an_unreadable_recorded_probe_until_a_forced_rebuild() {
         tmp.path().join("knowledge.db"),
         "nomic-embed-text",
     );
-    config.ollama.host = url;
+    config.ollama.as_mut().unwrap().host = url;
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
@@ -1700,4 +1785,1112 @@ fn ingest_refuses_an_unreadable_recorded_probe_until_a_forced_rebuild() {
         .assert()
         .success()
         .stderr(predicate::str::contains("Already up to date"));
+}
+
+// -- Ollama output ------------------------------------------------------------
+
+/// A committed knowledge directory of the seed patterns and a saved config
+/// that points at Ollama on `host`.
+fn ollama_project(host: &str) -> (tempfile::TempDir, Config, PathBuf) {
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir,
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.as_mut().unwrap().host = host.to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    (tmp, config, config_path)
+}
+
+fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8(assert.get_output().stderr.clone()).unwrap()
+}
+
+#[test]
+fn status_keeps_its_ollama_lines() {
+    let (url, _) = serve_fake_ollama();
+    let (_tmp, config, config_path) = ollama_project(&url);
+    let config_arg = config_path.to_str().unwrap();
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success();
+    let commit = KnowledgeDB::open(&config.database)
+        .unwrap()
+        .get_metadata("last_ingested_commit")
+        .unwrap()
+        .unwrap();
+
+    let status = lore()
+        .env("PATH", "")
+        .env_remove("LORE_TRACE")
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        stderr_of(&status),
+        format!(
+            "=== lore status ===\n\n\
+             \x20 Config:       {config}\n\
+             \x20 Knowledge:    {knowledge}\n\
+             \x20 Scan set:     ✓ populated\n\
+             \x20 Database:     {database}\n\
+             \x20 Bind:         localhost:3100\n\n\
+             \x20 Ollama:       ✗ not found\n\
+             \x20 Ollama svc:   ✓ running\n\
+             \x20 Model:        ✓ nomic-embed-text\n\
+             \x20 Runtime:      —  (run 'lore status --full' to verify inference)\n\
+             \x20 sqlite-vec:   ✓ bundled\n\n\
+             \x20 Chunks:       3\n\
+             \x20 Sources:      3\n\
+             \x20 Languages:    undeclared 3\n\
+             \x20 Last commit:  {short}\n\n",
+            config = config_arg,
+            knowledge = config.knowledge_dir.display(),
+            database = config.database.display(),
+            short = &commit[..7],
+        )
+    );
+}
+
+#[test]
+fn a_crashed_ollama_runner_keeps_its_status_search_and_ingest_output() {
+    let (url, _, _) = serve_fake_ollama_answering(EmbedAnswer::RunnerCrash);
+    let (_tmp, config, config_path) = ollama_project(&url);
+    let config_arg = config_path.to_str().unwrap();
+    let commit = {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &config.knowledge_dir);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        db.get_metadata("last_ingested_commit").unwrap().unwrap()
+    };
+
+    let status = lore()
+        .env("PATH", "")
+        .env_remove("LORE_TRACE")
+        .args(["status", "--full", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        stderr_of(&status),
+        format!(
+            "=== lore status ===\n\n\
+             \x20 Config:       {config}\n\
+             \x20 Knowledge:    {knowledge}\n\
+             \x20 Scan set:     ✓ populated\n\
+             \x20 Database:     {database}\n\
+             \x20 Bind:         localhost:3100\n\n\
+             \x20 Ollama:       ✗ not found\n\
+             \x20 Ollama svc:   ✓ running\n\
+             \x20 Model:        ✓ nomic-embed-text\n\
+             \x20 Verifying inference runtime (may take a few seconds)…\n\
+             \x20 Runtime:      ✗ inference failed — llama runner process has terminated\n\
+             \x20 sqlite-vec:   ✓ bundled\n\n\
+             \x20 Chunks:       3\n\
+             \x20 Sources:      3\n\
+             \x20 Languages:    undeclared 3\n\
+             \x20 Last commit:  {short}\n\n",
+            config = config_arg,
+            knowledge = config.knowledge_dir.display(),
+            database = config.database.display(),
+            short = &commit[..7],
+        )
+    );
+
+    let search = lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success();
+    assert_eq!(
+        stderr_of(&search),
+        "Warning: Ollama embed failed (inference error); falling back to text search. \
+         Run 'lore status --full' for details.\n"
+    );
+
+    let draft = config.knowledge_dir.join("draft.md");
+    fs::write(
+        &draft,
+        "# Draft\n\nPrefer borrowed slices in function arguments.\n",
+    )
+    .unwrap();
+    let ingest = lore()
+        .env_remove("LORE_DEBUG")
+        .args([
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout("");
+    assert_eq!(
+        stderr_of(&ingest),
+        "Single-file ingest: draft.md\n\
+         \x20 draft.md → 1 chunks\n\
+         Errors: 1\n\
+         \x20 ✗ 1 embedding failure(s) while indexing draft.md\n\
+         Error: single-file ingest saved the text of draft.md but not all of its vectors. \
+         Run 'lore ingest' once the embedding model answers to add them.\n"
+    );
+
+    commit_all(&config.knowledge_dir);
+    let walk = lore()
+        .env_remove("LORE_DEBUG")
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        stderr_of(&walk),
+        "Ingesting knowledge directory...\n\n\
+         Delta ingest: 1 file(s) changed\n\
+         \x20 draft.md → 1 chunks\n\
+         Patterns: 1 ingested; 0 declare a language, 1 relies on body keywords.\n\n\
+         Done (delta): 1 files changed, 4 unchanged\n\
+         Universal patterns: 0\n\
+         Errors: 2\n\
+         \x20 ✗ 1 embedding failure(s) while indexing draft.md\n\
+         \x20 ✗ 1 chunk(s) have no vector and the embedding model did not answer: \
+         Ollama reached the model but the inference call failed \
+         — llama runner process has terminated\n"
+    );
+}
+
+#[test]
+fn the_session_start_trace_records_the_ollama_host_and_model() {
+    let (_tmp, config, config_path) = ollama_project("http://127.0.0.1:1");
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest_logged(&db, &FakeEmbedder::new(), &config.knowledge_dir);
+    }
+    let trace_dir = config_path.with_file_name("trace");
+    lore()
+        .env("LORE_TRACE", "1")
+        .env("LORE_TRACE_DIR", &trace_dir)
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "ollama-trace",
+            })
+            .to_string(),
+        )
+        .assert()
+        .success();
+
+    let files: Vec<PathBuf> = fs::read_dir(&trace_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let record: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&files[0]).unwrap().trim()).unwrap();
+    let snapshot = &record["config"];
+    assert_eq!(snapshot["ollama_host"], "http://127.0.0.1:1", "{record}");
+    assert_eq!(snapshot["ollama_model"], "nomic-embed-text", "{record}");
+    assert_eq!(snapshot["embedder_provider"], "ollama", "{record}");
+}
+
+/// A config written by hand: no `dimensions` in `[ollama]`, no `[trace]` and
+/// no `min_relevance_universal`.
+const HAND_WRITTEN_OLLAMA_CONFIG: &str = r#"knowledge_dir = "KNOWLEDGE_DIR"
+database = "DATABASE"
+bind = "localhost:3100"
+
+[ollama]
+host = "HOST"
+model = "nomic-embed-text"
+
+[search]
+hybrid = true
+top_k = 5
+min_relevance = 0.5
+
+[chunking]
+strategy = "heading"
+max_tokens = 1024
+"#;
+
+#[test]
+fn a_hand_written_ollama_config_loads_ingests_and_searches() {
+    use predicates::prelude::*;
+
+    let (url, served) = serve_fake_ollama();
+    let (_tmp, config, config_path) = ollama_project(&url);
+    fs::write(
+        &config_path,
+        HAND_WRITTEN_OLLAMA_CONFIG
+            .replace("KNOWLEDGE_DIR", config.knowledge_dir.to_str().unwrap())
+            .replace("DATABASE", config.database.to_str().unwrap())
+            .replace("HOST", &url),
+    )
+    .unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Errors:").not())
+        .stderr(predicate::str::contains("Warning").not());
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+    let before_search = served.load(Ordering::SeqCst);
+    lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr("");
+    assert_eq!(served.load(Ordering::SeqCst), before_search + 1);
+}
+
+#[test]
+fn ingest_sends_ollama_a_long_section_whole() {
+    let (url, _, inputs) = serve_fake_ollama_answering(EmbedAnswer::Vector);
+    let (_tmp, config, config_path) = ollama_project(&url);
+    let body = "Keep each module to one purpose and name it after that purpose.\n".repeat(110);
+    assert!(body.chars().count() >= 7000);
+    fs::write(
+        config.knowledge_dir.join("long.md"),
+        format!("# Module Boundaries\n\n{body}"),
+    )
+    .unwrap();
+    commit_all(&config.knowledge_dir);
+
+    lore()
+        .args(["ingest", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let inputs = inputs.lock().unwrap();
+    assert!(
+        inputs.iter().any(|input| input.ends_with(body.trim_end())),
+        "input lengths in characters: {:?}",
+        inputs
+            .iter()
+            .map(|input| input.chars().count())
+            .collect::<Vec<_>>()
+    );
+}
+
+// -- OpenAI-compatible embedding servers --------------------------------------
+
+/// How the server from [`serve_fake_embedding_server`] answers.
+#[derive(Clone, Copy)]
+enum ServerAnswer {
+    /// A [`FakeEmbedder`] vector.
+    Vector,
+    /// llama-server's batch error for every input longer than this many
+    /// characters, and a vector for the rest.
+    BatchTooSmallAbove(usize),
+    /// HTTP 401 with llama-server's invalid-key body, to every request.
+    InvalidKey,
+}
+
+/// One request the fake embedding server received.
+#[derive(Debug, Clone)]
+struct ServerRequest {
+    path: String,
+    authorization: Option<String>,
+    input: Option<String>,
+}
+
+/// Serve an OpenAI-compatible embeddings API under `/v1`. Returns the base URL and
+/// every request received.
+fn serve_fake_embedding_server(answer: ServerAnswer) -> (String, Arc<Mutex<Vec<ServerRequest>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        let embedder = FakeEmbedder::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            let mut content_length = 0;
+            let mut authorization = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    } else if name.eq_ignore_ascii_case("authorization") {
+                        authorization = Some(value.trim().to_string());
+                    }
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let input = request["input"].as_str().map(str::to_string);
+            let (status, response) = match (answer, &input) {
+                (ServerAnswer::InvalidKey, _) => (
+                    "401 Unauthorized",
+                    r#"{"error":{"message":"Invalid API Key","type":"authentication_error","code":401}}"#
+                        .to_string(),
+                ),
+                (_, None) => ("200 OK", r#"{"data":[]}"#.to_string()),
+                (ServerAnswer::BatchTooSmallAbove(max), Some(input))
+                    if input.chars().count() > max =>
+                {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":{"code":500,"message":"input (962 tokens) is too large to process. increase the physical batch size (current batch size: 512)","type":"server_error"}}"#
+                            .to_string(),
+                    )
+                }
+                (_, Some(input)) => (
+                    "200 OK",
+                    serde_json::json!({
+                        "data": [{ "embedding": embedder.embed(input).unwrap(), "index": 0 }]
+                    })
+                    .to_string(),
+                ),
+            };
+            log.lock().unwrap().push(ServerRequest {
+                path,
+                authorization,
+                input,
+            });
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    (url, requests)
+}
+
+const SERVER_MODEL: &str = "nomic-embed-text-v1.5";
+const SERVER_KEY_VARIABLE: &str = "LORE_E2E_EMBEDDING_KEY";
+const SERVER_KEY: &str = "sk-e2e-key-value";
+
+/// `config` saved at `config_path` with an `[embedding]` table for `url`
+/// in place of `[ollama]`, or beside it when `keep_ollama` is set.
+fn use_embedding_server(config: &mut Config, config_path: &Path, url: &str, keep_ollama: bool) {
+    if !keep_ollama {
+        config.ollama = None;
+    }
+    config.embedding = Some(lore::config::EmbeddingConfig {
+        provider: "openai-compatible".to_string(),
+        url: url.to_string(),
+        model: SERVER_MODEL.to_string(),
+        api_key_environment_variable_name: Some(SERVER_KEY_VARIABLE.to_string()),
+        dimensions: lore::config::Dimensions::Auto,
+    });
+    config.save(config_path).unwrap();
+}
+
+/// A committed knowledge directory of the seed patterns and a saved config
+/// that points at an OpenAI-compatible embedding server at `url`.
+fn server_project(url: &str) -> (tempfile::TempDir, Config, PathBuf) {
+    let (tmp, mut config, config_path) = ollama_project("http://127.0.0.1:1");
+    use_embedding_server(&mut config, &config_path, url, false);
+    (tmp, config, config_path)
+}
+
+#[test]
+fn an_embedding_server_indexes_searches_and_reports_its_status() {
+    let (url, requests) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, mut config, config_path) = server_project(&url);
+    config.chunking.max_tokens = 100;
+    config.save(&config_path).unwrap();
+    let body = "Keep each module to one purpose and name it after that purpose.\n".repeat(20);
+    fs::write(
+        config.knowledge_dir.join("long.md"),
+        format!("# Module Boundaries\n\n{body}"),
+    )
+    .unwrap();
+    commit_all(&config.knowledge_dir);
+    let config_arg = config_path.to_str().unwrap();
+
+    let ingest = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success();
+    let stderr = stderr_of(&ingest);
+    assert!(!stderr.contains("Errors:"), "{stderr}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    assert!(!stderr.contains(SERVER_KEY), "{stderr}");
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    {
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().all(|r| r.path == "/v1/embeddings"));
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some(&format!("Bearer {SERVER_KEY}")))
+        );
+        let lengths: Vec<_> = requests
+            .iter()
+            .map(|r| r.input.as_ref().unwrap().chars().count())
+            .collect();
+        assert_eq!(lengths.iter().max(), Some(&300), "{lengths:?}");
+    }
+
+    lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Error Handling"))
+        .stderr("");
+
+    let status = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .env_remove("LORE_TRACE")
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    let stderr = stderr_of(&status);
+    assert!(
+        stderr.contains(&format!(
+            "\x20 Bind:         localhost:3100\n\n\
+             \x20 Embedding:    OpenAI-compatible server\n\
+             \x20 Server:       ✓ answers at {url}\n\
+             \x20 Model:        {SERVER_MODEL}\n\
+             \x20 API key:      {SERVER_KEY_VARIABLE} is set\n\
+             \x20 Runtime:      —  (run 'lore status --full' to verify inference)\n\
+             \x20 sqlite-vec:   ✓ bundled\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Ollama"), "{stderr}");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.path == "/v1/models"
+                && r.authorization.as_deref() == Some(&format!("Bearer {SERVER_KEY}")))
+    );
+
+    let full = lore()
+        .env_remove(SERVER_KEY_VARIABLE)
+        .env_remove("LORE_TRACE")
+        .args(["status", "--full", "--config", config_arg])
+        .assert()
+        .success();
+    let stderr = stderr_of(&full);
+    assert!(
+        stderr.contains(&format!(
+            "\x20 API key:      ✗ {SERVER_KEY_VARIABLE} is not set\n\
+             \x20 Verifying inference runtime (may take a few seconds)…\n\
+             \x20 Runtime:      ✓ inference OK\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Index model:"), "{stderr}");
+}
+
+#[test]
+fn a_failing_embedding_server_names_itself_without_the_key() {
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, mut config, config_path) = server_project(&url);
+    let config_arg = config_path.to_str().unwrap();
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success();
+
+    let (refusing, _) = serve_fake_embedding_server(ServerAnswer::InvalidKey);
+    use_embedding_server(&mut config, &config_path, &refusing, false);
+    let search = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Error Handling"));
+    assert_eq!(
+        stderr_of(&search),
+        "Warning: the embedding server failed (API key refused), so this search uses text \
+         only. Run 'lore status --full' for details.\n"
+    );
+
+    let status = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .env_remove("LORE_TRACE")
+        .args(["status", "--full", "--config", config_arg])
+        .assert()
+        .success();
+    let stderr = stderr_of(&status);
+    assert!(
+        stderr.contains(&format!(
+            "\x20 Server:       ✗ HTTP 401 at {refusing}\n\
+             \x20 Model:        {SERVER_MODEL}\n\
+             \x20 API key:      {SERVER_KEY_VARIABLE} is set\n\
+             \x20 Verifying inference runtime (may take a few seconds)…\n\
+             \x20 Runtime:      ✗ the server refused the API key (HTTP 401)\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(SERVER_KEY), "{stderr}");
+}
+
+#[test]
+fn the_session_start_trace_records_the_embedding_server_without_its_secrets() {
+    let (_tmp, _config, config_path) = server_project("http://user:secret@127.0.0.1:1/v1");
+    let trace_dir = config_path.with_file_name("trace");
+    lore()
+        .env("LORE_TRACE", "1")
+        .env("LORE_TRACE_DIR", &trace_dir)
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "server-trace",
+            })
+            .to_string(),
+        )
+        .assert()
+        .success();
+
+    let files: Vec<PathBuf> = fs::read_dir(&trace_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let text = fs::read_to_string(&files[0]).unwrap();
+    let record: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    let snapshot = &record["config"];
+    assert_eq!(snapshot["ollama_host"], "http://127.0.0.1:1/v1", "{record}");
+    assert_eq!(snapshot["ollama_model"], SERVER_MODEL, "{record}");
+    assert!(!text.contains("secret"), "{text}");
+    assert!(!text.contains(SERVER_KEY), "{text}");
+}
+
+#[test]
+fn ingest_names_each_embedding_server_remedy_once() {
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::BatchTooSmallAbove(40));
+    let (_tmp, mut config, config_path) = server_project(&url);
+    config.chunking.max_tokens = 100;
+    config.save(&config_path).unwrap();
+
+    let ingest = lore()
+        .env_remove("LORE_DEBUG")
+        .args(["ingest", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stderr = stderr_of(&ingest);
+    let hint = format!(
+        "\x20 ✗ The embedding server at {url} rejected a section as too long. Start \
+         'llama-server' with '-ub' and '-b' of at least 100, or lower [chunking] max_tokens.\n"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Errors: 3\n\
+             \x20 ✗ 1 embedding failure(s) while indexing error-handling.md\n\
+             \x20 ✗ 1 embedding failure(s) while indexing naming-conventions.md\n\
+             \x20 ✗ 1 embedding failure(s) while indexing testing-strategy.md\n\
+             {hint}"
+        )),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches(&hint).count(), 1, "{stderr}");
+}
+
+#[test]
+fn both_tables_warn_on_status_ingest_and_init_but_not_search() {
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, mut config, config_path) = ollama_project("http://127.0.0.1:1");
+    use_embedding_server(&mut config, &config_path, &url, true);
+    let config_arg = config_path.to_str().unwrap();
+    let warning = format!(
+        "Warning: {config_arg} has both an [embedding] and an [ollama] table. Lore uses \
+         [embedding] and ignores [ollama]. Remove the table you do not use.\n"
+    );
+
+    for args in [
+        vec!["init", "--repo", config.knowledge_dir.to_str().unwrap()],
+        vec!["ingest"],
+        vec!["status"],
+    ] {
+        let run = lore()
+            .env_remove("LORE_TRACE")
+            .args(&args)
+            .args(["--config", config_arg])
+            .assert()
+            .success();
+        let stderr = stderr_of(&run);
+        assert_eq!(stderr.matches(&warning).count(), 1, "{args:?}: {stderr}");
+        assert!(!stderr.contains("Ollama"), "{args:?}: {stderr}");
+    }
+    lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn init_checks_an_existing_embedding_table_instead_of_provisioning_ollama() {
+    let (url, requests) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, config, config_path) = server_project(&url);
+    let config_arg = config_path.to_str().unwrap();
+    let repo = config.knowledge_dir.to_str().unwrap();
+
+    let init = lore()
+        .args(["init", "--repo", repo, "--config", config_arg])
+        .assert()
+        .success();
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(&format!(
+            "Using existing config at {config_arg}\n\n\
+             --- Checking the embedding server ---\n\n\
+             Checking {url} with model '{SERVER_MODEL}'...\n\
+             \x20 ✓ The server returned a 768-dimension vector\n\n\
+             --- Ingesting knowledge directory ---\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    assert_eq!(requests.lock().unwrap()[0].input.as_deref(), Some("."));
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+
+    lore()
+        .args([
+            "init", "--repo", repo, "--model", "other", "--config", config_arg,
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(format!(
+            "[embedding] model is \"{SERVER_MODEL}\" in the file, \"other\" from --model"
+        )));
+    lore()
+        .args([
+            "init",
+            "--repo",
+            repo,
+            "--model",
+            SERVER_MODEL,
+            "--config",
+            config_arg,
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn init_stops_when_the_embedding_server_does_not_answer() {
+    let (_tmp, config, config_path) = server_project("http://127.0.0.1:1/v1");
+    let init = lore()
+        .args([
+            "init",
+            "--repo",
+            config.knowledge_dir.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(
+            "Checking http://127.0.0.1:1/v1 with model 'nomic-embed-text-v1.5'...\n\n\
+             Embedding server check failed:\n\
+             \x20 ✗ Cannot reach the embedding server at http://127.0.0.1:1/v1: "
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.ends_with(
+            "\n\x20 Check that the server runs at that address. If a proxy is set, check that \
+             NO_PROXY covers it.\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Ingesting"), "{stderr}");
+}
+
+/// A committed knowledge directory of the seed patterns, with no config
+/// file at the returned path yet.
+fn project_without_config() -> (tempfile::TempDir, Config, PathBuf) {
+    let (tmp, config, config_path) = ollama_project("http://127.0.0.1:1");
+    fs::remove_file(&config_path).unwrap();
+    (tmp, config, config_path)
+}
+
+/// `lore init` arguments that set up the OpenAI-compatible server at `url`.
+fn init_provider_args<'a>(config: &'a Config, config_path: &'a Path, url: &'a str) -> Vec<&'a str> {
+    vec![
+        "init",
+        "--provider",
+        "openai-compatible",
+        "--url",
+        url,
+        "--model",
+        SERVER_MODEL,
+        "--repo",
+        config.knowledge_dir.to_str().unwrap(),
+        "--database",
+        config.database.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
+    ]
+}
+
+#[test]
+fn init_provider_writes_only_an_embedding_table_and_ingests() {
+    let (url, requests) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, config, config_path) = project_without_config();
+    let config_arg = config_path.to_str().unwrap();
+    let mut args = init_provider_args(&config, &config_path, &url);
+    args.extend(["--api-key-environment-variable-name", SERVER_KEY_VARIABLE]);
+
+    let init = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .args(&args)
+        .assert()
+        .success();
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(&format!(
+            "Config written to {config_arg}\n\n\
+             --- Checking the embedding server ---\n\n\
+             Checking {url} with model '{SERVER_MODEL}'...\n\
+             \x20 ✓ The server returned a 768-dimension vector\n\n\
+             --- Ingesting knowledge directory ---\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    assert!(!stderr.contains(SERVER_KEY), "{stderr}");
+
+    let written = fs::read_to_string(&config_path).unwrap();
+    assert!(!written.contains("[ollama]"), "{written}");
+    let loaded = Config::load(&config_path).unwrap();
+    assert_eq!(loaded.ollama, None);
+    assert_eq!(
+        loaded.embedding,
+        Some(lore::config::EmbeddingConfig {
+            provider: "openai-compatible".to_string(),
+            url: url.clone(),
+            model: SERVER_MODEL.to_string(),
+            api_key_environment_variable_name: Some(SERVER_KEY_VARIABLE.to_string()),
+            dimensions: lore::config::Dimensions::Auto,
+        })
+    );
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some(&format!("Bearer {SERVER_KEY}")))
+    );
+
+    let rerun = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .args(&args)
+        .assert()
+        .success();
+    assert!(
+        stderr_of(&rerun).contains(&format!("Using existing config at {config_arg}\n")),
+        "{}",
+        stderr_of(&rerun)
+    );
+}
+
+#[test]
+fn init_provider_flags_out_of_place_are_usage_errors_that_write_nothing() {
+    let (_tmp, config, config_path) = project_without_config();
+    let repo = config.knowledge_dir.to_str().unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    let url = "http://127.0.0.1:1/v1";
+
+    for flags in [
+        vec!["--provider", "openai-compatible", "--model", SERVER_MODEL],
+        vec!["--provider", "openai-compatible", "--url", url],
+        vec!["--url", url],
+        vec!["--api-key-environment-variable-name", SERVER_KEY_VARIABLE],
+    ] {
+        lore()
+            .args(["init", "--repo", repo, "--config", config_arg])
+            .args(&flags)
+            .assert()
+            .code(2);
+        assert!(!config_path.exists(), "{flags:?}");
+    }
+    for flags in [
+        vec!["--provider", "ollama", "--url", url],
+        vec![
+            "--provider",
+            "ollama",
+            "--api-key-environment-variable-name",
+            SERVER_KEY_VARIABLE,
+        ],
+    ] {
+        lore()
+            .args(["init", "--repo", repo, "--config", config_arg])
+            .args(&flags)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::starts_with(
+                "error: --url and --api-key-environment-variable-name apply only with \
+                 --provider openai-compatible\n",
+            ));
+        assert!(!config_path.exists(), "{flags:?}");
+    }
+}
+
+#[test]
+fn init_provider_names_each_flag_that_disagrees_with_the_file() {
+    let (_tmp, config, config_path) = server_project("http://127.0.0.1:1/v1");
+    let repo = config.knowledge_dir.to_str().unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    lore()
+        .args([
+            "init",
+            "--provider",
+            "ollama",
+            "--repo",
+            repo,
+            "--config",
+            config_arg,
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "provider is \"openai-compatible\" in the file, \"ollama\" from --provider",
+        ));
+
+    let mut args = init_provider_args(
+        &config,
+        &config_path,
+        "http://user:secret@127.0.0.1:2/v1?api_key=hidden",
+    );
+    args.extend(["--api-key-environment-variable-name", "OTHER_KEY"]);
+    let init = lore().args(&args).assert().code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(
+            "\x20 [embedding] url is \"http://127.0.0.1:1/v1\" in the file, \
+             \"http://127.0.0.1:2/v1\" from --url\n\
+             \x20 [embedding] api_key_environment_variable_name is \
+             \"LORE_E2E_EMBEDDING_KEY\" in the file, \"OTHER_KEY\" from \
+             --api-key-environment-variable-name\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret"), "{stderr}");
+    assert!(!stderr.contains("hidden"), "{stderr}");
+
+    let (_tmp, mut config, config_path) = server_project("http://127.0.0.1:1/v1");
+    config
+        .embedding
+        .as_mut()
+        .unwrap()
+        .api_key_environment_variable_name = None;
+    config.save(&config_path).unwrap();
+    let mut args = init_provider_args(&config, &config_path, "http://127.0.0.1:1/v1/");
+    args.extend(["--api-key-environment-variable-name", "OTHER_KEY"]);
+    let init = lore().args(&args).assert().code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(
+            "\x20 [embedding] api_key_environment_variable_name is not in the file, \
+             \"OTHER_KEY\" from --api-key-environment-variable-name\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("[embedding] url is"), "{stderr}");
+
+    let (_tmp, config, config_path) = ollama_project("http://127.0.0.1:1");
+    lore()
+        .args(init_provider_args(
+            &config,
+            &config_path,
+            "http://127.0.0.1:1/v1",
+        ))
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "provider is \"ollama\" in the file, \"openai-compatible\" from --provider",
+        ));
+}
+
+#[test]
+fn init_provider_keeps_the_file_and_names_the_remedy_when_the_server_fails() {
+    let (_tmp, config, config_path) = project_without_config();
+    let config_arg = config_path.to_str().unwrap();
+    let remedy = format!(
+        "Fix the server or the flags, then remove {config_arg} before you run 'lore init' again.\n"
+    );
+
+    let init = lore()
+        .args(init_provider_args(
+            &config,
+            &config_path,
+            "http://127.0.0.1:1/v1",
+        ))
+        .assert()
+        .code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(&format!("Config written to {config_arg}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\x20 ✗ Cannot reach the embedding server at http://127.0.0.1:1/v1: "),
+        "{stderr}"
+    );
+    assert!(stderr.ends_with(&format!(".\n\n{remedy}")), "{stderr}");
+    assert!(!stderr.contains("Ingesting"), "{stderr}");
+    assert!(config_path.exists());
+
+    fs::remove_file(&config_path).unwrap();
+    let init = lore()
+        .args(init_provider_args(&config, &config_path, "127.0.0.1:1/v1"))
+        .assert()
+        .code(1);
+    assert_eq!(
+        stderr_of(&init),
+        format!(
+            "=== lore init ===\n\n\
+             Config written to {config_arg}\n\n\
+             Error: Cannot use config at {config_arg}: [embedding] url has no http:// or \
+             https:// scheme. Start it with one of them.\n\
+             {remedy}"
+        )
+    );
+
+    fs::remove_file(&config_path).unwrap();
+    let init = lore()
+        .args(init_provider_args(
+            &config,
+            &config_path,
+            "http://127.0.0.1:1/v1?api_key=hidden",
+        ))
+        .assert()
+        .code(1);
+    assert_eq!(
+        stderr_of(&init),
+        format!(
+            "=== lore init ===\n\n\
+             Config written to {config_arg}\n\n\
+             Error: Cannot use config at {config_arg}: [embedding] url has a query or a \
+             fragment, and lore adds /embeddings to the url's path. Remove everything \
+             from the first \"?\" or \"#\".\n\
+             {remedy}"
+        )
+    );
+
+    fs::remove_file(&config_path).unwrap();
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::Vector);
+    lore()
+        .args(init_provider_args(&config, &config_path, &url))
+        .assert()
+        .success();
+}
+
+#[test]
+fn an_ollama_index_refuses_an_embedding_server_until_a_forced_rebuild() {
+    let (ollama, _) = serve_fake_ollama();
+    let (_tmp, mut config, config_path) = ollama_project(&ollama);
+    let config_arg = config_path.to_str().unwrap();
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success();
+
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::Vector);
+    use_embedding_server(&mut config, &config_path, &url, false);
+    let cause = format!(
+        "the index was built with nomic-embed-text on Ollama but lore is configured for \
+         {SERVER_MODEL} on an OpenAI-compatible server"
+    );
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .code(1)
+        .stderr(format!(
+            "Ingesting knowledge directory...\n\n\
+             Error: Refusing to ingest: {cause}, and vectors from two models cannot be \
+             searched together. Run 'lore ingest --force' to rebuild the index.\n"
+        ));
+    lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stderr(format!(
+            "Warning: {cause}, so searches use text only. Run 'lore ingest --force' to \
+             rebuild the index.\n"
+        ));
+
+    lore()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success();
+    lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn embedding_dimensions_the_model_does_not_return_refuse_and_name_the_table() {
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, mut config, config_path) = server_project(&url);
+    config.embedding.as_mut().unwrap().dimensions = lore::config::Dimensions::Fixed(1024);
+    config.save(&config_path).unwrap();
+
+    lore()
+        .args(["ingest", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stderr(format!(
+            "Ingesting knowledge directory...\n\n\
+             Error: Refusing to ingest: {SERVER_MODEL} returns 768-dimension vectors but \
+             [embedding] dimensions is 1024. Set [embedding] dimensions to 768 or \"auto\", \
+             or configure a model that returns 1024-dimension vectors.\n"
+        ));
 }

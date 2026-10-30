@@ -62,15 +62,29 @@ file across the extension boundary, such as `.md` renamed to `.txt`, is treated 
 
 | Field        | Type                | Default                    | Description                                                                                                                                                                         |
 | ------------ | ------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `host`       | string              | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host.                                                                                                             |
+| `host`       | string              | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host. It holds no query or fragment.                                                                              |
 | `model`      | string              | `"nomic-embed-text"`       | Embedding model name. Must be available in Ollama. Other options include `mxbai-embed-large` (1024 dimensions) and `snowflake-arctic-embed2` (1024 dimensions).                     |
 | `dimensions` | `"auto"` or integer | `"auto"`                   | `"auto"` (omitted on save) takes the model's width. An integer is a check, never sent to Ollama: a model of another width stops ingest with exit 1, naming both widths and the fix. |
+
+### `[embedding]` Section
+
+This section points lore at an OpenAI-compatible embedding server, such as `llama-server`, in place
+of Ollama. A config needs either an `[ollama]` or an `[embedding]` table. With both, lore uses
+`[embedding]` and ignores `[ollama]`. [Embedding Servers](embedding-servers.md) sets one up.
+
+| Field                               | Type                | Default  | Description                                                                                                                                                                                                                   |
+| ----------------------------------- | ------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`                          | string              | required | Must be `"openai-compatible"`.                                                                                                                                                                                                |
+| `url`                               | string              | required | Base URL of the server's API, such as `"http://127.0.0.1:8080/v1"`. Lore sends `POST {url}/embeddings` and checks the server with `GET {url}/models`. It starts with `http://` or `https://`, and holds no query or fragment. |
+| `model`                             | string              | required | Model name sent with each request.                                                                                                                                                                                            |
+| `api_key_environment_variable_name` | string              | unset    | Name of the environment variable that holds the API key. Lore sends the key as `Authorization: Bearer <key>` when the variable is set and not empty.                                                                          |
+| `dimensions`                        | `"auto"` or integer | `"auto"` | As in `[ollama]`: an integer is a check, never sent to the server. A model that returns another number of dimensions stops ingest with exit 1.                                                                                |
 
 ### `[search]` Section
 
 | Field                     | Type           | Default | Description                                                                                                                                                                                                                                                           |
 | ------------------------- | -------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `hybrid`                  | bool           | `true`  | Enable hybrid search (FTS5 + vector via Ollama). Set to `false` for FTS5-only search, which is faster but lacks semantic matching.                                                                                                                                    |
+| `hybrid`                  | bool           | `true`  | Enable hybrid search (FTS5 + vector via the embedding server). Set to `false` for FTS5-only search, which is faster but lacks semantic matching.                                                                                                                      |
 | `top_k`                   | usize          | `5`     | Number of top results to consider before sibling expansion and deduplication. Higher values inject more context per tool call.                                                                                                                                        |
 | `min_relevance`           | float          | `0.6`   | Minimum normalised score for a result to be injected. Applied only during hybrid search with successful embedding. Set to `0.0` to disable.                                                                                                                           |
 | `min_relevance_universal` | optional float | unset   | Per-tier score floor applied to universal-tagged patterns at PreToolUse search time. When unset, the effective universal floor inherits from `min_relevance`. Non-universal results continue to be filtered against `min_relevance` regardless of this field's value. |
@@ -85,10 +99,10 @@ a relevance axis (the pattern fires on calls in its tool class but with weak top
 
 ### `[chunking]` Section
 
-| Field        | Type   | Default     | Description                                                                                                                   |
-| ------------ | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `strategy`   | string | `"heading"` | Chunking strategy. Currently only `"heading"` is implemented, which splits markdown files on headings (`#` through `######`). |
-| `max_tokens` | usize  | `1024`      | Maximum tokens per chunk. Reserved for future token-based limiting (not yet implemented).                                     |
+| Field        | Type   | Default     | Description                                                                                                                                                                                                                                                            |
+| ------------ | ------ | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strategy`   | string | `"heading"` | Chunking strategy. Currently only `"heading"` is implemented, which splits markdown files on headings (`#` through `######`).                                                                                                                                          |
+| `max_tokens` | usize  | `1024`      | Lore does not split sections by tokens. An OpenAI-compatible embedding server gets at most `max_tokens × 3` characters of each section. If `llama-server` rejects that as too long, lore tries once more with `max_tokens × 2` characters. Ollama gets whole sections. |
 
 ### `[trace]` Section
 
@@ -135,10 +149,10 @@ documentation.
 ### What degrades or breaks without git
 
 - **Delta ingest is unavailable.** Every `lore ingest` re-reads and re-embeds every markdown file in
-  the knowledge directory. On a large corpus this is slower and multiplies the number of Ollama
-  embedding calls. Delta ingest uses `git diff` against the last ingested commit SHA. Without git,
-  there is no baseline to diff against. `lore ingest --force` is the equivalent rebuild path inside
-  a git repository when the database needs to be regenerated from scratch.
+  the knowledge directory. On a large corpus this is slower and multiplies the number of embedding
+  calls. Delta ingest uses `git diff` against the last ingested commit SHA. Without git, there is no
+  baseline to diff against. `lore ingest --force` is the equivalent rebuild path inside a git
+  repository when the database needs to be regenerated from scratch.
 - **Inbox branch workflow breaks.** Setting `[git] inbox_branch_prefix` in `lore.toml` causes
   `add_pattern`, `update_pattern`, and `append_to_pattern` to fail, because these commands call
   `git` unconditionally to create and push per-submission branches. Omit the `[git]` section
@@ -290,7 +304,9 @@ These flags apply to all commands:
 | Command            | Flag                | Description                                                                                                                                                                                                                                                                                    |
 | ------------------ | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lore init`        | `--repo <path>`     | Path to the knowledge directory. A git repository is recommended; see [Git Integration](#git-integration).                                                                                                                                                                                     |
-| `lore init`        | `--model <name>`    | Embedding model name (default: `nomic-embed-text`).                                                                                                                                                                                                                                            |
+| `lore init`        | `--provider <name>` | `ollama` (default) or `openai-compatible`.                                                                                                                                                                                                                                                     |
+| `lore init`        | `--url <url>`       | Base URL, for `openai-compatible` only.                                                                                                                                                                                                                                                        |
+| `lore init`        | `--model <name>`    | Embedding model name (Ollama default: `nomic-embed-text`).                                                                                                                                                                                                                                     |
 | `lore init`        | `--bind <addr>`     | Bind address (default: `localhost:3100`).                                                                                                                                                                                                                                                      |
 | `lore init`        | `--database <path>` | Database file path (overrides the XDG default).                                                                                                                                                                                                                                                |
 | `lore ingest`      | `--force`           | Force full re-ingest: drops and recreates the FTS5 table, re-embeds all files. Required after schema changes such as tokeniser updates.                                                                                                                                                        |
@@ -303,6 +319,10 @@ These flags apply to all commands:
 | `lore trace why`   | `--tool <name>`     | Filter to records whose `call_context.tool_name` matches (`Edit`, `Write`, `Bash`, …). Applies to PreToolUse and PostToolUse records only.                                                                                                                                                     |
 | `lore trace why`   | `--agent <name>`    | Filter to records whose `agent` field matches. Today every record carries `agent: "claude-code"`; the filter is forward-compatible for future Cursor / opencode adapters that share the trace directory.                                                                                       |
 | `lore trace prune` | _(no flags)_        | Run an unbounded maintenance pass: compress files older than `gzip_older_than_days`, delete files older than `retain_days`, and bump the throttle state file. Honours the `[trace]` retention settings; no override flags. Reports per-file errors to stderr but exits `0` on partial success. |
+
+`--api-key-environment-variable-name <name>`, also for `openai-compatible` only, names the API key's
+environment variable. `openai-compatible` requires `--url` and `--model`. A missing or misplaced
+flag exits 2.
 
 `lore init` never rewrites an existing config: a flag that disagrees exits 1, naming the key and
 both values.

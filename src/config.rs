@@ -9,7 +9,10 @@ pub struct Config {
     pub database: PathBuf,
     // TODO: evaluate TCP transport as alternative to stdio
     pub bind: String,
-    pub ollama: OllamaConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama: Option<OllamaConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingConfig>,
     pub search: SearchConfig,
     pub chunking: ChunkingConfig,
     #[serde(default)]
@@ -29,6 +32,59 @@ pub struct OllamaConfig {
     pub model: String,
     #[serde(default, skip_serializing_if = "Dimensions::is_auto")]
     pub dimensions: Dimensions,
+}
+
+/// The `[embedding]` table: an OpenAI-compatible embedding server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub provider: String,
+    /// Base URL; requests go to `{url}/embeddings`.
+    pub url: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_environment_variable_name: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Dimensions::is_auto",
+        deserialize_with = "embedding_dimensions"
+    )]
+    pub dimensions: Dimensions,
+}
+
+/// The only `[embedding] provider` lore takes.
+pub const OPENAI_COMPATIBLE: &str = "openai-compatible";
+
+/// The embedding server table a configuration uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EmbeddingTable<'a> {
+    Ollama(&'a OllamaConfig),
+    OpenAiCompatible(&'a EmbeddingConfig),
+}
+
+impl<'a> EmbeddingTable<'a> {
+    /// The table's name as a config file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ollama(_) => "[ollama]",
+            Self::OpenAiCompatible(_) => "[embedding]",
+        }
+    }
+
+    /// The server's address: `[ollama] host` or `[embedding] url`.
+    pub fn url(self) -> &'a str {
+        match self {
+            Self::Ollama(ollama) => &ollama.host,
+            Self::OpenAiCompatible(embedding) => &embedding.url,
+        }
+    }
+
+    pub fn model(self) -> &'a str {
+        match self {
+            Self::Ollama(ollama) => &ollama.model,
+            Self::OpenAiCompatible(embedding) => &embedding.model,
+        }
+    }
 }
 
 /// Width of the configured model's vectors. `Auto` takes the width the
@@ -66,43 +122,52 @@ impl Serialize for Dimensions {
 
 impl<'de> Deserialize<'de> for Dimensions {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::{Error, Unexpected, Visitor};
+        deserializer.deserialize_any(DimensionsVisitor("[ollama]"))
+    }
+}
 
-        struct DimensionsVisitor;
+fn embedding_dimensions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Dimensions, D::Error> {
+    deserializer.deserialize_any(DimensionsVisitor("[embedding]"))
+}
 
-        impl Visitor<'_> for DimensionsVisitor {
-            type Value = Dimensions;
+/// Reads `dimensions` in the table it names.
+struct DimensionsVisitor(&'static str);
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("\"auto\" or a positive integer for [ollama] dimensions")
-            }
+impl serde::de::Visitor<'_> for DimensionsVisitor {
+    type Value = Dimensions;
 
-            fn visit_str<E: Error>(self, value: &str) -> Result<Dimensions, E> {
-                if value == "auto" {
-                    Ok(Dimensions::Auto)
-                } else {
-                    Err(E::invalid_value(Unexpected::Str(value), &self))
-                }
-            }
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\"auto\" or a positive integer for {} dimensions",
+            self.0
+        )
+    }
 
-            fn visit_i64<E: Error>(self, value: i64) -> Result<Dimensions, E> {
-                usize::try_from(value)
-                    .ok()
-                    .filter(|width| *width > 0)
-                    .map(Dimensions::Fixed)
-                    .ok_or_else(|| E::invalid_value(Unexpected::Signed(value), &self))
-            }
-
-            fn visit_u64<E: Error>(self, value: u64) -> Result<Dimensions, E> {
-                usize::try_from(value)
-                    .ok()
-                    .filter(|width| *width > 0)
-                    .map(Dimensions::Fixed)
-                    .ok_or_else(|| E::invalid_value(Unexpected::Unsigned(value), &self))
-            }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Dimensions, E> {
+        if value == "auto" {
+            Ok(Dimensions::Auto)
+        } else {
+            Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
         }
+    }
 
-        deserializer.deserialize_any(DimensionsVisitor)
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Dimensions, E> {
+        usize::try_from(value)
+            .ok()
+            .filter(|width| *width > 0)
+            .map(Dimensions::Fixed)
+            .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Signed(value), &self))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Dimensions, E> {
+        usize::try_from(value)
+            .ok()
+            .filter(|width| *width > 0)
+            .map(Dimensions::Fixed)
+            .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))
     }
 }
 
@@ -190,11 +255,12 @@ impl Config {
             knowledge_dir,
             database,
             bind: "localhost:3100".to_string(),
-            ollama: OllamaConfig {
+            ollama: Some(OllamaConfig {
                 host: "http://127.0.0.1:11434".to_string(),
                 model: model.to_string(),
                 dimensions: Dimensions::Auto,
-            },
+            }),
+            embedding: None,
             search: SearchConfig {
                 hybrid: true,
                 top_k: 5,
@@ -239,8 +305,83 @@ impl Config {
             ),
             Err(e) => anyhow::bail!("Cannot read config at {}: {e}", path.display()),
         };
-        toml::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("Cannot parse config at {}: {e}", path.display()))
+        let config: Self = toml::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("Cannot parse config at {}: {e}", path.display()))?;
+        config.check_embedding_table(path)?;
+        Ok(config)
+    }
+
+    /// Refuse an embedding server table no request could work with. The
+    /// messages never echo a url, because it may hold a key.
+    fn check_embedding_table(&self, path: &Path) -> anyhow::Result<()> {
+        let refuse =
+            |reason: &str| anyhow::anyhow!("Cannot use config at {}: {reason}", path.display());
+        match (&self.embedding, &self.ollama) {
+            (None, None) => Err(refuse(
+                "it has neither an [ollama] nor an [embedding] table. Add one; \
+                 docs/configuration.md describes both.",
+            )),
+            (Some(embedding), _) => {
+                if embedding.provider != OPENAI_COMPATIBLE {
+                    return Err(refuse(&format!(
+                        "[embedding] provider is \"{}\", and the only provider it takes is \
+                         \"{OPENAI_COMPATIBLE}\". Set up Ollama in an [ollama] table instead.",
+                        embedding.provider
+                    )));
+                }
+                let scheme = embedding.url.to_ascii_lowercase();
+                if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
+                    return Err(refuse(
+                        "[embedding] url has no http:// or https:// scheme. Start it with one \
+                         of them.",
+                    ));
+                }
+                if embedding.url.contains(['?', '#']) {
+                    return Err(refuse(
+                        "[embedding] url has a query or a fragment, and lore adds /embeddings \
+                         to the url's path. Remove everything from the first \"?\" or \"#\".",
+                    ));
+                }
+                Ok(())
+            }
+            (None, Some(ollama)) => {
+                if ollama.host.contains(['?', '#']) {
+                    return Err(refuse(
+                        "[ollama] host has a query or a fragment, and lore adds /api/embed to \
+                         the host's path. Remove everything from the first \"?\" or \"#\".",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The embedding server table lore uses: `[embedding]` when the file has
+    /// one, else `[ollama]`.
+    ///
+    /// # Panics
+    ///
+    /// On a config with neither table, which [`Config::load`] refuses.
+    pub fn embedding_table(&self) -> EmbeddingTable<'_> {
+        match &self.embedding {
+            Some(embedding) => EmbeddingTable::OpenAiCompatible(embedding),
+            None => EmbeddingTable::Ollama(
+                self.ollama
+                    .as_ref()
+                    .expect("Config::load refuses a config with neither table"),
+            ),
+        }
+    }
+
+    /// The warning for a file with both tables, read from `path`.
+    pub fn both_tables_warning(&self, path: &Path) -> Option<String> {
+        (self.embedding.is_some() && self.ollama.is_some()).then(|| {
+            format!(
+                "Warning: {} has both an [embedding] and an [ollama] table. Lore uses \
+                 [embedding] and ignores [ollama]. Remove the table you do not use.",
+                path.display()
+            )
+        })
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -348,8 +489,10 @@ mod tests {
         let config = sample_config();
 
         assert_eq!(config.bind, "localhost:3100");
-        assert_eq!(config.ollama.host, "http://127.0.0.1:11434");
-        assert_eq!(config.ollama.model, "nomic-embed-text");
+        let ollama = config.ollama.as_ref().unwrap();
+        assert_eq!(ollama.host, "http://127.0.0.1:11434");
+        assert_eq!(ollama.model, "nomic-embed-text");
+        assert_eq!(config.embedding, None);
         assert!(config.search.hybrid);
         assert_eq!(config.search.top_k, 5);
         assert!((config.search.min_relevance - 0.6).abs() < f64::EPSILON);
@@ -728,7 +871,7 @@ include_transcript_tail = false
 
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded, sample_config());
-        assert_eq!(loaded.ollama.dimensions, Dimensions::Auto);
+        assert_eq!(loaded.ollama.as_ref().unwrap().dimensions, Dimensions::Auto);
 
         loaded.save(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SAVED_DEFAULT);
@@ -738,15 +881,16 @@ include_transcript_tail = false
     fn dimensions_auto_reads_as_absent() {
         let cfg: Config = toml::from_str(&with_dimensions("dimensions = \"auto\"")).unwrap();
         assert_eq!(cfg, sample_config());
-        assert_eq!(cfg.ollama.dimensions.fixed(), None);
+        assert_eq!(cfg.ollama.unwrap().dimensions.fixed(), None);
     }
 
     #[test]
     fn dimensions_integer_is_a_fixed_width_that_survives_a_save() {
         let text = with_dimensions("dimensions = 1024");
         let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.ollama.dimensions, Dimensions::Fixed(1024));
-        assert_eq!(cfg.ollama.dimensions.fixed(), Some(1024));
+        let dimensions = cfg.ollama.as_ref().unwrap().dimensions;
+        assert_eq!(dimensions, Dimensions::Fixed(1024));
+        assert_eq!(dimensions.fixed(), Some(1024));
         assert_eq!(toml::to_string_pretty(&cfg).unwrap(), text);
     }
 
@@ -762,6 +906,190 @@ include_transcript_tail = false
                 "value {value}: {msg}"
             );
         }
+    }
+
+    // -- [embedding] ----------------------------------------------------------
+
+    const OLLAMA_TABLE: &str = "\
+[ollama]
+host = \"http://127.0.0.1:11434\"
+model = \"nomic-embed-text\"
+";
+
+    const EMBEDDING_TABLE: &str = "\
+[embedding]
+provider = \"openai-compatible\"
+url = \"http://127.0.0.1:8080/v1\"
+model = \"nomic-embed-text-v1.5\"
+api_key_environment_variable_name = \"LLAMA_API_KEY\"
+dimensions = 768
+";
+
+    /// `SAVED_DEFAULT` with its `[ollama]` table replaced by `tables`.
+    fn with_tables(tables: &str) -> String {
+        SAVED_DEFAULT.replace(OLLAMA_TABLE, tables)
+    }
+
+    /// The message `Config::load` fails with for a file holding `tables`.
+    fn load_error(tables: &str) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        std::fs::write(&path, with_tables(tables)).unwrap();
+        let msg = format!("{:#}", Config::load(&path).unwrap_err());
+        (msg, path.display().to_string())
+    }
+
+    #[test]
+    fn an_embedding_table_loads_and_saves_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        let text = with_tables(EMBEDDING_TABLE);
+        std::fs::write(&path, &text).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.ollama, None);
+        let table = loaded.embedding_table();
+        assert!(matches!(table, EmbeddingTable::OpenAiCompatible(_)));
+        assert_eq!(table.name(), "[embedding]");
+        assert_eq!(table.url(), "http://127.0.0.1:8080/v1");
+        assert_eq!(table.model(), "nomic-embed-text-v1.5");
+        let embedding = loaded.embedding.as_ref().unwrap();
+        assert_eq!(
+            embedding.api_key_environment_variable_name.as_deref(),
+            Some("LLAMA_API_KEY")
+        );
+        assert_eq!(embedding.dimensions, Dimensions::Fixed(768));
+        assert_eq!(loaded.both_tables_warning(&path), None);
+
+        loaded.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn an_ollama_table_is_the_one_used_without_an_embedding_table() {
+        let config = sample_config();
+        let table = config.embedding_table();
+        assert!(matches!(table, EmbeddingTable::Ollama(_)));
+        assert_eq!(table.name(), "[ollama]");
+        assert_eq!(table.url(), "http://127.0.0.1:11434");
+        assert_eq!(table.model(), "nomic-embed-text");
+        assert!(
+            !toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("embedding")
+        );
+    }
+
+    #[test]
+    fn an_unknown_embedding_key_is_a_parse_error() {
+        let (msg, path) = load_error(&EMBEDDING_TABLE.replace("dimensions", "api_key"));
+        assert!(
+            msg.starts_with(&format!("Cannot parse config at {path}: ")),
+            "{msg}"
+        );
+        assert!(msg.contains("unknown field `api_key`"), "{msg}");
+    }
+
+    #[test]
+    fn an_embedding_provider_other_than_openai_compatible_is_refused() {
+        let (msg, path) = load_error(&EMBEDDING_TABLE.replace("openai-compatible", "ollama"));
+        assert_eq!(
+            msg,
+            format!(
+                "Cannot use config at {path}: [embedding] provider is \"ollama\", and the only \
+                 provider it takes is \"openai-compatible\". Set up Ollama in an [ollama] table \
+                 instead."
+            )
+        );
+    }
+
+    #[test]
+    fn a_config_without_an_embedding_server_table_is_refused() {
+        let (msg, path) = load_error("");
+        assert_eq!(
+            msg,
+            format!(
+                "Cannot use config at {path}: it has neither an [ollama] nor an [embedding] \
+                 table. Add one; docs/configuration.md describes both."
+            )
+        );
+    }
+
+    #[test]
+    fn an_embedding_url_lore_cannot_extend_is_refused_without_echoing_it() {
+        const QUERY: &str = "[embedding] url has a query or a fragment, and lore adds \
+                             /embeddings to the url's path. Remove everything from the first \
+                             \"?\" or \"#\".";
+        const SCHEME: &str =
+            "[embedding] url has no http:// or https:// scheme. Start it with one of them.";
+        for (url, reason) in [
+            ("http://h/v1?key=secret", QUERY),
+            ("https://h/v1#secret", QUERY),
+            ("h:8080/secret", SCHEME),
+            ("ftp://h/secret", SCHEME),
+        ] {
+            let (msg, path) = load_error(&EMBEDDING_TABLE.replace("http://127.0.0.1:8080/v1", url));
+            assert_eq!(
+                msg,
+                format!("Cannot use config at {path}: {reason}"),
+                "{url}"
+            );
+            assert!(!msg.contains("secret"), "{msg}");
+        }
+        let upper = EMBEDDING_TABLE.replace("http://", "HTTPS://");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        std::fs::write(&path, with_tables(&upper)).unwrap();
+        assert!(Config::load(&path).is_ok());
+    }
+
+    #[test]
+    fn an_ollama_host_with_a_query_or_a_fragment_is_refused() {
+        for host in ["http://127.0.0.1:11434?a=b", "http://127.0.0.1:11434/#x"] {
+            let (msg, path) = load_error(&OLLAMA_TABLE.replace("http://127.0.0.1:11434", host));
+            assert_eq!(
+                msg,
+                format!(
+                    "Cannot use config at {path}: [ollama] host has a query or a fragment, and \
+                     lore adds /api/embed to the host's path. Remove everything from the first \
+                     \"?\" or \"#\"."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_dimensions_other_than_auto_or_a_positive_integer_name_the_embedding_table() {
+        let (msg, _) = load_error(&EMBEDDING_TABLE.replace("768", "0"));
+        assert!(
+            msg.contains("\"auto\" or a positive integer for [embedding] dimensions"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_file_with_both_tables_uses_embedding_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        std::fs::write(
+            &path,
+            with_tables(&format!("{OLLAMA_TABLE}\n{EMBEDDING_TABLE}")),
+        )
+        .unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert!(matches!(
+            loaded.embedding_table(),
+            EmbeddingTable::OpenAiCompatible(_)
+        ));
+        assert_eq!(
+            loaded.both_tables_warning(&path).unwrap(),
+            format!(
+                "Warning: {} has both an [embedding] and an [ollama] table. Lore uses \
+                 [embedding] and ignores [ollama]. Remove the table you do not use.",
+                path.display()
+            )
+        );
     }
 
     // -- default_trace_dir (U1: etcetera path resolution) -------------------

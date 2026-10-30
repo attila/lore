@@ -380,11 +380,11 @@ relevant pattern but also consumes more of the agent's context window.
 
 ### Search Mode (`search.hybrid`)
 
-Default: `true`. When enabled, lore combines FTS5 lexical search with Ollama vector search using
-Reciprocal Rank Fusion.
+Default: `true`. When enabled, lore combines FTS5 lexical search with vector search using Reciprocal
+Rank Fusion. The vectors come from the embedding server.
 
-Set to `false` to use FTS5 only. This is faster (no Ollama round-trip at query time) but loses
-semantic matching. Patterns are found only through keyword overlap, not meaning.
+Set to `false` to use FTS5 only. This is faster (no embedding server round-trip at query time) but
+loses semantic matching. Patterns are found only through keyword overlap, not meaning.
 
 ### Force Re-Ingest (`lore ingest --force`)
 

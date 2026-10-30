@@ -10,6 +10,7 @@ pub mod hook;
 pub mod ingest;
 pub mod lockfile;
 pub mod loreignore;
+pub mod openai_compatible;
 pub mod provision;
 pub mod server;
 pub mod status;

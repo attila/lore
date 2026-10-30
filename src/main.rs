@@ -3,16 +3,21 @@
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
-use lore::config::{Config, default_config_path, default_database_path};
+use lore::config::{
+    Config, Dimensions, EmbeddingConfig, EmbeddingTable, OPENAI_COMPATIBLE, default_config_path,
+    default_database_path,
+};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{
-    Embedder, EmbeddingIdentity, OllamaClient, VectorMismatch, render_failure, same_model,
+    Embedder, EmbeddingBackend, EmbeddingIdentity, VectorMismatch, render_failure, same_model,
 };
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
+use lore::openai_compatible::{KeyVariable, redact_url};
 use lore::provision::ProbeOutcome;
 use lore::status::format_languages_line;
 use lore::{git, ingest, provision, server};
@@ -38,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Provision Ollama, pull model, create config, run first ingestion
+    /// Set up lore: write the config, check the embedding model, run the first ingest
     ///
     /// An existing config file is used as it is and never rewritten. A flag
     /// that disagrees with it is an error; edit the file, or remove it to
@@ -48,9 +53,25 @@ enum Commands {
         #[arg(long)]
         repo: PathBuf,
 
-        /// Ollama embedding model to use [default: nomic-embed-text]
-        #[arg(long)]
+        /// Embedding server for a new config [default: ollama]
+        #[arg(long, value_enum)]
+        provider: Option<Provider>,
+
+        /// Base URL of the OpenAI-compatible embedding server, usually ending in /v1
+        #[arg(
+            long,
+            required_if_eq("provider", "openai-compatible"),
+            requires = "provider"
+        )]
+        url: Option<String>,
+
+        /// Embedding model to use [default with Ollama: nomic-embed-text]
+        #[arg(long, required_if_eq("provider", "openai-compatible"))]
         model: Option<String>,
+
+        /// Environment variable that holds the embedding server's API key
+        #[arg(long, value_name = "NAME", requires = "provider")]
+        api_key_environment_variable_name: Option<String>,
 
         /// MCP server bind address [default: localhost:3100]
         #[arg(long)]
@@ -77,8 +98,8 @@ EXIT CODES:
      embedding service). Relative paths are resolved against the current working directory,
      not the knowledge directory. Also exits 1, writing nothing, when the index was built
      with another embedding model than the configured one; `lore ingest --force` rebuilds it.
-     Also exits 1, writing nothing, when the model's vectors differ in width from
-     `[ollama] dimensions`; change the setting or the model.
+     Also exits 1, writing nothing, when the model returns another number of dimensions
+     than `dimensions` in `[ollama]` or `[embedding]`; change the setting or the model.
 
 NOTES:
   - `--file` takes one path per invocation; globs are not expanded.
@@ -144,13 +165,14 @@ EXIT CODES:
 
     /// Check health of all components
     Status {
-        /// Run a deeper check that exercises Ollama inference, not just the
-        /// daemon and model manifest. Catches "manifest present but runner
-        /// broken" cases (e.g. the current Homebrew bottle bug).
+        /// Run a deeper check that asks the embedding server for a vector,
+        /// not just whether it answers. On Ollama, this catches "manifest
+        /// present but runner broken" cases (e.g. the current Homebrew bottle
+        /// bug).
         ///
         /// Adds 3–15 s of cold-load latency on first invocation; subsequent
-        /// invocations may be faster if Ollama still has the model resident
-        /// from a recent call.
+        /// invocations may be faster if the server still has the model
+        /// resident from a recent call.
         #[arg(long)]
         full: bool,
     },
@@ -160,6 +182,52 @@ EXIT CODES:
         #[command(subcommand)]
         action: TraceAction,
     },
+}
+
+/// The embedding server `lore init --provider` sets up.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Provider {
+    Ollama,
+    #[value(name = "openai-compatible")]
+    OpenAiCompatible,
+}
+
+impl Provider {
+    /// The name `--provider` takes and an error message prints.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::OpenAiCompatible => OPENAI_COMPATIBLE,
+        }
+    }
+}
+
+/// The embedding server flags of `lore init`.
+struct ServerFlags<'a> {
+    provider: Option<Provider>,
+    url: Option<&'a str>,
+    model: Option<&'a str>,
+    api_key_variable: Option<&'a str>,
+}
+
+impl ServerFlags<'_> {
+    /// The `[embedding]` table a new config holds, when the flags name an
+    /// OpenAI-compatible embedding server.
+    fn embedding_table(&self) -> Option<EmbeddingConfig> {
+        (self.provider == Some(Provider::OpenAiCompatible)).then(|| EmbeddingConfig {
+            provider: OPENAI_COMPATIBLE.to_string(),
+            url: self
+                .url
+                .expect("clap requires --url with --provider openai-compatible")
+                .to_string(),
+            model: self
+                .model
+                .expect("clap requires --model with --provider openai-compatible")
+                .to_string(),
+            api_key_environment_variable_name: self.api_key_variable.map(str::to_string),
+            dimensions: Dimensions::Auto,
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -223,17 +291,38 @@ fn main() {
     let result = match cli.command {
         Commands::Init {
             repo,
+            provider,
+            url,
             model,
+            api_key_environment_variable_name,
             bind,
             database,
-        } => cmd_init(
-            &config_path,
-            user_provided_config,
-            database.as_deref(),
-            &repo,
-            model.as_deref(),
-            bind.as_deref(),
-        ),
+        } => {
+            if provider == Some(Provider::Ollama)
+                && (url.is_some() || api_key_environment_variable_name.is_some())
+            {
+                Cli::command()
+                    .error(
+                        ErrorKind::ArgumentConflict,
+                        "--url and --api-key-environment-variable-name apply only with \
+                         --provider openai-compatible",
+                    )
+                    .exit();
+            }
+            cmd_init(
+                &config_path,
+                user_provided_config,
+                database.as_deref(),
+                &repo,
+                &ServerFlags {
+                    provider,
+                    url: url.as_deref(),
+                    model: model.as_deref(),
+                    api_key_variable: api_key_environment_variable_name.as_deref(),
+                },
+                bind.as_deref(),
+            )
+        }
         Commands::Ingest { force, file } => cmd_ingest(&config_path, force, file.as_deref()),
         Commands::Serve => cmd_serve(&config_path),
         Commands::Search { query, top_k } => {
@@ -257,7 +346,7 @@ fn cmd_init(
     user_provided_config: bool,
     database_override: Option<&Path>,
     repo: &Path,
-    model: Option<&str>,
+    server: &ServerFlags,
     bind: Option<&str>,
 ) -> anyhow::Result<()> {
     eprintln!("=== lore init ===\n");
@@ -277,7 +366,7 @@ fn cmd_init(
     }
 
     let (config, existing) =
-        init_config(config_path, knowledge_dir, database_override, model, bind)?;
+        init_config(config_path, knowledge_dir, database_override, server, bind)?;
 
     // Create parent directories for config and database
     if let Some(parent) = config_path.parent() {
@@ -295,46 +384,46 @@ fn cmd_init(
         std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
     if existing {
         eprintln!("Using existing config at {}\n", config_path.display());
+        if let Some(warning) = config.both_tables_warning(&config_path) {
+            eprintln!("{warning}\n");
+        }
     } else {
         eprintln!("Config written to {}\n", config_path.display());
     }
 
-    // provision
-    eprintln!("--- Provisioning ---\n");
-    let result = provision::provision(&config.ollama.host, &config.ollama.model, &|msg| {
-        eprintln!("{msg}");
+    let remove_hint = (!existing && config.embedding.is_some()).then(|| {
+        format!(
+            "Fix the server or the flags, then remove {} before you run 'lore init' again.",
+            config_path.display()
+        )
     });
-
-    if !result.errors.is_empty() {
-        eprintln!("\nProvisioning errors:");
-        for err in &result.errors {
-            eprintln!("  ✗ {err}");
-        }
-        process::exit(1);
+    // The flags have met none of the checks every later command makes when
+    // it loads this file.
+    if let Some(hint) = &remove_hint
+        && let Err(e) = Config::load(&config_path)
+    {
+        anyhow::bail!("{e}\n{hint}");
     }
 
-    if !result.actions.is_empty() {
-        eprintln!("\nActions taken:");
-        for action in &result.actions {
-            eprintln!("  ✓ {action}");
-        }
-    }
+    let embedder = EmbeddingBackend::from_config(&config);
+    prepare_embedding_server(&embedder, &config, remove_hint.as_deref());
 
     // run initial ingestion
     eprintln!("\n--- Ingesting knowledge directory ---\n");
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
-    let ingest_result = init_ingest(&db, &ollama, &config)?;
+    let ingest_result = init_ingest(&db, &embedder, &config)?;
 
     eprintln!("\n--- Done ---");
     eprintln!("  Files: {}", ingest_result.files_processed);
     eprintln!("  Chunks: {}", ingest_result.chunks_created);
     if !ingest_result.errors.is_empty() {
         eprintln!("  Errors: {}", ingest_result.errors.len());
+        for failure in &ingest_result.server_failures {
+            eprintln!("  ✗ {failure}");
+        }
     }
     if let Ok(dimensions) = db.vector_dimensions() {
         let has_vectors = dimensions.is_some();
@@ -372,13 +461,72 @@ fn cmd_init(
     Ok(())
 }
 
+/// Bring up Ollama, or check the OpenAI-compatible embedding server, before
+/// `lore init` ingests. Exits 1 when the embedding server cannot be used,
+/// after `remove_hint` when the check of the OpenAI-compatible server fails.
+fn prepare_embedding_server(
+    embedder: &EmbeddingBackend,
+    config: &Config,
+    remove_hint: Option<&str>,
+) {
+    match embedder {
+        EmbeddingBackend::Ollama(client) => {
+            eprintln!("--- Provisioning ---\n");
+            let result = provision::provision(
+                config.embedding_table().url(),
+                client.model_name(),
+                &|msg| {
+                    eprintln!("{msg}");
+                },
+            );
+
+            if !result.errors.is_empty() {
+                eprintln!("\nProvisioning errors:");
+                for err in &result.errors {
+                    eprintln!("  ✗ {err}");
+                }
+                process::exit(1);
+            }
+
+            if !result.actions.is_empty() {
+                eprintln!("\nActions taken:");
+                for action in &result.actions {
+                    eprintln!("  ✓ {action}");
+                }
+            }
+        }
+        EmbeddingBackend::OpenAiCompatible(client) => {
+            eprintln!("--- Checking the embedding server ---\n");
+            eprintln!(
+                "Checking {} with model '{}'...",
+                client.url(),
+                client.model()
+            );
+            match client.probe() {
+                Ok(dimensions) => {
+                    eprintln!("  ✓ The server returned a {dimensions}-dimension vector");
+                }
+                Err(e) => {
+                    eprintln!("\nEmbedding server check failed:");
+                    eprintln!("  ✗ {}", e.error_line());
+                    eprintln!("  {}", e.action_line());
+                    if let Some(hint) = remove_hint {
+                        eprintln!("\n{hint}");
+                    }
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 /// The config `lore init` runs with, and whether it already existed. An
 /// existing file is returned as it is, so `cmd_init` must not save it.
 fn init_config(
     config_path: &Path,
     knowledge_dir: PathBuf,
     database: Option<&Path>,
-    model: Option<&str>,
+    server: &ServerFlags,
     bind: Option<&str>,
 ) -> anyhow::Result<(Config, bool)> {
     let exists = config_path.try_exists().map_err(|e| {
@@ -392,8 +540,15 @@ fn init_config(
             Some(p) => std::path::absolute(p)?,
             None => default_database_path()?,
         };
-        let mut config =
-            Config::default_with(knowledge_dir, db_path, model.unwrap_or("nomic-embed-text"));
+        let mut config = Config::default_with(
+            knowledge_dir,
+            db_path,
+            server.model.unwrap_or("nomic-embed-text"),
+        );
+        if let Some(embedding) = server.embedding_table() {
+            config.ollama = None;
+            config.embedding = Some(embedding);
+        }
         if let Some(bind) = bind {
             config.bind = bind.to_string();
         }
@@ -423,12 +578,30 @@ fn init_config(
             database.display()
         ));
     }
-    if let Some(model) = model
-        && !same_model("ollama", &config.ollama.model, model)
+    let table = config.embedding_table();
+    let provider = match table {
+        EmbeddingTable::Ollama(_) => Provider::Ollama,
+        EmbeddingTable::OpenAiCompatible(_) => Provider::OpenAiCompatible,
+    };
+    if let Some(flag) = server.provider
+        && flag != provider
     {
         conflicts.push(format!(
-            "[ollama] model is \"{}\" in the file, \"{model}\" from --model",
-            config.ollama.model
+            "provider is \"{}\" in the file, \"{}\" from --provider",
+            provider.name(),
+            flag.name()
+        ));
+    }
+    if let EmbeddingTable::OpenAiCompatible(embedding) = table {
+        conflicts.extend(embedding_conflicts(embedding, server));
+    }
+    if let Some(model) = server.model
+        && !same_model(provider.name(), table.model(), model)
+    {
+        conflicts.push(format!(
+            "{} model is \"{}\" in the file, \"{model}\" from --model",
+            table.name(),
+            table.model()
         ));
     }
     if let Some(bind) = bind
@@ -448,6 +621,39 @@ fn init_config(
         );
     }
     Ok((config, true))
+}
+
+/// Where an existing `[embedding]` table disagrees with `--url` and
+/// `--api-key-environment-variable-name`.
+fn embedding_conflicts(embedding: &EmbeddingConfig, server: &ServerFlags) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    if let Some(url) = server.url
+        && url.trim_end_matches('/') != embedding.url.trim_end_matches('/')
+    {
+        // Nothing refuses a query in the flag before this message, and a
+        // query may hold a key.
+        let shown = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+        conflicts.push(format!(
+            "[embedding] url is \"{}\" in the file, \"{}\" from --url",
+            redact_url(&embedding.url),
+            redact_url(shown)
+        ));
+    }
+    if let Some(name) = server.api_key_variable
+        && embedding.api_key_environment_variable_name.as_deref() != Some(name)
+    {
+        conflicts.push(match &embedding.api_key_environment_variable_name {
+            Some(file) => format!(
+                "[embedding] api_key_environment_variable_name is \"{file}\" in the file, \
+                 \"{name}\" from --api-key-environment-variable-name"
+            ),
+            None => format!(
+                "[embedding] api_key_environment_variable_name is not in the file, \
+                 \"{name}\" from --api-key-environment-variable-name"
+            ),
+        });
+    }
+    conflicts
 }
 
 fn resolved(path: &Path) -> PathBuf {
@@ -497,6 +703,9 @@ fn init_ingest(
 
 fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
+    if let Some(warning) = config.both_tables_warning(config_path) {
+        eprintln!("{warning}");
+    }
     let mode_label = match (file.is_some(), force) {
         (true, true) => "single-file (force override .loreignore)",
         (true, false) => "single-file",
@@ -510,8 +719,7 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         config.chunking.strategy,
     );
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
+    let embedder = EmbeddingBackend::from_config(&config);
     // `lore ingest --force` (without `--file`) is the documented remedy when
     // the schema-compatibility probe bails. It drops and recreates the
     // tables via `clear_all`, so the probe must not run first — otherwise
@@ -530,7 +738,7 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
     let _lock_guard = write_lock.acquire()?;
 
-    let result = dispatch_ingest(&db, &ollama, &config, force, file, on_progress)?;
+    let result = dispatch_ingest(&db, &embedder, &config, force, file, on_progress)?;
     if let Some(reason) = &result.refused {
         anyhow::bail!("{reason}");
     }
@@ -556,6 +764,9 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         for err in &result.errors {
             eprintln!("  ✗ {err}");
         }
+        for failure in &result.server_failures {
+            eprintln!("  ✗ {failure}");
+        }
         // Any single-file error exits non-zero. Delta and full ingests may
         // collect per-file errors while still making progress on the rest.
         // `files_processed` is 1 only when the file's text landed, so its
@@ -563,7 +774,7 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         if let ingest::IngestMode::SingleFile { path } = &result.mode {
             if result.files_processed == 1 {
                 let recorded = db.recorded_probe_mismatch().ok().flatten();
-                let remedy = match VectorMismatch::of_recorded_probe(&ollama, recorded) {
+                let remedy = match VectorMismatch::of_recorded_probe(&embedder, recorded) {
                     Some(mismatch) => format!("{mismatch}."),
                     None => "Run 'lore ingest' once the embedding model answers to add them."
                         .to_string(),
@@ -619,7 +830,7 @@ fn text_only_note(hybrid: bool, has_vectors: bool, mode: &ingest::IngestMode) ->
 /// flags passed to `cmd_ingest`.
 fn dispatch_ingest(
     db: &KnowledgeDB,
-    ollama: &OllamaClient,
+    embedder: &dyn Embedder,
     config: &Config,
     force: bool,
     file: Option<&Path>,
@@ -636,7 +847,7 @@ fn dispatch_ingest(
             .map_err(|e| anyhow::anyhow!("Cannot resolve path {}: {e}", path.display()))?;
         return Ok(ingest::ingest_single_file(
             db,
-            ollama,
+            embedder,
             &config.knowledge_dir,
             &resolved,
             &config.chunking.strategy,
@@ -655,7 +866,7 @@ fn dispatch_ingest(
         }
         Ok(ingest::full_ingest(
             db,
-            ollama,
+            embedder,
             &config.knowledge_dir,
             &config.chunking.strategy,
             on_progress,
@@ -664,7 +875,7 @@ fn dispatch_ingest(
         eprintln!("Ingesting knowledge directory...\n");
         Ok(ingest::ingest(
             db,
-            ollama,
+            embedder,
             &config.knowledge_dir,
             &config.chunking.strategy,
             on_progress,
@@ -764,9 +975,8 @@ fn print_universal_advisories(result: &ingest::IngestResult) {
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
-    server::start_mcp_server(&config, &ollama)
+    let embedder = EmbeddingBackend::from_config(&config);
+    server::start_mcp_server(&config, &embedder)
 }
 
 fn cmd_search(
@@ -791,14 +1001,14 @@ fn cmd_search(
         config.search.min_relevance,
     );
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let embedder = EmbeddingBackend::from_config(&config);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
     let (results, _phases) = if json {
-        hook::search_with_threshold_quiet(&db, &ollama, &config, query)?
+        hook::search_with_threshold_quiet(&db, &embedder, &config, query)?
     } else {
-        hook::search_with_threshold(&db, &ollama, &config, query)?
+        hook::search_with_threshold(&db, &embedder, &config, query)?
     };
     lore_debug!("search: {} results", results.len());
 
@@ -887,11 +1097,11 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
     );
 
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let embedder = EmbeddingBackend::from_config(&config);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
-    if let Some(output) = hook::handle_hook(&input, &db, &ollama, &config)? {
+    if let Some(output) = hook::handle_hook(&input, &db, &embedder, &config)? {
         let json = serde_json::to_string(&output)?;
         println!("{json}");
     }
@@ -990,9 +1200,86 @@ fn render_runtime_line(outcome: &ProbeOutcome, full: bool) {
             let rendered = render_failure(err);
             eprintln!("  Runtime:      ✗ {}", rendered.status_line);
         }
+        ProbeOutcome::ServerFailed(err) => eprintln!("  Runtime:      ✗ {}", err.status_line()),
         // `ProbeOutcome` is `#[non_exhaustive]`; future variants render as
         // a neutral em-dash until the renderer is updated.
         _ => eprintln!("  Runtime:      —"),
+    }
+}
+
+/// Print the status lines of the configured embedding server and, under
+/// `full`, probe it.
+fn print_embedding_server_status(
+    embedder: &EmbeddingBackend,
+    config: &Config,
+    full: bool,
+) -> ProbeOutcome {
+    match embedder {
+        EmbeddingBackend::Ollama(client) => {
+            // Run the cheap checks first (no probe) so these lines print
+            // before any potentially-multi-second probe call. Without this, a
+            // `lore status --full` invocation against a slow or hung Ollama
+            // would show a frozen terminal for up to 30 s.
+            let status =
+                provision::check_status(config.embedding_table().url(), client.model_name(), false);
+            eprintln!(
+                "  Ollama:       {}",
+                if status.ollama_installed {
+                    "✓ installed"
+                } else {
+                    "✗ not found"
+                }
+            );
+            eprintln!(
+                "  Ollama svc:   {}",
+                if status.ollama_running {
+                    "✓ running"
+                } else {
+                    "✗ not running"
+                }
+            );
+            eprintln!(
+                "  Model:        {} {}",
+                if status.model_available { "✓" } else { "✗" },
+                client.model_name()
+            );
+
+            // Now run the probe under --full, with a visible "checking" line
+            // so the multi-second wait is not a frozen terminal. The probe
+            // sends a 30-second keep_alive in its request body.
+            if !full {
+                return status.runtime;
+            }
+            if !status.model_available {
+                return ProbeOutcome::Skipped;
+            }
+            eprintln!("  Verifying inference runtime (may take a few seconds)…");
+            match client.probe(Some(30)) {
+                Ok(()) => ProbeOutcome::Ok,
+                Err(err) => ProbeOutcome::Failed(err),
+            }
+        }
+        EmbeddingBackend::OpenAiCompatible(client) => {
+            eprintln!("  Embedding:    OpenAI-compatible server");
+            match client.reachability() {
+                Ok(()) => eprintln!("  Server:       ✓ answers at {}", client.url()),
+                Err(e) => eprintln!("  Server:       ✗ {}", e.reachability_line()),
+            }
+            eprintln!("  Model:        {}", client.model());
+            match client.key_variable() {
+                KeyVariable::Set(var) => eprintln!("  API key:      {var} is set"),
+                KeyVariable::Unset(var) => eprintln!("  API key:      ✗ {var} is not set"),
+                KeyVariable::Unnamed => eprintln!("  API key:      none"),
+            }
+            if !full {
+                return ProbeOutcome::NotChecked;
+            }
+            eprintln!("  Verifying inference runtime (may take a few seconds)…");
+            match client.probe() {
+                Ok(_) => ProbeOutcome::Ok,
+                Err(err) => ProbeOutcome::ServerFailed(err),
+            }
+        }
     }
 }
 
@@ -1006,13 +1293,10 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
         }
     };
 
-    // Run the cheap checks first (no probe) so the header lines print
-    // before any potentially-multi-second probe call. Without this, a
-    // `lore status --full` invocation against a slow or hung Ollama would
-    // show a blank terminal for up to 30 s before any output appears.
-    let mut status = provision::check_status(&config.ollama.host, &config.ollama.model, false);
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
+    if let Some(warning) = config.both_tables_warning(config_path) {
+        eprintln!("{warning}");
+    }
+    let embedder = EmbeddingBackend::from_config(&config);
 
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
@@ -1026,44 +1310,8 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     eprintln!("  Database:     {}", config.database.display());
     eprintln!("  Bind:         {}", config.bind);
     eprintln!();
-    eprintln!(
-        "  Ollama:       {}",
-        if status.ollama_installed {
-            "✓ installed"
-        } else {
-            "✗ not found"
-        }
-    );
-    eprintln!(
-        "  Ollama svc:   {}",
-        if status.ollama_running {
-            "✓ running"
-        } else {
-            "✗ not running"
-        }
-    );
-    eprintln!(
-        "  Model:        {} {}",
-        if status.model_available { "✓" } else { "✗" },
-        config.ollama.model
-    );
-
-    // Now run the probe under --full, with a visible "checking" line so
-    // the multi-second wait is not a frozen terminal. The probe re-uses
-    // the OllamaClient created above for its 30-second keep_alive
-    // request body.
-    if full {
-        if status.model_available {
-            eprintln!("  Verifying inference runtime (may take a few seconds)…");
-            status.runtime = match ollama.probe(Some(30)) {
-                Ok(()) => ProbeOutcome::Ok,
-                Err(err) => ProbeOutcome::Failed(err),
-            };
-        } else {
-            status.runtime = ProbeOutcome::Skipped;
-        }
-    }
-    render_runtime_line(&status.runtime, full);
+    let runtime = print_embedding_server_status(&embedder, &config, full);
+    render_runtime_line(&runtime, full);
     eprintln!("  sqlite-vec:   ✓ bundled");
 
     if let Ok(db) = KnowledgeDB::open(&config.database)
@@ -1093,8 +1341,8 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
             let short = git::short_sha(&config.knowledge_dir, &sha);
             eprintln!("  Last commit:  {short}");
         }
-        let model_answers = matches!(status.runtime, ProbeOutcome::Ok);
-        if let Some(line) = index_model_line(&db, &ollama, model_answers) {
+        let model_answers = matches!(runtime, ProbeOutcome::Ok);
+        if let Some(line) = index_model_line(&db, &embedder, model_answers) {
             eprintln!("  Index model:  ✗ {line}");
         }
         eprintln!();
@@ -1319,6 +1567,42 @@ mod tests {
         );
         assert!(db.search_fts("stderr", 10).unwrap().is_empty());
         assert_eq!(db.vector_dimensions().unwrap(), None);
+    }
+
+    // -- init_config ----------------------------------------------------------
+
+    #[test]
+    fn a_new_config_without_an_openai_compatible_provider_is_the_ollama_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("lore.toml");
+        let database = tmp.path().join("knowledge.db");
+        let knowledge_dir = tmp.path().to_path_buf();
+        let flags = |provider, model| ServerFlags {
+            provider,
+            url: None,
+            model,
+            api_key_variable: None,
+        };
+
+        for (provider, model, expected_model) in [
+            (None, None, "nomic-embed-text"),
+            (Some(Provider::Ollama), None, "nomic-embed-text"),
+            (Some(Provider::Ollama), Some("all-minilm"), "all-minilm"),
+        ] {
+            let (config, existing) = init_config(
+                &config_path,
+                knowledge_dir.clone(),
+                Some(&database),
+                &flags(provider, model),
+                None,
+            )
+            .unwrap();
+            assert!(!existing);
+            assert_eq!(
+                config,
+                Config::default_with(knowledge_dir.clone(), database.clone(), expected_model)
+            );
+        }
     }
 
     // -- search mode ------------------------------------------------------------

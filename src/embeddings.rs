@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{Config, EmbeddingTable};
+use crate::openai_compatible::OpenAiCompatibleClient;
+
 /// Trait for producing embedding vectors from text.
 pub trait Embedder {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>>;
@@ -72,9 +75,12 @@ pub struct RecordedModel {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VectorMismatch {
     /// The index records another provider or model than the one configured.
+    /// `providers` holds the recorded and the configured provider when they
+    /// differ.
     Model {
         recorded: String,
         configured: String,
+        providers: Option<(String, String)>,
     },
     /// The query vector differs in width from the index's vectors.
     /// `recorded` is `None` for an index that has no recorded model.
@@ -87,13 +93,13 @@ pub enum VectorMismatch {
     /// The configured model answers [`PROBE_TEXT`] unlike the model that
     /// built the index under the same name.
     Probe { model: String, similarity: f64 },
-    /// The configured model's vectors differ in width from `[ollama]
-    /// dimensions`. `--force` measures the same width again, so it is no
-    /// remedy.
+    /// The configured model's vectors differ in width from `dimensions` in
+    /// `table`. `--force` measures the same width again, so it is no remedy.
     Configured {
         model: String,
         measured: usize,
         configured: usize,
+        table: &'static str,
     },
     /// The index's recorded embedding model cannot be read, so nothing can
     /// be compared with it.
@@ -109,11 +115,14 @@ impl VectorMismatch {
     /// An index with no recorded model passes: only its width can tell.
     pub fn of_model(recorded: Option<&RecordedModel>, embedder: &dyn Embedder) -> Option<Self> {
         let recorded = recorded?;
-        let same = recorded.provider == embedder.provider()
-            && same_model(&recorded.provider, &recorded.model, embedder.model());
+        let same_provider = recorded.provider == embedder.provider();
+        let same =
+            same_provider && same_model(&recorded.provider, &recorded.model, embedder.model());
         (!same).then(|| Self::Model {
             recorded: recorded.model.clone(),
             configured: embedder.model().to_string(),
+            providers: (!same_provider)
+                .then(|| (recorded.provider.clone(), embedder.provider().to_string())),
         })
     }
 
@@ -152,14 +161,20 @@ impl VectorMismatch {
         })
     }
 
-    /// Compare the configured model's measured width with `[ollama]
-    /// dimensions`. Without a configured width, any width passes.
+    /// Compare the configured model's measured width with the configured
+    /// `dimensions`. Without a configured width, any width passes.
     pub fn of_configured(embedder: &dyn Embedder, measured: usize) -> Option<Self> {
         let configured = embedder.configured_dimensions()?;
+        let table = if embedder.provider() == "ollama" {
+            "[ollama]"
+        } else {
+            "[embedding]"
+        };
         (configured != measured).then(|| Self::Configured {
             model: embedder.model().to_string(),
             measured,
             configured,
+            table,
         })
     }
 
@@ -176,9 +191,10 @@ impl VectorMismatch {
             Self::Configured {
                 measured,
                 configured,
+                table,
                 ..
             } => format!(
-                "Set [ollama] dimensions to {measured} or \"auto\", or configure a model that \
+                "Set {table} dimensions to {measured} or \"auto\", or configure a model that \
                  returns {configured}-dimension vectors"
             ),
             _ => "Run 'lore ingest --force' to rebuild the index".to_string(),
@@ -191,8 +207,19 @@ impl VectorMismatch {
             Self::Model {
                 recorded,
                 configured,
+                providers: None,
             } => format!(
                 "the index was built with {recorded} but lore is configured for {configured}"
+            ),
+            Self::Model {
+                recorded,
+                configured,
+                providers: Some((from, to)),
+            } => format!(
+                "the index was built with {recorded} on {} but lore is configured for \
+                 {configured} on {}",
+                server_name(from),
+                server_name(to)
             ),
             Self::Width {
                 recorded,
@@ -219,14 +246,25 @@ impl VectorMismatch {
                 model,
                 measured,
                 configured,
+                table,
             } => format!(
-                "{model} returns {measured}-dimension vectors but [ollama] dimensions is \
+                "{model} returns {measured}-dimension vectors but {table} dimensions is \
                  {configured}"
             ),
             Self::Unreadable { reason } => {
                 format!("cannot read the index's embedding model ({reason})")
             }
         }
+    }
+}
+
+/// The embedding server a recorded provider names, as a mismatch cause
+/// reads it.
+pub(crate) fn server_name(provider: &str) -> &str {
+    match provider {
+        "ollama" => "Ollama",
+        crate::config::OPENAI_COMPATIBLE => "an OpenAI-compatible server",
+        other => other,
     }
 }
 
@@ -746,6 +784,58 @@ impl Embedder for OllamaClient {
     }
 }
 
+/// The embedding client the configuration names.
+pub enum EmbeddingBackend {
+    Ollama(OllamaClient),
+    OpenAiCompatible(OpenAiCompatibleClient),
+}
+
+impl EmbeddingBackend {
+    /// Build the configured client, holding it to the configured dimensions.
+    pub fn from_config(config: &Config) -> Self {
+        match config.embedding_table() {
+            EmbeddingTable::Ollama(ollama) => Self::Ollama(
+                OllamaClient::new(&ollama.host, &ollama.model)
+                    .with_dimensions(ollama.dimensions.fixed()),
+            ),
+            EmbeddingTable::OpenAiCompatible(embedding) => Self::OpenAiCompatible(
+                OpenAiCompatibleClient::new(
+                    &embedding.url,
+                    &embedding.model,
+                    config.chunking.max_tokens,
+                )
+                .with_api_key_variable(embedding.api_key_environment_variable_name.as_deref())
+                .with_dimensions(embedding.dimensions.fixed()),
+            ),
+        }
+    }
+
+    fn client(&self) -> &dyn Embedder {
+        match self {
+            Self::Ollama(client) => client,
+            Self::OpenAiCompatible(client) => client,
+        }
+    }
+}
+
+impl Embedder for EmbeddingBackend {
+    fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        self.client().embed(input)
+    }
+
+    fn provider(&self) -> &str {
+        self.client().provider()
+    }
+
+    fn model(&self) -> &str {
+        self.client().model()
+    }
+
+    fn configured_dimensions(&self) -> Option<usize> {
+        self.client().configured_dimensions()
+    }
+}
+
 /// Model name the test fakes report. Matches `Config::default_with`'s
 /// default so a fake-built index carries the configured identity.
 #[cfg(any(test, feature = "test-support"))]
@@ -996,6 +1086,80 @@ mod tests {
     }
 
     #[test]
+    fn of_model_names_the_servers_only_when_the_providers_differ() {
+        let server = OpenAiCompatibleClient::new("http://127.0.0.1:1/v1", "nomic-embed-text", 8);
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &server)
+                .unwrap()
+                .cause(),
+            "the index was built with nomic-embed-text on Ollama but lore is configured for \
+             nomic-embed-text on an OpenAI-compatible server"
+        );
+        let same_provider = RecordedModel {
+            provider: "openai-compatible".to_string(),
+            model: "other-model".to_string(),
+        };
+        assert_eq!(
+            VectorMismatch::of_model(Some(&same_provider), &server)
+                .unwrap()
+                .cause(),
+            "the index was built with other-model but lore is configured for nomic-embed-text"
+        );
+        assert_eq!(
+            VectorMismatch::of_model(
+                Some(&RecordedModel {
+                    provider: "openai-compatible".to_string(),
+                    model: "nomic-embed-text".to_string(),
+                }),
+                &server
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn of_configured_names_the_table_that_sets_the_dimensions() {
+        let ollama = FakeEmbedder::new().configured_for(1024);
+        assert_eq!(
+            VectorMismatch::of_configured(&ollama, 768)
+                .unwrap()
+                .remedy(),
+            "Set [ollama] dimensions to 768 or \"auto\", or configure a model that returns \
+             1024-dimension vectors"
+        );
+        let server = OpenAiCompatibleClient::new("http://127.0.0.1:1/v1", "nomic", 8)
+            .with_dimensions(Some(1024));
+        let mismatch = VectorMismatch::of_configured(&server, 768).unwrap();
+        assert_eq!(
+            mismatch.cause(),
+            "nomic returns 768-dimension vectors but [embedding] dimensions is 1024"
+        );
+        assert_eq!(
+            mismatch.remedy(),
+            "Set [embedding] dimensions to 768 or \"auto\", or configure a model that returns \
+             1024-dimension vectors"
+        );
+    }
+
+    #[test]
+    fn from_config_builds_the_client_the_embedding_table_names() {
+        let mut config = Config::default_with("k".into(), "k.db".into(), "nomic-embed-text");
+        config.chunking.max_tokens = 256;
+        config.embedding = Some(crate::config::EmbeddingConfig {
+            provider: "openai-compatible".to_string(),
+            url: "http://127.0.0.1:1/v1".to_string(),
+            model: "nomic-embed-text-v1.5".to_string(),
+            api_key_environment_variable_name: None,
+            dimensions: crate::config::Dimensions::Fixed(768),
+        });
+        let backend = EmbeddingBackend::from_config(&config);
+        assert!(matches!(backend, EmbeddingBackend::OpenAiCompatible(_)));
+        assert_eq!(backend.provider(), "openai-compatible");
+        assert_eq!(backend.model(), "nomic-embed-text-v1.5");
+        assert_eq!(backend.configured_dimensions(), Some(768));
+    }
+
+    #[test]
     fn of_width_flags_only_a_width_that_differs() {
         let embedder = FakeEmbedder::new();
         assert_eq!(VectorMismatch::of_width(None, &embedder, 768, 768), None);
@@ -1053,10 +1217,18 @@ mod tests {
 
     #[test]
     fn configured_dimensions_are_checked_by_lore_and_never_sent_to_ollama() {
-        let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model")
-            .with_dimensions(Some(1024));
-        assert_eq!(client.configured_dimensions(), Some(1024));
+        let mut config = Config::default_with(
+            "knowledge".into(),
+            "knowledge.db".into(),
+            "some-unlisted-model",
+        );
+        config.ollama.as_mut().unwrap().dimensions = crate::config::Dimensions::Fixed(1024);
+        let backend = EmbeddingBackend::from_config(&config);
+        assert_eq!(backend.configured_dimensions(), Some(1024));
 
+        let EmbeddingBackend::Ollama(client) = &backend else {
+            panic!("an [ollama] config builds the Ollama client");
+        };
         let request = serde_json::to_value(client.embed_request("hello")).unwrap();
         assert_eq!(
             request,

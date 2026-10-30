@@ -52,6 +52,8 @@
 
 ## Completed
 
+- [x] OpenAI-compatible embedding servers: an `[embedding]` table points lore at `llama-server`, LM
+      Studio or a hosted service (#79). Ollama stays the default. See `docs/embedding-servers.md`.
 - [x] Install on `PATH` without building from source: `brew install attila/tap/lore` from the
       `attila/homebrew-tap` tap; the release workflow bumps the formula on every stable release
       (#72). The README lists Homebrew first.

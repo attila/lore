@@ -22,6 +22,7 @@ use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::{Embedder, ProbeError, VectorMismatch, render_failure};
 use crate::engine::{self, CallContext};
 use crate::lore_debug;
+use crate::openai_compatible::{ServerError, redact_url};
 use crate::trace;
 
 /// Per-process state for the FTS-fallback warning rate limit.
@@ -42,10 +43,14 @@ static LAST_EMITTED_FAILURE_CLASS: Mutex<Option<String>> = Mutex::new(None);
 /// reason comes from `render_failure`. Other `anyhow::Error` shapes (kept as a
 /// defensive fallback) map to `"unreachable"`.
 fn emit_embed_failure_warning(err: &anyhow::Error) {
-    let short_reason = err.downcast_ref::<ProbeError>().map_or_else(
-        || "unreachable".to_string(),
-        |p| render_failure(p).short_reason,
-    );
+    let server_error = err.downcast_ref::<ServerError>();
+    let short_reason = match server_error {
+        Some(e) => e.short(),
+        None => err.downcast_ref::<ProbeError>().map_or_else(
+            || "unreachable".to_string(),
+            |p| render_failure(p).short_reason,
+        ),
+    };
 
     let mut last = match LAST_EMITTED_FAILURE_CLASS.lock() {
         Ok(guard) => guard,
@@ -63,6 +68,13 @@ fn emit_embed_failure_warning(err: &anyhow::Error) {
     *last = Some(short_reason.clone());
     drop(last);
 
+    if server_error.is_some() {
+        eprintln!(
+            "Warning: the embedding server failed ({short_reason}), so this search uses text \
+             only. Run 'lore status --full' for details."
+        );
+        return;
+    }
     eprintln!(
         "Warning: Ollama embed failed ({short_reason}); falling back to text search. \
          Run 'lore status --full' for details."
@@ -674,8 +686,8 @@ pub fn search_with_threshold(
     search_pipeline(db, embedder, config, query, &[], &[], true)
 }
 
-/// [`search_with_threshold`] without the model-mismatch warning on stderr,
-/// for `lore search --json`.
+/// [`search_with_threshold`] without the mismatch and embedding-failure
+/// warnings on stderr, for `lore search --json`.
 pub fn search_with_threshold_quiet(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -722,7 +734,8 @@ pub fn search_with_threshold_gated(
 /// must use text only: the index has no vector table, records another model
 /// than the embedder's or a probe mismatch a write found, the embedding
 /// fails, or the vector's width differs from the index's. `warn_on_mismatch`
-/// prints a model, probe or width mismatch on stderr.
+/// prints a model, probe or width mismatch, or the embedding failure, on
+/// stderr.
 fn query_vector(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -756,7 +769,9 @@ fn query_vector(
     let v = match outcome {
         Ok(v) => v,
         Err(e) => {
-            emit_embed_failure_warning(&e);
+            if warn_on_mismatch {
+                emit_embed_failure_warning(&e);
+            }
             lore_debug!("search: embedding failed: {e}");
             return None;
         }
@@ -1378,7 +1393,7 @@ fn snapshot_search_config(config: &Config) -> trace::ConfigSnapshot {
         top_k: config.search.top_k,
         min_relevance: config.search.min_relevance,
         min_relevance_universal: config.search.effective_min_relevance_universal(),
-        embedder_model: config.ollama.model.clone(),
+        embedder_model: config.embedding_table().model().to_string(),
     }
 }
 
@@ -1388,8 +1403,13 @@ fn snapshot_full_config(config: &Config) -> trace::FullConfigSnapshot {
         knowledge_dir: config.knowledge_dir.display().to_string(),
         database: config.database.display().to_string(),
         bind: config.bind.clone(),
-        ollama_host: config.ollama.host.clone(),
-        ollama_model: config.ollama.model.clone(),
+        ollama_host: redact_url(config.embedding_table().url()),
+        ollama_model: config.embedding_table().model().to_string(),
+        embedder_provider: match config.embedding_table() {
+            config::EmbeddingTable::Ollama(_) => "ollama",
+            config::EmbeddingTable::OpenAiCompatible(_) => config::OPENAI_COMPATIBLE,
+        }
+        .to_string(),
         search: snapshot_search_config(config),
         chunking_strategy: config.chunking.strategy.clone(),
         chunking_max_tokens: config.chunking.max_tokens,
@@ -2582,5 +2602,30 @@ mod tests {
         let results = vec![make_search_result("c1")];
         let filtered = dedup_filter_and_record(&path, &results).unwrap();
         assert_eq!(filtered.len(), 1, "c1 should pass after reset");
+    }
+
+    #[test]
+    fn the_session_start_snapshot_names_the_provider_and_hides_userinfo() {
+        let mut config = Config::default_with(
+            PathBuf::from("docs"),
+            PathBuf::from("lore.db"),
+            "nomic-embed-text",
+        );
+        config.ollama.as_mut().unwrap().host = "http://user:secret@127.0.0.1:11434".to_string();
+        let snapshot = snapshot_full_config(&config);
+        assert_eq!(snapshot.embedder_provider, "ollama");
+        assert_eq!(snapshot.ollama_host, "http://127.0.0.1:11434");
+
+        config.embedding = Some(config::EmbeddingConfig {
+            provider: config::OPENAI_COMPATIBLE.to_string(),
+            url: "http://user:secret@127.0.0.1:8080/v1".to_string(),
+            model: "nomic-embed-text-v1.5".to_string(),
+            api_key_environment_variable_name: None,
+            dimensions: config::Dimensions::Auto,
+        });
+        let snapshot = snapshot_full_config(&config);
+        assert_eq!(snapshot.embedder_provider, "openai-compatible");
+        assert_eq!(snapshot.ollama_host, "http://127.0.0.1:8080/v1");
+        assert_eq!(snapshot.ollama_model, "nomic-embed-text-v1.5");
     }
 }
