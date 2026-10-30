@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   returns another number of dimensions. (#78)
 - An `[embedding]` table with `provider = "openai-compatible"` points lore at an OpenAI-compatible
   embedding server, such as `llama-server` or LM Studio. (#N)
+- `lore init --provider openai-compatible --url <url> --model <name>` sets lore up to use an
+  embedding server that is already running. (#N)
 - Set `[embedding] dimensions` to make `lore init` and `lore ingest` exit 1 when the server returns
   another number of dimensions. (#N)
 - Lore sends the embedding server the API key held in the environment variable that
