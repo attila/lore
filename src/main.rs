@@ -3,10 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use lore::config::{
-    Config, EmbeddingTable, OPENAI_COMPATIBLE, default_config_path, default_database_path,
+    Config, Dimensions, EmbeddingConfig, EmbeddingTable, OPENAI_COMPATIBLE, default_config_path,
+    default_database_path,
 };
 use lore::database::KnowledgeDB;
 use lore::embeddings::{
@@ -15,7 +17,7 @@ use lore::embeddings::{
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
-use lore::openai_compatible::KeyVariable;
+use lore::openai_compatible::{KeyVariable, redact_url};
 use lore::provision::ProbeOutcome;
 use lore::status::format_languages_line;
 use lore::{git, ingest, provision, server};
@@ -41,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Provision Ollama, pull model, create config, run first ingestion
+    /// Set up lore: write the config, check the embedding model, run the first ingest
     ///
     /// An existing config file is used as it is and never rewritten. A flag
     /// that disagrees with it is an error; edit the file, or remove it to
@@ -51,9 +53,25 @@ enum Commands {
         #[arg(long)]
         repo: PathBuf,
 
-        /// Ollama embedding model to use [default: nomic-embed-text]
-        #[arg(long)]
+        /// Embedding server for a new config [default: ollama]
+        #[arg(long, value_enum)]
+        provider: Option<Provider>,
+
+        /// Base URL of the OpenAI-compatible embedding server, usually ending in /v1
+        #[arg(
+            long,
+            required_if_eq("provider", "openai-compatible"),
+            requires = "provider"
+        )]
+        url: Option<String>,
+
+        /// Embedding model to use [default with Ollama: nomic-embed-text]
+        #[arg(long, required_if_eq("provider", "openai-compatible"))]
         model: Option<String>,
+
+        /// Environment variable that holds the embedding server's API key
+        #[arg(long, value_name = "NAME", requires = "provider")]
+        api_key_environment_variable_name: Option<String>,
 
         /// MCP server bind address [default: localhost:3100]
         #[arg(long)]
@@ -166,6 +184,52 @@ EXIT CODES:
     },
 }
 
+/// The embedding server `lore init --provider` sets up.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Provider {
+    Ollama,
+    #[value(name = "openai-compatible")]
+    OpenAiCompatible,
+}
+
+impl Provider {
+    /// The name `--provider` takes and an error message prints.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::OpenAiCompatible => OPENAI_COMPATIBLE,
+        }
+    }
+}
+
+/// The embedding server flags of `lore init`.
+struct ServerFlags<'a> {
+    provider: Option<Provider>,
+    url: Option<&'a str>,
+    model: Option<&'a str>,
+    api_key_variable: Option<&'a str>,
+}
+
+impl ServerFlags<'_> {
+    /// The `[embedding]` table a new config holds, when the flags name an
+    /// OpenAI-compatible embedding server.
+    fn embedding_table(&self) -> Option<EmbeddingConfig> {
+        (self.provider == Some(Provider::OpenAiCompatible)).then(|| EmbeddingConfig {
+            provider: OPENAI_COMPATIBLE.to_string(),
+            url: self
+                .url
+                .expect("clap requires --url with --provider openai-compatible")
+                .to_string(),
+            model: self
+                .model
+                .expect("clap requires --model with --provider openai-compatible")
+                .to_string(),
+            api_key_environment_variable_name: self.api_key_variable.map(str::to_string),
+            dimensions: Dimensions::Auto,
+        })
+    }
+}
+
 #[derive(Subcommand)]
 enum TraceAction {
     /// Explain lore's injection decisions for a session by reading its
@@ -227,17 +291,38 @@ fn main() {
     let result = match cli.command {
         Commands::Init {
             repo,
+            provider,
+            url,
             model,
+            api_key_environment_variable_name,
             bind,
             database,
-        } => cmd_init(
-            &config_path,
-            user_provided_config,
-            database.as_deref(),
-            &repo,
-            model.as_deref(),
-            bind.as_deref(),
-        ),
+        } => {
+            if provider == Some(Provider::Ollama)
+                && (url.is_some() || api_key_environment_variable_name.is_some())
+            {
+                Cli::command()
+                    .error(
+                        ErrorKind::ArgumentConflict,
+                        "--url and --api-key-environment-variable-name apply only with \
+                         --provider openai-compatible",
+                    )
+                    .exit();
+            }
+            cmd_init(
+                &config_path,
+                user_provided_config,
+                database.as_deref(),
+                &repo,
+                &ServerFlags {
+                    provider,
+                    url: url.as_deref(),
+                    model: model.as_deref(),
+                    api_key_variable: api_key_environment_variable_name.as_deref(),
+                },
+                bind.as_deref(),
+            )
+        }
         Commands::Ingest { force, file } => cmd_ingest(&config_path, force, file.as_deref()),
         Commands::Serve => cmd_serve(&config_path),
         Commands::Search { query, top_k } => {
@@ -261,7 +346,7 @@ fn cmd_init(
     user_provided_config: bool,
     database_override: Option<&Path>,
     repo: &Path,
-    model: Option<&str>,
+    server: &ServerFlags,
     bind: Option<&str>,
 ) -> anyhow::Result<()> {
     eprintln!("=== lore init ===\n");
@@ -281,7 +366,7 @@ fn cmd_init(
     }
 
     let (config, existing) =
-        init_config(config_path, knowledge_dir, database_override, model, bind)?;
+        init_config(config_path, knowledge_dir, database_override, server, bind)?;
 
     // Create parent directories for config and database
     if let Some(parent) = config_path.parent() {
@@ -306,8 +391,22 @@ fn cmd_init(
         eprintln!("Config written to {}\n", config_path.display());
     }
 
+    let remove_hint = (!existing && config.embedding.is_some()).then(|| {
+        format!(
+            "Fix the server or the flags, then remove {} before you run 'lore init' again.",
+            config_path.display()
+        )
+    });
+    // The flags have met none of the checks every later command makes when
+    // it loads this file.
+    if let Some(hint) = &remove_hint
+        && let Err(e) = Config::load(&config_path)
+    {
+        anyhow::bail!("{e}\n{hint}");
+    }
+
     let embedder = EmbeddingBackend::from_config(&config);
-    prepare_embedding_server(&embedder, &config);
+    prepare_embedding_server(&embedder, &config, remove_hint.as_deref());
 
     // run initial ingestion
     eprintln!("\n--- Ingesting knowledge directory ---\n");
@@ -363,8 +462,13 @@ fn cmd_init(
 }
 
 /// Bring up Ollama, or check the OpenAI-compatible embedding server, before
-/// `lore init` ingests. Exits 1 when the embedding server cannot be used.
-fn prepare_embedding_server(embedder: &EmbeddingBackend, config: &Config) {
+/// `lore init` ingests. Exits 1 when the embedding server cannot be used,
+/// after `remove_hint` when the check of the OpenAI-compatible server fails.
+fn prepare_embedding_server(
+    embedder: &EmbeddingBackend,
+    config: &Config,
+    remove_hint: Option<&str>,
+) {
     match embedder {
         EmbeddingBackend::Ollama(client) => {
             eprintln!("--- Provisioning ---\n");
@@ -406,6 +510,9 @@ fn prepare_embedding_server(embedder: &EmbeddingBackend, config: &Config) {
                     eprintln!("\nEmbedding server check failed:");
                     eprintln!("  ✗ {}", e.error_line());
                     eprintln!("  {}", e.action_line());
+                    if let Some(hint) = remove_hint {
+                        eprintln!("\n{hint}");
+                    }
                     process::exit(1);
                 }
             }
@@ -419,7 +526,7 @@ fn init_config(
     config_path: &Path,
     knowledge_dir: PathBuf,
     database: Option<&Path>,
-    model: Option<&str>,
+    server: &ServerFlags,
     bind: Option<&str>,
 ) -> anyhow::Result<(Config, bool)> {
     let exists = config_path.try_exists().map_err(|e| {
@@ -433,8 +540,15 @@ fn init_config(
             Some(p) => std::path::absolute(p)?,
             None => default_database_path()?,
         };
-        let mut config =
-            Config::default_with(knowledge_dir, db_path, model.unwrap_or("nomic-embed-text"));
+        let mut config = Config::default_with(
+            knowledge_dir,
+            db_path,
+            server.model.unwrap_or("nomic-embed-text"),
+        );
+        if let Some(embedding) = server.embedding_table() {
+            config.ollama = None;
+            config.embedding = Some(embedding);
+        }
         if let Some(bind) = bind {
             config.bind = bind.to_string();
         }
@@ -466,11 +580,23 @@ fn init_config(
     }
     let table = config.embedding_table();
     let provider = match table {
-        EmbeddingTable::Ollama(_) => "ollama",
-        EmbeddingTable::OpenAiCompatible(_) => OPENAI_COMPATIBLE,
+        EmbeddingTable::Ollama(_) => Provider::Ollama,
+        EmbeddingTable::OpenAiCompatible(_) => Provider::OpenAiCompatible,
     };
-    if let Some(model) = model
-        && !same_model(provider, table.model(), model)
+    if let Some(flag) = server.provider
+        && flag != provider
+    {
+        conflicts.push(format!(
+            "provider is \"{}\" in the file, \"{}\" from --provider",
+            provider.name(),
+            flag.name()
+        ));
+    }
+    if let EmbeddingTable::OpenAiCompatible(embedding) = table {
+        conflicts.extend(embedding_conflicts(embedding, server));
+    }
+    if let Some(model) = server.model
+        && !same_model(provider.name(), table.model(), model)
     {
         conflicts.push(format!(
             "{} model is \"{}\" in the file, \"{model}\" from --model",
@@ -495,6 +621,39 @@ fn init_config(
         );
     }
     Ok((config, true))
+}
+
+/// Where an existing `[embedding]` table disagrees with `--url` and
+/// `--api-key-environment-variable-name`.
+fn embedding_conflicts(embedding: &EmbeddingConfig, server: &ServerFlags) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    if let Some(url) = server.url
+        && url.trim_end_matches('/') != embedding.url.trim_end_matches('/')
+    {
+        // Nothing refuses a query in the flag before this message, and a
+        // query may hold a key.
+        let shown = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+        conflicts.push(format!(
+            "[embedding] url is \"{}\" in the file, \"{}\" from --url",
+            redact_url(&embedding.url),
+            redact_url(shown)
+        ));
+    }
+    if let Some(name) = server.api_key_variable
+        && embedding.api_key_environment_variable_name.as_deref() != Some(name)
+    {
+        conflicts.push(match &embedding.api_key_environment_variable_name {
+            Some(file) => format!(
+                "[embedding] api_key_environment_variable_name is \"{file}\" in the file, \
+                 \"{name}\" from --api-key-environment-variable-name"
+            ),
+            None => format!(
+                "[embedding] api_key_environment_variable_name is not in the file, \
+                 \"{name}\" from --api-key-environment-variable-name"
+            ),
+        });
+    }
+    conflicts
 }
 
 fn resolved(path: &Path) -> PathBuf {
@@ -1408,6 +1567,42 @@ mod tests {
         );
         assert!(db.search_fts("stderr", 10).unwrap().is_empty());
         assert_eq!(db.vector_dimensions().unwrap(), None);
+    }
+
+    // -- init_config ----------------------------------------------------------
+
+    #[test]
+    fn a_new_config_without_an_openai_compatible_provider_is_the_ollama_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("lore.toml");
+        let database = tmp.path().join("knowledge.db");
+        let knowledge_dir = tmp.path().to_path_buf();
+        let flags = |provider, model| ServerFlags {
+            provider,
+            url: None,
+            model,
+            api_key_variable: None,
+        };
+
+        for (provider, model, expected_model) in [
+            (None, None, "nomic-embed-text"),
+            (Some(Provider::Ollama), None, "nomic-embed-text"),
+            (Some(Provider::Ollama), Some("all-minilm"), "all-minilm"),
+        ] {
+            let (config, existing) = init_config(
+                &config_path,
+                knowledge_dir.clone(),
+                Some(&database),
+                &flags(provider, model),
+                None,
+            )
+            .unwrap();
+            assert!(!existing);
+            assert_eq!(
+                config,
+                Config::default_with(knowledge_dir.clone(), database.clone(), expected_model)
+            );
+        }
     }
 
     // -- search mode ------------------------------------------------------------

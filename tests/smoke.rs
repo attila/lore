@@ -212,7 +212,9 @@ fn init_help_restates_the_model_and_bind_defaults() {
         .args(["init", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[default: nomic-embed-text]"))
+        .stdout(predicate::str::contains(
+            "[default with Ollama: nomic-embed-text]",
+        ))
         .stdout(predicate::str::contains("[default: localhost:3100]"));
 }
 

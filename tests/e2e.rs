@@ -2545,6 +2545,290 @@ fn init_stops_when_the_embedding_server_does_not_answer() {
     assert!(!stderr.contains("Ingesting"), "{stderr}");
 }
 
+/// A committed knowledge directory of the seed patterns, with no config
+/// file at the returned path yet.
+fn project_without_config() -> (tempfile::TempDir, Config, PathBuf) {
+    let (tmp, config, config_path) = ollama_project("http://127.0.0.1:1");
+    fs::remove_file(&config_path).unwrap();
+    (tmp, config, config_path)
+}
+
+/// `lore init` arguments that set up the OpenAI-compatible server at `url`.
+fn init_provider_args<'a>(config: &'a Config, config_path: &'a Path, url: &'a str) -> Vec<&'a str> {
+    vec![
+        "init",
+        "--provider",
+        "openai-compatible",
+        "--url",
+        url,
+        "--model",
+        SERVER_MODEL,
+        "--repo",
+        config.knowledge_dir.to_str().unwrap(),
+        "--database",
+        config.database.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
+    ]
+}
+
+#[test]
+fn init_provider_writes_only_an_embedding_table_and_ingests() {
+    let (url, requests) = serve_fake_embedding_server(ServerAnswer::Vector);
+    let (_tmp, config, config_path) = project_without_config();
+    let config_arg = config_path.to_str().unwrap();
+    let mut args = init_provider_args(&config, &config_path, &url);
+    args.extend(["--api-key-environment-variable-name", SERVER_KEY_VARIABLE]);
+
+    let init = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .args(&args)
+        .assert()
+        .success();
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(&format!(
+            "Config written to {config_arg}\n\n\
+             --- Checking the embedding server ---\n\n\
+             Checking {url} with model '{SERVER_MODEL}'...\n\
+             \x20 ✓ The server returned a 768-dimension vector\n\n\
+             --- Ingesting knowledge directory ---\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    assert!(!stderr.contains(SERVER_KEY), "{stderr}");
+
+    let written = fs::read_to_string(&config_path).unwrap();
+    assert!(!written.contains("[ollama]"), "{written}");
+    let loaded = Config::load(&config_path).unwrap();
+    assert_eq!(loaded.ollama, None);
+    assert_eq!(
+        loaded.embedding,
+        Some(lore::config::EmbeddingConfig {
+            provider: "openai-compatible".to_string(),
+            url: url.clone(),
+            model: SERVER_MODEL.to_string(),
+            api_key_environment_variable_name: Some(SERVER_KEY_VARIABLE.to_string()),
+            dimensions: lore::config::Dimensions::Auto,
+        })
+    );
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some(&format!("Bearer {SERVER_KEY}")))
+    );
+
+    let rerun = lore()
+        .env(SERVER_KEY_VARIABLE, SERVER_KEY)
+        .args(&args)
+        .assert()
+        .success();
+    assert!(
+        stderr_of(&rerun).contains(&format!("Using existing config at {config_arg}\n")),
+        "{}",
+        stderr_of(&rerun)
+    );
+}
+
+#[test]
+fn init_provider_flags_out_of_place_are_usage_errors_that_write_nothing() {
+    let (_tmp, config, config_path) = project_without_config();
+    let repo = config.knowledge_dir.to_str().unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    let url = "http://127.0.0.1:1/v1";
+
+    for flags in [
+        vec!["--provider", "openai-compatible", "--model", SERVER_MODEL],
+        vec!["--provider", "openai-compatible", "--url", url],
+        vec!["--url", url],
+        vec!["--api-key-environment-variable-name", SERVER_KEY_VARIABLE],
+    ] {
+        lore()
+            .args(["init", "--repo", repo, "--config", config_arg])
+            .args(&flags)
+            .assert()
+            .code(2);
+        assert!(!config_path.exists(), "{flags:?}");
+    }
+    for flags in [
+        vec!["--provider", "ollama", "--url", url],
+        vec![
+            "--provider",
+            "ollama",
+            "--api-key-environment-variable-name",
+            SERVER_KEY_VARIABLE,
+        ],
+    ] {
+        lore()
+            .args(["init", "--repo", repo, "--config", config_arg])
+            .args(&flags)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::starts_with(
+                "error: --url and --api-key-environment-variable-name apply only with \
+                 --provider openai-compatible\n",
+            ));
+        assert!(!config_path.exists(), "{flags:?}");
+    }
+}
+
+#[test]
+fn init_provider_names_each_flag_that_disagrees_with_the_file() {
+    let (_tmp, config, config_path) = server_project("http://127.0.0.1:1/v1");
+    let repo = config.knowledge_dir.to_str().unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    lore()
+        .args([
+            "init",
+            "--provider",
+            "ollama",
+            "--repo",
+            repo,
+            "--config",
+            config_arg,
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "provider is \"openai-compatible\" in the file, \"ollama\" from --provider",
+        ));
+
+    let mut args = init_provider_args(
+        &config,
+        &config_path,
+        "http://user:secret@127.0.0.1:2/v1?api_key=hidden",
+    );
+    args.extend(["--api-key-environment-variable-name", "OTHER_KEY"]);
+    let init = lore().args(&args).assert().code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(
+            "\x20 [embedding] url is \"http://127.0.0.1:1/v1\" in the file, \
+             \"http://127.0.0.1:2/v1\" from --url\n\
+             \x20 [embedding] api_key_environment_variable_name is \
+             \"LORE_E2E_EMBEDDING_KEY\" in the file, \"OTHER_KEY\" from \
+             --api-key-environment-variable-name\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret"), "{stderr}");
+    assert!(!stderr.contains("hidden"), "{stderr}");
+
+    let (_tmp, mut config, config_path) = server_project("http://127.0.0.1:1/v1");
+    config
+        .embedding
+        .as_mut()
+        .unwrap()
+        .api_key_environment_variable_name = None;
+    config.save(&config_path).unwrap();
+    let mut args = init_provider_args(&config, &config_path, "http://127.0.0.1:1/v1/");
+    args.extend(["--api-key-environment-variable-name", "OTHER_KEY"]);
+    let init = lore().args(&args).assert().code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(
+            "\x20 [embedding] api_key_environment_variable_name is not in the file, \
+             \"OTHER_KEY\" from --api-key-environment-variable-name\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("[embedding] url is"), "{stderr}");
+
+    let (_tmp, config, config_path) = ollama_project("http://127.0.0.1:1");
+    lore()
+        .args(init_provider_args(
+            &config,
+            &config_path,
+            "http://127.0.0.1:1/v1",
+        ))
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "provider is \"ollama\" in the file, \"openai-compatible\" from --provider",
+        ));
+}
+
+#[test]
+fn init_provider_keeps_the_file_and_names_the_remedy_when_the_server_fails() {
+    let (_tmp, config, config_path) = project_without_config();
+    let config_arg = config_path.to_str().unwrap();
+    let remedy = format!(
+        "Fix the server or the flags, then remove {config_arg} before you run 'lore init' again.\n"
+    );
+
+    let init = lore()
+        .args(init_provider_args(
+            &config,
+            &config_path,
+            "http://127.0.0.1:1/v1",
+        ))
+        .assert()
+        .code(1);
+    let stderr = stderr_of(&init);
+    assert!(
+        stderr.contains(&format!("Config written to {config_arg}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\x20 ✗ Cannot reach the embedding server at http://127.0.0.1:1/v1: "),
+        "{stderr}"
+    );
+    assert!(stderr.ends_with(&format!(".\n\n{remedy}")), "{stderr}");
+    assert!(!stderr.contains("Ingesting"), "{stderr}");
+    assert!(config_path.exists());
+
+    fs::remove_file(&config_path).unwrap();
+    let init = lore()
+        .args(init_provider_args(&config, &config_path, "127.0.0.1:1/v1"))
+        .assert()
+        .code(1);
+    assert_eq!(
+        stderr_of(&init),
+        format!(
+            "=== lore init ===\n\n\
+             Config written to {config_arg}\n\n\
+             Error: Cannot use config at {config_arg}: [embedding] url has no http:// or \
+             https:// scheme. Start it with one of them.\n\
+             {remedy}"
+        )
+    );
+
+    fs::remove_file(&config_path).unwrap();
+    let init = lore()
+        .args(init_provider_args(
+            &config,
+            &config_path,
+            "http://127.0.0.1:1/v1?api_key=hidden",
+        ))
+        .assert()
+        .code(1);
+    assert_eq!(
+        stderr_of(&init),
+        format!(
+            "=== lore init ===\n\n\
+             Config written to {config_arg}\n\n\
+             Error: Cannot use config at {config_arg}: [embedding] url has a query or a \
+             fragment, and lore adds /embeddings to the url's path. Remove everything \
+             from the first \"?\" or \"#\".\n\
+             {remedy}"
+        )
+    );
+
+    fs::remove_file(&config_path).unwrap();
+    let (url, _) = serve_fake_embedding_server(ServerAnswer::Vector);
+    lore()
+        .args(init_provider_args(&config, &config_path, &url))
+        .assert()
+        .success();
+}
+
 #[test]
 fn an_ollama_index_refuses_an_embedding_server_until_a_forced_rebuild() {
     let (ollama, _) = serve_fake_ollama();
