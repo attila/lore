@@ -10,9 +10,9 @@ pub trait Embedder {
     fn provider(&self) -> &str;
     /// Model name recorded with the index.
     fn model(&self) -> &str;
-    /// Width the configuration requires of this model's vectors. A build
-    /// whose measured width differs must stop before it sizes the vector
-    /// table.
+    /// Width the configuration requires of this model's vectors. Vectors of
+    /// another measured width are never written: an ingest stops, and an MCP
+    /// write saves text only.
     fn configured_dimensions(&self) -> Option<usize> {
         None
     }
@@ -76,8 +76,8 @@ pub enum VectorMismatch {
         recorded: String,
         configured: String,
     },
-    /// The query vector is not as wide as the index's vectors. `recorded` is
-    /// `None` for an index that has no recorded model.
+    /// The query vector differs in width from the index's vectors.
+    /// `recorded` is `None` for an index that has no recorded model.
     Width {
         recorded: Option<String>,
         configured: String,
@@ -87,14 +87,17 @@ pub enum VectorMismatch {
     /// The configured model answers [`PROBE_TEXT`] unlike the model that
     /// built the index under the same name.
     Probe { model: String, similarity: f64 },
-    /// The configured model's vectors are not as wide as `[ollama]
-    /// dimensions` requires. `--force` measures the same width again, so it
-    /// is no remedy.
+    /// The configured model's vectors differ in width from `[ollama]
+    /// dimensions`. `--force` measures the same width again, so it is no
+    /// remedy.
     Configured {
         model: String,
         measured: usize,
         configured: usize,
     },
+    /// The index's recorded embedding model cannot be read, so nothing can
+    /// be compared with it.
+    Unreadable { reason: String },
 }
 
 /// Cosine similarity a fresh probe vector must reach against the recorded
@@ -151,6 +154,13 @@ impl VectorMismatch {
         })
     }
 
+    /// The recorded identity could not be read: `e` says why.
+    pub fn unreadable(e: &anyhow::Error) -> Self {
+        Self::Unreadable {
+            reason: e.to_string(),
+        }
+    }
+
     /// What the user does about it.
     pub fn remedy(&self) -> String {
         match self {
@@ -204,6 +214,9 @@ impl VectorMismatch {
                 "{model} returns {measured}-dimension vectors but [ollama] dimensions is \
                  {configured}"
             ),
+            Self::Unreadable { reason } => {
+                format!("cannot read the index's embedding model ({reason})")
+            }
         }
     }
 }
@@ -550,8 +563,8 @@ impl OllamaClient {
         }
     }
 
-    /// Require the model's vectors to be `dimensions` wide when an ingest
-    /// builds the vector table.
+    /// Require the model's vectors to be `dimensions` wide before any of
+    /// them is written.
     #[must_use]
     pub fn with_dimensions(mut self, dimensions: Option<usize>) -> Self {
         self.dimensions = dimensions;

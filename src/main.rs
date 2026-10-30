@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, OllamaClient, VectorMismatch, render_failure, same_model};
+use lore::embeddings::{
+    Embedder, EmbeddingIdentity, OllamaClient, VectorMismatch, render_failure, same_model,
+};
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -75,8 +77,8 @@ EXIT CODES:
      embedding service). Relative paths are resolved against the current working directory,
      not the knowledge directory. Also exits 1, writing nothing, when the index was built
      with another embedding model than the configured one; `lore ingest --force` rebuilds it.
-     Also exits 1, writing nothing, when the model's vectors are not as wide as
-     `[ollama] dimensions` requires; change the setting or the model.
+     Also exits 1, writing nothing, when the model's vectors differ in width from
+     `[ollama] dimensions`; change the setting or the model.
 
 NOTES:
   - `--file` takes one path per invocation; globs are not expanded.
@@ -334,13 +336,15 @@ fn cmd_init(
     if !ingest_result.errors.is_empty() {
         eprintln!("  Errors: {}", ingest_result.errors.len());
     }
-    match db.vector_dimensions() {
-        Ok(Some(_)) => eprintln!("  Search mode: hybrid (FTS5 + vector)"),
-        Ok(None) => {
-            eprintln!("  Search mode: text only (FTS5)");
-            print_text_only_note(&ingest_result.mode);
+    if let Ok(dimensions) = db.vector_dimensions() {
+        let has_vectors = dimensions.is_some();
+        eprintln!(
+            "  Search mode: {}",
+            search_mode(config.search.hybrid, has_vectors)
+        );
+        if let Some(note) = text_only_note(config.search.hybrid, has_vectors, &ingest_result.mode) {
+            eprintln!("{note}");
         }
-        Err(_) => {}
     }
 
     // Claude Code plugin instructions
@@ -561,22 +565,37 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         }
     }
 
-    if matches!(db.vector_dimensions(), Ok(None)) {
-        print_text_only_note(&result.mode);
+    if let Ok(dimensions) = db.vector_dimensions()
+        && let Some(note) = text_only_note(config.search.hybrid, dimensions.is_some(), &result.mode)
+    {
+        eprintln!("{note}");
     }
 
     Ok(())
 }
 
-fn print_text_only_note(mode: &ingest::IngestMode) {
+/// What searches use, as `lore init` reports it.
+fn search_mode(hybrid: bool, has_vectors: bool) -> &'static str {
+    if hybrid && has_vectors {
+        "hybrid (FTS5 + vector)"
+    } else {
+        "text only (FTS5)"
+    }
+}
+
+/// The note that the index has no vectors, when searches would use them.
+fn text_only_note(hybrid: bool, has_vectors: bool, mode: &ingest::IngestMode) -> Option<String> {
+    if !hybrid || has_vectors {
+        return None;
+    }
     let text_only = match mode {
         ingest::IngestMode::SingleFile { path } => format!("{path} is searchable by text only"),
         _ => "searches use text only".to_string(),
     };
-    eprintln!(
+    Some(format!(
         "Note: the index has no vectors, so {text_only}. \
-         Run `lore ingest` once the embedding model answers to add them."
-    );
+         Run 'lore ingest' once the embedding model answers to add them."
+    ))
 }
 
 /// Route the ingest request to the right library entry point based on the
@@ -728,7 +747,8 @@ fn print_universal_advisories(result: &ingest::IngestResult) {
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
     server::start_mcp_server(&config, &ollama)
 }
 
@@ -974,7 +994,8 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     // `lore status --full` invocation against a slow or hung Ollama would
     // show a blank terminal for up to 30 s before any output appears.
     let mut status = provision::check_status(&config.ollama.host, &config.ollama.model, false);
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
 
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
@@ -1055,10 +1076,9 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
             let short = git::short_sha(&config.knowledge_dir, &sha);
             eprintln!("  Last commit:  {short}");
         }
-        if let Ok(recorded) = db.recorded_embedding_model()
-            && let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), &ollama)
-        {
-            eprintln!("  Index model:  ✗ {mismatch}");
+        let model_answers = matches!(status.runtime, ProbeOutcome::Ok);
+        if let Some(line) = index_model_line(&db, &ollama, model_answers) {
+            eprintln!("  Index model:  ✗ {line}");
         }
         eprintln!();
     }
@@ -1101,6 +1121,29 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The `Index model:` status line, naming every mismatch an ingest refuses
+/// over. Only a model that answered is probed; without a probe the recorded
+/// name alone is compared.
+fn index_model_line(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    model_answers: bool,
+) -> Option<String> {
+    let probe = model_answers
+        .then(|| EmbeddingIdentity::measure(embedder).ok())
+        .flatten();
+    let mismatch = ingest::vector_write_mismatch(db, embedder, probe.as_ref())
+        .unwrap_or_else(|e| Some(VectorMismatch::unreadable(&e)))?;
+    Some(match mismatch {
+        VectorMismatch::Model { .. } | VectorMismatch::Width { .. } => format!("{mismatch}."),
+        _ => format!(
+            "{}, so 'lore ingest' refuses to write. {}.",
+            mismatch.cause(),
+            mismatch.remedy()
+        ),
+    })
 }
 
 fn resolve_trace_dir() -> anyhow::Result<PathBuf> {
@@ -1244,5 +1287,126 @@ mod tests {
         );
         assert!(db.search_fts("stderr", 10).unwrap().is_empty());
         assert_eq!(db.vector_dimensions().unwrap(), None);
+    }
+
+    // -- search mode ------------------------------------------------------------
+
+    #[test]
+    fn search_mode_and_note_follow_the_hybrid_setting() {
+        let full = ingest::IngestMode::Full;
+        assert_eq!(search_mode(true, true), "hybrid (FTS5 + vector)");
+        assert_eq!(search_mode(true, false), "text only (FTS5)");
+        assert_eq!(search_mode(false, true), "text only (FTS5)");
+        assert_eq!(search_mode(false, false), "text only (FTS5)");
+        assert_eq!(text_only_note(true, true, &full), None);
+        assert_eq!(text_only_note(false, false, &full), None);
+        assert_eq!(
+            text_only_note(true, false, &full).as_deref(),
+            Some(
+                "Note: the index has no vectors, so searches use text only. Run 'lore ingest' \
+                 once the embedding model answers to add them."
+            )
+        );
+    }
+
+    // -- index_model_line -------------------------------------------------------
+
+    use lore::embeddings::FakeEmbedder;
+
+    fn index_of(embedder: &FakeEmbedder) -> KnowledgeDB {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity = EmbeddingIdentity::measure(embedder).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+        db
+    }
+
+    const FORCE: &str = "Run 'lore ingest --force' to rebuild the index.";
+
+    #[test]
+    fn status_names_a_model_of_another_name_without_probing() {
+        let db = index_of(&FakeEmbedder::with_model("other-model", 768));
+
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), false).unwrap(),
+            format!(
+                "the index was built with other-model but lore is configured for \
+                 nomic-embed-text, so searches use text only. {FORCE}"
+            )
+        );
+    }
+
+    #[test]
+    fn status_names_a_model_of_another_width_once_it_answers() {
+        let db = index_of(&FakeEmbedder::with_dimensions(4));
+
+        assert_eq!(index_model_line(&db, &FakeEmbedder::new(), false), None);
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), true).unwrap(),
+            format!(
+                "the index holds 4-dimension vectors from nomic-embed-text but \
+                 nomic-embed-text returns 768 dimensions, so searches use text only. {FORCE}"
+            )
+        );
+    }
+
+    #[test]
+    fn status_names_another_model_behind_the_recorded_name_once_it_answers() {
+        let db = index_of(&FakeEmbedder::new());
+        let probe = EmbeddingIdentity::measure(&FakeEmbedder::new())
+            .unwrap()
+            .probe_vector;
+        let negated: Vec<f32> = probe.iter().map(|x| -x).collect();
+        db.set_metadata(
+            "embedding_probe_vector",
+            &serde_json::to_string(&negated).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(index_model_line(&db, &FakeEmbedder::new(), false), None);
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), true).unwrap(),
+            format!(
+                "nomic-embed-text is not the model that built the index under that name: its \
+                 vectors match the recorded ones at cosine similarity -1.000, below 0.99, so \
+                 'lore ingest' refuses to write. {FORCE}"
+            )
+        );
+    }
+
+    #[test]
+    fn status_names_an_unreadable_recorded_identity() {
+        let db = index_of(&FakeEmbedder::new());
+        db.set_metadata("embedding_probe_vector", "[0.5,").unwrap();
+
+        let line = index_model_line(&db, &FakeEmbedder::new(), true).unwrap();
+
+        assert!(
+            line.starts_with("cannot read the index's embedding model (malformed"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("so 'lore ingest' refuses to write. {FORCE}")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn status_names_the_width_setting_the_model_contradicts() {
+        let db = index_of(&FakeEmbedder::new());
+
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new().configured_for(1024), true).unwrap(),
+            "nomic-embed-text returns 768-dimension vectors but [ollama] dimensions is 1024, \
+             so 'lore ingest' refuses to write. Set [ollama] dimensions to 768 or \"auto\", or \
+             configure a model that returns 1024-dimension vectors."
+        );
+    }
+
+    #[test]
+    fn status_is_silent_when_the_model_matches_the_index() {
+        let db = index_of(&FakeEmbedder::new());
+
+        assert_eq!(index_model_line(&db, &FakeEmbedder::new(), true), None);
     }
 }

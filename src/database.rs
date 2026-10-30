@@ -226,8 +226,9 @@ impl KnowledgeDB {
     /// Create all text tables if they don't already exist, then stamp the
     /// schema version so `check_schema_compatibility` can detect old databases
     /// with a single-integer read instead of parsing `PRAGMA table_info`
-    /// columns. The `patterns_vec` table is created separately by
-    /// [`Self::ensure_vector_table`].
+    /// columns. The `patterns_vec` table is created separately, at the
+    /// measured embedding width, by [`Self::clear_all`] or
+    /// [`Self::add_vector_table`].
     pub fn init(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(PATTERNS_FTS_DDL)?;
         self.conn.execute_batch(CHUNKS_DDL)?;
@@ -240,6 +241,7 @@ impl KnowledgeDB {
 
     /// Create the `patterns_vec` table for `dimensions`-wide embeddings if it
     /// doesn't already exist. An existing table keeps its width.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn ensure_vector_table(&self, dimensions: usize) -> anyhow::Result<()> {
         self.conn.execute_batch(&patterns_vec_ddl(dimensions))?;
         Ok(())
@@ -335,6 +337,10 @@ impl KnowledgeDB {
     /// identity is recorded in the same transaction. With no identity (the
     /// embedding model could not be reached) the index is left without a
     /// vector table and without a recorded identity.
+    ///
+    /// The recorded HEAD goes too, so a rebuild stopped before it records
+    /// HEAD again is resumed by the next ingest as a full one, never read as
+    /// up to date.
     pub fn clear_all(&self, identity: Option<&EmbeddingIdentity>) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
@@ -345,12 +351,13 @@ impl KnowledgeDB {
         tx.execute_batch("DROP TABLE IF EXISTS patterns")?;
         tx.execute_batch(PATTERNS_DDL)?;
         tx.execute(
-            "DELETE FROM ingest_metadata WHERE key IN (?1, ?2, ?3, ?4)",
+            "DELETE FROM ingest_metadata WHERE key IN (?1, ?2, ?3, ?4, ?5)",
             params![
                 META_EMBEDDING_PROVIDER,
                 META_EMBEDDING_MODEL,
                 META_EMBEDDING_DIMENSIONS,
                 META_EMBEDDING_PROBE_VECTOR,
+                crate::ingest::META_LAST_COMMIT,
             ],
         )?;
         if let Some(identity) = identity {

@@ -353,8 +353,9 @@ lore MCP server reports one of three values:
   > Coverage check halted: the cascade-detection query fell back to FTS-only, and the parallel
   > coverage queries that follow would do the same: producing a report whose ranks are not
   > comparable across queries. Fix the cause: restart Ollama if it is unreachable, run
-  > `lore ingest --force` if the index was built with another model, or run `lore ingest` to add the
-  > missing vectors. Then rerun the skill from the start.
+  > `lore ingest --force` if the index was built with another model (or restart the MCP server if
+  > `lore.toml` already names the index's model), or run `lore ingest` to add the missing vectors.
+  > Then rerun the skill from the start.
 
 These two early aborts catch deployment-misconfiguration and embedder-unavailability **once** at
 step 6 instead of repeating the diagnosis 5-12 times in step 7's parallel batch and then refusing

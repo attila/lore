@@ -273,10 +273,10 @@ The `min_relevance` setting (default: 0.6) filters results below a minimum norma
 threshold is applied only when:
 
 - Hybrid search is enabled (`search.hybrid = true`)
-- Embedding succeeded (Ollama returned a valid vector)
+- Embedding succeeded (Ollama returned a vector the index can use)
 - `min_relevance` is greater than zero
 
-When FTS5 is the sole search method (hybrid disabled or Ollama unreachable), no threshold is
+When FTS5 is the sole search method (hybrid disabled, or no usable query vector), no threshold is
 applied. FTS5 BM25 scores use a different scale and are not directly comparable.
 
 ## Ingest-Time Filtering with `.loreignore`

@@ -828,7 +828,7 @@ fn ingest_file_on_text_only_index_lands_text_and_exits_zero() {
         .stderr(predicate::str::contains(
             "Note: the index has no vectors, so draft.md is searchable by text only",
         ))
-        .stderr(predicate::str::contains("Run `lore ingest`"));
+        .stderr(predicate::str::contains("Run 'lore ingest'"));
 
     let db = KnowledgeDB::open(&config.database).unwrap();
     assert_eq!(db.vector_dimensions().unwrap(), None);
@@ -838,6 +838,36 @@ fn ingest_file_on_text_only_index_lands_text_and_exits_zero() {
             .iter()
             .any(|r| r.source_file == "draft.md")
     );
+}
+
+#[test]
+fn ingest_with_hybrid_search_off_prints_no_text_only_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut config, config_path) = text_only_index(tmp.path());
+    config.search.hybrid = false;
+    config.save(&config_path).unwrap();
+    let draft = config.knowledge_dir.join("draft.md");
+    std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    for args in [
+        vec!["ingest", "--config", config_arg],
+        vec![
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+        ],
+    ] {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(&args)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Note: the index has no vectors").not())
+            .stderr(predicate::str::contains("hybrid").not());
+    }
 }
 
 #[test]
@@ -926,7 +956,7 @@ fn ingest_and_ingest_file_refuse_an_index_of_another_model_and_write_nothing() {
     let draft = config.knowledge_dir.join("draft.md");
     std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
     let config_arg = config_path.to_str().unwrap();
-    let refusal = "Error: refusing to ingest: the index was built with other-model but lore is \
+    let refusal = "Error: Refusing to ingest: the index was built with other-model but lore is \
                    configured for nomic-embed-text, and vectors from two models cannot be \
                    searched together. Run 'lore ingest --force' to rebuild the index";
 

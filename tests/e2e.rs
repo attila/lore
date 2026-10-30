@@ -677,6 +677,29 @@ fn an_index_without_a_recorded_model_keeps_its_vectors_while_the_model_is_silent
     assert_eq!(db.recorded_embedding_model().unwrap(), None);
 }
 
+#[test]
+fn an_interrupted_rebuild_resumes_as_a_full_ingest() {
+    let tmp = tempdir().unwrap();
+    let (dir, db) = v0_5_index(tmp.path(), 768);
+    let identity = lore::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new()).unwrap();
+    // The rebuild cleared the index and recorded the model, then stopped
+    // before its first file.
+    db.clear_all(Some(&identity)).unwrap();
+
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), &dir);
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.mode, ingest::IngestMode::Full, "{lines:?}");
+    assert!(
+        logged(&lines, "No previous ingest recorded — running full ingest"),
+        "{lines:?}"
+    );
+    for term in ["anyhow", "abbreviations", "mocks"] {
+        assert_eq!(db.search_fts(term, 10).unwrap().len(), 1, "{term}");
+    }
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+}
+
 /// Answers under [`FakeEmbedder`]'s name with vectors pointing the other
 /// way, as another model pulled under the same name would.
 struct SwappedEmbedder(FakeEmbedder);
@@ -709,7 +732,7 @@ fn ingest_refuses_another_model_behind_the_recorded_name_and_writes_nothing() {
     fs::write(dir.join(".loreignore"), "naming-conventions.md\n").unwrap();
     commit_all(dir);
     let swapped = SwappedEmbedder(FakeEmbedder::new());
-    let probe_refusal = "refusing to ingest: nomic-embed-text is not the model that built the \
+    let probe_refusal = "Refusing to ingest: nomic-embed-text is not the model that built the \
                          index under that name: its vectors match the recorded ones at cosine \
                          similarity -1.000, below 0.99";
 
@@ -717,7 +740,7 @@ fn ingest_refuses_another_model_behind_the_recorded_name_and_writes_nothing() {
 
     let refused = result.refused.expect("a swapped model must be refused");
     assert!(refused.starts_with(probe_refusal), "{refused}");
-    assert!(refused.ends_with("Run 'lore ingest --force' to rebuild the index"));
+    assert!(refused.ends_with("Run 'lore ingest --force' to rebuild the index."));
     assert!(lines.is_empty(), "{lines:?}");
     assert!(db.search_fts("stderr", 10).unwrap().is_empty());
     assert_eq!(db.search_fts("abbreviations", 10).unwrap().len(), 1);
@@ -760,7 +783,7 @@ fn ingest_refuses_a_model_of_another_width_behind_the_recorded_name() {
     let db = memory_db();
     ingest_logged(&db, &FakeEmbedder::new(), dir);
     let wider = FakeEmbedder::with_dimensions(1024);
-    let width_refusal = "refusing to ingest: the index holds 768-dimension vectors from \
+    let width_refusal = "Refusing to ingest: the index holds 768-dimension vectors from \
                          nomic-embed-text but nomic-embed-text returns 1024 dimensions";
 
     let (result, _) = ingest_logged(&db, &wider, dir);
@@ -802,10 +825,10 @@ fn ingest_refuses_a_model_of_another_width_behind_the_recorded_name() {
     assert!(db.chunks_without_vectors().unwrap().is_empty());
 }
 
-const WIDTH_SETTING_REFUSAL: &str = "refusing to ingest: nomic-embed-text returns \
+const WIDTH_SETTING_REFUSAL: &str = "Refusing to ingest: nomic-embed-text returns \
                                      768-dimension vectors but [ollama] dimensions is 1024. \
                                      Set [ollama] dimensions to 768 or \"auto\", or configure \
-                                     a model that returns 1024-dimension vectors";
+                                     a model that returns 1024-dimension vectors.";
 
 #[test]
 fn a_first_ingest_stops_before_writing_when_the_width_is_not_the_configured_one() {
@@ -917,9 +940,9 @@ fn every_ingest_names_the_setting_when_a_pinned_width_meets_a_wider_model() {
     fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
     commit_all(dir);
     let wider = FakeEmbedder::with_dimensions(1024).configured_for(768);
-    let setting_refusal = "refusing to ingest: nomic-embed-text returns 1024-dimension vectors \
+    let setting_refusal = "Refusing to ingest: nomic-embed-text returns 1024-dimension vectors \
                            but [ollama] dimensions is 768. Set [ollama] dimensions to 1024 or \
-                           \"auto\", or configure a model that returns 768-dimension vectors";
+                           \"auto\", or configure a model that returns 768-dimension vectors.";
 
     let (result, _) = ingest_logged(&db, &wider, dir);
     assert_eq!(result.refused.as_deref(), Some(setting_refusal));
@@ -969,6 +992,7 @@ fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
             }
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let vector = embedder
                 .embed(request["input"][0].as_str().unwrap())
@@ -981,7 +1005,6 @@ fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
                 response.len()
             )
             .unwrap();
-            counter.fetch_add(1, Ordering::SeqCst);
         }
     });
     (url, served)
@@ -1011,7 +1034,7 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
     config.save(&config_path).unwrap();
     let config_arg = config_path.to_str().unwrap();
     let text_only_note = "Note: the index has no vectors, so searches use text only. \
-                          Run `lore ingest` once the embedding model answers to add them.";
+                          Run 'lore ingest' once the embedding model answers to add them.";
     let cause = "Embedding model did not answer (";
 
     lore()
@@ -1248,7 +1271,7 @@ fn ingest_refuses_an_unreadable_recorded_probe_until_a_forced_rebuild() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
-            "Error: refusing to ingest: cannot read the index's embedding model",
+            "Error: Refusing to ingest: cannot read the index's embedding model",
         ))
         .stderr(predicate::str::contains(
             "Run 'lore ingest --force' to rebuild the index",

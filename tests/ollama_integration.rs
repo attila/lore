@@ -637,7 +637,7 @@ fn ollama_unreachable_returns_error() {
         result.unwrap()
     );
 
-    // -- ingest() records errors but doesn't panic ----------------------------
+    // -- ingest() builds a text-only index without panicking -----------------
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
 
@@ -648,17 +648,29 @@ fn ollama_unreachable_returns_error() {
     .unwrap();
 
     let db = open_db(dir, OLLAMA_DIMENSIONS);
-    let result = ingest::ingest(&db, &dead_client, dir, "heading", &|_| {});
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let result = ingest::ingest(&db, &dead_client, dir, "heading", &|m| {
+        lines.borrow_mut().push(m.to_string());
+    });
 
     assert_eq!(result.files_processed, 1);
     assert!(
-        !result.errors.is_empty(),
-        "R8: ingest with dead Ollama should record errors, got none"
+        result.errors.is_empty(),
+        "R8: a model that does not answer leaves a text-only index, not errors: {:?}",
+        result.errors
     );
-    // Chunks are created with None embeddings — chunks_created will be > 0.
+    assert_eq!(db.vector_dimensions().unwrap(), None);
     assert!(
         result.chunks_created >= 1,
         "R8: chunks should still be created (with None embeddings)"
+    );
+    assert_eq!(db.search_fts("testing", 10).unwrap().len(), 1);
+    assert!(
+        lines
+            .into_inner()
+            .iter()
+            .any(|l| l.starts_with("Embedding model did not answer (")),
+        "R8: the ingest should say the model did not answer"
     );
 }
 

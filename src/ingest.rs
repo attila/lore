@@ -127,9 +127,9 @@ pub struct IngestResult {
     /// from the database.
     pub reconciled_added: usize,
     pub errors: Vec<String>,
-    /// Set when the ingest wrote nothing because the configured embedding
-    /// model is not, or cannot be confirmed as, the one the index was built
-    /// with. Names the remedy.
+    /// Set when the ingest wrote nothing because vectors from the configured
+    /// embedding model may not enter the index (see [`VectorMismatch`]).
+    /// Names the remedy.
     pub refused: Option<String>,
     /// Distinct source files that ingested at least one chunk tagged
     /// `universal` in this run. Drives the always-on `Universal patterns: N`
@@ -214,8 +214,8 @@ pub struct WriteResult {
     /// [`crate::engine::is_known_token`]; never `None` so callers can
     /// always render the field as an array on a `lore-metadata` fence.
     pub language_warnings: Vec<String>,
-    /// Set when the pattern was indexed without vectors because the index
-    /// was built with another embedding model.
+    /// Set when the pattern was indexed without vectors because vectors from
+    /// the configured embedding model may not enter the index.
     pub vectors_withheld: Option<VectorMismatch>,
 }
 
@@ -411,13 +411,13 @@ pub fn ingest(
 }
 
 /// The identity check before vectors are written, shared by every write
-/// path: `Some` when vectors from `embedder` must not enter the index. The
-/// recorded provider and model must match by name. Given the configured
-/// model's `probe`, its width must match `[ollama] dimensions` when set and
-/// the vector table's, and its vector
-/// the recorded probe vector, which catches another model pulled under the
-/// same name; without one, the name alone decides.
-fn vector_write_mismatch(
+/// path and `lore status`: `Some` when vectors from `embedder` must not
+/// enter the index. The recorded provider and model must match by name.
+/// Given the configured model's `probe`, its width must also match
+/// `[ollama] dimensions` when set and the vector table's, and its vector
+/// must match the recorded probe vector, which catches another model pulled
+/// under the same name; without a probe, the name alone decides.
+pub fn vector_write_mismatch(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     probe: Option<&EmbeddingIdentity>,
@@ -478,27 +478,22 @@ fn check_single_write(
     }
 }
 
-const REMEDY: &str = "Run 'lore ingest --force' to rebuild the index";
-
 /// The message an ingest that refuses to write prints.
 fn refusal(mismatch: &VectorMismatch) -> String {
-    if let VectorMismatch::Configured { .. } = mismatch {
-        return format!(
-            "refusing to ingest: {}. {}",
-            mismatch.cause(),
-            mismatch.remedy()
-        );
-    }
+    let consequence = match mismatch {
+        VectorMismatch::Configured { .. } | VectorMismatch::Unreadable { .. } => "",
+        _ => ", and vectors from two models cannot be searched together",
+    };
     format!(
-        "refusing to ingest: {}, and vectors from two models cannot be searched together. \
-         {REMEDY}",
-        mismatch.cause()
+        "Refusing to ingest: {}{consequence}. {}.",
+        mismatch.cause(),
+        mismatch.remedy()
     )
 }
 
 /// The refusal when the index's embedding model cannot be read at all.
 fn unreadable_refusal(e: &anyhow::Error) -> String {
-    format!("refusing to ingest: cannot read the index's embedding model ({e}). {REMEDY}")
+    refusal(&VectorMismatch::unreadable(e))
 }
 
 /// What a walk ingest does about the embedding model before writing. Each
@@ -765,9 +760,9 @@ fn reconcile_ignored(
                 {
                     warned_withheld = true;
                     on_progress(&format!(
-                        "Warning: {}, so re-indexed files are searchable by text only. \
-                         Run 'lore ingest --force' to rebuild the index.",
-                        mismatch.cause()
+                        "Warning: {}, so re-indexed files are searchable by text only. {}.",
+                        mismatch.cause(),
+                        mismatch.remedy()
                     ));
                 }
                 stats.added += 1;
@@ -2068,8 +2063,8 @@ fn emit_language_tally(result: &IngestResult, on_progress: &dyn Fn(&str)) {
 struct IndexedFile {
     chunks_indexed: usize,
     embedding_failures: usize,
-    /// Set when the index was built with another embedding model, so the
-    /// file's chunks were stored without vectors.
+    /// Set when vectors from the configured embedding model may not enter
+    /// the index, so the file's chunks were stored without vectors.
     vectors_withheld: Option<VectorMismatch>,
     rel_path: String,
     universal_metadata: UniversalMetadata,
@@ -2175,11 +2170,12 @@ fn index_single_file(
     // Collecting into a Vec materialises all embed calls up front; the
     // transaction block below contains only in-memory DB work.
     //
-    // A text-only index (no vector table), or one built with another
-    // embedding model, stores no vectors and counts no failures. A vector of
+    // A text-only index (no vector table), or one this model's vectors may
+    // not enter, stores no vectors and counts no failures. A vector of
     // a width the table cannot hold counts as an embedding failure so the
     // chunk's text still lands.
-    let vectors_withheld = vector_write_mismatch(db, embedder, probe)?;
+    let vectors_withheld = vector_write_mismatch(db, embedder, probe)
+        .unwrap_or_else(|e| Some(VectorMismatch::unreadable(&e)));
     let vector_dimensions = db
         .vector_dimensions()?
         .filter(|_| vectors_withheld.is_none());
@@ -2710,12 +2706,15 @@ mod tests {
         let refused = result.refused.expect("an unreadable probe must refuse");
         assert!(
             refused.starts_with(
-                "refusing to ingest: cannot read the index's embedding model (malformed \
+                "Refusing to ingest: cannot read the index's embedding model (malformed \
                  recorded probe vector:"
             ),
             "{refused}"
         );
-        assert!(refused.ends_with(REMEDY), "{refused}");
+        assert!(
+            refused.ends_with("Run 'lore ingest --force' to rebuild the index."),
+            "{refused}"
+        );
 
         full_ingest(&db, &embedder, dir, "heading", &|_| {});
         assert_eq!(

@@ -825,8 +825,9 @@ fn run_search(
     let mut embed_failed = false;
     let mut note = None;
     let mut mismatch_fallback = |mismatch: VectorMismatch| {
-        eprintln!("[lore] Warning: {mismatch}.");
-        note = Some(format!("{mismatch}."));
+        let hint = restart_hint(&mismatch);
+        eprintln!("[lore] Warning: {mismatch}{hint}.");
+        note = Some(format!("{mismatch}{hint}."));
     };
     let results = if ctx.config.search.hybrid {
         let vector_width = ctx.db.vector_dimensions();
@@ -1513,16 +1514,28 @@ fn build_trace_status_value(stats: &crate::trace::TraceStats) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Lead for a write tool's response when the pattern was saved without
-/// vectors because the index was built with another embedding model.
+/// vectors because vectors from the configured embedding model may not
+/// enter the index.
 fn withheld_vectors_note(mismatch: Option<&VectorMismatch>) -> String {
     mismatch.map_or_else(String::new, |mismatch| {
         format!(
             "Warning: {}, so this pattern was saved without vectors and is found by text \
-             search only. {}.\n\n",
+             search only. {}{}.\n\n",
             mismatch.cause(),
-            mismatch.remedy()
+            mismatch.remedy(),
+            restart_hint(mismatch)
         )
     })
+}
+
+/// The clause an MCP mismatch message ends with when the index records a
+/// model of another name: the server keeps the model it started with, so a
+/// `lore.toml` edited since then takes effect only on restart.
+fn restart_hint(mismatch: &VectorMismatch) -> String {
+    let VectorMismatch::Model { recorded, .. } = mismatch else {
+        return String::new();
+    };
+    format!(", or restart the MCP server if lore.toml already names {recorded}")
 }
 
 fn embedding_note(failures: usize) -> String {
@@ -2680,7 +2693,8 @@ mod tests {
             text.starts_with(
                 "Note: the index was built with other but lore is configured for \
                  nomic-embed-text, so searches use text only. Run 'lore ingest --force' \
-                 to rebuild the index.\n\n"
+                 to rebuild the index, or restart the MCP server if lore.toml already names \
+                 other.\n\n"
             ),
             "{text}"
         );
@@ -2770,7 +2784,8 @@ mod tests {
             text.starts_with(
                 "Warning: the index was built with other but lore is configured for \
                  nomic-embed-text, so this pattern was saved without vectors and is found by \
-                 text search only. Run 'lore ingest --force' to rebuild the index.\n\n\
+                 text search only. Run 'lore ingest --force' to rebuild the index, or restart \
+                 the MCP server if lore.toml already names other.\n\n\
                  Pattern \"Quokka Care\" saved to"
             ),
             "{text}"
@@ -2785,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn update_and_append_save_text_without_vectors_when_the_model_probe_differs() {
+    fn update_and_append_save_text_without_vectors_when_the_model_width_differs() {
         let tmp = tempdir().unwrap();
         let config = Config::default_with(
             tmp.path().to_path_buf(),
@@ -2833,6 +2848,83 @@ mod tests {
         assert_eq!(db.search_fts("water", 10).unwrap().len(), 1);
         assert_eq!(db.chunks_without_vectors().unwrap().len(), 2);
         assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+    }
+
+    /// Add a pattern through MCP to an index whose recorded probe vector is
+    /// `recorded_probe`, as JSON.
+    fn add_quokka_care_over_recorded_probe(recorded_probe: &str) -> (KnowledgeDB, Value) {
+        let tmp = tempdir().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity = crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new()).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+        db.set_metadata(crate::database::META_EMBEDDING_PROBE_VECTOR, recorded_probe)
+            .unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &FakeEmbedder::new(),
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":19,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{"title":"Quokka Care","body":"Feed quokkas native leaves only."}
+                }
+            }"#,
+        );
+        (db, resp)
+    }
+
+    #[test]
+    fn add_pattern_saves_text_without_vectors_when_another_model_answers_under_the_name() {
+        let probe = crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new())
+            .unwrap()
+            .probe_vector;
+        let negated: Vec<f32> = probe.iter().map(|x| -x).collect();
+
+        let (db, resp) =
+            add_quokka_care_over_recorded_probe(&serde_json::to_string(&negated).unwrap());
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Warning: nomic-embed-text is not the model that built the index under that \
+                 name: its vectors match the recorded ones at cosine similarity -1.000, below \
+                 0.99, so this pattern was saved without vectors and is found by text search \
+                 only. Run 'lore ingest --force' to rebuild the index.\n\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(db.search_fts("quokkas", 10).unwrap().len(), 1);
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_pattern_saves_text_without_vectors_when_the_recorded_identity_is_unreadable() {
+        let (db, resp) = add_quokka_care_over_recorded_probe("[0.5,");
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Warning: cannot read the index's embedding model (malformed"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "so this pattern was saved without vectors and is found by text search only. \
+                 Run 'lore ingest --force' to rebuild the index.\n\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(db.search_fts("quokkas", 10).unwrap().len(), 1);
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
     }
 
     #[test]

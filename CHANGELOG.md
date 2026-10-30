@@ -16,11 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - MCP tool descriptions, CLI output and the plugin skills name the pattern collection the "knowledge
   directory", matching the `knowledge_dir` setting. (#75)
 - `lore init` leaves an existing config untouched and exits 1 when a flag contradicts it. (#78)
+- Plain `lore ingest` and `lore ingest --file` exit 1 when the index was built with another
+  embedding model. (#78)
+- The first plain `lore ingest` after upgrading rebuilds an index that records no embedding model, a
+  one-off full re-embed. (#78)
 
 ### Fixed
 
 - Any Ollama embedding model now works at its own vector width, and after a model switch searches
   fall back to text and name `lore ingest --force` instead of mixing vectors from two models. (#78)
+- `lore status` reports a config it cannot read or parse instead of saying it was not found. (#78)
+- Chunks that failed to embed are retried by later ingests. (#78)
+- An interrupted `lore ingest --force` no longer leaves a half-empty index that later ingests report
+  as up to date. (#78)
 
 ### Security
 
