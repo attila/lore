@@ -210,7 +210,7 @@ impl VectorMismatch {
 
 /// Ollama resolves an untagged model name to its `:latest` tag, so the two
 /// spellings name the same model; any other tag is a different model.
-fn same_model(provider: &str, recorded: &str, configured: &str) -> bool {
+pub fn same_model(provider: &str, recorded: &str, configured: &str) -> bool {
     fn untagged(model: &str) -> &str {
         model.strip_suffix(":latest").unwrap_or(model)
     }

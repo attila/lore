@@ -152,6 +152,67 @@ fn init_custom_database_does_not_appear_in_output() {
 
 #[test]
 #[ignore = "requires running Ollama instance"]
+fn init_rerun_reuses_a_hand_edited_config() {
+    let tmp = tempdir().unwrap();
+    let config = tmp.path().join("lore.toml");
+    let repo = tempdir().unwrap();
+    seed_knowledge(repo.path());
+    git_init(repo.path());
+    let init = || {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .args(["init", "--repo"])
+            .arg(repo.path())
+            .arg("--database")
+            .arg(tmp.path().join("knowledge.db"))
+            .assert()
+            .success()
+    };
+    init();
+    let edited = format!(
+        "# Hand-edited.\n{}",
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("top_k = 5", "top_k = 9")
+    );
+    fs::write(&config, &edited).unwrap();
+
+    init().stderr(predicate::str::contains("Using existing config at"));
+
+    assert_eq!(fs::read_to_string(&config).unwrap(), edited);
+}
+
+#[test]
+#[ignore = "requires running Ollama instance"]
+fn init_refuses_a_pinned_width_the_model_does_not_return() {
+    let tmp = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    seed_knowledge(repo.path());
+    let mut config = lore::config::Config::default_with(
+        fs::canonicalize(repo.path()).unwrap(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.dimensions = lore::config::Dimensions::Fixed(7);
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .arg("--config")
+        .arg(&config_path)
+        .args(["init", "--repo"])
+        .arg(repo.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("but [ollama] dimensions is 7"))
+        .stderr(predicate::str::contains("--- Done ---").not());
+}
+
+#[test]
+#[ignore = "requires running Ollama instance"]
 fn init_output_paths_are_clean() {
     let xdg_config = tempdir().unwrap();
     let xdg_data = tempdir().unwrap();

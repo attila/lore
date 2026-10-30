@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
-use lore::embeddings::{OllamaClient, VectorMismatch, render_failure};
+use lore::embeddings::{Embedder, OllamaClient, VectorMismatch, render_failure, same_model};
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -37,18 +37,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Provision Ollama, pull model, create config, run first ingestion
+    ///
+    /// An existing config file is used as it is and never rewritten. A flag
+    /// that disagrees with it is an error; edit the file, or remove it to
+    /// start fresh.
     Init {
         /// Path to your markdown knowledge directory (git repo)
         #[arg(long)]
         repo: PathBuf,
 
-        /// Ollama embedding model to use
-        #[arg(long, default_value = "nomic-embed-text")]
-        model: String,
+        /// Ollama embedding model to use [default: nomic-embed-text]
+        #[arg(long)]
+        model: Option<String>,
 
-        /// MCP server bind address
-        #[arg(long, default_value = "localhost:3100")]
-        bind: String,
+        /// MCP server bind address [default: localhost:3100]
+        #[arg(long)]
+        bind: Option<String>,
 
         /// Path to database file [default: ~/.local/share/lore/knowledge.db]
         #[arg(long)]
@@ -225,8 +229,8 @@ fn main() {
             user_provided_config,
             database.as_deref(),
             &repo,
-            &model,
-            &bind,
+            model.as_deref(),
+            bind.as_deref(),
         ),
         Commands::Ingest { force, file } => cmd_ingest(&config_path, force, file.as_deref()),
         Commands::Serve => cmd_serve(&config_path),
@@ -251,8 +255,8 @@ fn cmd_init(
     user_provided_config: bool,
     database_override: Option<&Path>,
     repo: &Path,
-    model: &str,
-    bind: &str,
+    model: Option<&str>,
+    bind: Option<&str>,
 ) -> anyhow::Result<()> {
     eprintln!("=== lore init ===\n");
 
@@ -270,27 +274,28 @@ fn cmd_init(
         eprintln!("  them. See docs/configuration.md#git-integration for details.\n");
     }
 
-    let db_path = match database_override {
-        Some(p) => std::path::absolute(p)?,
-        None => default_database_path()?,
-    };
+    let (config, existing) =
+        init_config(config_path, knowledge_dir, database_override, model, bind)?;
 
     // Create parent directories for config and database
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Some(parent) = db_path.parent() {
+    if let Some(parent) = config.database.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut config = Config::default_with(knowledge_dir, db_path, model);
-    config.bind = bind.to_string();
-
-    config.save(config_path)?;
+    if !existing {
+        config.save(config_path)?;
+    }
     // Canonicalize after save so the output path is clean (no ".." hops).
     let config_path =
         std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    eprintln!("Config written to {}\n", config_path.display());
+    if existing {
+        eprintln!("Using existing config at {}\n", config_path.display());
+    } else {
+        eprintln!("Config written to {}\n", config_path.display());
+    }
 
     // provision
     eprintln!("--- Provisioning ---\n");
@@ -316,38 +321,26 @@ fn cmd_init(
     // run initial ingestion
     eprintln!("\n--- Ingesting knowledge directory ---\n");
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
-    eprintln!("Search mode: hybrid (FTS5 + vector)\n");
-
-    let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
-    let _lock_guard = write_lock.acquire()?;
-
-    // Mirror the tier-2 effective-empty warning that `ingest()` emits at its
-    // entry point. `cmd_init` calls `full_ingest` directly to avoid the
-    // delta/full state probe (the DB is fresh), so the warning would not fire
-    // otherwise. See project memory `project_cli_behaviour_ladder.md`.
-    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
-        eprintln!("{msg}");
-    }
-
-    let ingest_result = ingest::full_ingest(
-        &db,
-        &ollama,
-        &config.knowledge_dir,
-        &config.chunking.strategy,
-        &|msg| {
-            eprintln!("{msg}");
-        },
-    );
+    let ingest_result = init_ingest(&db, &ollama, &config)?;
 
     eprintln!("\n--- Done ---");
     eprintln!("  Files: {}", ingest_result.files_processed);
     eprintln!("  Chunks: {}", ingest_result.chunks_created);
     if !ingest_result.errors.is_empty() {
         eprintln!("  Errors: {}", ingest_result.errors.len());
+    }
+    match db.vector_dimensions() {
+        Ok(Some(_)) => eprintln!("  Search mode: hybrid (FTS5 + vector)"),
+        Ok(None) => {
+            eprintln!("  Search mode: text only (FTS5)");
+            print_text_only_note(&ingest_result.mode);
+        }
+        Err(_) => {}
     }
 
     // Claude Code plugin instructions
@@ -373,6 +366,130 @@ fn cmd_init(
     }
 
     Ok(())
+}
+
+/// The config `lore init` runs with, and whether it already existed. An
+/// existing file is returned as it is, so `cmd_init` must not save it.
+fn init_config(
+    config_path: &Path,
+    knowledge_dir: PathBuf,
+    database: Option<&Path>,
+    model: Option<&str>,
+    bind: Option<&str>,
+) -> anyhow::Result<(Config, bool)> {
+    let exists = config_path.try_exists().map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot check for a config at {}: {e}",
+            config_path.display()
+        )
+    })?;
+    if !exists {
+        let db_path = match database {
+            Some(p) => std::path::absolute(p)?,
+            None => default_database_path()?,
+        };
+        let mut config =
+            Config::default_with(knowledge_dir, db_path, model.unwrap_or("nomic-embed-text"));
+        if let Some(bind) = bind {
+            config.bind = bind.to_string();
+        }
+        return Ok((config, false));
+    }
+    let config = Config::load(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "The existing config at {} could not be loaded and was left untouched. \
+             Fix it, or remove it to start fresh.\n{e}",
+            config_path.display()
+        )
+    })?;
+
+    let mut conflicts = Vec::new();
+    if resolved(&config.knowledge_dir) != knowledge_dir {
+        conflicts.push(format!(
+            "knowledge_dir is \"{}\" in the file, \"{}\" from --repo",
+            config.knowledge_dir.display(),
+            knowledge_dir.display()
+        ));
+    }
+    if let Some(database) = database
+        && resolved(&config.database) != resolved(database)
+    {
+        conflicts.push(format!(
+            "database is \"{}\" in the file, \"{}\" from --database",
+            config.database.display(),
+            database.display()
+        ));
+    }
+    if let Some(model) = model
+        && !same_model("ollama", &config.ollama.model, model)
+    {
+        conflicts.push(format!(
+            "[ollama] model is \"{}\" in the file, \"{model}\" from --model",
+            config.ollama.model
+        ));
+    }
+    if let Some(bind) = bind
+        && bind != config.bind
+    {
+        conflicts.push(format!(
+            "bind is \"{}\" in the file, \"{bind}\" from --bind",
+            config.bind
+        ));
+    }
+    if !conflicts.is_empty() {
+        anyhow::bail!(
+            "The existing config at {} disagrees with the flags given:\n  {}\n\
+             Edit the file to change a setting, or remove it to start fresh.",
+            config_path.display(),
+            conflicts.join("\n  ")
+        );
+    }
+    Ok((config, true))
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return path;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(parent) = std::fs::canonicalize(parent)
+    {
+        return parent.join(name);
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Build the index `lore init` ends with. A refused ingest is an error, so
+/// init never reports success over an index it did not build.
+fn init_ingest(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+) -> anyhow::Result<ingest::IngestResult> {
+    let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
+    let _lock_guard = write_lock.acquire()?;
+
+    // Mirror the tier-2 effective-empty warning that `ingest()` emits at its
+    // entry point. `lore init` calls `full_ingest` directly, skipping the
+    // delta/full probe, so the warning would not fire otherwise. See project
+    // memory `project_cli_behaviour_ladder.md`.
+    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+        eprintln!("{msg}");
+    }
+
+    let result = ingest::full_ingest(
+        db,
+        embedder,
+        &config.knowledge_dir,
+        &config.chunking.strategy,
+        &|msg| {
+            eprintln!("{msg}");
+        },
+    );
+    if let Some(reason) = &result.refused {
+        anyhow::bail!("{reason}");
+    }
+    Ok(result)
 }
 
 fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::Result<()> {
@@ -446,17 +563,21 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     }
 
     if matches!(db.vector_dimensions(), Ok(None)) {
-        let text_only = match &result.mode {
-            ingest::IngestMode::SingleFile { path } => format!("{path} is searchable by text only"),
-            _ => "searches use text only".to_string(),
-        };
-        eprintln!(
-            "Note: the index has no vectors, so {text_only}. \
-             Run `lore ingest` once the embedding model answers to add them."
-        );
+        print_text_only_note(&result.mode);
     }
 
     Ok(())
+}
+
+fn print_text_only_note(mode: &ingest::IngestMode) {
+    let text_only = match mode {
+        ingest::IngestMode::SingleFile { path } => format!("{path} is searchable by text only"),
+        _ => "searches use text only".to_string(),
+    };
+    eprintln!(
+        "Note: the index has no vectors, so {text_only}. \
+         Run `lore ingest` once the embedding model answers to add them."
+    );
 }
 
 /// Route the ingest request to the right library entry point based on the
@@ -1090,5 +1211,36 @@ mod tests {
         // `lore ingest --file path` without `--force`; orthogonal to schema.
         let path = Path::new("draft.md");
         assert!(!should_skip_schema_probe(false, Some(path)));
+    }
+
+    // -- init_ingest ----------------------------------------------------------
+
+    #[test]
+    fn init_refuses_when_the_pinned_width_contradicts_the_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let knowledge_dir = tmp.path().join("knowledge");
+        std::fs::create_dir_all(&knowledge_dir).unwrap();
+        std::fs::write(
+            knowledge_dir.join("logging.md"),
+            "# Logging\n\nLog to stderr.\n",
+        )
+        .unwrap();
+        let config = Config::default_with(
+            knowledge_dir,
+            tmp.path().join("knowledge.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let wider = lore::embeddings::FakeEmbedder::with_dimensions(1024).configured_for(768);
+
+        let err = init_ingest(&db, &wider, &config).unwrap_err().to_string();
+
+        assert!(
+            err.contains("returns 1024-dimension vectors but [ollama] dimensions is 768"),
+            "{err}"
+        );
+        assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+        assert_eq!(db.vector_dimensions().unwrap(), None);
     }
 }
