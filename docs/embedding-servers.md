@@ -16,6 +16,9 @@ llama-server --embeddings -m nomic-embed-text-v1.5.Q8_0.gguf --port 8080 -ub 102
 A default `llama-server` takes at most 512 tokens per input. Set `-ub` and `-b` to at least
 `[chunking] max_tokens`, which is 1024 by default, so long sections fit.
 
+LM Studio drops any input beyond the model's loaded context without an error, so give the model a
+context of at least twice `[chunking] max_tokens`.
+
 ## Set Up Lore
 
 Run `lore init` with the server's base URL and a model name:
@@ -31,7 +34,9 @@ If the server needs a key, add `--api-key-environment-variable-name`, as
 For `llama-server` and LM Studio, the URL ends in `/v1`.
 
 The model name is what lore sends with each request. `llama-server` answers with the model it
-loaded, whatever the name says, so pick a name that matches that model.
+loaded, whatever the name says, so pick a name that matches that model. LM Studio embeds with the
+model that the name picks. It answers an unknown name with the loaded model and no error, so use a
+name that `GET {url}/models` lists.
 
 Lore writes `lore.toml` with an `[embedding]` table in place of `[ollama]`. Then it checks that the
 file loads and that the server returns a vector. After that, it builds the index. It installs no
