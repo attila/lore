@@ -802,6 +802,146 @@ fn ingest_refuses_a_model_of_another_width_behind_the_recorded_name() {
     assert!(db.chunks_without_vectors().unwrap().is_empty());
 }
 
+const WIDTH_SETTING_REFUSAL: &str = "refusing to ingest: nomic-embed-text returns \
+                                     768-dimension vectors but [ollama] dimensions is 1024. \
+                                     Set [ollama] dimensions to 768 or \"auto\", or configure \
+                                     a model that returns 1024-dimension vectors";
+
+#[test]
+fn a_first_ingest_stops_before_writing_when_the_width_is_not_the_configured_one() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new().configured_for(1024), dir);
+
+    assert_eq!(result.refused.as_deref(), Some(WIDTH_SETTING_REFUSAL));
+    assert_eq!(db.stats().unwrap().chunks, 0);
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), None);
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new().configured_for(768), dir);
+    assert_eq!(result.refused, None);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+}
+
+#[test]
+fn a_forced_rebuild_stops_before_writing_when_the_width_is_not_the_configured_one() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    let head = commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &FakeEmbedder::new(), dir);
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+
+    let result = ingest::full_ingest(
+        &db,
+        &FakeEmbedder::new().configured_for(1024),
+        dir,
+        "heading",
+        &|_| {},
+    );
+
+    assert_eq!(result.refused.as_deref(), Some(WIDTH_SETTING_REFUSAL));
+    assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+    assert_eq!(db.search_fts("abbreviations", 10).unwrap().len(), 1);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
+}
+
+#[test]
+fn an_unrecorded_index_is_not_rebuilt_when_the_width_is_not_the_configured_one() {
+    let tmp = tempdir().unwrap();
+    let (dir, db) = v0_5_index(tmp.path(), 768);
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new().configured_for(1024), &dir);
+
+    assert_eq!(result.refused.as_deref(), Some(WIDTH_SETTING_REFUSAL));
+    assert_eq!(db.recorded_embedding_model().unwrap(), None);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new().configured_for(768), &dir);
+    assert_eq!(result.refused, None);
+    assert_eq!(rebuilds(&lines), 1, "{lines:?}");
+    assert!(db.recorded_embedding_model().unwrap().is_some());
+}
+
+#[test]
+fn a_text_only_index_gains_no_table_or_text_when_the_width_is_not_the_configured_one() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &FailingEmbedder::new(768), dir);
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    let head = commit_all(dir);
+
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new().configured_for(1024), dir);
+
+    assert_eq!(result.refused.as_deref(), Some(WIDTH_SETTING_REFUSAL));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+    assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+    assert_ne!(
+        db.get_metadata("last_ingested_commit").unwrap(),
+        Some(head.clone())
+    );
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new().configured_for(768), dir);
+    assert_eq!(result.refused, None);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+    assert_eq!(db.get_metadata("last_ingested_commit").unwrap(), Some(head));
+}
+
+#[test]
+fn every_ingest_names_the_setting_when_a_pinned_width_meets_a_wider_model() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &FakeEmbedder::new().configured_for(768), dir);
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    commit_all(dir);
+    let wider = FakeEmbedder::with_dimensions(1024).configured_for(768);
+    let setting_refusal = "refusing to ingest: nomic-embed-text returns 1024-dimension vectors \
+                           but [ollama] dimensions is 768. Set [ollama] dimensions to 1024 or \
+                           \"auto\", or configure a model that returns 768-dimension vectors";
+
+    let (result, _) = ingest_logged(&db, &wider, dir);
+    assert_eq!(result.refused.as_deref(), Some(setting_refusal));
+
+    let result = ingest::ingest_single_file(
+        &db,
+        &wider,
+        dir,
+        &dir.join("logging.md"),
+        "heading",
+        false,
+        &|_| {},
+    );
+    assert_eq!(result.refused.as_deref(), Some(setting_refusal));
+
+    let result = ingest::full_ingest(&db, &wider, dir, "heading", &|_| {});
+    assert_eq!(result.refused.as_deref(), Some(setting_refusal));
+
+    assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+}
+
 /// Answer `/api/embed` the way Ollama does, with [`FakeEmbedder`] vectors.
 /// Returns the base URL and a count of the requests served.
 fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
@@ -1003,6 +1143,71 @@ fn ingest_force_rebuilds_an_index_of_another_model_with_the_configured_one() {
             "search: embedding succeeded (768 dims)",
         ))
         .stderr(predicate::str::contains("lore ingest --force").not());
+}
+
+#[test]
+fn ingest_exits_1_when_the_model_width_is_not_the_configured_dimensions() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let (url, _) = serve_fake_ollama();
+    let mut config = Config::default_with(
+        knowledge_dir,
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = url;
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let saved = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        saved.replace(
+            "model = \"nomic-embed-text\"\n",
+            "model = \"nomic-embed-text\"\ndimensions = 1024\n",
+        ),
+    )
+    .unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    for force in [false, true] {
+        let mut args = vec!["ingest", "--config", config_arg];
+        if force {
+            args.push("--force");
+        }
+        lore()
+            .args(&args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(format!(
+                "Error: {WIDTH_SETTING_REFUSAL}"
+            )))
+            .stderr(predicate::str::contains("lore ingest --force").not());
+    }
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        assert_eq!(db.stats().unwrap().chunks, 0);
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+    }
+
+    let pinned = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        pinned.replace("dimensions = 1024\n", "dimensions = 768\n"),
+    )
+    .unwrap();
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success();
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert!(db.stats().unwrap().chunks > 0);
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
 }
 
 #[test]

@@ -413,7 +413,8 @@ pub fn ingest(
 /// The identity check before vectors are written, shared by every write
 /// path: `Some` when vectors from `embedder` must not enter the index. The
 /// recorded provider and model must match by name. Given the configured
-/// model's `probe`, its width must match the vector table's and its vector
+/// model's `probe`, its width must match `[ollama] dimensions` when set and
+/// the vector table's, and its vector
 /// the recorded probe vector, which catches another model pulled under the
 /// same name; without one, the name alone decides.
 fn vector_write_mismatch(
@@ -423,6 +424,11 @@ fn vector_write_mismatch(
 ) -> anyhow::Result<Option<VectorMismatch>> {
     let recorded = db.recorded_embedding_model()?;
     if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), embedder) {
+        return Ok(Some(mismatch));
+    }
+    if let Some(mismatch) =
+        probe.and_then(|probe| VectorMismatch::of_configured(embedder, probe.dimensions))
+    {
         return Ok(Some(mismatch));
     }
     let (Some(probe), Some(width)) = (probe, db.vector_dimensions()?) else {
@@ -476,6 +482,13 @@ const REMEDY: &str = "Run 'lore ingest --force' to rebuild the index";
 
 /// The message an ingest that refuses to write prints.
 fn refusal(mismatch: &VectorMismatch) -> String {
+    if let VectorMismatch::Configured { .. } = mismatch {
+        return format!(
+            "refusing to ingest: {}. {}",
+            mismatch.cause(),
+            mismatch.remedy()
+        );
+    }
     format!(
         "refusing to ingest: {}, and vectors from two models cannot be searched together. \
          {REMEDY}",
@@ -499,12 +512,21 @@ enum WalkCheck {
 }
 
 /// Check the configured model against the index before a walk ingest
-/// writes anything. A name mismatch refuses without calling the model.
+/// writes anything. A name mismatch refuses without calling the model; a
+/// measured width other than `[ollama] dimensions` refuses before the
+/// index's width or probe is compared.
 fn check_walk_model(db: &KnowledgeDB, embedder: &dyn Embedder) -> anyhow::Result<WalkCheck> {
     if let Some(mismatch) = vector_write_mismatch(db, embedder, None)? {
         return Ok(WalkCheck::Refuse(mismatch));
     }
     let probe = EmbeddingIdentity::measure(embedder);
+    if let Some(mismatch) = probe
+        .as_ref()
+        .ok()
+        .and_then(|identity| VectorMismatch::of_configured(embedder, identity.dimensions))
+    {
+        return Ok(WalkCheck::Refuse(mismatch));
+    }
     if let Ok(identity) = &probe
         && db.vector_dimensions()?.is_some()
         && db.recorded_embedding_model()?.is_none()
@@ -1168,6 +1190,12 @@ fn full_ingest_probed(
     on_progress: &dyn Fn(&str),
 ) -> IngestResult {
     let mut result = IngestResult::with_mode(IngestMode::Full);
+    if let Ok(measured) = probe
+        && let Some(mismatch) = VectorMismatch::of_configured(embedder, measured.dimensions)
+    {
+        result.refused = Some(refusal(&mismatch));
+        return result;
+    }
 
     // Single read of .loreignore: matcher and hash come from the same bytes.
     let loaded_ignore = loreignore::load(knowledge_dir);

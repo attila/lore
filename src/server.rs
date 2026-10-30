@@ -1518,8 +1518,9 @@ fn withheld_vectors_note(mismatch: Option<&VectorMismatch>) -> String {
     mismatch.map_or_else(String::new, |mismatch| {
         format!(
             "Warning: {}, so this pattern was saved without vectors and is found by text \
-             search only. Run 'lore ingest --force' to rebuild the index.\n\n",
-            mismatch.cause()
+             search only. {}.\n\n",
+            mismatch.cause(),
+            mismatch.remedy()
         )
     })
 }
@@ -2681,6 +2682,52 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn add_pattern_saves_text_without_vectors_when_the_width_is_not_the_configured_one() {
+        let tmp = tempdir().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity = crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new()).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &FakeEmbedder::new().configured_for(1024),
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":16,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{
+                        "title":"Quokka Care",
+                        "body":"Feed quokkas native leaves only.",
+                        "include_metadata":true
+                    }
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Warning: nomic-embed-text returns 768-dimension vectors but [ollama] \
+                 dimensions is 1024, so this pattern was saved without vectors and is found by \
+                 text search only. Set [ollama] dimensions to 768 or \"auto\", or configure a \
+                 model that returns 1024-dimension vectors.\n\n\
+                 Pattern \"Quokka Care\" saved to"
+            ),
+            "{text}"
+        );
+        assert_eq!(db.search_fts("quokkas", 10).unwrap().len(), 1);
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
     }
 
     #[test]

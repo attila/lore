@@ -10,6 +10,12 @@ pub trait Embedder {
     fn provider(&self) -> &str;
     /// Model name recorded with the index.
     fn model(&self) -> &str;
+    /// Width the configuration requires of this model's vectors. A build
+    /// whose measured width differs must stop before it sizes the vector
+    /// table.
+    fn configured_dimensions(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Text embedded once per index build. Changing it makes every recorded
@@ -81,6 +87,14 @@ pub enum VectorMismatch {
     /// The configured model answers [`PROBE_TEXT`] unlike the model that
     /// built the index under the same name.
     Probe { model: String, similarity: f64 },
+    /// The configured model's vectors are not as wide as `[ollama]
+    /// dimensions` requires. `--force` measures the same width again, so it
+    /// is no remedy.
+    Configured {
+        model: String,
+        measured: usize,
+        configured: usize,
+    },
 }
 
 /// Cosine similarity a fresh probe vector must reach against the recorded
@@ -126,6 +140,32 @@ impl VectorMismatch {
         })
     }
 
+    /// Compare the configured model's measured width with `[ollama]
+    /// dimensions`. Without a configured width, any width passes.
+    pub fn of_configured(embedder: &dyn Embedder, measured: usize) -> Option<Self> {
+        let configured = embedder.configured_dimensions()?;
+        (configured != measured).then(|| Self::Configured {
+            model: embedder.model().to_string(),
+            measured,
+            configured,
+        })
+    }
+
+    /// What the user does about it.
+    pub fn remedy(&self) -> String {
+        match self {
+            Self::Configured {
+                measured,
+                configured,
+                ..
+            } => format!(
+                "Set [ollama] dimensions to {measured} or \"auto\", or configure a model that \
+                 returns {configured}-dimension vectors"
+            ),
+            _ => "Run 'lore ingest --force' to rebuild the index".to_string(),
+        }
+    }
+
     /// What differs, without what it means for the caller.
     pub fn cause(&self) -> String {
         match self {
@@ -156,6 +196,14 @@ impl VectorMismatch {
                      {PROBE_SIMILARITY_FLOOR}"
                 )
             }
+            Self::Configured {
+                model,
+                measured,
+                configured,
+            } => format!(
+                "{model} returns {measured}-dimension vectors but [ollama] dimensions is \
+                 {configured}"
+            ),
         }
     }
 }
@@ -198,8 +246,9 @@ impl std::fmt::Display for VectorMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}, so searches use text only. Run 'lore ingest --force' to rebuild the index",
-            self.cause()
+            "{}, so searches use text only. {}",
+            self.cause(),
+            self.remedy()
         )
     }
 }
@@ -208,6 +257,7 @@ impl std::fmt::Display for VectorMismatch {
 pub struct OllamaClient {
     host: String,
     model: String,
+    dimensions: Option<usize>,
     agent: ureq::Agent,
 }
 
@@ -495,7 +545,24 @@ impl OllamaClient {
         Self {
             host: host.to_string(),
             model: model.to_string(),
+            dimensions: None,
             agent,
+        }
+    }
+
+    /// Require the model's vectors to be `dimensions` wide when an ingest
+    /// builds the vector table.
+    #[must_use]
+    pub fn with_dimensions(mut self, dimensions: Option<usize>) -> Self {
+        self.dimensions = dimensions;
+        self
+    }
+
+    fn embed_request(&self, input: &str) -> EmbedRequest {
+        EmbedRequest {
+            model: self.model.clone(),
+            input: vec![input.to_string()],
+            keep_alive: None,
         }
     }
 
@@ -610,11 +677,7 @@ impl OllamaClient {
 impl Embedder for OllamaClient {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
         let url = format!("{}/api/embed", self.host);
-        let req = EmbedRequest {
-            model: self.model.clone(),
-            input: vec![input.to_string()],
-            keep_alive: None,
-        };
+        let req = self.embed_request(input);
 
         // Use the shared ureq-3.x-aware classifier so HTTP 5xx (broken-runner
         // case) produces a structured `ProbeError` instead of an opaque serde
@@ -655,6 +718,10 @@ impl Embedder for OllamaClient {
     fn model(&self) -> &str {
         &self.model
     }
+
+    fn configured_dimensions(&self) -> Option<usize> {
+        self.dimensions
+    }
 }
 
 /// Model name the test fakes report. Matches `Config::default_with`'s
@@ -670,6 +737,7 @@ const FAKE_MODEL: &str = "nomic-embed-text";
 pub struct FakeEmbedder {
     dims: usize,
     model: String,
+    configured: Option<usize>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -688,7 +756,16 @@ impl FakeEmbedder {
         Self {
             dims,
             model: model.to_string(),
+            configured: None,
         }
+    }
+
+    /// The fake as configured with `[ollama] dimensions = configured`.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn configured_for(mut self, configured: usize) -> Self {
+        self.configured = Some(configured);
+        self
     }
 
     /// Width of every vector this fake produces.
@@ -735,6 +812,10 @@ impl Embedder for FakeEmbedder {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn configured_dimensions(&self) -> Option<usize> {
+        self.configured
     }
 }
 
@@ -946,6 +1027,19 @@ mod tests {
         let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model");
         assert_eq!(client.provider(), "ollama");
         assert_eq!(client.model(), "some-unlisted-model");
+    }
+
+    #[test]
+    fn configured_dimensions_are_checked_by_lore_and_never_sent_to_ollama() {
+        let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model")
+            .with_dimensions(Some(1024));
+        assert_eq!(client.configured_dimensions(), Some(1024));
+
+        let request = serde_json::to_value(client.embed_request("hello")).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({ "model": "some-unlisted-model", "input": ["hello"] })
+        );
     }
 
     #[test]

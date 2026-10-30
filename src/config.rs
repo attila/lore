@@ -27,6 +27,83 @@ pub struct GitConfig {
 pub struct OllamaConfig {
     pub host: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Dimensions::is_auto")]
+    pub dimensions: Dimensions,
+}
+
+/// Width of the configured model's vectors. `Auto` takes the width the
+/// model returns; `Fixed` is a check against it, never sent to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dimensions {
+    #[default]
+    Auto,
+    Fixed(usize),
+}
+
+impl Dimensions {
+    /// The width the vector table must have, when the config sets one.
+    pub fn fixed(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(width) => Some(width),
+        }
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+impl Serialize for Dimensions {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Fixed(width) => serializer.serialize_u64(*width as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Dimensions {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Unexpected, Visitor};
+
+        struct DimensionsVisitor;
+
+        impl Visitor<'_> for DimensionsVisitor {
+            type Value = Dimensions;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"auto\" or a positive integer for [ollama] dimensions")
+            }
+
+            fn visit_str<E: Error>(self, value: &str) -> Result<Dimensions, E> {
+                if value == "auto" {
+                    Ok(Dimensions::Auto)
+                } else {
+                    Err(E::invalid_value(Unexpected::Str(value), &self))
+                }
+            }
+
+            fn visit_i64<E: Error>(self, value: i64) -> Result<Dimensions, E> {
+                usize::try_from(value)
+                    .ok()
+                    .filter(|width| *width > 0)
+                    .map(Dimensions::Fixed)
+                    .ok_or_else(|| E::invalid_value(Unexpected::Signed(value), &self))
+            }
+
+            fn visit_u64<E: Error>(self, value: u64) -> Result<Dimensions, E> {
+                usize::try_from(value)
+                    .ok()
+                    .filter(|width| *width > 0)
+                    .map(Dimensions::Fixed)
+                    .ok_or_else(|| E::invalid_value(Unexpected::Unsigned(value), &self))
+            }
+        }
+
+        deserializer.deserialize_any(DimensionsVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +193,7 @@ impl Config {
             ollama: OllamaConfig {
                 host: "http://127.0.0.1:11434".to_string(),
                 model: model.to_string(),
+                dimensions: Dimensions::Auto,
             },
             search: SearchConfig {
                 hybrid: true,
@@ -573,6 +651,85 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.search.min_relevance_universal, Some(0.75));
         assert_eq!(loaded, config);
+    }
+
+    // -- [ollama] dimensions --------------------------------------------------
+
+    const SAVED_DEFAULT: &str = "\
+knowledge_dir = \"docs\"
+database = \"lore.db\"
+bind = \"localhost:3100\"
+
+[ollama]
+host = \"http://127.0.0.1:11434\"
+model = \"nomic-embed-text\"
+
+[search]
+hybrid = true
+top_k = 5
+min_relevance = 0.6
+
+[chunking]
+strategy = \"heading\"
+max_tokens = 1024
+
+[trace]
+enabled = false
+retain_days = 30
+gzip_older_than_days = 7
+include_full_command = false
+include_transcript_tail = false
+";
+
+    fn with_dimensions(line: &str) -> String {
+        SAVED_DEFAULT.replace(
+            "model = \"nomic-embed-text\"\n",
+            &format!("model = \"nomic-embed-text\"\n{line}\n"),
+        )
+    }
+
+    #[test]
+    fn a_config_without_dimensions_loads_unchanged_and_saves_without_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        std::fs::write(&path, SAVED_DEFAULT).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded, sample_config());
+        assert_eq!(loaded.ollama.dimensions, Dimensions::Auto);
+
+        loaded.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAVED_DEFAULT);
+    }
+
+    #[test]
+    fn dimensions_auto_reads_as_absent() {
+        let cfg: Config = toml::from_str(&with_dimensions("dimensions = \"auto\"")).unwrap();
+        assert_eq!(cfg, sample_config());
+        assert_eq!(cfg.ollama.dimensions.fixed(), None);
+    }
+
+    #[test]
+    fn dimensions_integer_is_a_fixed_width_that_survives_a_save() {
+        let text = with_dimensions("dimensions = 1024");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.ollama.dimensions, Dimensions::Fixed(1024));
+        assert_eq!(cfg.ollama.dimensions.fixed(), Some(1024));
+        assert_eq!(toml::to_string_pretty(&cfg).unwrap(), text);
+    }
+
+    #[test]
+    fn dimensions_other_than_auto_or_a_positive_integer_is_a_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lore.toml");
+        for value in ["0", "-768", "\"wide\"", "\"AUTO\"", "768.0", "true"] {
+            std::fs::write(&path, with_dimensions(&format!("dimensions = {value}"))).unwrap();
+            let msg = format!("{:#}", Config::load(&path).unwrap_err());
+            assert!(
+                msg.contains("\"auto\" or a positive integer for [ollama] dimensions"),
+                "value {value}: {msg}"
+            );
+        }
     }
 
     // -- default_trace_dir (U1: etcetera path resolution) -------------------

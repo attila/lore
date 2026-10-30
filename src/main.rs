@@ -71,6 +71,8 @@ EXIT CODES:
      embedding service). Relative paths are resolved against the current working directory,
      not the knowledge directory. Also exits 1, writing nothing, when the index was built
      with another embedding model than the configured one; `lore ingest --force` rebuilds it.
+     Also exits 1, writing nothing, when the model's vectors are not as wide as
+     `[ollama] dimensions` requires; change the setting or the model.
 
 NOTES:
   - `--file` takes one path per invocation; globs are not expanded.
@@ -388,7 +390,8 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         config.chunking.strategy,
     );
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
     // `lore ingest --force` (without `--file`) is the documented remedy when
     // the schema-compatibility probe bails. It drops and recreates the
     // tables via `clear_all`, so the probe must not run first — otherwise
