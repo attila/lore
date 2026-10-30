@@ -9,7 +9,8 @@ For guidance on tuning search and injection behaviour, see the
 ## Configuration File
 
 The configuration file is `lore.toml`, created by `lore init`. Its default location follows the XDG
-Base Directory Specification (see [File Paths](#file-paths) below).
+Base Directory Specification (see [File Paths](#file-paths) below). `lore status` reports a config
+it cannot read or parse.
 
 ### Complete Example
 
@@ -59,10 +60,11 @@ file across the extension boundary, such as `.md` renamed to `.txt`, is treated 
 
 ### `[ollama]` Section
 
-| Field   | Type   | Default                    | Description                                                                                                                                                     |
-| ------- | ------ | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `host`  | string | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host.                                                                                         |
-| `model` | string | `"nomic-embed-text"`       | Embedding model name. Must be available in Ollama. Other options include `mxbai-embed-large` (1024 dimensions) and `snowflake-arctic-embed2` (1024 dimensions). |
+| Field        | Type                | Default                    | Description                                                                                                                                                                         |
+| ------------ | ------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host`       | string              | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host.                                                                                                             |
+| `model`      | string              | `"nomic-embed-text"`       | Embedding model name. Must be available in Ollama. Other options include `mxbai-embed-large` (1024 dimensions) and `snowflake-arctic-embed2` (1024 dimensions).                     |
+| `dimensions` | `"auto"` or integer | `"auto"`                   | `"auto"` (omitted on save) takes the model's width. An integer is a check, never sent to Ollama: a model of another width stops ingest with exit 1, naming both widths and the fix. |
 
 ### `[search]` Section
 
@@ -301,6 +303,9 @@ These flags apply to all commands:
 | `lore trace why`   | `--tool <name>`     | Filter to records whose `call_context.tool_name` matches (`Edit`, `Write`, `Bash`, …). Applies to PreToolUse and PostToolUse records only.                                                                                                                                                     |
 | `lore trace why`   | `--agent <name>`    | Filter to records whose `agent` field matches. Today every record carries `agent: "claude-code"`; the filter is forward-compatible for future Cursor / opencode adapters that share the trace directory.                                                                                       |
 | `lore trace prune` | _(no flags)_        | Run an unbounded maintenance pass: compress files older than `gzip_older_than_days`, delete files older than `retain_days`, and bump the throttle state file. Honours the `[trace]` retention settings; no override flags. Reports per-file errors to stderr but exits `0` on partial success. |
+
+`lore init` never rewrites an existing config: a flag that disagrees exits 1, naming the key and
+both values.
 
 ## MCP Tool Input Limits
 

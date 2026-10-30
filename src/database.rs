@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::chunking::{Chunk, PatternRow};
+use crate::embeddings::{EmbeddingIdentity, RecordedModel};
 
 // ---------------------------------------------------------------------------
 // sqlite-vec FFI registration
@@ -56,7 +57,6 @@ fn register_sqlite_vec() {
 /// Handle to the local knowledge database.
 pub struct KnowledgeDB {
     conn: Connection,
-    dimensions: usize,
 }
 
 /// A single search result returned by FTS, vector, or hybrid queries.
@@ -189,15 +189,14 @@ pub struct UniversalPattern {
 // ---------------------------------------------------------------------------
 
 impl KnowledgeDB {
-    /// Open (or create) a database at `db_path` configured for `dimensions`-wide
-    /// embeddings.
+    /// Open (or create) a database at `db_path`.
     ///
     /// Probes the `chunks` table for the `is_universal` column. If the table
     /// exists from a prior version of lore but lacks the column, returns a
     /// friendly upgrade-required error instead of letting individual SELECTs
     /// fail later with a confusing `no such column` message.
-    pub fn open(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
-        Self::open_inner(db_path, dimensions, true)
+    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, true)
     }
 
     /// Open the database without the schema-compatibility probe. Reserved for
@@ -205,11 +204,11 @@ impl KnowledgeDB {
     /// which drops and recreates the tables with the current DDL, so running
     /// the probe would block the only path that actually fixes the condition
     /// it warns about.
-    pub fn open_skipping_schema_check(db_path: &Path, dimensions: usize) -> anyhow::Result<Self> {
-        Self::open_inner(db_path, dimensions, false)
+    pub fn open_skipping_schema_check(db_path: &Path) -> anyhow::Result<Self> {
+        Self::open_inner(db_path, false)
     }
 
-    fn open_inner(db_path: &Path, dimensions: usize, check_schema: bool) -> anyhow::Result<Self> {
+    fn open_inner(db_path: &Path, check_schema: bool) -> anyhow::Result<Self> {
         register_sqlite_vec();
 
         let conn = Connection::open(db_path)?;
@@ -221,21 +220,132 @@ impl KnowledgeDB {
             check_schema_compatibility(&conn)?;
         }
 
-        Ok(Self { conn, dimensions })
+        Ok(Self { conn })
     }
 
-    /// Create all tables if they don't already exist, then stamp the schema
-    /// version so `check_schema_compatibility` can detect old databases with
-    /// a single-integer read instead of parsing `PRAGMA table_info` columns.
+    /// Create all text tables if they don't already exist, then stamp the
+    /// schema version so `check_schema_compatibility` can detect old databases
+    /// with a single-integer read instead of parsing `PRAGMA table_info`
+    /// columns. The `patterns_vec` table is created separately, at the
+    /// measured embedding width, by [`Self::clear_all`] or
+    /// [`Self::add_vector_table`].
     pub fn init(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(PATTERNS_FTS_DDL)?;
         self.conn.execute_batch(CHUNKS_DDL)?;
-        self.conn
-            .execute_batch(&patterns_vec_ddl(self.dimensions))?;
         self.conn.execute_batch(INGEST_METADATA_DDL)?;
         self.conn.execute_batch(PATTERNS_DDL)?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Create the `patterns_vec` table for `dimensions`-wide embeddings if it
+    /// doesn't already exist. An existing table keeps its width.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ensure_vector_table(&self, dimensions: usize) -> anyhow::Result<()> {
+        self.conn.execute_batch(&patterns_vec_ddl(dimensions))?;
+        Ok(())
+    }
+
+    /// Width of the `patterns_vec` table, or `None` when the index has no
+    /// vector table and searches can only use text.
+    pub fn vector_dimensions(&self) -> anyhow::Result<Option<usize>> {
+        vector_table_dimensions(&self.conn)
+    }
+
+    /// Provider and model recorded with the vector table, or `None` when
+    /// the index records none, such as one built by an older lore.
+    pub fn recorded_embedding_model(&self) -> anyhow::Result<Option<RecordedModel>> {
+        let provider = self.get_metadata(META_EMBEDDING_PROVIDER)?;
+        let model = self.get_metadata(META_EMBEDDING_MODEL)?;
+        Ok(provider
+            .zip(model)
+            .map(|(provider, model)| RecordedModel { provider, model }))
+    }
+
+    /// The cosine similarity a write's probe of the configured model last
+    /// found below the floor, or `None` when no probe mismatch is recorded.
+    pub fn recorded_probe_mismatch(&self) -> anyhow::Result<Option<f64>> {
+        self.get_metadata(META_EMBEDDING_PROBE_MISMATCH)?
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("malformed recorded probe mismatch: {e}"))
+            })
+            .transpose()
+    }
+
+    /// Record the similarity of a probe mismatch a write found, or with
+    /// `None` clear it once a write finds the model's vectors may enter the
+    /// index again.
+    pub fn set_probe_mismatch(&self, similarity: Option<f64>) -> anyhow::Result<()> {
+        if let Some(similarity) = similarity {
+            return self.set_metadata(META_EMBEDDING_PROBE_MISMATCH, &similarity.to_string());
+        }
+        self.conn.execute(
+            "DELETE FROM ingest_metadata WHERE key = ?1",
+            params![META_EMBEDDING_PROBE_MISMATCH],
+        )?;
+        Ok(())
+    }
+
+    /// Give a text-only index its `patterns_vec` table at `identity`'s
+    /// measured width and record the identity, in one transaction. Errors
+    /// when the index already has a vector table, whose width and identity
+    /// only [`Self::clear_all`] may replace.
+    pub fn add_vector_table(&self, identity: &EmbeddingIdentity) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if vector_table_sql(&tx)?.is_some() {
+            anyhow::bail!("the index already has a vector table");
+        }
+        create_vector_table_with_identity(&tx, identity)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Chunks with no row in `patterns_vec`: their embedding failed, or they
+    /// were written while the index had no vector table. Empty when the
+    /// index still has no vector table.
+    pub fn chunks_without_vectors(&self) -> anyhow::Result<Vec<Chunk>> {
+        if vector_table_sql(&self.conn)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.title, c.body, c.tags, c.source_file, c.heading_path,
+                    c.is_universal, c.applies_when_json, c.language_json
+             FROM chunks c
+             WHERE NOT EXISTS (SELECT 1 FROM patterns_vec v WHERE v.id = c.id)
+             ORDER BY c.id",
+        )?;
+        let chunks = stmt
+            .query_map([], |row| {
+                Ok(Chunk {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    tags: row.get(3)?,
+                    source_file: row.get(4)?,
+                    heading_path: row.get(5)?,
+                    is_universal: row.get::<_, i64>(6)? != 0,
+                    applies_when_json: row.get(7)?,
+                    language_json: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(chunks)
+    }
+
+    /// Store vectors for chunks that have none, keyed by chunk id, in one
+    /// transaction. Each vector must match [`Self::vector_dimensions`].
+    pub fn insert_vectors(&self, vectors: &[(String, Vec<f32>)]) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, embedding) in vectors {
+            tx.execute(
+                "INSERT INTO patterns_vec (id, embedding) VALUES (?1, ?2)",
+                params![id, vec_to_blob(embedding)],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -248,15 +358,38 @@ impl KnowledgeDB {
     /// leave the old column list intact, so an old-schema database that
     /// somehow bypassed `check_schema_compatibility` would still reject
     /// subsequent inserts against the missing `is_universal` column.
-    pub fn clear_all(&self) -> anyhow::Result<()> {
+    ///
+    /// `patterns_vec` is recreated at `identity`'s measured width and the
+    /// identity is recorded in the same transaction. With no identity (the
+    /// embedding model could not be reached) the index is left without a
+    /// vector table and without a recorded identity.
+    ///
+    /// The recorded HEAD goes too, so a rebuild stopped before it records
+    /// HEAD again is resumed by the next ingest as a full one, never read as
+    /// up to date.
+    pub fn clear_all(&self, identity: Option<&EmbeddingIdentity>) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns_fts")?;
         tx.execute_batch(PATTERNS_FTS_DDL)?;
         tx.execute_batch("DROP TABLE IF EXISTS chunks")?;
         tx.execute_batch(CHUNKS_DDL)?;
-        tx.execute_batch("DELETE FROM patterns_vec")?;
+        tx.execute_batch("DROP TABLE IF EXISTS patterns_vec")?;
         tx.execute_batch("DROP TABLE IF EXISTS patterns")?;
         tx.execute_batch(PATTERNS_DDL)?;
+        tx.execute(
+            "DELETE FROM ingest_metadata WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                META_EMBEDDING_PROVIDER,
+                META_EMBEDDING_MODEL,
+                META_EMBEDDING_DIMENSIONS,
+                META_EMBEDDING_PROBE_VECTOR,
+                META_EMBEDDING_PROBE_MISMATCH,
+                crate::ingest::META_LAST_COMMIT,
+            ],
+        )?;
+        if let Some(identity) = identity {
+            create_vector_table_with_identity(&tx, identity)?;
+        }
         // Keep the schema stamp in sync with the freshly recreated tables.
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1039,6 +1172,18 @@ const PATTERNS_FTS_DDL: &str = "\
 const INGEST_METADATA_DDL: &str =
     "CREATE TABLE IF NOT EXISTS ingest_metadata (key TEXT PRIMARY KEY, value TEXT)";
 
+/// `ingest_metadata` keys recording the embedding model the vector table
+/// was built with. Written only together with the vector table they
+/// describe, by `clear_all` or `add_vector_table`.
+pub(crate) const META_EMBEDDING_PROVIDER: &str = "embedding_provider";
+pub(crate) const META_EMBEDDING_MODEL: &str = "embedding_model";
+pub(crate) const META_EMBEDDING_DIMENSIONS: &str = "embedding_dimensions";
+/// JSON array of the vector for [`crate::embeddings::PROBE_TEXT`].
+pub(crate) const META_EMBEDDING_PROBE_VECTOR: &str = "embedding_probe_vector";
+/// Cosine similarity at which a write's probe last failed to match the
+/// recorded probe vector. Searches never probe, so they read this instead.
+pub(crate) const META_EMBEDDING_PROBE_MISMATCH: &str = "embedding_probe_mismatch";
+
 /// Authoritative DDL for the `patterns` table. Stores one row per pattern
 /// file — the authorial view of an indexed document, complementary to the
 /// heading-split fragments in `chunks`.
@@ -1073,6 +1218,53 @@ fn patterns_vec_ddl(dimensions: usize) -> String {
             embedding float[{dimensions}]
         )"
     )
+}
+
+/// Create `patterns_vec` at the measured width and record `identity` beside
+/// it. The caller owns the transaction, so the table never exists without
+/// the identity that sized it.
+fn create_vector_table_with_identity(
+    tx: &Transaction<'_>,
+    identity: &EmbeddingIdentity,
+) -> anyhow::Result<()> {
+    tx.execute_batch(&patterns_vec_ddl(identity.dimensions))?;
+    let dimensions = identity.dimensions.to_string();
+    let probe_vector = serde_json::to_string(&identity.probe_vector)?;
+    for (key, value) in [
+        (META_EMBEDDING_PROVIDER, identity.provider.as_str()),
+        (META_EMBEDDING_MODEL, identity.model.as_str()),
+        (META_EMBEDDING_DIMENSIONS, dimensions.as_str()),
+        (META_EMBEDDING_PROBE_VECTOR, probe_vector.as_str()),
+    ] {
+        tx.execute(
+            "INSERT OR REPLACE INTO ingest_metadata (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+    }
+    Ok(())
+}
+
+/// Read the `patterns_vec` width from its stored DDL rather than from
+/// `embedding_dimensions`: an index with no recorded identity still has a
+/// vector table, and the DDL is the width the table accepts.
+fn vector_table_dimensions(conn: &Connection) -> anyhow::Result<Option<usize>> {
+    let Some(sql) = vector_table_sql(conn)? else {
+        return Ok(None);
+    };
+    sql.split_once("float[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(width, _)| width.trim().parse().ok())
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("cannot read the embedding width from patterns_vec: {sql}"))
+}
+
+fn vector_table_sql(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'patterns_vec'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Probe the on-disk `PRAGMA user_version` against [`SCHEMA_VERSION`].
@@ -1294,11 +1486,13 @@ pub fn delete_pattern_and_chunks_in_tx(
          (SELECT id FROM chunks WHERE source_file = ?1)",
         params![source_file],
     )?;
-    tx.execute(
-        "DELETE FROM patterns_vec WHERE id IN \
-         (SELECT id FROM chunks WHERE source_file = ?1)",
-        params![source_file],
-    )?;
+    if vector_table_sql(tx)?.is_some() {
+        tx.execute(
+            "DELETE FROM patterns_vec WHERE id IN \
+             (SELECT id FROM chunks WHERE source_file = ?1)",
+            params![source_file],
+        )?;
+    }
     tx.execute(
         "DELETE FROM chunks WHERE source_file = ?1",
         params![source_file],
@@ -1314,6 +1508,9 @@ pub fn delete_pattern_and_chunks_in_tx(
 /// tables, inside a caller-managed transaction. Counterpart to
 /// [`KnowledgeDB::insert_chunk`] for callers that need to compose multiple
 /// writes into one outer transaction (single-file ingest).
+///
+/// An embedding must match [`KnowledgeDB::vector_dimensions`]; the vector
+/// table rejects any other width and the whole transaction rolls back.
 pub fn insert_chunk_in_tx(
     tx: &Transaction<'_>,
     chunk: &Chunk,
@@ -1324,7 +1521,9 @@ pub fn insert_chunk_in_tx(
         "DELETE FROM patterns_fts WHERE chunk_id = ?1",
         params![chunk.id],
     )?;
-    tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
+    if vector_table_sql(tx)?.is_some() {
+        tx.execute("DELETE FROM patterns_vec WHERE id = ?1", params![chunk.id])?;
+    }
 
     tx.execute(
         "INSERT OR REPLACE INTO chunks \
@@ -1555,9 +1754,9 @@ fn reciprocal_rank_fusion_n(lists: &[&[SearchResult]], limit: usize) -> Vec<Sear
 mod tests {
     use super::*;
 
-    /// Helper: open an in-memory `KnowledgeDB` with the given dimensions.
-    fn open_memory_db(dimensions: usize) -> KnowledgeDB {
-        KnowledgeDB::open(Path::new(":memory:"), dimensions).expect("failed to open in-memory DB")
+    /// Helper: open an in-memory `KnowledgeDB`.
+    fn open_memory_db() -> KnowledgeDB {
+        KnowledgeDB::open(Path::new(":memory:")).expect("failed to open in-memory DB")
     }
 
     /// Helper: build a non-universal `Chunk` for test use.
@@ -1613,7 +1812,7 @@ mod tests {
 
     #[test]
     fn sqlite_vec_ffi_creates_vec0_table() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.conn
             .execute_batch(
                 "CREATE VIRTUAL TABLE test_vec USING vec0(
@@ -1643,8 +1842,9 @@ mod tests {
 
     #[test]
     fn insert_and_fts_search() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -1665,8 +1865,9 @@ mod tests {
 
     #[test]
     fn insert_and_vector_search() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Vector Test", "Some body", "test.md");
         let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
@@ -1682,8 +1883,9 @@ mod tests {
 
     #[test]
     fn hybrid_search_combines_fts_and_vector() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Insert two chunks with different embeddings.
         let c1 = Chunk {
@@ -1725,8 +1927,9 @@ mod tests {
 
     #[test]
     fn hybrid_search_none_embedding_falls_back_to_fts() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -1746,8 +1949,9 @@ mod tests {
 
     #[test]
     fn clear_all_removes_all_data() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         db.insert_chunk(
             &make_chunk("c1", "T1", "Body one", "a.md"),
@@ -1763,19 +1967,236 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 2);
 
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 0);
         assert_eq!(stats.sources, 0);
     }
 
+    fn identity(model: &str, dimensions: usize) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+            dimensions,
+            probe_vector: vec![0.5; dimensions],
+        }
+    }
+
+    #[test]
+    fn clear_all_recreates_the_vector_table_at_the_identity_width() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
+        db.insert_chunk(
+            &make_chunk("c1", "T1", "Body one", "a.md"),
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+
+        db.clear_all(Some(&identity("wider-model", 6))).unwrap();
+
+        assert_eq!(db.vector_dimensions().unwrap(), Some(6));
+        db.insert_chunk(
+            &make_chunk("c2", "T2", "Body two", "b.md"),
+            Some(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        let hits = db
+            .search_vector(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["c2"]
+        );
+
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_PROVIDER).unwrap().as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
+            Some("wider-model")
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_DIMENSIONS)
+                .unwrap()
+                .as_deref(),
+            Some("6")
+        );
+        let probe: Vec<f32> = serde_json::from_str(
+            &db.get_metadata(META_EMBEDDING_PROBE_VECTOR)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(probe, vec![0.5; 6]);
+    }
+
+    #[test]
+    fn clear_all_without_identity_leaves_no_vector_table_and_no_identity() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.clear_all(Some(&identity("nomic-embed-text", 4)))
+            .unwrap();
+
+        db.clear_all(None).unwrap();
+
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+        for key in [
+            META_EMBEDDING_PROVIDER,
+            META_EMBEDDING_MODEL,
+            META_EMBEDDING_DIMENSIONS,
+            META_EMBEDDING_PROBE_VECTOR,
+        ] {
+            assert_eq!(db.get_metadata(key).unwrap(), None, "{key} must be gone");
+        }
+    }
+
+    #[test]
+    fn clear_all_failure_keeps_the_vector_table_rows_and_identity() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.clear_all(Some(&identity("nomic-embed-text", 4)))
+            .unwrap();
+        db.insert_chunk(
+            &make_chunk("c1", "T1", "Body one", "a.md"),
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        // Fails the identity write, after the vector table was dropped and
+        // recreated at the new width.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_identity BEFORE INSERT ON ingest_metadata \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+
+        let err = db.clear_all(Some(&identity("wider-model", 6))).unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err:#}");
+
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+        assert_eq!(db.stats().unwrap().chunks, 1);
+        let hits = db.search_vector(&[1.0, 0.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["c1"]
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
+            Some("nomic-embed-text")
+        );
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_DIMENSIONS)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn add_vector_table_records_the_identity_and_refuses_an_existing_table() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.insert_chunk(&make_chunk("c1", "T1", "Body one", "a.md"), None)
+            .unwrap();
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+        db.add_vector_table(&identity("nomic-embed-text", 4))
+            .unwrap();
+
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_DIMENSIONS)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+        let missing = db.chunks_without_vectors().unwrap();
+        assert_eq!(
+            missing.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["c1"]
+        );
+        db.insert_vectors(&[("c1".to_string(), vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+        let err = db
+            .add_vector_table(&identity("wider-model", 6))
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a vector table"));
+        assert_eq!(db.vector_dimensions().unwrap(), Some(4));
+        assert_eq!(
+            db.get_metadata(META_EMBEDDING_MODEL).unwrap().as_deref(),
+            Some("nomic-embed-text")
+        );
+    }
+
+    #[test]
+    fn recorded_embedding_model_reads_the_identity_and_is_none_without_one() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
+        assert_eq!(db.recorded_embedding_model().unwrap(), None);
+
+        db.clear_all(Some(&identity("wider-model", 6))).unwrap();
+
+        assert_eq!(
+            db.recorded_embedding_model().unwrap(),
+            Some(RecordedModel {
+                provider: "ollama".to_string(),
+                model: "wider-model".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_recorded_probe_mismatch_reads_back_until_cleared_or_rebuilt() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.clear_all(Some(&identity("nomic-embed-text", 4)))
+            .unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+
+        db.set_probe_mismatch(Some(-0.25)).unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), Some(-0.25));
+        db.set_probe_mismatch(None).unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+
+        for rebuilt_with in [Some(identity("nomic-embed-text", 4)), None] {
+            db.set_probe_mismatch(Some(0.5)).unwrap();
+            db.clear_all(rebuilt_with.as_ref()).unwrap();
+            assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+        }
+
+        db.set_metadata(META_EMBEDDING_PROBE_MISMATCH, "low")
+            .unwrap();
+        assert!(db.recorded_probe_mismatch().is_err());
+    }
+
+    #[test]
+    fn text_only_index_accepts_writes_deletes_and_text_search() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+
+        seed_pattern_and_chunk(&db, &make_chunk("c1", "Alpha", "Alpha body", "a.md"), None);
+        db.insert_chunk(&make_chunk("c1", "Alpha", "Alpha body", "a.md"), None)
+            .unwrap();
+        assert_eq!(db.search_fts("alpha", 10).unwrap().len(), 1);
+
+        db.delete_by_source("a.md").unwrap();
+        assert_eq!(db.stats().unwrap().chunks, 0);
+    }
+
     // -- delete_by_source -------------------------------------------------
 
     #[test]
     fn delete_by_source_removes_only_that_file() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -1808,8 +2229,9 @@ mod tests {
 
     #[test]
     fn stats_returns_correct_counts() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let stats = db.stats().unwrap();
         assert_eq!(stats.chunks, 0);
@@ -1862,8 +2284,9 @@ mod tests {
 
     #[test]
     fn language_counts_empty_db_returns_zero_buckets() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let counts = db.language_counts().unwrap();
         assert!(counts.declared.is_empty());
@@ -1872,8 +2295,9 @@ mod tests {
 
     #[test]
     fn language_counts_single_language_sources_only() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -1901,8 +2325,9 @@ mod tests {
 
     #[test]
     fn language_counts_all_undeclared_sources() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(&db, &make_chunk("c1", "T1", "Body one", "a.md"), None);
         seed_pattern_and_chunk(&db, &make_chunk("c2", "T2", "Body two", "b.md"), None);
@@ -1914,8 +2339,9 @@ mod tests {
 
     #[test]
     fn language_counts_multi_language_source_counts_in_each_bucket() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // One source declaring two languages — should add +1 to each
         // bucket, so the bucket sum (2) exceeds the source count (1).
@@ -1939,8 +2365,9 @@ mod tests {
 
     #[test]
     fn language_counts_mixed_declared_and_undeclared() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -1971,8 +2398,9 @@ mod tests {
         // the inner SELECT DISTINCT, the json_each join would yield
         // two `(source, "rust")` rows and the outer COUNT would
         // double-count the source. Pin the dedup behaviour.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         db.upsert_pattern(&crate::chunking::PatternRow {
             source_file: "dup.md".to_string(),
@@ -1999,8 +2427,9 @@ mod tests {
         // json_each rows) and the undeclared bucket (`IS NULL` filter
         // misses it). Defence-in-depth: roll it into `undeclared` so
         // the operator still sees the source somewhere.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Seed via upsert_pattern directly so we can plant the exact
         // `'[]'` value the validator would normally reject.
@@ -2036,8 +2465,9 @@ mod tests {
 
     #[test]
     fn language_counts_reads_patterns_not_chunks() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Seed the patterns row for "a.md" once, then add a second chunk
         // pointing at the same source. The aggregate reads from
@@ -2064,8 +2494,9 @@ mod tests {
 
     #[test]
     fn source_files_returns_distinct_paths_in_sorted_order() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2092,8 +2523,9 @@ mod tests {
 
     #[test]
     fn source_files_returns_empty_vec_for_empty_database() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let files = db.source_files().unwrap();
         assert!(files.is_empty());
@@ -2101,8 +2533,9 @@ mod tests {
 
     #[test]
     fn source_files_excludes_files_after_delete_by_source() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2337,8 +2770,9 @@ mod tests {
         // AE3: a pattern declaring `language: rust` with a body that
         // does NOT contain "rust" still surfaces via the structural
         // branch when the inferred set is `{rust}` and the terms match.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let chunk = Chunk {
             id: "p1:Top".into(),
             title: "Error Handling".into(),
@@ -2364,8 +2798,9 @@ mod tests {
         // AE4 (FTS half): a `language: rust` pattern does NOT surface
         // through the structural branch when the inferred set is
         // `{python}`.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let chunk = Chunk {
             id: "p1:Top".into(),
             title: "Rust thing".into(),
@@ -2394,8 +2829,9 @@ mod tests {
         // `language:` declaration — declared patterns reach retrieval
         // through the structural branch, so the two FTS lists are
         // disjoint by `language_json IS NULL`.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let declared = Chunk {
             id: "decl:Top".into(),
             title: "Declared".into(),
@@ -2433,8 +2869,9 @@ mod tests {
 
     #[test]
     fn duplicate_insert_produces_single_fts_row() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "dup1",
@@ -2477,8 +2914,9 @@ mod tests {
 
     #[test]
     fn fts_title_match_ranks_above_body_match() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Chunk with "typescript" in title and tags.
         let tagged = Chunk {
@@ -2523,8 +2961,9 @@ mod tests {
 
     #[test]
     fn fts_empty_tags_still_works() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Error Handling", "Use anyhow for errors", "errors.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2593,8 +3032,9 @@ mod tests {
 
     #[test]
     fn fts_search_with_dots_does_not_crash() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Dotted", "Some dotted content", "a.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2607,8 +3047,9 @@ mod tests {
 
     #[test]
     fn fts_search_with_path_does_not_crash() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Path", "Some path content", "a.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2619,8 +3060,9 @@ mod tests {
 
     #[test]
     fn fts_search_with_hyphenated_term_does_not_crash() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -2641,8 +3083,9 @@ mod tests {
 
     #[test]
     fn fts_search_empty_after_sanitize_returns_empty() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Title", "Body content", "a.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2655,8 +3098,9 @@ mod tests {
 
     #[test]
     fn list_patterns_returns_one_per_source() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Two chunks from same source, one from another. `list_patterns`
         // reads the `patterns` table directly so tests must seed both.
@@ -2677,8 +3121,9 @@ mod tests {
 
     #[test]
     fn list_patterns_empty_db() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let patterns = db.list_patterns().unwrap();
         assert!(patterns.is_empty());
@@ -2686,8 +3131,9 @@ mod tests {
 
     #[test]
     fn fts_and_or_query_non_matching_returns_empty() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let c1 = Chunk {
             id: "c1".into(),
@@ -2727,8 +3173,9 @@ mod tests {
 
     #[test]
     fn fts_and_operator_requires_all_terms() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk("c1", "Rust Guide", "Ownership and borrowing", "rust.md");
         db.insert_chunk(&chunk, None).unwrap();
@@ -2747,8 +3194,9 @@ mod tests {
 
     #[test]
     fn list_patterns_includes_tags() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = Chunk {
             id: "c1".into(),
@@ -2800,8 +3248,9 @@ mod tests {
 
     #[test]
     fn insert_and_select_chunk_round_trips_is_universal() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let universal =
             make_universal_chunk("u1", "Workflow", "Always git push origin HEAD.", "wf.md");
@@ -2821,8 +3270,9 @@ mod tests {
 
     #[test]
     fn chunk_check_constraint_rejects_invalid_is_universal_value() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let result = db.conn.execute(
             "INSERT INTO chunks (id, title, body, source_file, is_universal) \
@@ -2837,8 +3287,9 @@ mod tests {
 
     #[test]
     fn universal_patterns_returns_only_universal_tagged() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2869,8 +3320,9 @@ mod tests {
 
     #[test]
     fn list_patterns_marks_universal_when_any_chunk_is_universal() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2899,8 +3351,9 @@ mod tests {
         // pinning matrix without re-reading source markdown. Build three
         // fixtures: an un-predicated universal, a predicated universal, and a
         // plain non-universal pattern.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         seed_pattern_and_chunk(
             &db,
@@ -2978,7 +3431,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = match KnowledgeDB::open(&db_path, 4) {
+        let err = match KnowledgeDB::open(&db_path) {
             Ok(_) => panic!("expected open to fail on old schema"),
             Err(e) => e.to_string(),
         };
@@ -2993,8 +3446,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("fresh.db");
         // Open a brand-new file: no chunks table yet, probe is satisfied.
-        let db = KnowledgeDB::open(&db_path, 4).expect("fresh DB should open cleanly");
+        let db = KnowledgeDB::open(&db_path).expect("fresh DB should open cleanly");
         db.init().expect("init should succeed");
+        db.ensure_vector_table(4)
+            .expect("failed to create vector table");
     }
 
     #[test]
@@ -3024,18 +3479,20 @@ mod tests {
             .unwrap();
         }
 
-        assert!(KnowledgeDB::open(&db_path, 4).is_err());
+        assert!(KnowledgeDB::open(&db_path).is_err());
 
-        let db = KnowledgeDB::open_skipping_schema_check(&db_path, 4)
+        let db = KnowledgeDB::open_skipping_schema_check(&db_path)
             .expect("skip-probe open must succeed on old schema");
         db.init().expect("init under skip-probe open must succeed");
-        db.clear_all()
+        db.ensure_vector_table(4)
+            .expect("failed to create vector table");
+        db.clear_all(None)
             .expect("clear_all must drop+recreate the old chunks table");
 
         // After clear_all the new schema is live — a re-open through the
         // probe path succeeds, confirming the advertised remedy works.
         drop(db);
-        KnowledgeDB::open(&db_path, 4).expect("re-open after clear_all must pass the probe");
+        KnowledgeDB::open(&db_path).expect("re-open after clear_all must pass the probe");
     }
 
     #[test]
@@ -3045,8 +3502,9 @@ mod tests {
         // restores the expected column set.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("chunks_ddl.db");
-        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Forcibly swap the chunks table to the old shape — no `is_universal`.
         db.conn
@@ -3068,7 +3526,7 @@ mod tests {
             )
             .unwrap();
 
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let columns: Vec<String> = db
             .conn
@@ -3095,8 +3553,9 @@ mod tests {
 
     #[test]
     fn metadata_round_trip() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.set_metadata("last_commit", "abc123").unwrap();
         assert_eq!(
             db.get_metadata("last_commit").unwrap(),
@@ -3106,8 +3565,9 @@ mod tests {
 
     #[test]
     fn metadata_overwrite() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.set_metadata("key", "first").unwrap();
         db.set_metadata("key", "second").unwrap();
         assert_eq!(db.get_metadata("key").unwrap(), Some("second".to_string()));
@@ -3115,15 +3575,17 @@ mod tests {
 
     #[test]
     fn metadata_missing_key_returns_none() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         assert_eq!(db.get_metadata("nonexistent").unwrap(), None);
     }
 
     #[test]
     fn metadata_empty_value() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         db.set_metadata("key", "").unwrap();
         assert_eq!(db.get_metadata("key").unwrap(), Some(String::new()));
     }
@@ -3132,8 +3594,9 @@ mod tests {
 
     #[test]
     fn porter_stemming_matches_morphological_variants() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk = make_chunk(
             "c1",
@@ -3170,8 +3633,9 @@ mod tests {
     fn fresh_db_carries_applies_when_json_column_on_both_tables() {
         // Happy path: a freshly initialised DB has `applies_when_json` on
         // both `chunks` and `patterns` and is stamped at v3.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let chunk_columns: Vec<String> = db
             .conn
@@ -3214,8 +3678,9 @@ mod tests {
         // Happy path: write two chunks (one with predicate JSON, one without),
         // confirm both shapes round-trip through the FTS, vector, and
         // `chunks_by_sources` SELECT sites.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let predicate_json =
             r#"{"tools":["Bash"],"bash_command_starts_with":["git","gh"]}"#.to_string();
@@ -3294,8 +3759,9 @@ mod tests {
         // mirroring the chunk-side persistence so MCP write paths can update
         // the column without re-deriving it from chunks (U7 plumbing
         // dependency).
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let predicate_json = r#"{"tools":["Bash"]}"#.to_string();
         db.upsert_pattern(&PatternRow {
@@ -3349,8 +3815,9 @@ mod tests {
         // `PATTERNS_DDL`, which now include `applies_when_json`. Confirm the
         // column is present after the drop+recreate (and PRAGMA user_version
         // is stamped at the current target).
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         // Seed a row with a predicate so we can confirm clear_all wipes it.
         let chunk = Chunk {
@@ -3366,7 +3833,7 @@ mod tests {
         };
         db.insert_chunk(&chunk, None).unwrap();
 
-        db.clear_all().unwrap();
+        db.clear_all(None).unwrap();
 
         let chunk_columns: Vec<String> = db
             .conn
@@ -3489,7 +3956,7 @@ mod tests {
 
         // Open via the regular path — no `--force`. The probe must migrate
         // in place and return successfully.
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v2 → v3 additive migration must apply silently on KnowledgeDB::open");
 
         let user_version: u32 = db
@@ -3663,7 +4130,7 @@ mod tests {
 
         // Open via the regular path — no `--force`. The probe must migrate
         // in place and return successfully.
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v3 → v4 additive migration must apply silently on KnowledgeDB::open");
 
         let user_version: u32 = db
@@ -3736,8 +4203,9 @@ mod tests {
         // the idempotency guard regressed.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("v4.db");
-        let db = KnowledgeDB::open(&db_path, 4).unwrap();
+        let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         drop(db);
 
         // Re-open — no migration runs because version is already at target,
@@ -3748,7 +4216,7 @@ mod tests {
             let conn = Connection::open(&db_path).unwrap();
             conn.pragma_update(None, "user_version", 3u32).unwrap();
         }
-        let _db = KnowledgeDB::open(&db_path, 4)
+        let _db = KnowledgeDB::open(&db_path)
             .expect("re-running v3 → v4 migration on an already-v4 schema must be idempotent");
     }
 
@@ -3811,7 +4279,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2u32).unwrap();
         }
 
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v2 → v4 single-pass migration must apply on KnowledgeDB::open");
 
         let user_version: u32 = db
@@ -3845,9 +4313,10 @@ mod tests {
         // now include `language_json`. Confirm the column is present
         // after the drop+recreate and PRAGMA user_version is stamped at
         // the current target.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
-        db.clear_all().unwrap();
+        db.ensure_vector_table(4).unwrap();
+        db.clear_all(None).unwrap();
 
         let chunk_columns: Vec<String> = db
             .conn
@@ -3884,8 +4353,9 @@ mod tests {
 
     #[test]
     fn fresh_init_stamps_v4_user_version() {
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
         let user_version: u32 = db
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -3925,7 +4395,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1u32).unwrap();
         }
 
-        let Err(err) = KnowledgeDB::open(&db_path, 4) else {
+        let Err(err) = KnowledgeDB::open(&db_path) else {
             panic!("pre-v2 schema must hard-bail");
         };
         let msg = format!("{err}");
@@ -3943,8 +4413,9 @@ mod tests {
         // (U7's invariant) — but the DB layer just round-trips whatever was
         // written. Here we seed two chunks per source with matching JSON to
         // confirm the SELECT site preserves the column on every row.
-        let db = open_memory_db(4);
+        let db = open_memory_db();
         db.init().unwrap();
+        db.ensure_vector_table(4).unwrap();
 
         let predicate_json = r#"{"tools":["Bash"]}"#.to_string();
         let chunks = vec![
@@ -4090,7 +4561,7 @@ mod tests {
 
         // Migrate via the regular open path; FTS5 / vec0 should survive.
         let db =
-            KnowledgeDB::open(&db_path, 4).expect("v2 → v3 additive migration must apply silently");
+            KnowledgeDB::open(&db_path).expect("v2 → v3 additive migration must apply silently");
 
         let user_version: u32 = db
             .conn
@@ -4183,7 +4654,7 @@ mod tests {
 
         // Open should succeed: chunks gets the new column, patterns is
         // absent so its branch is skipped, user_version stamps to v3.
-        let db = KnowledgeDB::open(&db_path, 4)
+        let db = KnowledgeDB::open(&db_path)
             .expect("v2→v3 migration must succeed even without a patterns table");
 
         let user_version: u32 = db

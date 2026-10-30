@@ -6,13 +6,280 @@ use serde::{Deserialize, Serialize};
 /// Trait for producing embedding vectors from text.
 pub trait Embedder {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>>;
-    fn dimensions(&self) -> usize;
+    /// Backend name recorded with the index, such as `ollama`.
+    fn provider(&self) -> &str;
+    /// Model name recorded with the index.
+    fn model(&self) -> &str;
+    /// Width the configuration requires of this model's vectors. Vectors of
+    /// another measured width are never written: an ingest stops, and an MCP
+    /// write saves text only.
+    fn configured_dimensions(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Text embedded once per index build. Changing it makes every recorded
+/// probe vector incomparable with a fresh one.
+pub const PROBE_TEXT: &str = "lore embedding identity probe";
+
+/// The embedding model an index was built with, measured rather than
+/// looked up: `dimensions` is the length of `probe_vector`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingIdentity {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub probe_vector: Vec<f32>,
+}
+
+impl EmbeddingIdentity {
+    /// Embed [`PROBE_TEXT`] and record who answered and how wide the vector is.
+    /// A vector with no direction fails like a model that did not answer: no
+    /// later probe could match it.
+    pub fn measure(embedder: &dyn Embedder) -> anyhow::Result<Self> {
+        let probe_vector = embedder.embed(PROBE_TEXT)?;
+        if probe_vector.is_empty() {
+            anyhow::bail!(
+                "embedding model {} returned an empty vector",
+                embedder.model()
+            );
+        }
+        let norm: f64 = probe_vector.iter().map(|x| f64::from(*x).powi(2)).sum();
+        if !(norm.is_finite() && norm > 0.0) {
+            anyhow::bail!(
+                "embedding model {} returned a vector with no direction",
+                embedder.model()
+            );
+        }
+        Ok(Self {
+            provider: embedder.provider().to_string(),
+            model: embedder.model().to_string(),
+            dimensions: probe_vector.len(),
+            probe_vector,
+        })
+    }
+}
+
+/// Provider and model recorded with an index's vector table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedModel {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Why vectors from the configured model must not meet the index's: a
+/// query searches text only, and an ingest writes no vectors.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorMismatch {
+    /// The index records another provider or model than the one configured.
+    Model {
+        recorded: String,
+        configured: String,
+    },
+    /// The query vector differs in width from the index's vectors.
+    /// `recorded` is `None` for an index that has no recorded model.
+    Width {
+        recorded: Option<String>,
+        configured: String,
+        index: usize,
+        query: usize,
+    },
+    /// The configured model answers [`PROBE_TEXT`] unlike the model that
+    /// built the index under the same name.
+    Probe { model: String, similarity: f64 },
+    /// The configured model's vectors differ in width from `[ollama]
+    /// dimensions`. `--force` measures the same width again, so it is no
+    /// remedy.
+    Configured {
+        model: String,
+        measured: usize,
+        configured: usize,
+    },
+    /// The index's recorded embedding model cannot be read, so nothing can
+    /// be compared with it.
+    Unreadable { reason: String },
+}
+
+/// Cosine similarity a fresh probe vector must reach against the recorded
+/// one for the configured model to count as the model that built the index.
+pub const PROBE_SIMILARITY_FLOOR: f64 = 0.99;
+
+impl VectorMismatch {
+    /// Compare the recorded model with `embedder` before embedding a query.
+    /// An index with no recorded model passes: only its width can tell.
+    pub fn of_model(recorded: Option<&RecordedModel>, embedder: &dyn Embedder) -> Option<Self> {
+        let recorded = recorded?;
+        let same = recorded.provider == embedder.provider()
+            && same_model(&recorded.provider, &recorded.model, embedder.model());
+        (!same).then(|| Self::Model {
+            recorded: recorded.model.clone(),
+            configured: embedder.model().to_string(),
+        })
+    }
+
+    /// Compare a query vector's width with the width of the index's vectors.
+    pub fn of_width(
+        recorded: Option<&RecordedModel>,
+        embedder: &dyn Embedder,
+        index: usize,
+        query: usize,
+    ) -> Option<Self> {
+        (index != query).then(|| Self::Width {
+            recorded: recorded.map(|r| r.model.clone()),
+            configured: embedder.model().to_string(),
+            index,
+            query,
+        })
+    }
+
+    /// Compare a fresh [`PROBE_TEXT`] vector with the one recorded when the
+    /// index was built. Vectors of different widths never match.
+    pub fn of_probe(embedder: &dyn Embedder, recorded: &[f32], fresh: &[f32]) -> Option<Self> {
+        let similarity = cosine_similarity(recorded, fresh);
+        let same = similarity >= PROBE_SIMILARITY_FLOOR;
+        (!same).then(|| Self::Probe {
+            model: embedder.model().to_string(),
+            similarity,
+        })
+    }
+
+    /// The probe mismatch a write recorded at `similarity`, for a search,
+    /// which never probes the model itself.
+    pub fn of_recorded_probe(embedder: &dyn Embedder, similarity: Option<f64>) -> Option<Self> {
+        similarity.map(|similarity| Self::Probe {
+            model: embedder.model().to_string(),
+            similarity,
+        })
+    }
+
+    /// Compare the configured model's measured width with `[ollama]
+    /// dimensions`. Without a configured width, any width passes.
+    pub fn of_configured(embedder: &dyn Embedder, measured: usize) -> Option<Self> {
+        let configured = embedder.configured_dimensions()?;
+        (configured != measured).then(|| Self::Configured {
+            model: embedder.model().to_string(),
+            measured,
+            configured,
+        })
+    }
+
+    /// The recorded identity could not be read: `e` says why.
+    pub fn unreadable(e: &anyhow::Error) -> Self {
+        Self::Unreadable {
+            reason: e.to_string(),
+        }
+    }
+
+    /// What the user does about it.
+    pub fn remedy(&self) -> String {
+        match self {
+            Self::Configured {
+                measured,
+                configured,
+                ..
+            } => format!(
+                "Set [ollama] dimensions to {measured} or \"auto\", or configure a model that \
+                 returns {configured}-dimension vectors"
+            ),
+            _ => "Run 'lore ingest --force' to rebuild the index".to_string(),
+        }
+    }
+
+    /// What differs, without what it means for the caller.
+    pub fn cause(&self) -> String {
+        match self {
+            Self::Model {
+                recorded,
+                configured,
+            } => format!(
+                "the index was built with {recorded} but lore is configured for {configured}"
+            ),
+            Self::Width {
+                recorded,
+                configured,
+                index,
+                query,
+            } => {
+                let from = recorded.as_deref().unwrap_or("an unrecorded model");
+                format!(
+                    "the index holds {index}-dimension vectors from {from} but {configured} \
+                     returns {query} dimensions"
+                )
+            }
+            Self::Probe { model, similarity } => {
+                // Rounded down, so a value just below the floor never prints as the floor.
+                let shown = (similarity.clamp(-1.0, 1.0) * 1000.0).floor() / 1000.0;
+                format!(
+                    "{model} is not the model that built the index under that name: its \
+                     vectors match the recorded ones at cosine similarity {shown:.3}, below \
+                     {PROBE_SIMILARITY_FLOOR}"
+                )
+            }
+            Self::Configured {
+                model,
+                measured,
+                configured,
+            } => format!(
+                "{model} returns {measured}-dimension vectors but [ollama] dimensions is \
+                 {configured}"
+            ),
+            Self::Unreadable { reason } => {
+                format!("cannot read the index's embedding model ({reason})")
+            }
+        }
+    }
+}
+
+/// Ollama resolves an untagged model name to its `:latest` tag, so the two
+/// spellings name the same model; any other tag is a different model.
+pub fn same_model(provider: &str, recorded: &str, configured: &str) -> bool {
+    fn untagged(model: &str) -> &str {
+        model.strip_suffix(":latest").unwrap_or(model)
+    }
+    if provider == "ollama" {
+        untagged(recorded) == untagged(configured)
+    } else {
+        recorded == configured
+    }
+}
+
+/// Zero for vectors of different widths or of zero length. Accumulates in
+/// f64 so rounding over a thousand dimensions cannot push a same-model probe
+/// below [`PROBE_SIMILARITY_FLOOR`].
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut norm_a, mut norm_b) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let norms = (norm_a * norm_b).sqrt();
+    if norms == 0.0 {
+        return 0.0;
+    }
+    dot / norms
+}
+
+impl std::fmt::Display for VectorMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}, so searches use text only. {}",
+            self.cause(),
+            self.remedy()
+        )
+    }
 }
 
 /// Client for the Ollama embedding API.
 pub struct OllamaClient {
     host: String,
     model: String,
+    dimensions: Option<usize>,
     agent: ureq::Agent,
 }
 
@@ -300,7 +567,24 @@ impl OllamaClient {
         Self {
             host: host.to_string(),
             model: model.to_string(),
+            dimensions: None,
             agent,
+        }
+    }
+
+    /// Require the model's vectors to be `dimensions` wide before any of
+    /// them is written.
+    #[must_use]
+    pub fn with_dimensions(mut self, dimensions: Option<usize>) -> Self {
+        self.dimensions = dimensions;
+        self
+    }
+
+    fn embed_request(&self, input: &str) -> EmbedRequest {
+        EmbedRequest {
+            model: self.model.clone(),
+            input: vec![input.to_string()],
+            keep_alive: None,
         }
     }
 
@@ -415,11 +699,7 @@ impl OllamaClient {
 impl Embedder for OllamaClient {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
         let url = format!("{}/api/embed", self.host);
-        let req = EmbedRequest {
-            model: self.model.clone(),
-            input: vec![input.to_string()],
-            keep_alive: None,
-        };
+        let req = self.embed_request(input);
 
         // Use the shared ureq-3.x-aware classifier so HTTP 5xx (broken-runner
         // case) produces a structured `ProbeError` instead of an opaque serde
@@ -453,15 +733,23 @@ impl Embedder for OllamaClient {
             .ok_or_else(|| anyhow::Error::new(ProbeError::InferenceError { body }))
     }
 
-    fn dimensions(&self) -> usize {
-        match self.model.as_str() {
-            "mxbai-embed-large" | "snowflake-arctic-embed2" => 1024,
-            "all-minilm" => 384,
-            // nomic-embed-text and anything unrecognized default to 768
-            _ => 768,
-        }
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn configured_dimensions(&self) -> Option<usize> {
+        self.dimensions
     }
 }
+
+/// Model name the test fakes report. Matches `Config::default_with`'s
+/// default so a fake-built index carries the configured identity.
+#[cfg(any(test, feature = "test-support"))]
+const FAKE_MODEL: &str = "nomic-embed-text";
 
 /// A deterministic fake embedder for use in tests.
 ///
@@ -470,17 +758,41 @@ impl Embedder for OllamaClient {
 #[cfg(any(test, feature = "test-support"))]
 pub struct FakeEmbedder {
     dims: usize,
+    model: String,
+    configured: Option<usize>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl FakeEmbedder {
     pub fn new() -> Self {
-        Self { dims: 768 }
+        Self::with_dimensions(768)
     }
 
     #[allow(dead_code)]
     pub fn with_dimensions(dims: usize) -> Self {
-        Self { dims }
+        Self::with_model(FAKE_MODEL, dims)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_model(model: &str, dims: usize) -> Self {
+        Self {
+            dims,
+            model: model.to_string(),
+            configured: None,
+        }
+    }
+
+    /// The fake as configured with `[ollama] dimensions = configured`.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn configured_for(mut self, configured: usize) -> Self {
+        self.configured = Some(configured);
+        self
+    }
+
+    /// Width of every vector this fake produces.
+    pub fn dimensions(&self) -> usize {
+        self.dims
     }
 }
 
@@ -516,8 +828,16 @@ impl Embedder for FakeEmbedder {
         Ok(vec)
     }
 
-    fn dimensions(&self) -> usize {
-        self.dims
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn configured_dimensions(&self) -> Option<usize> {
+        self.configured
     }
 }
 
@@ -533,6 +853,11 @@ impl FailingEmbedder {
     pub fn new(dims: usize) -> Self {
         Self { dims }
     }
+
+    /// Width a test gives the vector table it builds alongside this fake.
+    pub fn dimensions(&self) -> usize {
+        self.dims
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -541,8 +866,12 @@ impl Embedder for FailingEmbedder {
         anyhow::bail!("Ollama is unreachable")
     }
 
-    fn dimensions(&self) -> usize {
-        self.dims
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn model(&self) -> &str {
+        FAKE_MODEL
     }
 }
 
@@ -574,21 +903,165 @@ mod tests {
     }
 
     #[test]
-    fn dimensions_returns_correct_values() {
-        let client = OllamaClient::new("http://localhost:11434", "nomic-embed-text");
-        assert_eq!(client.dimensions(), 768);
+    fn measure_records_provider_model_and_probe_width() {
+        let embedder = FakeEmbedder::with_model("some-unlisted-model", 1024);
+        let identity = EmbeddingIdentity::measure(&embedder).unwrap();
+        assert_eq!(identity.provider, "ollama");
+        assert_eq!(identity.model, "some-unlisted-model");
+        assert_eq!(identity.dimensions, 1024);
+        assert_eq!(identity.probe_vector, embedder.embed(PROBE_TEXT).unwrap());
+    }
 
-        let client = OllamaClient::new("http://localhost:11434", "mxbai-embed-large");
-        assert_eq!(client.dimensions(), 1024);
+    #[test]
+    fn measure_fails_when_the_embedder_fails() {
+        assert!(EmbeddingIdentity::measure(&FailingEmbedder::new(4)).is_err());
+    }
 
-        let client = OllamaClient::new("http://localhost:11434", "all-minilm");
-        assert_eq!(client.dimensions(), 384);
+    #[test]
+    fn measure_fails_when_the_probe_vector_has_no_direction() {
+        struct ConstantEmbedder(f32);
+        impl Embedder for ConstantEmbedder {
+            fn embed(&self, _input: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![self.0; 4])
+            }
+            fn provider(&self) -> &'static str {
+                "ollama"
+            }
+            fn model(&self) -> &'static str {
+                "zero-model"
+            }
+        }
 
-        let client = OllamaClient::new("http://localhost:11434", "snowflake-arctic-embed2");
-        assert_eq!(client.dimensions(), 1024);
+        for value in [0.0, f32::NAN] {
+            let err = EmbeddingIdentity::measure(&ConstantEmbedder(value)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "embedding model zero-model returned a vector with no direction"
+            );
+        }
+        assert!(EmbeddingIdentity::measure(&ConstantEmbedder(0.5)).is_ok());
+    }
 
-        let client = OllamaClient::new("http://localhost:11434", "unknown-model");
-        assert_eq!(client.dimensions(), 768);
+    fn recorded(model: &str) -> RecordedModel {
+        RecordedModel {
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn of_model_flags_only_a_recorded_model_that_differs() {
+        let embedder = FakeEmbedder::new();
+        assert_eq!(VectorMismatch::of_model(None, &embedder), None);
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &embedder),
+            None
+        );
+        let mismatch =
+            VectorMismatch::of_model(Some(&recorded("mxbai-embed-large")), &embedder).unwrap();
+        assert_eq!(
+            mismatch.to_string(),
+            "the index was built with mxbai-embed-large but lore is configured for \
+             nomic-embed-text, so searches use text only. Run 'lore ingest --force' to \
+             rebuild the index"
+        );
+    }
+
+    #[test]
+    fn of_model_reads_an_untagged_ollama_model_as_its_latest_tag() {
+        let bare = FakeEmbedder::with_model("nomic-embed-text", 768);
+        let latest = FakeEmbedder::with_model("nomic-embed-text:latest", 768);
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text:latest")), &bare),
+            None
+        );
+        assert_eq!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &latest),
+            None
+        );
+        assert!(
+            VectorMismatch::of_model(Some(&recorded("nomic-embed-text:v1.5")), &bare).is_some()
+        );
+        let tagged = FakeEmbedder::with_model("nomic-embed-text:v1.5", 768);
+        assert!(VectorMismatch::of_model(Some(&recorded("nomic-embed-text")), &tagged).is_some());
+    }
+
+    #[test]
+    fn of_model_flags_a_different_provider() {
+        let other = RecordedModel {
+            provider: "other".to_string(),
+            model: "nomic-embed-text".to_string(),
+        };
+        assert!(VectorMismatch::of_model(Some(&other), &FakeEmbedder::new()).is_some());
+    }
+
+    #[test]
+    fn of_width_flags_only_a_width_that_differs() {
+        let embedder = FakeEmbedder::new();
+        assert_eq!(VectorMismatch::of_width(None, &embedder, 768, 768), None);
+        assert_eq!(
+            VectorMismatch::of_width(None, &embedder, 1024, 768)
+                .unwrap()
+                .to_string(),
+            "the index holds 1024-dimension vectors from an unrecorded model but \
+             nomic-embed-text returns 768 dimensions, so searches use text only. Run \
+             'lore ingest --force' to rebuild the index"
+        );
+        assert!(
+            VectorMismatch::of_width(Some(&recorded("nomic-embed-text")), &embedder, 4, 768)
+                .unwrap()
+                .to_string()
+                .starts_with("the index holds 4-dimension vectors from nomic-embed-text but")
+        );
+    }
+
+    #[test]
+    fn of_probe_flags_a_probe_vector_below_the_similarity_floor() {
+        let embedder = FakeEmbedder::new();
+        let recorded = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            VectorMismatch::of_probe(&embedder, &recorded, &[2.0, 0.1, 0.0, 0.0]),
+            None
+        );
+        let mismatch =
+            VectorMismatch::of_probe(&embedder, &recorded, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            mismatch.cause(),
+            "nomic-embed-text is not the model that built the index under that name: its \
+             vectors match the recorded ones at cosine similarity 0.000, below 0.99"
+        );
+        assert!(VectorMismatch::of_probe(&embedder, &recorded, &[1.0, 0.0, 0.0]).is_some());
+        assert!(VectorMismatch::of_probe(&embedder, &recorded, &[f32::NAN; 4]).is_some());
+
+        let just_below =
+            VectorMismatch::of_probe(&embedder, &recorded, &[0.98996, 0.14135, 0.0, 0.0]).unwrap();
+        assert!(
+            just_below
+                .cause()
+                .ends_with("cosine similarity 0.989, below 0.99"),
+            "{}",
+            just_below.cause()
+        );
+    }
+
+    #[test]
+    fn ollama_client_reports_its_configured_model() {
+        let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model");
+        assert_eq!(client.provider(), "ollama");
+        assert_eq!(client.model(), "some-unlisted-model");
+    }
+
+    #[test]
+    fn configured_dimensions_are_checked_by_lore_and_never_sent_to_ollama() {
+        let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model")
+            .with_dimensions(Some(1024));
+        assert_eq!(client.configured_dimensions(), Some(1024));
+
+        let request = serde_json::to_value(client.embed_request("hello")).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({ "model": "some-unlisted-model", "input": ["hello"] })
+        );
     }
 
     #[test]

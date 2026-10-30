@@ -22,17 +22,18 @@ Per the project's SQLite convention (`agents/sqlite.md`):
 > time. This means migration tooling is unnecessary; schema changes are applied by re-ingesting.
 
 Schema migrations cohere with this principle in one important way: **the ALTER TABLE or DROP+CREATE
-is purely a cache-shape change. Data always comes from re-ingest of source markdown.** Both
-operational strategies below honour this.
+is purely a cache-shape change. Data always comes from re-ingest of source markdown.** Every
+operational strategy below honours this.
 
 The convention is not a ban on `ALTER TABLE`; it is a ban on transforming existing authoritative
 data inside the DB. ALTER TABLE that adds a nullable column doesn't transform data — it opens an
 empty slot. Subsequent `lore ingest` populates that slot from source markdown.
 
-## Two operational strategies
+## Three operational strategies
 
 Choose by answering one question: **does the new binary operate correctly against an unmigrated DB
-whose new column is NULL on existing rows?**
+whose new column is NULL on existing rows?** The third strategy covers state that is not a column:
+how the stored data was produced.
 
 ### Silent in-place additive
 
@@ -78,7 +79,45 @@ Example: v1→v2 added `is_universal` with no fallback path; the engine required
 to decide injection behaviour. Existing rows with no value would behave incorrectly, so the binary
 hard-bails and requires `lore ingest --force` to rebuild the cache from source markdown.
 
-### When both are technically possible
+### Recorded state with rebuild on demand
+
+Use when:
+
+- The data's meaning depends on how it was produced, not on the columns: which embedding model built
+  the vectors, and at what width.
+- That state fits in `ingest_metadata` keys, so no new columns or tables and `PRAGMA user_version`
+  is not bumped. An index without the keys is the old state.
+- An old index can still be read, and a rebuild can record the keys.
+
+User UX: reads keep working. When the recorded state disagrees with the configuration, searches fall
+back to the path that does not depend on it and warn, naming `lore ingest --force`. An ingest that
+would mix incompatible data exits 1, writes no patterns and names the same command. Pattern writes
+through the Model Context Protocol (MCP) server save the text without vectors and warn.
+
+An index without the keys is read as it is. The first `lore ingest` without `--file` that can record
+the keys rebuilds it once, with a progress line.
+
+Example: the embedding identity. `embedding_provider`, `embedding_model`, `embedding_dimensions` and
+`embedding_probe_vector` sit in `ingest_metadata`. Searches compare provider, model and query width
+before using vectors and fall back to text search on a mismatch. Every vector write also compares a
+fresh probe vector with the recorded one, which catches another model pulled under the same name. A
+write records such a mismatch as `embedding_probe_mismatch`, which searches read as a mismatch too,
+and clears it once a probe matches again.
+
+Code contract:
+
+1. **Record with the data.** `clear_all` drops and recreates `patterns_vec` at the measured width
+   and writes the keys in the same transaction, so the keys never describe vectors they did not
+   produce.
+2. **Check at every read and every write,** not once at open: the configuration can change between
+   commands.
+3. **Missing keys mean unrecorded, not mismatched.** An unrecorded index is searched with vectors
+   while its width matches the query's, until the first `lore ingest` without `--file` rebuilds it.
+4. **Name only a remedy that clears the check,** proven by a binary-level test that runs it. A
+   pinned `[ollama] dimensions` that contradicts the model names the setting, not `--force`, which
+   would measure the same width and refuse again.
+
+### When silent additive and hard-bail both fit
 
 Prefer silent in-place additive. It's zero user friction and preserves operational continuity. The
 hard-bail path is the right tool when the schema change is structurally non-additive or when the new
@@ -91,12 +130,14 @@ behaviour can't tolerate NULL.
 - **Hard-bail:** friendly advisory prints, binary refuses to serve queries until
   `lore ingest --force` completes. One bump → one advisory variant; no per-bump custom wording
   unless the user-facing action genuinely differs.
+- **Recorded state:** reads continue, falling back where the state disagrees and naming the rebuild;
+  writes withhold the mismatched data rather than mix it. No `user_version` bump.
 - **Never silent migration with data loss or transformation.** The DB is the cache; authoritative
   data lives in source markdown.
 - **Never partial-state.** The DB is at exactly one schema version after migration; no half-migrated
   intermediate states. Either the ALTER TABLE completes atomically or the bail fires before any
   change.
-- **Both strategies rely on re-ingest as the data path.** ALTER TABLE is cache-shape only;
+- **Every strategy relies on re-ingest as the data path.** ALTER TABLE is cache-shape only;
   `lore ingest` is what fills the cache from source.
 
 ## Code-structure contract
@@ -168,8 +209,7 @@ For reference and worked-example value:
 ## When to revisit this doc
 
 - After every schema bump: add a row to the bump history table.
-- If a new strategy emerges that doesn't fit either silent-additive or hard-bail (e.g., a "silent
-  rebuild on first run" pattern — currently unused), document it as a third strategy with its own UX
-  and code contracts.
+- If a new strategy emerges that fits none of silent-additive, hard-bail or recorded state, document
+  it as a fourth strategy with its own UX and code contracts.
 - If the foundational "DB is a derived artefact" principle changes (e.g., lore starts storing
   authoritative data in the DB), revise the principle section first.

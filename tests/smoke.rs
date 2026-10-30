@@ -5,7 +5,7 @@ use predicates::prelude::*;
 
 use lore::config::Config;
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, FakeEmbedder};
+use lore::embeddings::{FailingEmbedder, FakeEmbedder};
 use lore::ingest;
 
 /// Set up a temp directory with a config, database, and ingested test patterns.
@@ -40,8 +40,9 @@ fn setup_populated_env(dir: &Path) -> std::path::PathBuf {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
 
     ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
 
@@ -205,6 +206,387 @@ fn init_against_git_repo_does_not_emit_git_advisory() {
 }
 
 #[test]
+fn init_help_restates_the_model_and_bind_defaults() {
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[default: nomic-embed-text]"))
+        .stdout(predicate::str::contains("[default: localhost:3100]"));
+}
+
+/// A knowledge directory and a hand-edited config pointing at it, with a
+/// layout and comments `Config::save` would not reproduce.
+struct ExistingConfig {
+    _tmp: tempfile::TempDir,
+    knowledge_dir: std::path::PathBuf,
+    database: std::path::PathBuf,
+    path: std::path::PathBuf,
+    contents: String,
+    no_ollama: std::path::PathBuf,
+}
+
+impl ExistingConfig {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let knowledge_dir = std::fs::canonicalize(tmp.path()).unwrap().join("knowledge");
+        std::fs::create_dir_all(&knowledge_dir).unwrap();
+        std::fs::write(knowledge_dir.join("logging.md"), "# Logging\n\nLog.\n").unwrap();
+        let database = knowledge_dir.with_file_name("knowledge.db");
+        let contents = format!(
+            "# Hand-edited.\n\
+             knowledge_dir = \"{}\"\n\
+             database = \"{}\"\n\
+             bind = \"localhost:3100\"\n\n\
+             [search]\n\
+             top_k = 9\n\
+             hybrid = true\n\n\
+             [ollama]\n\
+             model = \"nomic-embed-text\"   # pinned below\n\
+             host = \"http://127.0.0.1:1\"\n\
+             dimensions = 768\n\n\
+             [chunking]\n\
+             strategy = \"heading\"\n\
+             max_tokens = 1024\n",
+            knowledge_dir.display(),
+            database.display()
+        );
+        let path = tmp.path().join("lore.toml");
+        std::fs::write(&path, &contents).unwrap();
+        let no_ollama = tmp.path().join("empty-path");
+        std::fs::create_dir_all(&no_ollama).unwrap();
+        Self {
+            _tmp: tmp,
+            knowledge_dir,
+            database,
+            path,
+            contents,
+            no_ollama,
+        }
+    }
+
+    /// Run `lore init` with no `ollama` on `PATH`, so provisioning fails
+    /// fast wherever init gets that far.
+    fn init(&self, flags: &[&str]) -> (Option<i32>, String) {
+        self.init_at(&self.knowledge_dir, flags)
+    }
+
+    fn init_at(&self, repo: &Path, flags: &[&str]) -> (Option<i32>, String) {
+        let output = Command::cargo_bin("lore")
+            .unwrap()
+            .env("PATH", &self.no_ollama)
+            .arg("--config")
+            .arg(&self.path)
+            .arg("init")
+            .arg("--repo")
+            .arg(repo)
+            .args(flags)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    }
+
+    fn assert_untouched(&self) {
+        assert_eq!(std::fs::read_to_string(&self.path).unwrap(), self.contents);
+    }
+}
+
+#[test]
+fn init_rerun_leaves_a_hand_edited_config_byte_identical() {
+    let existing = ExistingConfig::new();
+
+    let (code, stderr) = existing.init(&[]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("Using existing config at"), "{stderr}");
+    assert!(stderr.contains("Ollama is not installed"), "{stderr}");
+    existing.assert_untouched();
+}
+
+#[test]
+fn init_flags_that_agree_with_the_existing_config_proceed() {
+    let existing = ExistingConfig::new();
+    let database = existing.database.to_str().unwrap();
+
+    let (code, stderr) = existing.init(&[
+        "--model",
+        "nomic-embed-text",
+        "--bind",
+        "localhost:3100",
+        "--database",
+        database,
+    ]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(!stderr.contains("disagrees"), "{stderr}");
+    assert!(stderr.contains("--- Provisioning ---"), "{stderr}");
+    existing.assert_untouched();
+}
+
+#[test]
+fn init_model_flag_matches_the_file_by_ollama_tag_rule() {
+    let existing = ExistingConfig::new();
+
+    let (code, stderr) = existing.init(&["--model", "nomic-embed-text:latest"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(!stderr.contains("disagrees"), "{stderr}");
+    assert!(stderr.contains("--- Provisioning ---"), "{stderr}");
+
+    let (code, stderr) = existing.init(&["--model", "nomic-embed-text:v1.5"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "[ollama] model is \"nomic-embed-text\" in the file, \"nomic-embed-text:v1.5\" from --model"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    existing.assert_untouched();
+}
+
+#[test]
+fn init_database_flag_spelled_through_dotdot_matches_a_database_not_yet_created() {
+    let existing = ExistingConfig::new();
+    assert!(!existing.database.exists());
+    let database = existing.knowledge_dir.join("..").join("knowledge.db");
+
+    let (code, stderr) = existing.init(&["--database", database.to_str().unwrap()]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(!stderr.contains("disagrees"), "{stderr}");
+    assert!(stderr.contains("--- Provisioning ---"), "{stderr}");
+    existing.assert_untouched();
+}
+
+/// Run a first `lore init` with no `ollama` on `PATH` and return the config
+/// it saved before provisioning failed.
+fn first_init(flags: &[&str]) -> Config {
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+    let no_ollama = tmp.path().join("empty-path");
+    std::fs::create_dir_all(&no_ollama).unwrap();
+    let config_path = tmp.path().join("lore.toml");
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .env("PATH", &no_ollama)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("init")
+        .arg("--repo")
+        .arg(&knowledge_dir)
+        .arg("--database")
+        .arg(tmp.path().join("knowledge.db"))
+        .args(flags)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Config written to"), "{stderr}");
+
+    Config::load(&config_path).unwrap()
+}
+
+#[test]
+fn first_init_saves_the_default_model_and_bind() {
+    let config = first_init(&[]);
+
+    assert_eq!(config.ollama.model, "nomic-embed-text");
+    assert_eq!(config.bind, "localhost:3100");
+}
+
+#[test]
+fn first_init_saves_the_model_and_bind_flags() {
+    let config = first_init(&["--model", "mxbai-embed-large", "--bind", "localhost:3200"]);
+
+    assert_eq!(config.ollama.model, "mxbai-embed-large");
+    assert_eq!(config.bind, "localhost:3200");
+}
+
+#[test]
+fn init_flag_that_contradicts_the_existing_config_errors_and_leaves_it_untouched() {
+    let existing = ExistingConfig::new();
+    let other_repo = existing.knowledge_dir.with_file_name("other");
+    std::fs::create_dir_all(&other_repo).unwrap();
+    let database = existing.database.display().to_string();
+    let other_database = existing.database.with_file_name("other.db");
+    let other_database = other_database.to_str().unwrap();
+    let knowledge_dir = existing.knowledge_dir.display().to_string();
+    let other_repo = other_repo.to_str().unwrap();
+
+    for (flags, conflict) in [
+        (
+            vec!["--model", "mxbai-embed-large"],
+            "[ollama] model is \"nomic-embed-text\" in the file, \"mxbai-embed-large\" from --model"
+                .to_string(),
+        ),
+        (
+            vec!["--bind", "localhost:3200"],
+            "bind is \"localhost:3100\" in the file, \"localhost:3200\" from --bind".to_string(),
+        ),
+        (
+            vec!["--database", other_database],
+            format!("database is \"{database}\" in the file, \"{other_database}\" from --database"),
+        ),
+    ] {
+        let (code, stderr) = existing.init(&flags);
+
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains(&conflict), "{stderr}");
+        assert!(stderr.contains("remove it to start fresh"), "{stderr}");
+        assert!(!stderr.contains("Provisioning"), "{stderr}");
+        existing.assert_untouched();
+    }
+
+    let (code, stderr) = existing.init_at(Path::new(other_repo), &[]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "knowledge_dir is \"{knowledge_dir}\" in the file, \"{other_repo}\" from --repo"
+        )),
+        "{stderr}"
+    );
+    existing.assert_untouched();
+}
+
+#[test]
+fn init_leaves_a_malformed_config_untouched() {
+    let mut existing = ExistingConfig::new();
+    existing.contents = "knowledge_dir = [unclosed\n".to_string();
+    std::fs::write(&existing.path, &existing.contents).unwrap();
+
+    let (code, stderr) = existing.init(&[]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("could not be loaded and was left untouched"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("TOML parse error"), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches(existing.path.display().to_string().as_str())
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Config not found"), "{stderr}");
+    assert!(!stderr.contains("Run 'lore init' first"), "{stderr}");
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    existing.assert_untouched();
+}
+
+#[test]
+fn init_with_a_directory_at_the_config_path_names_the_read_error() {
+    let existing = ExistingConfig::new();
+    std::fs::remove_file(&existing.path).unwrap();
+    std::fs::create_dir(&existing.path).unwrap();
+
+    let (code, stderr) = existing.init(&[]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Cannot read config at {}: ",
+            existing.path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Config not found"), "{stderr}");
+    assert!(!stderr.contains("Run 'lore init' first"), "{stderr}");
+    assert!(!stderr.contains("Provisioning"), "{stderr}");
+    assert!(existing.path.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_with_an_unreadable_config_names_the_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let existing = ExistingConfig::new();
+    let set_mode = |mode| {
+        std::fs::set_permissions(&existing.path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o000);
+    // Root reads the file regardless of its mode, so there is nothing to test.
+    if std::fs::read(&existing.path).is_ok() {
+        return;
+    }
+
+    let (code, stderr) = existing.init(&[]);
+    set_mode(0o644);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Cannot read config at {}: ",
+            existing.path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("ermission denied"), "{stderr}");
+    assert!(!stderr.contains("Config not found"), "{stderr}");
+    assert!(!stderr.contains("Run 'lore init' first"), "{stderr}");
+    existing.assert_untouched();
+}
+
+#[test]
+fn status_reports_a_malformed_config_instead_of_a_missing_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("lore.toml");
+    std::fs::write(&config_path, "knowledge_dir = [unclosed\n").unwrap();
+
+    let output = Command::cargo_bin("lore")
+        .unwrap()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "✗ Cannot parse config at {}: TOML parse error",
+            config_path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not found"), "{stderr}");
+    assert!(!stderr.contains("lore init"), "{stderr}");
+}
+
+#[test]
+fn hook_with_a_malformed_config_stays_silent_on_stdout_and_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("lore.toml");
+    std::fs::write(&config_path, "knowledge_dir = [unclosed\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "test-session"
+    });
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("hook")
+        .write_stdin(input.to_string())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(format!(
+            "lore hook: Cannot parse config at {}",
+            config_path.display()
+        )));
+}
+
+#[test]
 fn status_without_config_shows_init_hint() {
     let tmp = tempfile::tempdir().unwrap();
     Command::cargo_bin("lore")
@@ -264,8 +646,9 @@ fn status_renders_languages_line_for_mixed_declared_and_undeclared_kb() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
 
     let assert = Command::cargo_bin("lore")
@@ -295,8 +678,9 @@ fn status_suppresses_languages_line_on_empty_knowledge_dir() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     // No ingest call — DB stays empty.
 
     Command::cargo_bin("lore")
@@ -361,6 +745,258 @@ fn search_top_k_zero_returns_no_results() {
         .stderr(predicate::str::contains("No results found."));
 }
 
+/// Build an index with no vector table, configured against a host that
+/// refuses connections.
+fn text_only_index(tmp: &Path) -> (Config, std::path::PathBuf) {
+    let knowledge_dir = tmp.join("knowledge");
+    std::fs::create_dir_all(&knowledge_dir).unwrap();
+    std::fs::write(
+        knowledge_dir.join("rust-testing.md"),
+        "# Rust Testing\n\nPrefer integration tests over mocks.\n",
+    )
+    .unwrap();
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    db.init().unwrap();
+    ingest::full_ingest(
+        &db,
+        &FailingEmbedder::new(768),
+        &knowledge_dir,
+        "heading",
+        &|_| {},
+    );
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+    (config, config_path)
+}
+
+#[test]
+fn search_on_text_only_index_returns_text_results_without_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+
+    // An embed attempt against the refusing host would also return text
+    // results, but with a warning; no warning proves the embedder was skipped.
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["search", "--config", config_path.to_str().unwrap(), "mocks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stderr(predicate::str::contains("Warning").not());
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["status", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(
+        db.vector_dimensions().unwrap(),
+        None,
+        "read paths must not create the vector table"
+    );
+}
+
+#[test]
+fn ingest_file_on_text_only_index_lands_text_and_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+    let draft = config.knowledge_dir.join("draft.md");
+    std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args([
+            "ingest",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--file",
+            draft.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Done (single-file): draft.md"))
+        .stderr(predicate::str::contains("embedding failure").not())
+        .stderr(predicate::str::contains(
+            "Note: the index has no vectors, so draft.md is searchable by text only",
+        ))
+        .stderr(predicate::str::contains("Run 'lore ingest'"));
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), None);
+    assert!(
+        db.search_fts("quokka", 10)
+            .unwrap()
+            .iter()
+            .any(|r| r.source_file == "draft.md")
+    );
+}
+
+#[test]
+fn ingest_with_hybrid_search_off_prints_no_text_only_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut config, config_path) = text_only_index(tmp.path());
+    config.search.hybrid = false;
+    config.save(&config_path).unwrap();
+    let draft = config.knowledge_dir.join("draft.md");
+    std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    for args in [
+        vec!["ingest", "--config", config_arg],
+        vec![
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+        ],
+    ] {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(&args)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Note: the index has no vectors").not())
+            .stderr(predicate::str::contains("hybrid").not());
+    }
+}
+
+#[test]
+fn search_on_an_index_of_another_model_warns_until_a_forced_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        ingest::full_ingest(
+            &db,
+            &FakeEmbedder::with_model("other-model", 768),
+            &config.knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+        assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    }
+    let config_arg = config_path.to_str().unwrap();
+    let warning = "Warning: the index was built with other-model but lore is configured for \
+                   nomic-embed-text, so searches use text only. Run 'lore ingest --force' to \
+                   rebuild the index.";
+
+    // The configured host refuses connections, so an embed attempt would
+    // add its own warning; its absence proves the embedder was skipped.
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["search", "--config", config_arg, "mocks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stderr(predicate::str::contains(warning))
+        .stderr(predicate::str::contains("Ollama embed failed").not());
+    let json = Command::cargo_bin("lore")
+        .unwrap()
+        .args(["--json", "search", "--config", config_arg, "mocks"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let results: serde_json::Value = serde_json::from_slice(&json.get_output().stdout).unwrap();
+    assert_eq!(results[0]["title"], "Rust Testing");
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Index model:  ✗ the index was built with other-model but lore is configured \
+             for nomic-embed-text",
+        ));
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success();
+
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["search", "--config", config_arg, "mocks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rust Testing"))
+        .stderr(predicate::str::contains("lore ingest --force").not());
+    Command::cargo_bin("lore")
+        .unwrap()
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Index model:").not());
+}
+
+#[test]
+fn ingest_and_ingest_file_refuse_an_index_of_another_model_and_write_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, config_path) = text_only_index(tmp.path());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        ingest::full_ingest(
+            &db,
+            &FakeEmbedder::with_model("other-model", 768),
+            &config.knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+    }
+    let draft = config.knowledge_dir.join("draft.md");
+    std::fs::write(&draft, "# Draft\n\nQuokka handling notes.\n").unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    let refusal = "Error: Refusing to ingest: the index was built with other-model but lore is \
+                   configured for nomic-embed-text, and vectors from two models cannot be \
+                   searched together. Run 'lore ingest --force' to rebuild the index";
+
+    for args in [
+        vec!["ingest", "--config", config_arg],
+        vec![
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+        ],
+        vec![
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+            "--force",
+        ],
+    ] {
+        Command::cargo_bin("lore")
+            .unwrap()
+            .args(&args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(refusal))
+            .stderr(predicate::str::contains("Done").not());
+    }
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert!(db.search_fts("quokka", 10).unwrap().is_empty());
+    assert_eq!(db.stats().unwrap().sources, 1);
+    assert_eq!(
+        db.recorded_embedding_model().unwrap().unwrap().model,
+        "other-model"
+    );
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+}
+
 // -- lore list --------------------------------------------------------------
 
 #[test]
@@ -390,8 +1026,9 @@ fn list_empty_database_exits_cleanly() {
 
     // Ensure the database tables exist (init creates them).
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     drop(db);
 
     Command::cargo_bin("lore")
@@ -536,8 +1173,9 @@ fn search_json_includes_full_body() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, &knowledge_dir, "heading", &|_| {});
     drop(db);
 
@@ -750,8 +1388,9 @@ fn list_json_empty_database() {
     config.save(&config_path).unwrap();
 
     let embedder = FakeEmbedder::new();
-    let db = KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&config.database).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     drop(db);
 
     let output = Command::cargo_bin("lore")

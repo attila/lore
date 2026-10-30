@@ -22,8 +22,9 @@ use tempfile::tempdir;
 /// Initialise an in-memory `KnowledgeDB` matching the production embedding
 /// dimensions used in unit tests (768).
 fn memory_db() -> KnowledgeDB {
-    let db = KnowledgeDB::open(Path::new(":memory:"), 768).unwrap();
+    let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(768).unwrap();
     db
 }
 

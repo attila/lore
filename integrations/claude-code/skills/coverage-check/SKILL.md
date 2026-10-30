@@ -344,15 +344,18 @@ lore MCP server reports one of three values:
   > requires hybrid mode (Ollama embedder + FTS combined via reciprocal-rank fusion) because
   > FTS-only ranks (BM25) are not comparable to hybrid ranks across queries: the per-query coverage
   > scoring would be meaningless. Set `hybrid = true` in `~/.config/lore/lore.toml` and retry.
-- **`"fts_fallback"`**: the lore deployment is configured for hybrid mode but the embedder (Ollama)
-  was unreachable for this query, so the search fell back to FTS-only. The parallel query batch in
-  step 7 would also fall back, producing a fully-degraded report. Halt the iteration immediately
-  with:
+- **`"fts_fallback"`**: the lore deployment is configured for hybrid mode but the search fell back
+  to FTS-only: the embedder (Ollama) was unreachable, the index was built with another embedding
+  model, or the index has no vectors yet. The response's leading `Note:` line names the first two
+  causes. The parallel query batch in step 7 would also fall back, producing a fully-degraded
+  report. Halt the iteration immediately with:
 
-  > Coverage check halted: the lore embedder (Ollama) is unreachable. The cascade-detection query
-  > fell back to FTS-only, and the parallel coverage queries that follow would do the same:
-  > producing a report whose ranks are not comparable across queries. Restart Ollama and retry the
-  > skill.
+  > Coverage check halted: the cascade-detection query fell back to FTS-only, and the parallel
+  > coverage queries that follow would do the same: producing a report whose ranks are not
+  > comparable across queries. Fix the cause: restart Ollama if it is unreachable, run
+  > `lore ingest --force` if the index was built with another model (or restart the MCP server if
+  > `lore.toml` already names the index's model), or run `lore ingest` to add the missing vectors.
+  > Then rerun the skill from the start.
 
 These two early aborts catch deployment-misconfiguration and embedder-unavailability **once** at
 step 6 instead of repeating the diagnosis 5-12 times in step 7's parallel batch and then refusing

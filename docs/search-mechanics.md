@@ -215,9 +215,13 @@ The embedding text for each chunk is constructed as: `{title}\n{tags}\n{body}`. 
 titles contribute to semantic similarity, not only lexical matching.
 
 The default embedding model is `nomic-embed-text` (768 dimensions). Other models are supported by
-changing `ollama.model` in `lore.toml`.
+changing `ollama.model` in `lore.toml`. The index records the embedding provider, model, width and
+the vector of a fixed probe text.
 
-If Ollama is unreachable or embedding fails, the search falls back to FTS5 only.
+If Ollama is unreachable or embedding fails, the search falls back to FTS5 only. So does an index
+built with another model, by name, width or a write's probe, with a warning to run
+`lore ingest --force`. `lore ingest` retries chunks left without a vector and rebuilds an index that
+records no model.
 
 ## Hybrid Merge: Reciprocal Rank Fusion
 
@@ -270,10 +274,10 @@ The `min_relevance` setting (default: 0.6) filters results below a minimum norma
 threshold is applied only when:
 
 - Hybrid search is enabled (`search.hybrid = true`)
-- Embedding succeeded (Ollama returned a valid vector)
+- Embedding succeeded (Ollama returned a vector the index can use)
 - `min_relevance` is greater than zero
 
-When FTS5 is the sole search method (hybrid disabled or Ollama unreachable), no threshold is
+When FTS5 is the sole search method (hybrid disabled, or no usable query vector), no threshold is
 applied. FTS5 BM25 scores use a different scale and are not directly comparable.
 
 ## Ingest-Time Filtering with `.loreignore`

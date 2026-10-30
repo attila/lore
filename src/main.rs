@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, OllamaClient, render_failure};
+use lore::embeddings::{
+    Embedder, EmbeddingIdentity, OllamaClient, VectorMismatch, render_failure, same_model,
+};
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
 use lore::lore_debug;
@@ -37,18 +39,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Provision Ollama, pull model, create config, run first ingestion
+    ///
+    /// An existing config file is used as it is and never rewritten. A flag
+    /// that disagrees with it is an error; edit the file, or remove it to
+    /// start fresh.
     Init {
         /// Path to your markdown knowledge directory (git repo)
         #[arg(long)]
         repo: PathBuf,
 
-        /// Ollama embedding model to use
-        #[arg(long, default_value = "nomic-embed-text")]
-        model: String,
+        /// Ollama embedding model to use [default: nomic-embed-text]
+        #[arg(long)]
+        model: Option<String>,
 
-        /// MCP server bind address
-        #[arg(long, default_value = "localhost:3100")]
-        bind: String,
+        /// MCP server bind address [default: localhost:3100]
+        #[arg(long)]
+        bind: Option<String>,
 
         /// Path to database file [default: ~/.local/share/lore/knowledge.db]
         #[arg(long)]
@@ -69,7 +75,10 @@ EXIT CODES:
      .loreignore) prints a warning to stderr and still exits 0 — the empty state is legal.
   1  Single-file ingest failed (atomic), or an unrecoverable error (config, database,
      embedding service). Relative paths are resolved against the current working directory,
-     not the knowledge directory.
+     not the knowledge directory. Also exits 1, writing nothing, when the index was built
+     with another embedding model than the configured one; `lore ingest --force` rebuilds it.
+     Also exits 1, writing nothing, when the model's vectors differ in width from
+     `[ollama] dimensions`; change the setting or the model.
 
 NOTES:
   - `--file` takes one path per invocation; globs are not expanded.
@@ -222,8 +231,8 @@ fn main() {
             user_provided_config,
             database.as_deref(),
             &repo,
-            &model,
-            &bind,
+            model.as_deref(),
+            bind.as_deref(),
         ),
         Commands::Ingest { force, file } => cmd_ingest(&config_path, force, file.as_deref()),
         Commands::Serve => cmd_serve(&config_path),
@@ -248,8 +257,8 @@ fn cmd_init(
     user_provided_config: bool,
     database_override: Option<&Path>,
     repo: &Path,
-    model: &str,
-    bind: &str,
+    model: Option<&str>,
+    bind: Option<&str>,
 ) -> anyhow::Result<()> {
     eprintln!("=== lore init ===\n");
 
@@ -267,27 +276,28 @@ fn cmd_init(
         eprintln!("  them. See docs/configuration.md#git-integration for details.\n");
     }
 
-    let db_path = match database_override {
-        Some(p) => std::path::absolute(p)?,
-        None => default_database_path()?,
-    };
+    let (config, existing) =
+        init_config(config_path, knowledge_dir, database_override, model, bind)?;
 
     // Create parent directories for config and database
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Some(parent) = db_path.parent() {
+    if let Some(parent) = config.database.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut config = Config::default_with(knowledge_dir, db_path, model);
-    config.bind = bind.to_string();
-
-    config.save(config_path)?;
+    if !existing {
+        config.save(config_path)?;
+    }
     // Canonicalize after save so the output path is clean (no ".." hops).
     let config_path =
         std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    eprintln!("Config written to {}\n", config_path.display());
+    if existing {
+        eprintln!("Using existing config at {}\n", config_path.display());
+    } else {
+        eprintln!("Config written to {}\n", config_path.display());
+    }
 
     // provision
     eprintln!("--- Provisioning ---\n");
@@ -313,38 +323,28 @@ fn cmd_init(
     // run initial ingestion
     eprintln!("\n--- Ingesting knowledge directory ---\n");
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
-    eprintln!("Search mode: hybrid (FTS5 + vector)\n");
-
-    let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
-    let _lock_guard = write_lock.acquire()?;
-
-    // Mirror the tier-2 effective-empty warning that `ingest()` emits at its
-    // entry point. `cmd_init` calls `full_ingest` directly to avoid the
-    // delta/full state probe (the DB is fresh), so the warning would not fire
-    // otherwise. See project memory `project_cli_behaviour_ladder.md`.
-    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
-        eprintln!("{msg}");
-    }
-
-    let ingest_result = ingest::full_ingest(
-        &db,
-        &ollama,
-        &config.knowledge_dir,
-        &config.chunking.strategy,
-        &|msg| {
-            eprintln!("{msg}");
-        },
-    );
+    let ingest_result = init_ingest(&db, &ollama, &config)?;
 
     eprintln!("\n--- Done ---");
     eprintln!("  Files: {}", ingest_result.files_processed);
     eprintln!("  Chunks: {}", ingest_result.chunks_created);
     if !ingest_result.errors.is_empty() {
         eprintln!("  Errors: {}", ingest_result.errors.len());
+    }
+    if let Ok(dimensions) = db.vector_dimensions() {
+        let has_vectors = dimensions.is_some();
+        eprintln!(
+            "  Search mode: {}",
+            search_mode(config.search.hybrid, has_vectors)
+        );
+        if let Some(note) = text_only_note(config.search.hybrid, has_vectors, &ingest_result.mode) {
+            eprintln!("{note}");
+        }
     }
 
     // Claude Code plugin instructions
@@ -372,6 +372,129 @@ fn cmd_init(
     Ok(())
 }
 
+/// The config `lore init` runs with, and whether it already existed. An
+/// existing file is returned as it is, so `cmd_init` must not save it.
+fn init_config(
+    config_path: &Path,
+    knowledge_dir: PathBuf,
+    database: Option<&Path>,
+    model: Option<&str>,
+    bind: Option<&str>,
+) -> anyhow::Result<(Config, bool)> {
+    let exists = config_path.try_exists().map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot check for a config at {}: {e}",
+            config_path.display()
+        )
+    })?;
+    if !exists {
+        let db_path = match database {
+            Some(p) => std::path::absolute(p)?,
+            None => default_database_path()?,
+        };
+        let mut config =
+            Config::default_with(knowledge_dir, db_path, model.unwrap_or("nomic-embed-text"));
+        if let Some(bind) = bind {
+            config.bind = bind.to_string();
+        }
+        return Ok((config, false));
+    }
+    let config = Config::load(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "The existing config could not be loaded and was left untouched. \
+             Fix it, or remove it to start fresh.\n{e}"
+        )
+    })?;
+
+    let mut conflicts = Vec::new();
+    if resolved(&config.knowledge_dir) != knowledge_dir {
+        conflicts.push(format!(
+            "knowledge_dir is \"{}\" in the file, \"{}\" from --repo",
+            config.knowledge_dir.display(),
+            knowledge_dir.display()
+        ));
+    }
+    if let Some(database) = database
+        && resolved(&config.database) != resolved(database)
+    {
+        conflicts.push(format!(
+            "database is \"{}\" in the file, \"{}\" from --database",
+            config.database.display(),
+            database.display()
+        ));
+    }
+    if let Some(model) = model
+        && !same_model("ollama", &config.ollama.model, model)
+    {
+        conflicts.push(format!(
+            "[ollama] model is \"{}\" in the file, \"{model}\" from --model",
+            config.ollama.model
+        ));
+    }
+    if let Some(bind) = bind
+        && bind != config.bind
+    {
+        conflicts.push(format!(
+            "bind is \"{}\" in the file, \"{bind}\" from --bind",
+            config.bind
+        ));
+    }
+    if !conflicts.is_empty() {
+        anyhow::bail!(
+            "The existing config at {} disagrees with the flags given:\n  {}\n\
+             Edit the file to change a setting, or remove it to start fresh.",
+            config_path.display(),
+            conflicts.join("\n  ")
+        );
+    }
+    Ok((config, true))
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return path;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(parent) = std::fs::canonicalize(parent)
+    {
+        return parent.join(name);
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Build the index `lore init` ends with. A refused ingest is an error, so
+/// init never reports success over an index it did not build.
+fn init_ingest(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    config: &Config,
+) -> anyhow::Result<ingest::IngestResult> {
+    let mut write_lock = WriteLock::open(&lock_path_for(&config.database))?;
+    let _lock_guard = write_lock.acquire()?;
+
+    // Mirror the tier-2 effective-empty warning that `ingest()` emits at its
+    // entry point. `lore init` calls `full_ingest` directly, skipping the
+    // delta/full probe, so the warning would not fire otherwise. See project
+    // memory `project_cli_behaviour_ladder.md`.
+    if let Some(msg) = ingest::empty_warning_message(&config.knowledge_dir) {
+        eprintln!("{msg}");
+    }
+
+    let result = ingest::full_ingest(
+        db,
+        embedder,
+        &config.knowledge_dir,
+        &config.chunking.strategy,
+        &|msg| {
+            eprintln!("{msg}");
+        },
+    );
+    if let Some(reason) = &result.refused {
+        anyhow::bail!("{reason}");
+    }
+    Ok(result)
+}
+
 fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let mode_label = match (file.is_some(), force) {
@@ -387,15 +510,16 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         config.chunking.strategy,
     );
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
     // `lore ingest --force` (without `--file`) is the documented remedy when
     // the schema-compatibility probe bails. It drops and recreates the
     // tables via `clear_all`, so the probe must not run first — otherwise
     // the very advisory it emits would never be actionable.
     let db = if should_skip_schema_probe(force, file) {
-        KnowledgeDB::open_skipping_schema_check(&config.database, ollama.dimensions())?
+        KnowledgeDB::open_skipping_schema_check(&config.database)?
     } else {
-        KnowledgeDB::open(&config.database, ollama.dimensions())?
+        KnowledgeDB::open(&config.database)?
     };
     db.init()?;
 
@@ -407,6 +531,9 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
     let _lock_guard = write_lock.acquire()?;
 
     let result = dispatch_ingest(&db, &ollama, &config, force, file, on_progress)?;
+    if let Some(reason) = &result.refused {
+        anyhow::bail!("{reason}");
+    }
 
     lore_debug!(
         "ingest: processed={} chunks_created={} errors={}",
@@ -429,16 +556,63 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         for err in &result.errors {
             eprintln!("  ✗ {err}");
         }
-        // Single-file ingest is atomic: any error means the one requested
-        // file did not land, so propagate as a non-zero exit. Delta and
-        // full ingests may collect per-file errors while still making
-        // progress on the rest, so their behaviour is unchanged.
-        if matches!(result.mode, ingest::IngestMode::SingleFile { .. }) {
+        // Any single-file error exits non-zero. Delta and full ingests may
+        // collect per-file errors while still making progress on the rest.
+        // `files_processed` is 1 only when the file's text landed, so its
+        // errors are embedding failures.
+        if let ingest::IngestMode::SingleFile { path } = &result.mode {
+            if result.files_processed == 1 {
+                let recorded = db.recorded_probe_mismatch().ok().flatten();
+                let remedy = match VectorMismatch::of_recorded_probe(&ollama, recorded) {
+                    Some(mismatch) => format!("{mismatch}."),
+                    None => "Run 'lore ingest' once the embedding model answers to add them."
+                        .to_string(),
+                };
+                let ignored = if force {
+                    " If .loreignore excludes the file, that ingest may remove it instead."
+                } else {
+                    ""
+                };
+                anyhow::bail!(
+                    "single-file ingest saved the text of {path} but not all of its vectors. \
+                     {remedy}{ignored}"
+                );
+            }
             anyhow::bail!("single-file ingest failed");
         }
     }
 
+    if let Ok(dimensions) = db.vector_dimensions()
+        && let Some(note) = text_only_note(config.search.hybrid, dimensions.is_some(), &result.mode)
+    {
+        eprintln!("{note}");
+    }
+
     Ok(())
+}
+
+/// What searches use, as `lore init` reports it.
+fn search_mode(hybrid: bool, has_vectors: bool) -> &'static str {
+    if hybrid && has_vectors {
+        "hybrid (FTS5 + vector)"
+    } else {
+        "text only (FTS5)"
+    }
+}
+
+/// The note that the index has no vectors, when searches would use them.
+fn text_only_note(hybrid: bool, has_vectors: bool, mode: &ingest::IngestMode) -> Option<String> {
+    if !hybrid || has_vectors {
+        return None;
+    }
+    let text_only = match mode {
+        ingest::IngestMode::SingleFile { path } => format!("{path} is searchable by text only"),
+        _ => "searches use text only".to_string(),
+    };
+    Some(format!(
+        "Note: the index has no vectors, so {text_only}. \
+         Run 'lore ingest' once the embedding model answers to add them."
+    ))
 }
 
 /// Route the ingest request to the right library entry point based on the
@@ -590,7 +764,8 @@ fn print_universal_advisories(result: &ingest::IngestResult) {
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
     server::start_mcp_server(&config, &ollama)
 }
 
@@ -617,10 +792,14 @@ fn cmd_search(
     );
 
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
-    let (results, _phases) = hook::search_with_threshold(&db, &ollama, &config, query)?;
+    let (results, _phases) = if json {
+        hook::search_with_threshold_quiet(&db, &ollama, &config, query)?
+    } else {
+        hook::search_with_threshold(&db, &ollama, &config, query)?
+    };
     lore_debug!("search: {} results", results.len());
 
     if json {
@@ -709,7 +888,7 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
 
     let config = Config::load(config_path)?;
     let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
     if let Some(output) = hook::handle_hook(&input, &db, &ollama, &config)? {
@@ -761,8 +940,7 @@ fn cmd_extract_queries() -> anyhow::Result<()> {
 
 fn cmd_list(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
-    let db = KnowledgeDB::open(&config.database, ollama.dimensions())?;
+    let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
     let patterns = db.list_patterns()?;
@@ -820,9 +998,12 @@ fn render_runtime_line(outcome: &ProbeOutcome, full: bool) {
 
 #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
 fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
-    let Ok(config) = Config::load(config_path) else {
-        eprintln!("✗ No config found. Run 'lore init' first.");
-        process::exit(1);
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("✗ {e}");
+            process::exit(1);
+        }
     };
 
     // Run the cheap checks first (no probe) so the header lines print
@@ -830,7 +1011,8 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     // `lore status --full` invocation against a slow or hung Ollama would
     // show a blank terminal for up to 30 s before any output appears.
     let mut status = provision::check_status(&config.ollama.host, &config.ollama.model, false);
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
+        .with_dimensions(config.ollama.dimensions.fixed());
 
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
@@ -884,7 +1066,7 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     render_runtime_line(&status.runtime, full);
     eprintln!("  sqlite-vec:   ✓ bundled");
 
-    if let Ok(db) = KnowledgeDB::open(&config.database, ollama.dimensions())
+    if let Ok(db) = KnowledgeDB::open(&config.database)
         && db.init().is_ok()
         && let Ok(stats) = db.stats()
     {
@@ -910,6 +1092,10 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
         if let Ok(Some(sha)) = db.get_metadata("last_ingested_commit") {
             let short = git::short_sha(&config.knowledge_dir, &sha);
             eprintln!("  Last commit:  {short}");
+        }
+        let model_answers = matches!(status.runtime, ProbeOutcome::Ok);
+        if let Some(line) = index_model_line(&db, &ollama, model_answers) {
+            eprintln!("  Index model:  ✗ {line}");
         }
         eprintln!();
     }
@@ -952,6 +1138,44 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The `Index model:` status line, naming every mismatch an ingest refuses
+/// over, else a probe mismatch an earlier write recorded. Only a model that
+/// answered is probed; without a probe the recorded name alone is compared.
+fn index_model_line(
+    db: &KnowledgeDB,
+    embedder: &dyn Embedder,
+    model_answers: bool,
+) -> Option<String> {
+    let probe = model_answers
+        .then(|| EmbeddingIdentity::measure(embedder).ok())
+        .flatten();
+    let mismatch = match ingest::vector_write_mismatch(db, embedder, probe.as_ref()) {
+        Ok(Some(mismatch)) => mismatch,
+        Ok(None) => {
+            let recorded = db.recorded_probe_mismatch().ok().flatten();
+            let mismatch = VectorMismatch::of_recorded_probe(embedder, recorded)?;
+            if probe.is_none() {
+                return Some(format!("{mismatch}."));
+            }
+            return Some(format!(
+                "an earlier write found another model under the name {}, but it now answers as \
+                 the model that built the index; searches use text only until that record \
+                 clears. Run 'lore ingest' to clear it.",
+                embedder.model()
+            ));
+        }
+        Err(e) => VectorMismatch::unreadable(&e),
+    };
+    Some(match mismatch {
+        VectorMismatch::Model { .. } | VectorMismatch::Width { .. } => format!("{mismatch}."),
+        _ => format!(
+            "{}, so 'lore ingest' refuses to write. {}.",
+            mismatch.cause(),
+            mismatch.remedy()
+        ),
+    })
 }
 
 fn resolve_trace_dir() -> anyhow::Result<PathBuf> {
@@ -1064,5 +1288,188 @@ mod tests {
         // `lore ingest --file path` without `--force`; orthogonal to schema.
         let path = Path::new("draft.md");
         assert!(!should_skip_schema_probe(false, Some(path)));
+    }
+
+    // -- init_ingest ----------------------------------------------------------
+
+    #[test]
+    fn init_refuses_when_the_pinned_width_contradicts_the_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let knowledge_dir = tmp.path().join("knowledge");
+        std::fs::create_dir_all(&knowledge_dir).unwrap();
+        std::fs::write(
+            knowledge_dir.join("logging.md"),
+            "# Logging\n\nLog to stderr.\n",
+        )
+        .unwrap();
+        let config = Config::default_with(
+            knowledge_dir,
+            tmp.path().join("knowledge.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let wider = lore::embeddings::FakeEmbedder::with_dimensions(1024).configured_for(768);
+
+        let err = init_ingest(&db, &wider, &config).unwrap_err().to_string();
+
+        assert!(
+            err.contains("returns 1024-dimension vectors but [ollama] dimensions is 768"),
+            "{err}"
+        );
+        assert!(db.search_fts("stderr", 10).unwrap().is_empty());
+        assert_eq!(db.vector_dimensions().unwrap(), None);
+    }
+
+    // -- search mode ------------------------------------------------------------
+
+    #[test]
+    fn search_mode_and_note_follow_the_hybrid_setting() {
+        let full = ingest::IngestMode::Full;
+        assert_eq!(search_mode(true, true), "hybrid (FTS5 + vector)");
+        assert_eq!(search_mode(true, false), "text only (FTS5)");
+        assert_eq!(search_mode(false, true), "text only (FTS5)");
+        assert_eq!(search_mode(false, false), "text only (FTS5)");
+        assert_eq!(text_only_note(true, true, &full), None);
+        assert_eq!(text_only_note(false, false, &full), None);
+        assert_eq!(
+            text_only_note(true, false, &full).as_deref(),
+            Some(
+                "Note: the index has no vectors, so searches use text only. Run 'lore ingest' \
+                 once the embedding model answers to add them."
+            )
+        );
+    }
+
+    // -- index_model_line -------------------------------------------------------
+
+    use lore::embeddings::FakeEmbedder;
+
+    fn index_of(embedder: &FakeEmbedder) -> KnowledgeDB {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity = EmbeddingIdentity::measure(embedder).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+        db
+    }
+
+    const FORCE: &str = "Run 'lore ingest --force' to rebuild the index.";
+
+    #[test]
+    fn status_names_a_model_of_another_name_without_probing() {
+        let db = index_of(&FakeEmbedder::with_model("other-model", 768));
+
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), false).unwrap(),
+            format!(
+                "the index was built with other-model but lore is configured for \
+                 nomic-embed-text, so searches use text only. {FORCE}"
+            )
+        );
+    }
+
+    #[test]
+    fn status_names_a_model_of_another_width_once_it_answers() {
+        let db = index_of(&FakeEmbedder::with_dimensions(4));
+
+        assert_eq!(index_model_line(&db, &FakeEmbedder::new(), false), None);
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), true).unwrap(),
+            format!(
+                "the index holds 4-dimension vectors from nomic-embed-text but \
+                 nomic-embed-text returns 768 dimensions, so searches use text only. {FORCE}"
+            )
+        );
+    }
+
+    #[test]
+    fn status_names_another_model_behind_the_recorded_name_once_it_answers() {
+        let db = index_of(&FakeEmbedder::new());
+        let probe = EmbeddingIdentity::measure(&FakeEmbedder::new())
+            .unwrap()
+            .probe_vector;
+        let negated: Vec<f32> = probe.iter().map(|x| -x).collect();
+        db.set_metadata(
+            "embedding_probe_vector",
+            &serde_json::to_string(&negated).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(index_model_line(&db, &FakeEmbedder::new(), false), None);
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), true).unwrap(),
+            format!(
+                "nomic-embed-text is not the model that built the index under that name: its \
+                 vectors match the recorded ones at cosine similarity -1.000, below 0.99, so \
+                 'lore ingest' refuses to write. {FORCE}"
+            )
+        );
+    }
+
+    #[test]
+    fn status_names_a_probe_mismatch_a_write_recorded_without_calling_the_model() {
+        let db = index_of(&FakeEmbedder::new());
+        db.set_probe_mismatch(Some(-1.0)).unwrap();
+
+        let silent = lore::embeddings::FailingEmbedder::new(768);
+        assert_eq!(
+            index_model_line(&db, &silent, false).unwrap(),
+            format!(
+                "nomic-embed-text is not the model that built the index under that name: its \
+                 vectors match the recorded ones at cosine similarity -1.000, below 0.99, so \
+                 searches use text only. {FORCE}"
+            )
+        );
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), Some(-1.0));
+    }
+
+    #[test]
+    fn status_says_a_model_that_answers_as_recorded_again_needs_only_a_plain_ingest() {
+        let db = index_of(&FakeEmbedder::new());
+        db.set_probe_mismatch(Some(-1.0)).unwrap();
+
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), true).unwrap(),
+            "an earlier write found another model under the name nomic-embed-text, but it now \
+             answers as the model that built the index; searches use text only until that \
+             record clears. Run 'lore ingest' to clear it."
+        );
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), Some(-1.0));
+    }
+
+    #[test]
+    fn status_names_an_unreadable_recorded_identity() {
+        let db = index_of(&FakeEmbedder::new());
+        db.set_metadata("embedding_probe_vector", "[0.5,").unwrap();
+
+        let line = index_model_line(&db, &FakeEmbedder::new(), true).unwrap();
+
+        assert!(
+            line.starts_with("cannot read the index's embedding model (malformed"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("so 'lore ingest' refuses to write. {FORCE}")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn status_names_the_width_setting_the_model_contradicts() {
+        let db = index_of(&FakeEmbedder::new());
+
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new().configured_for(1024), true).unwrap(),
+            "nomic-embed-text returns 768-dimension vectors but [ollama] dimensions is 1024, \
+             so 'lore ingest' refuses to write. Set [ollama] dimensions to 768 or \"auto\", or \
+             configure a model that returns 1024-dimension vectors."
+        );
+    }
+
+    #[test]
+    fn status_is_silent_when_the_model_matches_the_index() {
+        let db = index_of(&FakeEmbedder::new());
+
+        assert_eq!(index_model_line(&db, &FakeEmbedder::new(), true), None);
     }
 }

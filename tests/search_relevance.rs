@@ -137,8 +137,9 @@ fn setup_test_env() -> (tempfile::TempDir, Config, KnowledgeDB) {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
 
     let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
     assert!(

@@ -352,7 +352,7 @@ Default: `0.6`. Controls the minimum normalised score a pattern must reach to be
 - Set to `0.0` to disable the threshold entirely (inject all results)
 
 The threshold applies only to hybrid search with successful embedding. When the search falls back to
-FTS5 only, no threshold is applied.
+FTS5 only, for example on an index built with another model, no threshold is applied.
 
 ### Universal Floor (`search.min_relevance_universal`)
 
@@ -396,8 +396,8 @@ lore ingest --force
 ```
 
 This drops and recreates the FTS5 virtual table, ensuring schema changes (such as porter stemming)
-take effect. Without `--force`, delta ingest only processes files that have changed since the last
-ingestion and does not recreate the table.
+take effect. Without `--force`, delta ingest processes files that have changed since the last
+ingestion and embeds chunks still missing a vector. It does not recreate the table.
 
 ## Troubleshooting
 

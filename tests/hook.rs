@@ -5,7 +5,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 use lore::database::KnowledgeDB;
-use lore::embeddings::{Embedder, FakeEmbedder};
+use lore::embeddings::FakeEmbedder;
 use lore::ingest;
 use tempfile::tempdir;
 
@@ -44,8 +44,10 @@ max_tokens = 1024
 /// Open an on-disk `KnowledgeDB` in the given directory.
 fn open_db(dir: &Path, dims: usize) -> KnowledgeDB {
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, dims).expect("failed to open DB");
+    let db = KnowledgeDB::open(&db_path).expect("failed to open DB");
     db.init().expect("failed to init DB");
+    db.ensure_vector_table(dims)
+        .expect("failed to create vector table");
     db
 }
 
@@ -1384,8 +1386,9 @@ fn hook_session_start_skips_pinned_pattern_with_path_traversal_source_file() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
     // Tamper a chunk row so its source_file points outside knowledge_dir.
@@ -1441,8 +1444,9 @@ fn hook_session_start_truncates_pinned_section_at_render_budget() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
     assert!(
         result.errors.is_empty(),
@@ -1489,8 +1493,9 @@ fn hook_session_start_renders_raw_body_control_chars_verbatim() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
     // Tamper: insert a `patterns` row whose `raw_body` carries raw ANSI
@@ -1550,8 +1555,9 @@ fn hook_session_start_renders_from_db_even_when_source_file_removed() {
 
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(embedder.dimensions()).unwrap();
     ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
     // Remove ghost.md from disk after ingest — its patterns row stays in
@@ -2486,8 +2492,9 @@ fn hook_pre_tool_use_predicate_parse_error_logs_and_falls_through() {
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
     {
-        let db = lore::database::KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+        let db = lore::database::KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
 
         // Inject malformed JSON directly into the persisted chunk row(s).
@@ -2563,8 +2570,9 @@ fn setup_min_relevance_universal_env()
     let embedder = FakeEmbedder::new();
     let db_path = dir.join("knowledge.db");
     {
-        let db = lore::database::KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+        let db = lore::database::KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(embedder.dimensions()).unwrap();
         ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
     }
 
@@ -2594,7 +2602,7 @@ fn setup_min_relevance_universal_env()
 fn hook_search_path_min_relevance_universal_filters_universal_above_score() {
     let (_tmp, _db_path, mut config) = setup_min_relevance_universal_env();
     let embedder = FakeEmbedder::new();
-    let db = lore::database::KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = lore::database::KnowledgeDB::open(&config.database).unwrap();
 
     // Step 1: with floors at 0.0, the universal chunk is in the result set.
     config.search.min_relevance = 0.0;
@@ -2645,7 +2653,7 @@ fn hook_search_path_min_relevance_universal_filters_universal_above_score() {
 fn hook_search_path_min_relevance_universal_defaults_to_min_relevance() {
     let (_tmp, _db_path, mut config) = setup_min_relevance_universal_env();
     let embedder = FakeEmbedder::new();
-    let db = lore::database::KnowledgeDB::open(&config.database, embedder.dimensions()).unwrap();
+    let db = lore::database::KnowledgeDB::open(&config.database).unwrap();
 
     // Both floors raised together via min_relevance only — universal floor
     // inherits and filters the chunk.
@@ -3246,4 +3254,161 @@ fn hook_transcript_tail_toggle_omits_field_by_default() {
             || rec["call_context"]["transcript_tail"].is_null(),
         "transcript_tail must be absent under default privacy posture, got: {rec}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Searching an index built with another embedding model
+// ---------------------------------------------------------------------------
+
+/// Index `seed_patterns` with `embedder` and return a hybrid config whose
+/// relevance floor no hybrid score reaches, so any result proves the search
+/// fell back to text. With `record` false the recorded model is removed, as
+/// in an index built before lore recorded it.
+fn index_built_with(
+    embedder: &FakeEmbedder,
+    record: bool,
+) -> (tempfile::TempDir, KnowledgeDB, lore::config::Config) {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    let db_path = dir.join("knowledge.db");
+    {
+        let db = KnowledgeDB::open(&db_path).unwrap();
+        db.init().unwrap();
+        ingest::ingest(&db, embedder, dir, "heading", &|_| {});
+    }
+    if !record {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "DELETE FROM ingest_metadata WHERE key LIKE 'embedding\\_%' ESCAPE '\\'",
+                [],
+            )
+            .unwrap();
+    }
+    let db = KnowledgeDB::open(&db_path).unwrap();
+    assert_eq!(db.recorded_embedding_model().unwrap().is_some(), record);
+    let mut config =
+        lore::config::Config::default_with(dir.to_path_buf(), db_path, "nomic-embed-text");
+    config.search.min_relevance = 1.5;
+    (tmp, db, config)
+}
+
+fn titles(results: &[lore::database::SearchResult]) -> Vec<&str> {
+    results.iter().map(|r| r.title.as_str()).collect()
+}
+
+#[test]
+fn search_uses_text_only_when_the_index_records_another_model() {
+    let (_tmp, db, config) = index_built_with(&FakeEmbedder::with_model("other-model", 768), true);
+
+    let (results, _) = lore::hook::search_with_threshold(
+        &db,
+        &FakeEmbedder::new(),
+        &config,
+        "anyhow error propagation",
+    )
+    .unwrap();
+
+    assert_eq!(titles(&results), ["Rust Conventions"]);
+}
+
+#[test]
+fn search_uses_text_only_when_the_query_vector_width_differs() {
+    let (_tmp, db, config) = index_built_with(&FakeEmbedder::with_dimensions(4), true);
+
+    let (results, _) = lore::hook::search_with_threshold(
+        &db,
+        &FakeEmbedder::new(),
+        &config,
+        "anyhow error propagation",
+    )
+    .unwrap();
+
+    assert_eq!(titles(&results), ["Rust Conventions"]);
+}
+
+#[test]
+fn search_on_an_unrecorded_index_of_the_same_width_stays_hybrid() {
+    let (_tmp, db, config) = index_built_with(&FakeEmbedder::new(), false);
+
+    let (results, phases) = lore::hook::search_with_threshold(
+        &db,
+        &FakeEmbedder::with_model("any-model", 768),
+        &config,
+        "anyhow error propagation",
+    )
+    .unwrap();
+
+    assert!(results.is_empty(), "{:?}", titles(&results));
+    assert!(phases.search_vector_ms.is_some());
+}
+
+#[test]
+fn search_on_an_unrecorded_index_of_another_width_uses_text_only() {
+    let (_tmp, db, config) = index_built_with(&FakeEmbedder::with_dimensions(4), false);
+
+    let (results, _) = lore::hook::search_with_threshold(
+        &db,
+        &FakeEmbedder::new(),
+        &config,
+        "anyhow error propagation",
+    )
+    .unwrap();
+
+    assert_eq!(titles(&results), ["Rust Conventions"]);
+}
+
+#[test]
+fn hook_warns_and_injects_text_results_when_the_index_records_another_model() {
+    let (tmp, _db, mut config) = index_built_with(&FakeEmbedder::new(), true);
+    config.ollama.model = "other-model".to_string();
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+
+    let session_id = format!("model-mismatch-{}", std::process::id());
+    let inputs = [
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_response": {
+                "exit_code": 1,
+                "stderr": "error: anyhow rust conventions unwrap propagation"
+            }
+        }),
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": session_id,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "src/error_handling.rs"
+            }
+        }),
+    ];
+    for input in inputs {
+        let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
+        let output = Command::cargo_bin("lore")
+            .unwrap()
+            .args(["hook", "--config", config_path.to_str().unwrap()])
+            .write_stdin(serde_json::to_string(&input).unwrap())
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "Warning: the index was built with nomic-embed-text but lore is configured \
+                 for other-model, so searches use text only. Run 'lore ingest --force' to \
+                 rebuild the index.",
+            ))
+            .stderr(predicate::str::contains("Ollama embed failed").not());
+
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.contains("Rust Conventions"), "{input}: {context}");
+    }
+    let _ = std::fs::remove_file(lore::hook::dedup_file_path(&session_id));
 }

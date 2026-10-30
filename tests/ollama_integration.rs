@@ -16,6 +16,8 @@ use tempfile::tempdir;
 
 const OLLAMA_HOST: &str = "http://127.0.0.1:11434";
 const OLLAMA_MODEL: &str = "nomic-embed-text";
+/// Width of an `OLLAMA_MODEL` vector.
+const OLLAMA_DIMENSIONS: usize = 768;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,8 +47,10 @@ fn git_init(dir: &Path) {
 /// Open an on-disk `KnowledgeDB` in the given directory.
 fn open_db(dir: &Path, dims: usize) -> KnowledgeDB {
     let db_path = dir.join("knowledge.db");
-    let db = KnowledgeDB::open(&db_path, dims).expect("failed to open DB");
+    let db = KnowledgeDB::open(&db_path).expect("failed to open DB");
     db.init().expect("failed to init DB");
+    db.ensure_vector_table(dims)
+        .expect("failed to create vector table");
     db
 }
 
@@ -152,7 +156,7 @@ fn ollama_lifecycle() {
         .unwrap();
 
     let embedder = ollama_client();
-    let db = open_db(dir, embedder.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
 
     // -- Ingest ---------------------------------------------------------------
     let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
@@ -307,7 +311,7 @@ fn ollama_stale_embeddings_removed() {
     let dir = tmp.path();
 
     let embedder = ollama_client();
-    let db = open_db(dir, embedder.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
 
     // Seed two files with distinct content.
     fs::write(
@@ -381,8 +385,9 @@ fn ollama_mcp_subprocess_roundtrip() {
     let embedder = ollama_client();
     let db_path = dir.join("knowledge.db");
     {
-        let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+        let db = KnowledgeDB::open(&db_path).unwrap();
         db.init().unwrap();
+        db.ensure_vector_table(OLLAMA_DIMENSIONS).unwrap();
         let result = ingest::ingest(&db, &embedder, dir, "heading", &|_| {});
         assert!(
             result.errors.is_empty(),
@@ -490,7 +495,7 @@ fn ingest_single_file_happy_path_with_real_embeddings() {
     .unwrap();
 
     let embedder = ollama_client();
-    let db = open_db(dir, embedder.dimensions());
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
 
     let result = ingest::ingest_single_file(
         &db,
@@ -570,8 +575,7 @@ fn ingest_file_happy_path_via_binary() {
 
     // Pre-create the DB so the CLI does not have to do first-time setup.
     {
-        let embedder = ollama_client();
-        let db = open_db(dir, embedder.dimensions());
+        let db = open_db(dir, OLLAMA_DIMENSIONS);
         // Drop closes the DB; the CLI will reopen it.
         drop(db);
     }
@@ -607,9 +611,9 @@ fn ingest_file_happy_path_via_binary() {
     // Reopen the DB and confirm the file is searchable by its distinctive
     // marker. This proves the binary actually persisted real chunks, not
     // just printed a success message.
-    let embedder = ollama_client();
-    let db = KnowledgeDB::open(&db_path, embedder.dimensions()).unwrap();
+    let db = KnowledgeDB::open(&db_path).unwrap();
     db.init().unwrap();
+    db.ensure_vector_table(OLLAMA_DIMENSIONS).unwrap();
     let hits = db.search_fts("xyzzysinglefile", 10).unwrap();
     assert!(
         hits.iter().any(|h| h.source_file == "draft.md"),
@@ -633,7 +637,7 @@ fn ollama_unreachable_returns_error() {
         result.unwrap()
     );
 
-    // -- ingest() records errors but doesn't panic ----------------------------
+    // -- ingest() builds a text-only index without panicking -----------------
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
 
@@ -643,19 +647,30 @@ fn ollama_unreachable_returns_error() {
     )
     .unwrap();
 
-    // Use the dead client's dimensions (768 for nomic-embed-text).
-    let db = open_db(dir, dead_client.dimensions());
-    let result = ingest::ingest(&db, &dead_client, dir, "heading", &|_| {});
+    let db = open_db(dir, OLLAMA_DIMENSIONS);
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let result = ingest::ingest(&db, &dead_client, dir, "heading", &|m| {
+        lines.borrow_mut().push(m.to_string());
+    });
 
     assert_eq!(result.files_processed, 1);
     assert!(
-        !result.errors.is_empty(),
-        "R8: ingest with dead Ollama should record errors, got none"
+        result.errors.is_empty(),
+        "R8: a model that does not answer leaves a text-only index, not errors: {:?}",
+        result.errors
     );
-    // Chunks are created with None embeddings — chunks_created will be > 0.
+    assert_eq!(db.vector_dimensions().unwrap(), None);
     assert!(
         result.chunks_created >= 1,
         "R8: chunks should still be created (with None embeddings)"
+    );
+    assert_eq!(db.search_fts("testing", 10).unwrap().len(), 1);
+    assert!(
+        lines
+            .into_inner()
+            .iter()
+            .any(|l| l.starts_with("Embedding model did not answer (")),
+        "R8: the ingest should say the model did not answer"
     );
 }
 
