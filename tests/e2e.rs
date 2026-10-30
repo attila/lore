@@ -1191,6 +1191,61 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
 }
 
 #[test]
+fn search_json_writes_nothing_to_stderr_when_the_model_cannot_embed() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &knowledge_dir);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    lore()
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains("Warning: Ollama embed failed"));
+    let output = lore()
+        .env_remove("LORE_DEBUG")
+        .args([
+            "search",
+            "--json",
+            "--config",
+            config_arg,
+            "error propagation",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    let results: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let results = results.as_array().unwrap();
+    assert!(
+        results.iter().any(|r| r["title"] == "Error Handling"),
+        "{results:?}"
+    );
+}
+
+#[test]
 fn ingest_file_says_the_text_was_saved_when_the_model_cannot_embed() {
     use predicates::prelude::*;
 

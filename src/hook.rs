@@ -674,8 +674,8 @@ pub fn search_with_threshold(
     search_pipeline(db, embedder, config, query, &[], &[], true)
 }
 
-/// [`search_with_threshold`] without the model-mismatch warning on stderr,
-/// for `lore search --json`.
+/// [`search_with_threshold`] without the mismatch and embedding-failure
+/// warnings on stderr, for `lore search --json`.
 pub fn search_with_threshold_quiet(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -722,7 +722,8 @@ pub fn search_with_threshold_gated(
 /// must use text only: the index has no vector table, records another model
 /// than the embedder's or a probe mismatch a write found, the embedding
 /// fails, or the vector's width differs from the index's. `warn_on_mismatch`
-/// prints a model, probe or width mismatch on stderr.
+/// prints a model, probe or width mismatch, or the embedding failure, on
+/// stderr.
 fn query_vector(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -756,7 +757,9 @@ fn query_vector(
     let v = match outcome {
         Ok(v) => v,
         Err(e) => {
-            emit_embed_failure_warning(&e);
+            if warn_on_mismatch {
+                emit_embed_failure_warning(&e);
+            }
             lore_debug!("search: embedding failed: {e}");
             return None;
         }
