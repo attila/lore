@@ -370,7 +370,7 @@ history attributed to the tap App.
 
 Read these reasons before you change the workflow.
 
-- **One Linux runner builds all four targets with `cargo-zigbuild`.** A per-platform matrix adds
+- **One Linux runner builds all five targets with `cargo-zigbuild`.** A per-platform matrix adds
   slower macOS runners and a second toolchain setup, and lore has no native dependency that needs
   one.
 - **No GPG or Sigstore signing.** `SHA256SUMS` served over HTTPS from GitHub covers the current

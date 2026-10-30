@@ -12,3 +12,4 @@
 #
 # Drop this when sqlite-vec ships a fix or we move off the 0.1 line.
 CFLAGS_x86_64_unknown_linux_musl = "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t"
+CFLAGS_aarch64_unknown_linux_musl = "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t"

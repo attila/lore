@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and model, whether it answers, and whether its API key variable is set. (#79)
 - Trace files record whether Ollama or an OpenAI-compatible embedding server produced the
   embeddings. (#79)
+- Each release ships a static Arm Linux binary, `aarch64-unknown-linux-musl`. (#80)
 
 ### Changed
 

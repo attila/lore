@@ -48,7 +48,8 @@ search falls back to keyword matching and warns that it has.
 
 ### Homebrew
 
-On macOS (Apple Silicon or Intel) and x86_64 Linux, install with [Homebrew](https://brew.sh):
+On macOS (Apple Silicon or Intel) and Linux (x86_64 or Arm), install with
+[Homebrew](https://brew.sh):
 
 ```sh
 brew install attila/tap/lore
@@ -63,7 +64,8 @@ Prebuilt binaries are published with every tagged release on the
 [releases page](https://github.com/attila/lore/releases), accompanied by a `SHA256SUMS` file for
 integrity verification. Pick `VERSION` from the releases page. Set `TARGET` to one of
 `x86_64-unknown-linux-gnu` (most Linux), `x86_64-unknown-linux-musl` (Alpine and musl distros),
-`aarch64-apple-darwin` (Apple Silicon), or `x86_64-apple-darwin` (Intel Mac):
+`aarch64-unknown-linux-musl` (Arm Linux), `aarch64-apple-darwin` (Apple Silicon), or
+`x86_64-apple-darwin` (Intel Mac):
 
 ```sh
 VERSION=0.5.0
