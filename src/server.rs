@@ -20,6 +20,7 @@ use crate::git;
 use crate::ingest;
 use crate::ingest::CommitStatus;
 use crate::lockfile::{WriteLock, lock_path_for};
+use crate::openai_compatible::ServerError;
 use crate::provision::{self, ProbeOutcome};
 
 // ---------------------------------------------------------------------------
@@ -861,7 +862,14 @@ fn run_search(
                 Err(e) => {
                     eprintln!("[lore] Embedding failed, falling back to text search: {e}");
                     embed_failed = true;
-                    note = Some("Ollama unreachable — results are from text search only.".into());
+                    note = Some(match e.downcast_ref::<ServerError>() {
+                        Some(server_error) => format!(
+                            "The embedding server failed ({}), so results are from text \
+                             search only.",
+                            server_error.short()
+                        ),
+                        None => "Ollama unreachable — results are from text search only.".into(),
+                    });
                     None
                 }
             }
@@ -1357,33 +1365,38 @@ fn handle_lore_status(
     // out to `lore status --full`. Default-mode probe would add 3–15 s
     // cold-load latency to every MCP `lore_status` call, which is the
     // wrong default for a frequently-polled health endpoint.
-    let ollama_status =
-        provision::check_status(&ctx.config.ollama.host, &ctx.config.ollama.model, false);
     let probe_runtime = args
         .get("probe_runtime")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let ollama_runtime = if probe_runtime {
-        let backend = crate::embeddings::EmbeddingBackend::from_config(ctx.config);
-        let crate::embeddings::EmbeddingBackend::Ollama(client) = &backend;
-        if ollama_status.model_available {
-            match client.probe(Some(30)) {
-                Ok(()) => ProbeOutcome::Ok,
-                Err(err) => ProbeOutcome::Failed(err),
-            }
-        } else {
-            ProbeOutcome::Skipped
+    let backend = crate::embeddings::EmbeddingBackend::from_config(ctx.config);
+    let ollama_json = match &backend {
+        crate::embeddings::EmbeddingBackend::Ollama(client) => {
+            let ollama_status = provision::check_status(
+                ctx.config.embedding_table().url(),
+                client.model_name(),
+                false,
+            );
+            let ollama_runtime = if !probe_runtime {
+                ProbeOutcome::NotChecked
+            } else if ollama_status.model_available {
+                match client.probe(Some(30)) {
+                    Ok(()) => ProbeOutcome::Ok,
+                    Err(err) => ProbeOutcome::Failed(err),
+                }
+            } else {
+                ProbeOutcome::Skipped
+            };
+            json!({
+                "installed": ollama_status.ollama_installed,
+                "running": ollama_status.ollama_running,
+                "model_available": ollama_status.model_available,
+                "model": client.model_name(),
+                "runtime": runtime_outcome_to_json(&ollama_runtime),
+            })
         }
-    } else {
-        ProbeOutcome::NotChecked
+        crate::embeddings::EmbeddingBackend::OpenAiCompatible(_) => Value::Null,
     };
-    let ollama_json = json!({
-        "installed": ollama_status.ollama_installed,
-        "running": ollama_status.ollama_running,
-        "model_available": ollama_status.model_available,
-        "model": ctx.config.ollama.model,
-        "runtime": runtime_outcome_to_json(&ollama_runtime),
-    });
 
     let mut metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
@@ -1483,6 +1496,11 @@ fn runtime_outcome_to_json(outcome: &ProbeOutcome) -> Value {
                 "status_line": rendered.status_line,
             })
         }
+        ProbeOutcome::ServerFailed(err) => json!({
+            "state": "failed",
+            "short_reason": err.short(),
+            "status_line": err.status_line(),
+        }),
     }
 }
 
@@ -1537,10 +1555,21 @@ fn withheld_vectors_note(mismatch: Option<&VectorMismatch>) -> String {
 /// model of another name: the server keeps the model it started with, so a
 /// `lore.toml` edited since then takes effect only on restart.
 fn restart_hint(mismatch: &VectorMismatch) -> String {
-    let VectorMismatch::Model { recorded, .. } = mismatch else {
+    let VectorMismatch::Model {
+        recorded,
+        providers,
+        ..
+    } = mismatch
+    else {
         return String::new();
     };
-    format!(", or restart the MCP server if lore.toml already names {recorded}")
+    match providers {
+        Some((from, _)) => format!(
+            ", or restart the MCP server if lore.toml already names {recorded} on {}",
+            crate::embeddings::server_name(from)
+        ),
+        None => format!(", or restart the MCP server if lore.toml already names {recorded}"),
+    }
 }
 
 fn embedding_note(failures: usize) -> String {
@@ -2707,6 +2736,80 @@ mod tests {
         );
     }
 
+    /// An OpenAI-compatible client at an address that never answers.
+    fn silent_server() -> crate::openai_compatible::OpenAiCompatibleClient {
+        crate::openai_compatible::OpenAiCompatibleClient::new(
+            "http://127.0.0.1:1/v1",
+            "nomic-embed-text",
+            1024,
+        )
+    }
+
+    #[test]
+    fn search_patterns_names_the_embedding_server_that_failed() {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let mut identity =
+            crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new()).unwrap();
+        identity.provider = "openai-compatible".to_string();
+        db.clear_all(Some(&identity)).unwrap();
+
+        let resp = search_cargo_deny(&db, &silent_server());
+
+        assert!(resp["error"].is_null(), "{resp}");
+        assert_eq!(metadata_from_response(&resp)["mode"], "fts_fallback");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Note: The embedding server failed (unreachable), so results are from text \
+                 search only."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn add_pattern_saves_text_only_when_the_index_was_built_on_ollama() {
+        let tmp = tempdir().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity = crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new()).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &silent_server(),
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":17,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{"title":"Quokka Care","body":"Feed quokkas native leaves only."}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Warning: the index was built with nomic-embed-text on Ollama but lore is \
+                 configured for nomic-embed-text on an OpenAI-compatible server, so this \
+                 pattern was saved without vectors and is found by text search only. Run \
+                 'lore ingest --force' to rebuild the index, or restart the MCP server if \
+                 lore.toml already names nomic-embed-text on Ollama.\n\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(db.search_fts("quokkas", 10).unwrap().len(), 1);
+        assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+    }
+
     #[test]
     fn add_pattern_saves_text_without_vectors_when_the_width_is_not_the_configured_one() {
         let tmp = tempdir().unwrap();
@@ -3756,7 +3859,7 @@ mod tests {
             }
         });
         let mut h = TestHarness::new();
-        h.config.ollama.host = host;
+        h.config.ollama.as_mut().unwrap().host = host;
 
         let resp = h.request_value(
             r#"{"jsonrpc":"2.0","id":82,"method":"tools/call",

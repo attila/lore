@@ -24,6 +24,7 @@ use crate::embeddings::{Embedder, EmbeddingIdentity, VectorMismatch};
 use crate::git;
 use crate::lore_debug;
 use crate::loreignore;
+use crate::openai_compatible::ServerError;
 
 // ---------------------------------------------------------------------------
 // Embedding helpers
@@ -127,6 +128,9 @@ pub struct IngestResult {
     /// from the database.
     pub reconciled_added: usize,
     pub errors: Vec<String>,
+    /// The embedding server failures behind `errors`: the first one to name
+    /// each remedy.
+    pub server_failures: Vec<ServerError>,
     /// Set when the ingest wrote nothing because vectors from the configured
     /// embedding model may not enter the index (see [`VectorMismatch`]).
     /// Names the remedy.
@@ -368,7 +372,9 @@ pub fn ingest(
     if changes.is_empty() {
         // An index with missing vectors and no new commits must still gain
         // them.
-        let vector_errors = add_missing_vectors(db, embedder, &probe, on_progress);
+        let mut server_failures = Vec::new();
+        let vector_errors =
+            add_missing_vectors(db, embedder, &probe, &mut server_failures, on_progress);
         if !reconcile_did_work && reconcile_errors.is_empty() {
             on_progress("Already up to date — no files changed since last ingest");
         } else {
@@ -385,6 +391,7 @@ pub fn ingest(
         result.reconciled_added = reconciled_added;
         result.errors = reconcile_errors;
         result.errors.extend(vector_errors);
+        result.server_failures = server_failures;
         return result;
     }
 
@@ -401,9 +408,14 @@ pub fn ingest(
     // Surface reconciliation errors and counts to the caller alongside delta
     // results.
     result.errors.extend(reconcile_errors);
-    result
-        .errors
-        .extend(add_missing_vectors(db, embedder, &probe, on_progress));
+    let vector_errors = add_missing_vectors(
+        db,
+        embedder,
+        &probe,
+        &mut result.server_failures,
+        on_progress,
+    );
+    result.errors.extend(vector_errors);
     result.reconciled_removed = reconciled_removed;
     result.reconciled_added = reconciled_added;
     result.chunks_created += reconcile_chunks;
@@ -566,6 +578,7 @@ fn add_missing_vectors(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
     probe: &anyhow::Result<EmbeddingIdentity>,
+    server_failures: &mut Vec<ServerError>,
     on_progress: &dyn Fn(&str),
 ) -> Vec<String> {
     match vector_write_mismatch(db, embedder, probe.as_ref().ok()) {
@@ -616,6 +629,7 @@ fn add_missing_vectors(
         .filter_map(|chunk| {
             embedder
                 .embed(&embed_text(chunk))
+                .map_err(|e| note_server_failure(server_failures, &e))
                 .ok()
                 .filter(|emb| emb.len() == dimensions)
                 .map(|emb| (chunk.id.clone(), emb))
@@ -912,6 +926,7 @@ fn process_change(
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
                     fold_malformed_applies_when(result, &indexed.malformed_applies_when);
                     fold_language_metadata(result, &indexed);
+                    fold_server_failures(result, &indexed);
                     on_progress(&format!("  {path} → {} chunks", indexed.chunks_indexed));
                 }
                 Err(e) => {
@@ -958,6 +973,7 @@ fn process_change(
                     fold_universal_metadata(result, &indexed.rel_path, &indexed.universal_metadata);
                     fold_malformed_applies_when(result, &indexed.malformed_applies_when);
                     fold_language_metadata(result, &indexed);
+                    fold_server_failures(result, &indexed);
                     on_progress(&format!(
                         "  {from} → {to} ({} chunks)",
                         indexed.chunks_indexed
@@ -1267,6 +1283,7 @@ fn full_ingest_probed(
                 );
                 fold_malformed_applies_when(&mut result, &indexed.malformed_applies_when);
                 fold_language_metadata(&mut result, &indexed);
+                fold_server_failures(&mut result, &indexed);
                 result.files_processed += 1;
                 on_progress(&format!(
                     "  {} → {} chunks",
@@ -1445,6 +1462,7 @@ pub fn ingest_single_file(
             fold_universal_metadata(&mut result, &indexed.rel_path, &indexed.universal_metadata);
             fold_malformed_applies_when(&mut result, &indexed.malformed_applies_when);
             fold_language_metadata(&mut result, &indexed);
+            fold_server_failures(&mut result, &indexed);
             on_progress(&format!("  {rel_path} → {} chunks", indexed.chunks_indexed));
         }
         Err(e) => {
@@ -2087,6 +2105,8 @@ fn emit_language_tally(result: &IngestResult, on_progress: &dyn Fn(&str)) {
 struct IndexedFile {
     chunks_indexed: usize,
     embedding_failures: usize,
+    /// The embedding server's failures: the first one to name each remedy.
+    server_failures: Vec<ServerError>,
     /// Set when vectors from the configured embedding model may not enter
     /// the index, so the file's chunks were stored without vectors.
     vectors_withheld: Option<VectorMismatch>,
@@ -2117,6 +2137,7 @@ struct IndexedFile {
 /// `"document"`). `probe` is the configured model's answer to the identity
 /// probe; a walk ingest compares it once before its first file and passes
 /// `None`, leaving only the name to compare here.
+#[allow(clippy::too_many_lines)]
 fn index_single_file(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -2204,12 +2225,14 @@ fn index_single_file(
         .vector_dimensions()?
         .filter(|_| vectors_withheld.is_none());
     let mut embedding_failures = 0_usize;
+    let mut server_failures = Vec::new();
     let chunks_with_embeddings: Vec<(Chunk, Option<Vec<f32>>)> = chunks
         .iter()
         .map(|chunk| {
             let embedding = vector_dimensions.and_then(|dims| {
                 let embedding = embedder
                     .embed(&embed_text(chunk))
+                    .map_err(|e| note_server_failure(&mut server_failures, &e))
                     .ok()
                     .filter(|emb| emb.len() == dims);
                 if embedding.is_none() {
@@ -2272,6 +2295,7 @@ fn index_single_file(
     Ok(IndexedFile {
         chunks_indexed: count,
         embedding_failures,
+        server_failures,
         vectors_withheld,
         rel_path,
         universal_metadata,
@@ -2279,6 +2303,27 @@ fn index_single_file(
         malformed_language,
         declares_language,
     })
+}
+
+/// Record an embedding server failure, unless `failures` already holds one
+/// that names the same remedy.
+fn note_server_failure(failures: &mut Vec<ServerError>, e: &anyhow::Error) {
+    if let Some(e) = e.downcast_ref::<ServerError>() {
+        push_failure(failures, e);
+    }
+}
+
+fn push_failure(failures: &mut Vec<ServerError>, e: &ServerError) {
+    let remedy = e.action_line();
+    if !failures.iter().any(|f| f.action_line() == remedy) {
+        failures.push(e.clone());
+    }
+}
+
+fn fold_server_failures(result: &mut IngestResult, indexed: &IndexedFile) {
+    for e in &indexed.server_failures {
+        push_failure(&mut result.server_failures, e);
+    }
 }
 
 /// Validate that `file_path` lies within `knowledge_dir` after canonicalisation
@@ -2805,7 +2850,7 @@ mod tests {
         let lines = std::cell::RefCell::new(Vec::new());
         let embedder = FakeEmbedder::new();
         let probe = EmbeddingIdentity::measure(&embedder);
-        let errors = add_missing_vectors(&db, &embedder, &probe, &|m| {
+        let errors = add_missing_vectors(&db, &embedder, &probe, &mut Vec::new(), &|m| {
             lines.borrow_mut().push(m.to_string());
         });
 

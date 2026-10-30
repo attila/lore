@@ -147,6 +147,23 @@ impl ServerError {
             }
         }
     }
+
+    /// `lore status` server line body, after the `✗`.
+    pub fn reachability_line(&self) -> String {
+        let url = &self.url;
+        match &self.kind {
+            ServerErrorKind::Unauthorized { status } | ServerErrorKind::Status { status, .. } => {
+                format!("HTTP {status} at {url}")
+            }
+            ServerErrorKind::Timeout => {
+                format!("cannot reach {url}: no answer within {TIMEOUT_SECS} seconds")
+            }
+            ServerErrorKind::Transport(msg) => format!("cannot reach {url}: {msg}"),
+            ServerErrorKind::InputTooLarge | ServerErrorKind::BadResponse => {
+                format!("{} at {url}", self.short())
+            }
+        }
+    }
 }
 
 fn suffix(message: Option<&str>) -> String {
@@ -305,6 +322,39 @@ impl OpenAiCompatibleClient {
     pub fn with_dimensions(mut self, dimensions: Option<usize>) -> Self {
         self.dimensions = dimensions;
         self
+    }
+
+    /// The base URL without its userinfo.
+    pub fn url(&self) -> String {
+        redact_url(&self.url)
+    }
+
+    pub fn key_variable(&self) -> &KeyVariable {
+        &self.key_variable
+    }
+
+    /// Ask `{url}/models` whether the server answers, without embedding.
+    pub fn reachability(&self) -> Result<(), ServerError> {
+        let mut request = self.agent.get(format!("{}/models", self.url));
+        if let Some(ApiKey(key)) = &self.key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = request.call().map_err(|e| self.error(failure_kind(e)))?;
+        let status = response.status().as_u16();
+        match status {
+            200..=299 => Ok(()),
+            401 | 403 => Err(self.error(ServerErrorKind::Unauthorized { status })),
+            _ => Err(self.error(ServerErrorKind::Status {
+                status,
+                message: None,
+            })),
+        }
+    }
+
+    /// Embed a one-character text and return the vector's number of
+    /// dimensions.
+    pub fn probe(&self) -> Result<usize, ServerError> {
+        self.request(".").map(|vector| vector.len())
     }
 
     fn error(&self, kind: ServerErrorKind) -> ServerError {
@@ -887,5 +937,58 @@ mod tests {
             "{err}"
         );
         assert!(!err.to_string().contains("pw"), "{err}");
+    }
+
+    #[test]
+    fn reachability_asks_for_the_models_with_the_key() {
+        let (url, received) = serve(|r| {
+            if r.authorization.is_some() {
+                ("200 OK".to_string(), r#"{"data":[]}"#.to_string())
+            } else {
+                reject("401 Unauthorized", INVALID_KEY)
+            }
+        });
+        let var = "LORE_TEST_OPENAI_COMPATIBLE_MODELS_KEY";
+        temp_env::with_var(var, Some("sk-models"), || {
+            let client = OpenAiCompatibleClient::new(&format!("{url}/v1"), "m", 8)
+                .with_api_key_variable(Some(var));
+            assert!(client.reachability().is_ok());
+            assert_eq!(client.key_variable(), &KeyVariable::Set(var.to_string()));
+        });
+        let refused = OpenAiCompatibleClient::new(&format!("{url}/v1"), "m", 8)
+            .reachability()
+            .unwrap_err();
+        assert_eq!(refused.kind, ServerErrorKind::Unauthorized { status: 401 });
+        assert_eq!(refused.reachability_line(), format!("HTTP 401 at {url}/v1"));
+
+        let received = received.lock().unwrap();
+        assert_eq!(received[0].method, "GET");
+        assert_eq!(received[0].path, "/v1/models");
+        assert_eq!(
+            received[0].authorization.as_deref(),
+            Some("Bearer sk-models")
+        );
+        assert_eq!(received[1].authorization, None);
+    }
+
+    #[test]
+    fn reachability_names_an_address_that_does_not_answer() {
+        let client = OpenAiCompatibleClient::new("http://user:pw@127.0.0.1:1/v1", "m", 8);
+        assert_eq!(client.url(), "http://127.0.0.1:1/v1");
+        let line = client.reachability().unwrap_err().reachability_line();
+        assert!(
+            line.starts_with("cannot reach http://127.0.0.1:1/v1: "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn probe_returns_the_number_of_dimensions() {
+        let (url, received) = serve(|_| vector(&[1.0, 2.0, 2.0]));
+        assert_eq!(
+            OpenAiCompatibleClient::new(&url, "m", 8).probe().unwrap(),
+            3
+        );
+        assert_eq!(received.lock().unwrap()[0].input(), ".");
     }
 }

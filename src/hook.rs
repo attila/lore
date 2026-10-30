@@ -22,6 +22,7 @@ use crate::database::{KnowledgeDB, SearchResult};
 use crate::embeddings::{Embedder, ProbeError, VectorMismatch, render_failure};
 use crate::engine::{self, CallContext};
 use crate::lore_debug;
+use crate::openai_compatible::{ServerError, redact_url};
 use crate::trace;
 
 /// Per-process state for the FTS-fallback warning rate limit.
@@ -42,10 +43,14 @@ static LAST_EMITTED_FAILURE_CLASS: Mutex<Option<String>> = Mutex::new(None);
 /// reason comes from `render_failure`. Other `anyhow::Error` shapes (kept as a
 /// defensive fallback) map to `"unreachable"`.
 fn emit_embed_failure_warning(err: &anyhow::Error) {
-    let short_reason = err.downcast_ref::<ProbeError>().map_or_else(
-        || "unreachable".to_string(),
-        |p| render_failure(p).short_reason,
-    );
+    let server_error = err.downcast_ref::<ServerError>();
+    let short_reason = match server_error {
+        Some(e) => e.short(),
+        None => err.downcast_ref::<ProbeError>().map_or_else(
+            || "unreachable".to_string(),
+            |p| render_failure(p).short_reason,
+        ),
+    };
 
     let mut last = match LAST_EMITTED_FAILURE_CLASS.lock() {
         Ok(guard) => guard,
@@ -63,6 +68,13 @@ fn emit_embed_failure_warning(err: &anyhow::Error) {
     *last = Some(short_reason.clone());
     drop(last);
 
+    if server_error.is_some() {
+        eprintln!(
+            "Warning: the embedding server failed ({short_reason}), so this search uses text \
+             only. Run 'lore status --full' for details."
+        );
+        return;
+    }
     eprintln!(
         "Warning: Ollama embed failed ({short_reason}); falling back to text search. \
          Run 'lore status --full' for details."
@@ -1381,7 +1393,7 @@ fn snapshot_search_config(config: &Config) -> trace::ConfigSnapshot {
         top_k: config.search.top_k,
         min_relevance: config.search.min_relevance,
         min_relevance_universal: config.search.effective_min_relevance_universal(),
-        embedder_model: config.ollama.model.clone(),
+        embedder_model: config.embedding_table().model().to_string(),
     }
 }
 
@@ -1391,8 +1403,8 @@ fn snapshot_full_config(config: &Config) -> trace::FullConfigSnapshot {
         knowledge_dir: config.knowledge_dir.display().to_string(),
         database: config.database.display().to_string(),
         bind: config.bind.clone(),
-        ollama_host: config.ollama.host.clone(),
-        ollama_model: config.ollama.model.clone(),
+        ollama_host: redact_url(config.embedding_table().url()),
+        ollama_model: config.embedding_table().model().to_string(),
         search: snapshot_search_config(config),
         chunking_strategy: config.chunking.strategy.clone(),
         chunking_max_tokens: config.chunking.max_tokens,

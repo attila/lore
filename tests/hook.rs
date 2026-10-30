@@ -3362,8 +3362,9 @@ fn search_on_an_unrecorded_index_of_another_width_uses_text_only() {
 #[test]
 fn hook_warns_and_injects_text_results_when_the_index_records_another_model() {
     let (tmp, _db, mut config) = index_built_with(&FakeEmbedder::new(), true);
-    config.ollama.model = "other-model".to_string();
-    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let ollama = config.ollama.as_mut().unwrap();
+    ollama.model = "other-model".to_string();
+    ollama.host = "http://127.0.0.1:1".to_string();
     let config_path = tmp.path().join("lore.toml");
     config.save(&config_path).unwrap();
 
