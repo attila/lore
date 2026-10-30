@@ -62,15 +62,29 @@ file across the extension boundary, such as `.md` renamed to `.txt`, is treated 
 
 | Field        | Type                | Default                    | Description                                                                                                                                                                         |
 | ------------ | ------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `host`       | string              | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host.                                                                                                             |
+| `host`       | string              | `"http://127.0.0.1:11434"` | Ollama API endpoint. Change if Ollama runs on a different port or host. It holds no query or fragment.                                                                              |
 | `model`      | string              | `"nomic-embed-text"`       | Embedding model name. Must be available in Ollama. Other options include `mxbai-embed-large` (1024 dimensions) and `snowflake-arctic-embed2` (1024 dimensions).                     |
 | `dimensions` | `"auto"` or integer | `"auto"`                   | `"auto"` (omitted on save) takes the model's width. An integer is a check, never sent to Ollama: a model of another width stops ingest with exit 1, naming both widths and the fix. |
+
+### `[embedding]` Section
+
+This section points lore at an OpenAI-compatible embedding server, such as `llama-server`, in place
+of Ollama. A config needs either an `[ollama]` or an `[embedding]` table. With both, lore uses
+`[embedding]` and ignores `[ollama]`. [Embedding Servers](embedding-servers.md) sets one up.
+
+| Field                               | Type                | Default  | Description                                                                                                                                                                                                                   |
+| ----------------------------------- | ------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`                          | string              | required | Must be `"openai-compatible"`.                                                                                                                                                                                                |
+| `url`                               | string              | required | Base URL of the server's API, such as `"http://127.0.0.1:8080/v1"`. Lore sends `POST {url}/embeddings` and checks the server with `GET {url}/models`. It starts with `http://` or `https://`, and holds no query or fragment. |
+| `model`                             | string              | required | Model name sent with each request.                                                                                                                                                                                            |
+| `api_key_environment_variable_name` | string              | unset    | Name of the environment variable that holds the API key. Lore sends the key as `Authorization: Bearer <key>` when the variable is set and not empty.                                                                          |
+| `dimensions`                        | `"auto"` or integer | `"auto"` | As in `[ollama]`: an integer is a check, never sent to the server. A model that returns another number of dimensions stops ingest with exit 1.                                                                                |
 
 ### `[search]` Section
 
 | Field                     | Type           | Default | Description                                                                                                                                                                                                                                                           |
 | ------------------------- | -------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `hybrid`                  | bool           | `true`  | Enable hybrid search (FTS5 + vector via Ollama). Set to `false` for FTS5-only search, which is faster but lacks semantic matching.                                                                                                                                    |
+| `hybrid`                  | bool           | `true`  | Enable hybrid search (FTS5 + vector via the embedding server). Set to `false` for FTS5-only search, which is faster but lacks semantic matching.                                                                                                                      |
 | `top_k`                   | usize          | `5`     | Number of top results to consider before sibling expansion and deduplication. Higher values inject more context per tool call.                                                                                                                                        |
 | `min_relevance`           | float          | `0.6`   | Minimum normalised score for a result to be injected. Applied only during hybrid search with successful embedding. Set to `0.0` to disable.                                                                                                                           |
 | `min_relevance_universal` | optional float | unset   | Per-tier score floor applied to universal-tagged patterns at PreToolUse search time. When unset, the effective universal floor inherits from `min_relevance`. Non-universal results continue to be filtered against `min_relevance` regardless of this field's value. |
@@ -85,10 +99,10 @@ a relevance axis (the pattern fires on calls in its tool class but with weak top
 
 ### `[chunking]` Section
 
-| Field        | Type   | Default     | Description                                                                                                                   |
-| ------------ | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `strategy`   | string | `"heading"` | Chunking strategy. Currently only `"heading"` is implemented, which splits markdown files on headings (`#` through `######`). |
-| `max_tokens` | usize  | `1024`      | Maximum tokens per chunk. Reserved for future token-based limiting (not yet implemented).                                     |
+| Field        | Type   | Default     | Description                                                                                                                                                                                                                                                            |
+| ------------ | ------ | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strategy`   | string | `"heading"` | Chunking strategy. Currently only `"heading"` is implemented, which splits markdown files on headings (`#` through `######`).                                                                                                                                          |
+| `max_tokens` | usize  | `1024`      | Lore does not split sections by tokens. An OpenAI-compatible embedding server gets at most `max_tokens × 3` characters of each section. If `llama-server` rejects that as too long, lore tries once more with `max_tokens × 2` characters. Ollama gets whole sections. |
 
 ### `[trace]` Section
 
@@ -135,10 +149,10 @@ documentation.
 ### What degrades or breaks without git
 
 - **Delta ingest is unavailable.** Every `lore ingest` re-reads and re-embeds every markdown file in
-  the knowledge directory. On a large corpus this is slower and multiplies the number of Ollama
-  embedding calls. Delta ingest uses `git diff` against the last ingested commit SHA. Without git,
-  there is no baseline to diff against. `lore ingest --force` is the equivalent rebuild path inside
-  a git repository when the database needs to be regenerated from scratch.
+  the knowledge directory. On a large corpus this is slower and multiplies the number of embedding
+  calls. Delta ingest uses `git diff` against the last ingested commit SHA. Without git, there is no
+  baseline to diff against. `lore ingest --force` is the equivalent rebuild path inside a git
+  repository when the database needs to be regenerated from scratch.
 - **Inbox branch workflow breaks.** Setting `[git] inbox_branch_prefix` in `lore.toml` causes
   `add_pattern`, `update_pattern`, and `append_to_pattern` to fail, because these commands call
   `git` unconditionally to create and push per-submission branches. Omit the `[git]` section

@@ -208,20 +208,23 @@ structured queries such as `rust AND (validate OR email)`.
 
 ## Vector Search
 
-When hybrid mode is enabled and Ollama is reachable, the query is also embedded as a vector. The
-vector is compared against stored pattern embeddings using cosine distance via sqlite-vec.
+When hybrid mode is enabled and the embedding server is reachable, the query is also embedded as a
+vector. The vector is compared against stored pattern embeddings using Euclidean distance via
+sqlite-vec. Lore's vectors have unit length, so this ranks results as cosine similarity would.
 
 The embedding text for each chunk is constructed as: `{title}\n{tags}\n{body}`. This means tags and
 titles contribute to semantic similarity, not only lexical matching.
 
-The default embedding model is `nomic-embed-text` (768 dimensions). Other models are supported by
-changing `ollama.model` in `lore.toml`. The index records the embedding provider, model, width and
-the vector of a fixed probe text.
+The default embedding model is `nomic-embed-text` (768 dimensions). For another Ollama model, set
+`[ollama] model` in `lore.toml`. For an OpenAI-compatible embedding server, see
+[Embedding Servers](embedding-servers.md). The index records the embedding provider, model, number
+of dimensions and the vector of a fixed probe text.
 
-If Ollama is unreachable or embedding fails, the search falls back to FTS5 only. So does an index
-built with another model, by name, width or a write's probe, with a warning to run
-`lore ingest --force`. `lore ingest` retries chunks left without a vector and rebuilds an index that
-records no model.
+If the embedding server is unreachable or embedding fails, the search falls back to FTS5 only. So
+does an index built with another model, by name, number of dimensions or a write's probe, with a
+warning to run `lore ingest --force`. If only the probe text's vector differs, restoring the index's
+model and running `lore ingest` clears it. `lore ingest` retries chunks left without a vector and
+rebuilds an index that records no model.
 
 ## Hybrid Merge: Reciprocal Rank Fusion
 
@@ -274,7 +277,7 @@ The `min_relevance` setting (default: 0.6) filters results below a minimum norma
 threshold is applied only when:
 
 - Hybrid search is enabled (`search.hybrid = true`)
-- Embedding succeeded (Ollama returned a vector the index can use)
+- Embedding succeeded (the embedding server returned a vector the index can use)
 - `min_relevance` is greater than zero
 
 When FTS5 is the sole search method (hybrid disabled, or no usable query vector), no threshold is

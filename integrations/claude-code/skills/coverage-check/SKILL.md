@@ -332,7 +332,7 @@ triple-backtick fence with language tag `lore-metadata`, advance past it, read u
 closing triple-backtick fence, parse as JSON). Read the `mode` field from the parsed object. The
 lore MCP server reports one of three values:
 
-- **`"hybrid"`**: full hybrid search (Ollama embedder + FTS combined via reciprocal-rank fusion).
+- **`"hybrid"`**: full hybrid search (embedding server + FTS combined via reciprocal-rank fusion).
   Proceed to (b) below.
 - **`"fts_only"`**: the lore deployment is configured for FTS-only search via
   `config.search.hybrid = false` in the lore configuration file. The embedder was never attempted.
@@ -341,18 +341,18 @@ lore MCP server reports one of three values:
   > Coverage check halted: lore is configured for FTS-only search
   > (`config.search.hybrid =
   > false` in `~/.config/lore/lore.toml`). The coverage-check skill
-  > requires hybrid mode (Ollama embedder + FTS combined via reciprocal-rank fusion) because
+  > requires hybrid mode (embedding server + FTS combined via reciprocal-rank fusion) because
   > FTS-only ranks (BM25) are not comparable to hybrid ranks across queries: the per-query coverage
   > scoring would be meaningless. Set `hybrid = true` in `~/.config/lore/lore.toml` and retry.
 - **`"fts_fallback"`**: the lore deployment is configured for hybrid mode but the search fell back
-  to FTS-only: the embedder (Ollama) was unreachable, the index was built with another embedding
+  to FTS-only: the embedding server was unreachable, the index was built with another embedding
   model, or the index has no vectors yet. The response's leading `Note:` line names the first two
   causes. The parallel query batch in step 7 would also fall back, producing a fully-degraded
   report. Halt the iteration immediately with:
 
   > Coverage check halted: the cascade-detection query fell back to FTS-only, and the parallel
   > coverage queries that follow would do the same: producing a report whose ranks are not
-  > comparable across queries. Fix the cause: restart Ollama if it is unreachable, run
+  > comparable across queries. Fix the cause: restart the embedding server if it is unreachable, run
   > `lore ingest --force` if the index was built with another model (or restart the MCP server if
   > `lore.toml` already names the index's model), or run `lore ingest` to add the missing vectors.
   > Then rerun the skill from the start.
@@ -396,7 +396,7 @@ queries.
 ```
 
 **Wait for all parallel calls to settle** before scoring per-query state in step 8. v1 commits no
-per-query timeout. One slow Ollama query holds up the report. There is no Bash fallback: if
+per-query timeout. One slow embedding query holds up the report. There is no Bash fallback: if
 `search_patterns` is unavailable, halt with "Coverage check halted: `search_patterns` MCP tool
 unavailable. Restart the Claude Code session."
 
@@ -413,11 +413,11 @@ into exactly one of four states:
   `"fts_fallback"`. The embedder was unreachable for this individual query, falling back to FTS-only
   mid-batch. This state is **rare in practice** because step 6's pre-flight already aborted the
   iteration if the cascade-detection query reported `fts_fallback`. It can still happen if the
-  embedder fails partway through the parallel batch (e.g. Ollama hits a request budget mid-batch).
-  When it does, hybrid-mode rank is not comparable to FTS-only rank, so coverage cannot be computed
-  for this query. Note: `mode == "fts_only"` is **structurally impossible** at this step because
-  step 6 catches the FTS-only deployment and aborts the iteration before the parallel batch ever
-  runs.
+  embedder fails partway through the parallel batch (e.g. the embedding server hits a request budget
+  mid-batch). When it does, hybrid-mode rank is not comparable to FTS-only rank, so coverage cannot
+  be computed for this query. Note: `mode == "fts_only"` is **structurally impossible** at this step
+  because step 6 catches the FTS-only deployment and aborts the iteration before the parallel batch
+  ever runs.
 - **surfaced (rank: N)**: the target's canonical `source_file` (relative to `knowledge_dir`) appears
   in any row of the extracted metadata's `results` array. Compute N as the **minimum** `rank` value
   across all matching rows (a single source file may produce multiple chunk rows; the lowest rank
@@ -436,8 +436,9 @@ prevents authors from chasing low coverage scores on patterns that always re-inj
 ratio.** Render the report listing per-query states (surfaced, not_present, errored, degraded) but
 replace the ratio line with:
 
-> Embedder was partially unavailable (`<N>` of `<M>` queries degraded). Coverage ratio is not
-> computed because hybrid and FTS-only ranks are not comparable. Retry once Ollama is back.
+> The embedding server was partially unavailable (`<N>` of `<M>` queries degraded). Coverage ratio
+> is not computed because hybrid and FTS-only ranks are not comparable. Retry once the embedding
+> server is back.
 
 Suggest no edits in this iteration. Skip to step 14 (exit reminder).
 
