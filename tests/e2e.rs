@@ -1191,6 +1191,145 @@ fn plain_ingest_adds_vectors_to_a_text_only_index_once_the_model_answers() {
 }
 
 #[test]
+fn ingest_file_says_the_text_was_saved_when_the_model_cannot_embed() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &knowledge_dir);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+    let draft = knowledge_dir.join("draft.md");
+    fs::write(
+        &draft,
+        "# Draft\n\nPrefer borrowed slices in function arguments.\n",
+    )
+    .unwrap();
+    let draft_arg = draft.to_str().unwrap();
+    let saved = "single-file ingest saved the text of draft.md but not all of its vectors. \
+                 Run 'lore ingest' once the embedding model answers to add them.";
+    let ignored = "If .loreignore excludes the file, that ingest may remove it instead.";
+
+    lore()
+        .args(["ingest", "--config", config_arg, "--file", draft_arg])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(saved))
+        .stderr(predicate::str::contains(ignored).not())
+        .stderr(predicate::str::contains("single-file ingest failed").not());
+    lore()
+        .args([
+            "ingest", "--config", config_arg, "--file", draft_arg, "--force",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(format!("{saved} {ignored}")));
+
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    let missing: Vec<String> = db
+        .chunks_without_vectors()
+        .unwrap()
+        .into_iter()
+        .map(|chunk| chunk.source_file)
+        .collect();
+    assert_eq!(missing, ["draft.md"]);
+    let (result, lines) = ingest_logged(&db, &FakeEmbedder::new(), &knowledge_dir);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(
+        logged(&lines, "Embedded 1 chunk(s) that had no vector"),
+        "{lines:?}"
+    );
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+}
+
+#[test]
+fn ingest_file_names_ingest_force_when_a_probe_mismatch_is_recorded() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest::full_ingest(
+            &db,
+            &SwappedEmbedder(FakeEmbedder::new()),
+            &knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &knowledge_dir);
+        assert!(result.refused.is_some());
+    }
+    let draft = knowledge_dir.join("draft.md");
+    fs::write(
+        &draft,
+        "# Draft\n\nPrefer borrowed slices in function arguments.\n",
+    )
+    .unwrap();
+    let draft_arg = draft.to_str().unwrap();
+
+    lore()
+        .args(["ingest", "--config", config_arg, "--file", draft_arg])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "single-file ingest saved the text of draft.md but not all of its vectors. \
+             nomic-embed-text is not the model that built the index under that name: its \
+             vectors match the recorded ones at cosine similarity -1.000, below 0.99, so \
+             searches use text only. Run 'lore ingest --force' to rebuild the index.",
+        ))
+        .stderr(predicate::str::contains("once the embedding model answers").not());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        assert!(db.recorded_probe_mismatch().unwrap().is_some());
+        assert!(db.chunk_count_for_source("draft.md").unwrap() > 0);
+    }
+
+    let (url, _) = serve_fake_ollama();
+    config.ollama.host = url;
+    config.save(&config_path).unwrap();
+    lore()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Errors:").not());
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+    assert!(db.chunk_count_for_source("draft.md").unwrap() > 0);
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+}
+
+#[test]
 fn ingest_force_rebuilds_an_index_of_another_model_with_the_configured_one() {
     use predicates::prelude::*;
 

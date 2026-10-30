@@ -556,11 +556,28 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         for err in &result.errors {
             eprintln!("  ✗ {err}");
         }
-        // Single-file ingest is atomic: any error means the one requested
-        // file did not land, so propagate as a non-zero exit. Delta and
-        // full ingests may collect per-file errors while still making
-        // progress on the rest, so their behaviour is unchanged.
-        if matches!(result.mode, ingest::IngestMode::SingleFile { .. }) {
+        // Any single-file error exits non-zero. Delta and full ingests may
+        // collect per-file errors while still making progress on the rest.
+        // `files_processed` is 1 only when the file's text landed, so its
+        // errors are embedding failures.
+        if let ingest::IngestMode::SingleFile { path } = &result.mode {
+            if result.files_processed == 1 {
+                let recorded = db.recorded_probe_mismatch().ok().flatten();
+                let remedy = match VectorMismatch::of_recorded_probe(&ollama, recorded) {
+                    Some(mismatch) => format!("{mismatch}."),
+                    None => "Run 'lore ingest' once the embedding model answers to add them."
+                        .to_string(),
+                };
+                let ignored = if force {
+                    " If .loreignore excludes the file, that ingest may remove it instead."
+                } else {
+                    ""
+                };
+                anyhow::bail!(
+                    "single-file ingest saved the text of {path} but not all of its vectors. \
+                     {remedy}{ignored}"
+                );
+            }
             anyhow::bail!("single-file ingest failed");
         }
     }

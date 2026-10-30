@@ -27,6 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fall back to text and name `lore ingest --force` instead of mixing vectors from two models. (#78)
 - `lore status` reports a config it cannot read or parse instead of saying it was not found. (#78)
 - Chunks that failed to embed are retried by later ingests. (#78)
+- When the embedding model fails, `lore ingest --file` says the file's text was saved and that
+  `lore ingest` adds the vectors once the model answers, instead of only saying the ingest failed.
+  (#78)
 - An interrupted `lore ingest --force` no longer leaves a half-empty index that later ingests report
   as up to date. (#78)
 

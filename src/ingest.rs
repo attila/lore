@@ -1434,6 +1434,8 @@ pub fn ingest_single_file(
         Ok(indexed) => {
             result.files_processed = 1;
             result.chunks_created = indexed.chunks_indexed;
+            // Push no other error past this point: `cmd_ingest` reports any
+            // error with `files_processed` at 1 as text saved without vectors.
             if indexed.embedding_failures > 0 {
                 result.errors.push(format!(
                     "{} embedding failure(s) while indexing {rel_path}",
