@@ -20,7 +20,7 @@ use crate::git;
 use crate::ingest;
 use crate::ingest::CommitStatus;
 use crate::lockfile::{WriteLock, lock_path_for};
-use crate::openai_compatible::ServerError;
+use crate::openai_compatible::{KeyVariable, ServerError, redact_url};
 use crate::provision::{self, ProbeOutcome};
 
 // ---------------------------------------------------------------------------
@@ -564,12 +564,18 @@ fn tool_definitions() -> Value {
                              inbox_workflow_configured, delta_ingest_available, \
                              loreignore_active, universal_advisories (count, \
                              oversized bodies, near-miss tags from the most recent full or \
-                             single-file ingest), and `ollama` (object with \
-                             `installed`, `running`, `model_available`, `model`, and \
-                             `runtime` — the latter is `{\"state\": \"not_checked\"}` by \
-                             default, switching to `\"ok\"`, `\"skipped\"`, or \
-                             `\"failed\"` with `short_reason` and `status_line` when \
-                             probe_runtime is passed). The empty_knowledge_dir field reports \
+                             single-file ingest), `embedder` (object with `provider` \
+                             (\"ollama\" or \"openai-compatible\"), `url`, `model`, \
+                             `dimensions` (\"auto\" or a number), \
+                             `api_key_environment_variable_name`, `api_key_set`, \
+                             `reachable`, and `runtime`; `runtime` is \
+                             `{\"state\": \"not_checked\"}` by default, and `\"ok\"`, \
+                             `\"skipped\"` (Ollama, when the model is missing), or \
+                             `\"failed\"` with `short_reason` and \
+                             `status_line` when probe_runtime is passed), and, for Ollama \
+                             only, `ollama` (object with `installed`, `running`, \
+                             `model_available`, `model`, and the same `runtime`). The \
+                             empty_knowledge_dir field reports \
                              on-disk state, distinct from sources_indexed (database state): \
                              when sources_indexed is 0 and empty_knowledge_dir is false, \
                              files exist but have not been ingested — run `lore ingest`. \
@@ -582,12 +588,13 @@ fn tool_definitions() -> Value {
                     "probe_runtime": {
                         "type": "boolean",
                         "description":
-                            "When true, runs a runtime probe against Ollama (a minimal \
-                             embed call) to verify inference actually works — equivalent \
-                             to `lore status --full`. The result is exposed under \
-                             `metadata.ollama.runtime`. Adds 3–15 seconds of latency on \
-                             first call (cold model load); subsequent calls within 30 s \
-                             are fast. Default false — agents calling lore_status as a \
+                            "When true, runs a runtime probe against the embedding server \
+                             (a minimal embed call) to verify inference actually works, \
+                             as `lore status --full` does. The result is exposed under \
+                             `metadata.embedder.runtime`, and for Ollama also under \
+                             `metadata.ollama.runtime`. For Ollama, the first call can \
+                             add 3–15 seconds while the model loads. Calls within 30 s \
+                             after it are fast. Default false — agents calling lore_status as a \
                              routine health check should leave this off; agents \
                              debugging a silent FTS fallback should turn it on.",
                         "default": false
@@ -1370,7 +1377,7 @@ fn handle_lore_status(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let backend = crate::embeddings::EmbeddingBackend::from_config(ctx.config);
-    let ollama_json = match &backend {
+    let (ollama_json, reachable, key_variable, runtime) = match &backend {
         crate::embeddings::EmbeddingBackend::Ollama(client) => {
             let ollama_status = provision::check_status(
                 ctx.config.embedding_table().url(),
@@ -1387,16 +1394,56 @@ fn handle_lore_status(
             } else {
                 ProbeOutcome::Skipped
             };
-            json!({
+            let runtime = runtime_outcome_to_json(&ollama_runtime);
+            let ollama_json = json!({
                 "installed": ollama_status.ollama_installed,
                 "running": ollama_status.ollama_running,
                 "model_available": ollama_status.model_available,
                 "model": client.model_name(),
-                "runtime": runtime_outcome_to_json(&ollama_runtime),
-            })
+                "runtime": runtime,
+            });
+            (
+                Some(ollama_json),
+                ollama_status.ollama_running,
+                &KeyVariable::Unnamed,
+                runtime,
+            )
         }
-        crate::embeddings::EmbeddingBackend::OpenAiCompatible(_) => Value::Null,
+        crate::embeddings::EmbeddingBackend::OpenAiCompatible(client) => {
+            let reachable = client.reachability().is_ok();
+            let outcome = if probe_runtime {
+                match client.probe() {
+                    Ok(_) => ProbeOutcome::Ok,
+                    Err(err) => ProbeOutcome::ServerFailed(err),
+                }
+            } else {
+                ProbeOutcome::NotChecked
+            };
+            (
+                None,
+                reachable,
+                client.key_variable(),
+                runtime_outcome_to_json(&outcome),
+            )
+        }
     };
+    let (key_variable_name, api_key_set) = match key_variable {
+        KeyVariable::Unnamed => (None, false),
+        KeyVariable::Unset(name) => (Some(name), false),
+        KeyVariable::Set(name) => (Some(name), true),
+    };
+    let embedder_json = json!({
+        "provider": backend.provider(),
+        "url": redact_url(ctx.config.embedding_table().url()),
+        "model": backend.model(),
+        "dimensions": backend
+            .configured_dimensions()
+            .map_or_else(|| json!("auto"), |n| json!(n)),
+        "api_key_environment_variable_name": key_variable_name,
+        "api_key_set": api_key_set,
+        "reachable": reachable,
+        "runtime": runtime,
+    });
 
     let mut metadata = json!({
         "knowledge_dir": ctx.config.knowledge_dir.display().to_string(),
@@ -1413,8 +1460,13 @@ fn handle_lore_status(
         "delta_ingest_available": delta_ingest_available,
         "loreignore_active": loreignore_active,
         "universal_advisories": universal_advisories,
-        "ollama": ollama_json,
+        "embedder": embedder_json,
     });
+    if let Some(ollama_json) = ollama_json
+        && let Some(obj) = metadata.as_object_mut()
+    {
+        obj.insert("ollama".to_string(), ollama_json);
+    }
 
     // Track 2 Observability: surface trace state when tracing is on.
     // Mirrors the existing `empty_knowledge_dir` conditional pattern —
@@ -1474,8 +1526,9 @@ fn handle_lore_status(
     text_response(req, &summary_with_fence)
 }
 
-/// Build the JSON value surfaced under `metadata.ollama.runtime` on the MCP
-/// `lore_status` tool. Mirrors the variant set of
+/// Build the JSON value surfaced under `metadata.embedder.runtime` and, for
+/// Ollama, `metadata.ollama.runtime` on the MCP `lore_status` tool. Mirrors
+/// the variant set of
 /// `crate::provision::ProbeOutcome` in machine-readable form:
 /// - `Ok` → `{ "state": "ok" }`
 /// - `NotChecked` → `{ "state": "not_checked" }` (no probe was requested)
@@ -1483,6 +1536,8 @@ fn handle_lore_status(
 /// - `Failed(err)` → `{ "state": "failed", "short_reason": "...", "status_line": "..." }`
 ///   where the strings come from `render_failure(&err)` — the same source
 ///   the CLI `lore status --full` Runtime line uses.
+/// - `ServerFailed(err)` → the same `failed` shape, with the strings from
+///   `err.short()` and `err.status_line()`.
 fn runtime_outcome_to_json(outcome: &ProbeOutcome) -> Value {
     match outcome {
         ProbeOutcome::Ok => json!({ "state": "ok" }),
@@ -3887,6 +3942,145 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn lore_status_describes_an_ollama_embedder_without_its_userinfo() {
+        let mut h = TestHarness::new();
+        h.config.ollama.as_mut().unwrap().host = "http://user:secret@127.0.0.1:1".to_string();
+
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":83,"method":"tools/call",
+                "params":{"name":"lore_status","arguments":{"include_metadata":true}}}"#,
+        );
+
+        assert_eq!(
+            metadata_from_response(&resp)["embedder"],
+            json!({
+                "provider": "ollama",
+                "url": "http://127.0.0.1:1",
+                "model": "test-model",
+                "dimensions": "auto",
+                "api_key_environment_variable_name": null,
+                "api_key_set": false,
+                "reachable": false,
+                "runtime": { "state": "not_checked" },
+            })
+        );
+        assert!(!resp.to_string().contains("secret"), "{resp}");
+    }
+
+    /// Serve `GET /models` and `POST /embeddings` the way an
+    /// OpenAI-compatible embedding server does, and return its address.
+    fn serve_embedding_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                std::io::Read::read_exact(&mut reader, &mut vec![0; content_length]).unwrap();
+                let body = if request_line.contains("/embeddings") {
+                    r#"{"data":[{"embedding":[3.0,4.0,0.0,0.0]}]}"#
+                } else {
+                    r#"{"data":[]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        format!("{address}")
+    }
+
+    fn embedding_table(url: String, variable: &str) -> crate::config::EmbeddingConfig {
+        crate::config::EmbeddingConfig {
+            provider: crate::config::OPENAI_COMPATIBLE.to_string(),
+            url,
+            model: "nomic-embed-text-v1.5".to_string(),
+            api_key_environment_variable_name: Some(variable.to_string()),
+            dimensions: crate::config::Dimensions::Fixed(4),
+        }
+    }
+
+    #[test]
+    fn lore_status_describes_an_embedding_server_without_its_key_or_userinfo() {
+        const VARIABLE: &str = "LORE_SERVER_TEST_STATUS_KEY";
+        const KEY: &str = "key-value-7c1d";
+        let address = serve_embedding_server();
+        let mut h = TestHarness::new();
+        h.config.embedding = Some(embedding_table(
+            format!("http://user:secret@{address}/v1"),
+            VARIABLE,
+        ));
+
+        let resp = temp_env::with_var(VARIABLE, Some(KEY), || {
+            h.request_value(
+                r#"{"jsonrpc":"2.0","id":84,"method":"tools/call",
+                    "params":{"name":"lore_status",
+                              "arguments":{"include_metadata":true,"probe_runtime":true}}}"#,
+            )
+        });
+
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(
+            metadata["embedder"],
+            json!({
+                "provider": "openai-compatible",
+                "url": format!("http://{address}/v1"),
+                "model": "nomic-embed-text-v1.5",
+                "dimensions": 4,
+                "api_key_environment_variable_name": VARIABLE,
+                "api_key_set": true,
+                "reachable": true,
+                "runtime": { "state": "ok" },
+            })
+        );
+        assert!(metadata.get("ollama").is_none(), "{metadata}");
+        let text = resp.to_string();
+        assert!(!text.contains(KEY) && !text.contains("secret"), "{text}");
+    }
+
+    #[test]
+    fn lore_status_reports_an_unreachable_embedding_server_and_an_unset_key() {
+        const VARIABLE: &str = "LORE_SERVER_TEST_UNSET_KEY";
+        let mut h = TestHarness::new();
+        h.config.embedding = Some(embedding_table(
+            "http://127.0.0.1:1/v1".to_string(),
+            VARIABLE,
+        ));
+
+        let resp = temp_env::with_var_unset(VARIABLE, || {
+            h.request_value(
+                r#"{"jsonrpc":"2.0","id":85,"method":"tools/call",
+                    "params":{"name":"lore_status","arguments":{"include_metadata":true}}}"#,
+            )
+        });
+
+        let embedder = &metadata_from_response(&resp)["embedder"];
+        assert_eq!(embedder["api_key_environment_variable_name"], VARIABLE);
+        assert_eq!(embedder["api_key_set"], false);
+        assert_eq!(embedder["reachable"], false);
+        assert_eq!(embedder["runtime"], json!({ "state": "not_checked" }));
     }
 
     /// When the caller does NOT pass `include_metadata: true`, `lore_status`

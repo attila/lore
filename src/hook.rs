@@ -1405,6 +1405,11 @@ fn snapshot_full_config(config: &Config) -> trace::FullConfigSnapshot {
         bind: config.bind.clone(),
         ollama_host: redact_url(config.embedding_table().url()),
         ollama_model: config.embedding_table().model().to_string(),
+        embedder_provider: match config.embedding_table() {
+            config::EmbeddingTable::Ollama(_) => "ollama",
+            config::EmbeddingTable::OpenAiCompatible(_) => config::OPENAI_COMPATIBLE,
+        }
+        .to_string(),
         search: snapshot_search_config(config),
         chunking_strategy: config.chunking.strategy.clone(),
         chunking_max_tokens: config.chunking.max_tokens,
@@ -2597,5 +2602,30 @@ mod tests {
         let results = vec![make_search_result("c1")];
         let filtered = dedup_filter_and_record(&path, &results).unwrap();
         assert_eq!(filtered.len(), 1, "c1 should pass after reset");
+    }
+
+    #[test]
+    fn the_session_start_snapshot_names_the_provider_and_hides_userinfo() {
+        let mut config = Config::default_with(
+            PathBuf::from("docs"),
+            PathBuf::from("lore.db"),
+            "nomic-embed-text",
+        );
+        config.ollama.as_mut().unwrap().host = "http://user:secret@127.0.0.1:11434".to_string();
+        let snapshot = snapshot_full_config(&config);
+        assert_eq!(snapshot.embedder_provider, "ollama");
+        assert_eq!(snapshot.ollama_host, "http://127.0.0.1:11434");
+
+        config.embedding = Some(config::EmbeddingConfig {
+            provider: config::OPENAI_COMPATIBLE.to_string(),
+            url: "http://user:secret@127.0.0.1:8080/v1".to_string(),
+            model: "nomic-embed-text-v1.5".to_string(),
+            api_key_environment_variable_name: None,
+            dimensions: config::Dimensions::Auto,
+        });
+        let snapshot = snapshot_full_config(&config);
+        assert_eq!(snapshot.embedder_provider, "openai-compatible");
+        assert_eq!(snapshot.ollama_host, "http://127.0.0.1:8080/v1");
+        assert_eq!(snapshot.ollama_model, "nomic-embed-text-v1.5");
     }
 }

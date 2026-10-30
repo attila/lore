@@ -206,6 +206,8 @@ pub struct FullConfigSnapshot {
     pub bind: String,
     pub ollama_host: String,
     pub ollama_model: String,
+    #[serde(default = "ollama_provider")]
+    pub embedder_provider: String,
     pub search: ConfigSnapshot,
     pub chunking_strategy: String,
     pub chunking_max_tokens: usize,
@@ -214,6 +216,10 @@ pub struct FullConfigSnapshot {
     pub trace_gzip_older_than_days: u32,
     pub trace_include_full_command: bool,
     pub trace_include_transcript_tail: bool,
+}
+
+fn ollama_provider() -> String {
+    "ollama".to_string()
 }
 
 /// Ollama embedding state — captured per-record when the search path
@@ -352,6 +358,43 @@ mod tests {
     }
 
     #[test]
+    fn a_session_start_line_without_embedder_provider_reads_as_ollama() {
+        let json = r#"{
+            "event": "SessionStart",
+            "schema_version": 1,
+            "ts": "2026-05-15T14:00:00.000Z",
+            "session_id": "s1",
+            "agent": "claude-code",
+            "config": {
+                "knowledge_dir": "docs",
+                "database": "lore.db",
+                "bind": "localhost:3100",
+                "ollama_host": "http://127.0.0.1:11434",
+                "ollama_model": "nomic-embed-text",
+                "search": {
+                    "hybrid": true,
+                    "top_k": 5,
+                    "min_relevance": 0.6,
+                    "min_relevance_universal": 0.6,
+                    "embedder_model": "nomic-embed-text"
+                },
+                "chunking_strategy": "heading",
+                "chunking_max_tokens": 1024,
+                "trace_enabled": true,
+                "trace_retain_days": 30,
+                "trace_gzip_older_than_days": 7,
+                "trace_include_full_command": false,
+                "trace_include_transcript_tail": false
+            },
+            "duration_ms": 3
+        }"#;
+        let TraceRecord::SessionStart(record) = serde_json::from_str(json).unwrap() else {
+            panic!("expected a SessionStart record");
+        };
+        assert_eq!(record.config.embedder_provider, "ollama");
+    }
+
+    #[test]
     fn session_id_accessor_returns_per_variant_id() {
         assert_eq!(sample_pre_tool_use().session_id(), "abc-123");
     }
@@ -375,6 +418,7 @@ mod tests {
                 bind: "localhost:3100".to_string(),
                 ollama_host: "http://127.0.0.1:11434".to_string(),
                 ollama_model: "nomic-embed-text".to_string(),
+                embedder_provider: "ollama".to_string(),
                 search: ConfigSnapshot {
                     hybrid: true,
                     top_k: 5,

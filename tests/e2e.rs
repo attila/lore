@@ -2003,7 +2003,7 @@ fn the_session_start_trace_records_the_ollama_host_and_model() {
     let snapshot = &record["config"];
     assert_eq!(snapshot["ollama_host"], "http://127.0.0.1:1", "{record}");
     assert_eq!(snapshot["ollama_model"], "nomic-embed-text", "{record}");
-    assert!(snapshot.get("embedder_provider").is_none(), "{record}");
+    assert_eq!(snapshot["embedder_provider"], "ollama", "{record}");
 }
 
 /// A config written by hand: no `dimensions` in `[ollama]`, no `[trace]` and
