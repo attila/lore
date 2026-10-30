@@ -720,9 +720,9 @@ pub fn search_with_threshold_gated(
 
 /// The vector for the hybrid half of a search, or `None` when the search
 /// must use text only: the index has no vector table, records another model
-/// than the embedder's, the embedding fails, or the vector's width differs
-/// from the index's. `warn_on_mismatch` prints a model or width mismatch on
-/// stderr.
+/// than the embedder's or a probe mismatch a write found, the embedding
+/// fails, or the vector's width differs from the index's. `warn_on_mismatch`
+/// prints a model, probe or width mismatch on stderr.
 fn query_vector(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -743,7 +743,9 @@ fn query_vector(
         return None;
     }
     let recorded = db.recorded_embedding_model().ok().flatten();
-    if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), embedder) {
+    if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), embedder).or_else(|| {
+        VectorMismatch::of_recorded_probe(embedder, db.recorded_probe_mismatch().ok().flatten())
+    }) {
         fallback(mismatch);
         return None;
     }

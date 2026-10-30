@@ -835,7 +835,12 @@ fn run_search(
         let query_embedding = if matches!(vector_width, Ok(None)) {
             embed_failed = true;
             None
-        } else if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), ctx.embedder) {
+        } else if let Some(mismatch) = VectorMismatch::of_model(recorded.as_ref(), ctx.embedder)
+            .or_else(|| {
+                let similarity = ctx.db.recorded_probe_mismatch().ok().flatten();
+                VectorMismatch::of_recorded_probe(ctx.embedder, similarity)
+            })
+        {
             mismatch_fallback(mismatch);
             embed_failed = true;
             None
@@ -1568,7 +1573,8 @@ fn commit_note(status: &CommitStatus) -> String {
 ///   reciprocal-rank fusion. Scores are comparable across queries.
 /// - `FtsFallback`: hybrid is configured but this query fell back to
 ///   FTS-only: the embedder was unreachable, the index was built with
-///   another model name or width, or there is no vector table yet.
+///   another model name or width, a write's probe found another model
+///   under the name, or there is no vector table yet.
 ///   Scores use BM25 rank, not comparable to `Hybrid`.
 /// - `FtsOnly`: deployment is configured for FTS-only via
 ///   `config.search.hybrid = false`. The embedder was never attempted.
@@ -1597,7 +1603,8 @@ impl SearchMode {
     /// (FTS-only is a deliberate deployment decision); `embed_failed`
     /// reflects whether this request had no usable query vector: the
     /// embedder was unreachable, the index was built with another model
-    /// name or width, or there is no vector table yet.
+    /// name or width, a write's probe found another model under the name,
+    /// or there is no vector table yet.
     fn from_search_state(hybrid_enabled: bool, embed_failed: bool) -> Self {
         if !hybrid_enabled {
             // Configured FTS-only — `handle_search` never attempts the
@@ -2904,6 +2911,72 @@ mod tests {
         );
         assert_eq!(db.search_fts("quokkas", 10).unwrap().len(), 1);
         assert_eq!(db.chunks_without_vectors().unwrap().len(), 1);
+        assert!(
+            db.recorded_probe_mismatch()
+                .unwrap()
+                .is_some_and(|similarity| similarity < 0.0)
+        );
+    }
+
+    #[test]
+    fn add_pattern_clears_a_probe_mismatch_once_the_model_answers_as_recorded() {
+        let tmp = tempdir().unwrap();
+        let config = Config::default_with(
+            tmp.path().to_path_buf(),
+            tmp.path().join("lore-test.db"),
+            "nomic-embed-text",
+        );
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity = crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::new()).unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+        db.set_probe_mismatch(Some(-1.0)).unwrap();
+
+        let resp = dispatch_value(
+            &db,
+            &FakeEmbedder::new(),
+            &config,
+            r#"{
+                "jsonrpc":"2.0","id":19,"method":"tools/call",
+                "params":{
+                    "name":"add_pattern",
+                    "arguments":{"title":"Quokka Care","body":"Feed quokkas native leaves only."}
+                }
+            }"#,
+        );
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.starts_with("Warning:"), "{text}");
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_patterns_searches_text_only_without_embedding_after_a_recorded_probe_mismatch() {
+        let db = KnowledgeDB::open(Path::new(":memory:")).unwrap();
+        db.init().unwrap();
+        let identity =
+            crate::embeddings::EmbeddingIdentity::measure(&FakeEmbedder::with_dimensions(4))
+                .unwrap();
+        db.clear_all(Some(&identity)).unwrap();
+        db.set_probe_mismatch(Some(-1.0)).unwrap();
+
+        let resp = search_cargo_deny(&db, &crate::embeddings::FailingEmbedder::new(4));
+
+        assert!(resp["error"].is_null(), "{resp}");
+        let metadata = metadata_from_response(&resp);
+        assert_eq!(metadata["mode"], "fts_fallback");
+        assert_eq!(metadata["result_count"], 1);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Note: nomic-embed-text is not the model that built the index under that name: \
+                 its vectors match the recorded ones at cosine similarity -1.000, below 0.99, \
+                 so searches use text only. Run 'lore ingest --force' to rebuild the index.\n\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2968,8 +3041,9 @@ mod tests {
     /// FTS-only configured search (`config.search.hybrid = false`) flips
     /// `mode` to `"fts_only"`, distinct from both `"hybrid"` (full
     /// embedder + FTS) and `"fts_fallback"` (embedder unreachable, index
-    /// built with another model name or width, or no vector table yet, in
-    /// a hybrid-configured deployment).
+    /// built with another model name or width, a write's probe found
+    /// another model under the name, or no vector table yet, in a
+    /// hybrid-configured deployment).
     ///
     /// This test pins the contract that `fts_only` is its own mode value,
     /// not aliased to `hybrid` or `fts_fallback`. The coverage-check skill

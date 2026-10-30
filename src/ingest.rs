@@ -451,9 +451,21 @@ pub fn vector_write_mismatch(
     ))
 }
 
+/// Record what a write found by comparing the configured model's probe,
+/// `verdict` from [`vector_write_mismatch`], for searches to read: a probe
+/// mismatch is recorded, and a write the model's vectors may enter clears
+/// it. Must only be given a verdict reached with a probe.
+fn record_probe_verdict(db: &KnowledgeDB, verdict: Option<&VectorMismatch>) -> anyhow::Result<()> {
+    match verdict {
+        Some(VectorMismatch::Probe { similarity, .. }) => db.set_probe_mismatch(Some(*similarity)),
+        None => db.set_probe_mismatch(None),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Probe the configured model before a write of one file, when the index
-/// has vectors and records no other model by name. `None` when there is
-/// nothing to compare or the model does not answer.
+/// has vectors and records no other model by name, and record the verdict.
+/// `None` when there is nothing to compare or the model does not answer.
 fn probe_before_write(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -461,7 +473,13 @@ fn probe_before_write(
     if db.vector_dimensions()?.is_none() || vector_write_mismatch(db, embedder, None)?.is_some() {
         return Ok(None);
     }
-    Ok(EmbeddingIdentity::measure(embedder).ok())
+    let Ok(probe) = EmbeddingIdentity::measure(embedder) else {
+        return Ok(None);
+    };
+    if let Ok(verdict) = vector_write_mismatch(db, embedder, Some(&probe)) {
+        record_probe_verdict(db, verdict.as_ref())?;
+    }
+    Ok(Some(probe))
 }
 
 /// Check the configured model before `--file` writes: the probe to pass
@@ -528,7 +546,11 @@ fn check_walk_model(db: &KnowledgeDB, embedder: &dyn Embedder) -> anyhow::Result
     {
         return Ok(WalkCheck::RebuildUnrecorded(identity.clone()));
     }
-    if let Some(mismatch) = vector_write_mismatch(db, embedder, probe.as_ref().ok())? {
+    let verdict = vector_write_mismatch(db, embedder, probe.as_ref().ok())?;
+    if probe.is_ok() {
+        record_probe_verdict(db, verdict.as_ref())?;
+    }
+    if let Some(mismatch) = verdict {
         return Ok(WalkCheck::Refuse(mismatch));
     }
     Ok(WalkCheck::Proceed(probe))

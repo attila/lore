@@ -263,6 +263,32 @@ impl KnowledgeDB {
             .map(|(provider, model)| RecordedModel { provider, model }))
     }
 
+    /// The cosine similarity a write's probe of the configured model last
+    /// found below the floor, or `None` when no probe mismatch is recorded.
+    pub fn recorded_probe_mismatch(&self) -> anyhow::Result<Option<f64>> {
+        self.get_metadata(META_EMBEDDING_PROBE_MISMATCH)?
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("malformed recorded probe mismatch: {e}"))
+            })
+            .transpose()
+    }
+
+    /// Record the similarity of a probe mismatch a write found, or with
+    /// `None` clear it once a write finds the model's vectors may enter the
+    /// index again.
+    pub fn set_probe_mismatch(&self, similarity: Option<f64>) -> anyhow::Result<()> {
+        if let Some(similarity) = similarity {
+            return self.set_metadata(META_EMBEDDING_PROBE_MISMATCH, &similarity.to_string());
+        }
+        self.conn.execute(
+            "DELETE FROM ingest_metadata WHERE key = ?1",
+            params![META_EMBEDDING_PROBE_MISMATCH],
+        )?;
+        Ok(())
+    }
+
     /// Give a text-only index its `patterns_vec` table at `identity`'s
     /// measured width and record the identity, in one transaction. Errors
     /// when the index already has a vector table, whose width and identity
@@ -351,12 +377,13 @@ impl KnowledgeDB {
         tx.execute_batch("DROP TABLE IF EXISTS patterns")?;
         tx.execute_batch(PATTERNS_DDL)?;
         tx.execute(
-            "DELETE FROM ingest_metadata WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+            "DELETE FROM ingest_metadata WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 META_EMBEDDING_PROVIDER,
                 META_EMBEDDING_MODEL,
                 META_EMBEDDING_DIMENSIONS,
                 META_EMBEDDING_PROBE_VECTOR,
+                META_EMBEDDING_PROBE_MISMATCH,
                 crate::ingest::META_LAST_COMMIT,
             ],
         )?;
@@ -1153,6 +1180,9 @@ pub(crate) const META_EMBEDDING_MODEL: &str = "embedding_model";
 pub(crate) const META_EMBEDDING_DIMENSIONS: &str = "embedding_dimensions";
 /// JSON array of the vector for [`crate::embeddings::PROBE_TEXT`].
 pub(crate) const META_EMBEDDING_PROBE_VECTOR: &str = "embedding_probe_vector";
+/// Cosine similarity at which a write's probe last failed to match the
+/// recorded probe vector. Searches never probe, so they read this instead.
+pub(crate) const META_EMBEDDING_PROBE_MISMATCH: &str = "embedding_probe_mismatch";
 
 /// Authoritative DDL for the `patterns` table. Stores one row per pattern
 /// file — the authorial view of an indexed document, complementary to the
@@ -2119,6 +2149,30 @@ mod tests {
                 model: "wider-model".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn a_recorded_probe_mismatch_reads_back_until_cleared_or_rebuilt() {
+        let db = open_memory_db();
+        db.init().unwrap();
+        db.clear_all(Some(&identity("nomic-embed-text", 4)))
+            .unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+
+        db.set_probe_mismatch(Some(-0.25)).unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), Some(-0.25));
+        db.set_probe_mismatch(None).unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+
+        for rebuilt_with in [Some(identity("nomic-embed-text", 4)), None] {
+            db.set_probe_mismatch(Some(0.5)).unwrap();
+            db.clear_all(rebuilt_with.as_ref()).unwrap();
+            assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+        }
+
+        db.set_metadata(META_EMBEDDING_PROBE_MISMATCH, "low")
+            .unwrap();
+        assert!(db.recorded_probe_mismatch().is_err());
     }
 
     #[test]

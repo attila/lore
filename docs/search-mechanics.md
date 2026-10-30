@@ -219,8 +219,9 @@ changing `ollama.model` in `lore.toml`. The index records the embedding provider
 the vector of a fixed probe text.
 
 If Ollama is unreachable or embedding fails, the search falls back to FTS5 only. So does an index
-built with another model name or width, with a warning to run `lore ingest --force`. `lore ingest`
-retries chunks left without a vector and rebuilds an index that records no model.
+built with another model, by name, width or a write's probe, with a warning to run
+`lore ingest --force`. `lore ingest` retries chunks left without a vector and rebuilds an index that
+records no model.
 
 ## Hybrid Merge: Reciprocal Rank Fusion
 

@@ -143,6 +143,15 @@ impl VectorMismatch {
         })
     }
 
+    /// The probe mismatch a write recorded at `similarity`, for a search,
+    /// which never probes the model itself.
+    pub fn of_recorded_probe(embedder: &dyn Embedder, similarity: Option<f64>) -> Option<Self> {
+        similarity.map(|similarity| Self::Probe {
+            model: embedder.model().to_string(),
+            similarity,
+        })
+    }
+
     /// Compare the configured model's measured width with `[ollama]
     /// dimensions`. Without a configured width, any width passes.
     pub fn of_configured(embedder: &dyn Embedder, measured: usize) -> Option<Self> {

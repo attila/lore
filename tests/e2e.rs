@@ -773,6 +773,101 @@ fn ingest_refuses_another_model_behind_the_recorded_name_and_writes_nothing() {
     assert!(db.search_fts("abbreviations", 10).unwrap().is_empty());
 }
 
+/// Search `db` the way the hook does with [`FakeEmbedder`], under a
+/// relevance floor no hybrid score reaches, so a result proves the search
+/// fell back to text.
+fn search_error_propagation(db: &KnowledgeDB, dir: &Path) -> (Vec<String>, lore::trace::Phases) {
+    let mut config = Config::default_with(
+        dir.to_path_buf(),
+        dir.join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.search.min_relevance = 1.5;
+    let (results, phases) = lore::hook::search_with_threshold(
+        db,
+        &FakeEmbedder::new(),
+        &config,
+        "anyhow error propagation",
+    )
+    .unwrap();
+    (results.into_iter().map(|r| r.title).collect(), phases)
+}
+
+#[test]
+fn searches_use_text_only_once_a_write_finds_another_model_under_the_name_until_a_rebuild() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    ingest_logged(&db, &SwappedEmbedder(FakeEmbedder::new()), dir);
+
+    let (titles, phases) = search_error_propagation(&db, dir);
+    assert!(titles.is_empty(), "{titles:?}");
+    assert!(phases.search_vector_ms.is_some());
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), dir);
+    assert!(result.refused.is_some());
+    assert!(
+        db.recorded_probe_mismatch()
+            .unwrap()
+            .is_some_and(|similarity| similarity < 0.99)
+    );
+
+    let (titles, phases) = search_error_propagation(&db, dir);
+    assert_eq!(titles, ["Error Handling"]);
+    assert_eq!(phases.embedding_ms, None);
+
+    ingest::full_ingest(&db, &FakeEmbedder::new(), dir, "heading", &|_| {});
+    assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+    let (titles, phases) = search_error_propagation(&db, dir);
+    assert!(titles.is_empty(), "{titles:?}");
+    assert!(phases.search_vector_ms.is_some());
+}
+
+#[test]
+fn a_write_records_a_probe_mismatch_and_a_write_whose_probe_matches_clears_it() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    seed_patterns(dir);
+    git_init(dir);
+    commit_all(dir);
+    let db = memory_db();
+    let swapped = SwappedEmbedder(FakeEmbedder::new());
+    ingest_logged(&db, &swapped, dir);
+    fs::write(dir.join("logging.md"), "# Logging\n\nLog to stderr.\n").unwrap();
+    let ingest_file = |embedder: &dyn Embedder| {
+        ingest::ingest_single_file(
+            &db,
+            embedder,
+            dir,
+            &dir.join("logging.md"),
+            "heading",
+            false,
+            &|_| {},
+        )
+    };
+
+    let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), dir);
+    assert!(result.refused.is_some());
+    assert!(db.recorded_probe_mismatch().unwrap().is_some());
+    let (result, _) = ingest_logged(&db, &swapped, dir);
+    assert_eq!(result.refused, None);
+    assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+
+    assert!(ingest_file(&FakeEmbedder::new()).refused.is_some());
+    assert!(db.recorded_probe_mismatch().unwrap().is_some());
+    assert_eq!(ingest_file(&swapped).refused, None);
+    assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+
+    // A model that does not answer compares nothing, so the record stands.
+    assert!(ingest_file(&FakeEmbedder::new()).refused.is_some());
+    let (result, _) = ingest_logged(&db, &FailingEmbedder::new(768), dir);
+    assert_eq!(result.refused, None);
+    assert!(db.recorded_probe_mismatch().unwrap().is_some());
+}
+
 #[test]
 fn ingest_refuses_a_model_of_another_width_behind_the_recorded_name() {
     let tmp = tempdir().unwrap();
@@ -965,8 +1060,10 @@ fn every_ingest_names_the_setting_when_a_pinned_width_meets_a_wider_model() {
     assert_eq!(db.vector_dimensions().unwrap(), Some(768));
 }
 
-/// Answer `/api/embed` the way Ollama does, with [`FakeEmbedder`] vectors.
-/// Returns the base URL and a count of the requests served.
+/// Answer `/api/embed` the way Ollama does, with [`FakeEmbedder`] vectors,
+/// and every other request, such as `lore status`'s health and model checks,
+/// with an empty success. Returns the base URL and a count of the embed
+/// requests served.
 fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -992,12 +1089,15 @@ fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
             }
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
-            counter.fetch_add(1, Ordering::SeqCst);
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let vector = embedder
-                .embed(request["input"][0].as_str().unwrap())
-                .unwrap();
-            let response = serde_json::json!({ "embeddings": [vector] }).to_string();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let response = match request["input"][0].as_str() {
+                Some(input) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({ "embeddings": [embedder.embed(input).unwrap()] })
+                }
+                None => serde_json::json!({}),
+            }
+            .to_string();
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -1166,6 +1266,181 @@ fn ingest_force_rebuilds_an_index_of_another_model_with_the_configured_one() {
             "search: embedding succeeded (768 dims)",
         ))
         .stderr(predicate::str::contains("lore ingest --force").not());
+}
+
+#[test]
+fn ingest_force_clears_a_probe_mismatch_and_searches_return_to_hybrid() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = "http://127.0.0.1:1".to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest::full_ingest(
+            &db,
+            &SwappedEmbedder(FakeEmbedder::new()),
+            &knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &knowledge_dir);
+        assert!(result.refused.is_some());
+    }
+    let warning = "Warning: nomic-embed-text is not the model that built the index under that \
+                   name: its vectors match the recorded ones at cosine similarity -1.000, below \
+                   0.99, so searches use text only. Run 'lore ingest --force' to rebuild the \
+                   index.";
+
+    // The configured host refuses connections, so an embed attempt would
+    // add its own warning; its absence proves the search never embedded.
+    lore()
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains(warning))
+        .stderr(predicate::str::contains("Ollama embed failed").not());
+    lore()
+        .args([
+            "--json",
+            "search",
+            "--config",
+            config_arg,
+            "error propagation",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::is_empty());
+    lore()
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "Index model:  ✗ {}",
+            warning.strip_prefix("Warning: ").unwrap()
+        )));
+
+    let (url, served) = serve_fake_ollama();
+    config.ollama.host = url;
+    config.save(&config_path).unwrap();
+    lore()
+        .args(["ingest", "--force", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Errors:").not());
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), None);
+        assert!(db.chunks_without_vectors().unwrap().is_empty());
+    }
+
+    let before_search = served.load(Ordering::SeqCst);
+    lore()
+        .env("LORE_DEBUG", "1")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains(
+            "search: embedding succeeded (768 dims)",
+        ))
+        .stderr(predicate::str::contains("lore ingest --force").not());
+    assert_eq!(served.load(Ordering::SeqCst), before_search + 1);
+}
+
+#[test]
+fn plain_ingest_clears_a_probe_mismatch_once_the_model_answers_as_recorded() {
+    use predicates::prelude::*;
+
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let (url, served) = serve_fake_ollama();
+    let mut config = Config::default_with(
+        knowledge_dir.clone(),
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = url;
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest::full_ingest(
+            &db,
+            &FakeEmbedder::new(),
+            &knowledge_dir,
+            "heading",
+            &|_| {},
+        );
+        let (result, _) = ingest_logged(&db, &SwappedEmbedder(FakeEmbedder::new()), &knowledge_dir);
+        assert!(result.refused.is_some());
+        assert!(db.recorded_probe_mismatch().unwrap().is_some());
+    }
+
+    lore()
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Index model:  ✗ nomic-embed-text is not the model that built the index",
+        ));
+    lore()
+        .args(["status", "--full", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Runtime:      ✓ inference OK"))
+        .stderr(predicate::str::contains(
+            "Index model:  ✗ an earlier write found another model under the name \
+             nomic-embed-text, but it now answers as the model that built the index; searches \
+             use text only until that record clears. Run 'lore ingest' to clear it.",
+        ));
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Errors:").not());
+    assert_eq!(
+        KnowledgeDB::open(&config.database)
+            .unwrap()
+            .recorded_probe_mismatch()
+            .unwrap(),
+        None
+    );
+
+    let before_search = served.load(Ordering::SeqCst);
+    lore()
+        .env("LORE_DEBUG", "1")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr(predicate::str::contains(
+            "search: embedding succeeded (768 dims)",
+        ))
+        .stderr(predicate::str::contains("lore ingest").not());
+    assert_eq!(served.load(Ordering::SeqCst), before_search + 1);
 }
 
 #[test]

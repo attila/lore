@@ -91,7 +91,7 @@ Use when:
 
 User UX: reads keep working. When the recorded state disagrees with the configuration, searches fall
 back to the path that does not depend on it and warn, naming `lore ingest --force`. An ingest that
-would mix incompatible data exits 1, writes nothing and names the same command. Pattern writes
+would mix incompatible data exits 1, writes no patterns and names the same command. Pattern writes
 through the Model Context Protocol (MCP) server save the text without vectors and warn.
 
 An index without the keys is read as it is. The first `lore ingest` without `--file` that can record
@@ -100,7 +100,9 @@ the keys rebuilds it once, with a progress line.
 Example: the embedding identity. `embedding_provider`, `embedding_model`, `embedding_dimensions` and
 `embedding_probe_vector` sit in `ingest_metadata`. Searches compare provider, model and query width
 before using vectors and fall back to text search on a mismatch. Every vector write also compares a
-fresh probe vector with the recorded one, which catches another model pulled under the same name.
+fresh probe vector with the recorded one, which catches another model pulled under the same name. A
+write records such a mismatch as `embedding_probe_mismatch`, which searches read as a mismatch too,
+and clears it once a probe matches again.
 
 Code contract:
 

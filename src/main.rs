@@ -1124,8 +1124,8 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
 }
 
 /// The `Index model:` status line, naming every mismatch an ingest refuses
-/// over. Only a model that answered is probed; without a probe the recorded
-/// name alone is compared.
+/// over, else a probe mismatch an earlier write recorded. Only a model that
+/// answered is probed; without a probe the recorded name alone is compared.
 fn index_model_line(
     db: &KnowledgeDB,
     embedder: &dyn Embedder,
@@ -1134,8 +1134,23 @@ fn index_model_line(
     let probe = model_answers
         .then(|| EmbeddingIdentity::measure(embedder).ok())
         .flatten();
-    let mismatch = ingest::vector_write_mismatch(db, embedder, probe.as_ref())
-        .unwrap_or_else(|e| Some(VectorMismatch::unreadable(&e)))?;
+    let mismatch = match ingest::vector_write_mismatch(db, embedder, probe.as_ref()) {
+        Ok(Some(mismatch)) => mismatch,
+        Ok(None) => {
+            let recorded = db.recorded_probe_mismatch().ok().flatten();
+            let mismatch = VectorMismatch::of_recorded_probe(embedder, recorded)?;
+            if probe.is_none() {
+                return Some(format!("{mismatch}."));
+            }
+            return Some(format!(
+                "an earlier write found another model under the name {}, but it now answers as \
+                 the model that built the index; searches use text only until that record \
+                 clears. Run 'lore ingest' to clear it.",
+                embedder.model()
+            ));
+        }
+        Err(e) => VectorMismatch::unreadable(&e),
+    };
     Some(match mismatch {
         VectorMismatch::Model { .. } | VectorMismatch::Width { .. } => format!("{mismatch}."),
         _ => format!(
@@ -1372,6 +1387,37 @@ mod tests {
                  'lore ingest' refuses to write. {FORCE}"
             )
         );
+    }
+
+    #[test]
+    fn status_names_a_probe_mismatch_a_write_recorded_without_calling_the_model() {
+        let db = index_of(&FakeEmbedder::new());
+        db.set_probe_mismatch(Some(-1.0)).unwrap();
+
+        let silent = lore::embeddings::FailingEmbedder::new(768);
+        assert_eq!(
+            index_model_line(&db, &silent, false).unwrap(),
+            format!(
+                "nomic-embed-text is not the model that built the index under that name: its \
+                 vectors match the recorded ones at cosine similarity -1.000, below 0.99, so \
+                 searches use text only. {FORCE}"
+            )
+        );
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), Some(-1.0));
+    }
+
+    #[test]
+    fn status_says_a_model_that_answers_as_recorded_again_needs_only_a_plain_ingest() {
+        let db = index_of(&FakeEmbedder::new());
+        db.set_probe_mismatch(Some(-1.0)).unwrap();
+
+        assert_eq!(
+            index_model_line(&db, &FakeEmbedder::new(), true).unwrap(),
+            "an earlier write found another model under the name nomic-embed-text, but it now \
+             answers as the model that built the index; searches use text only until that \
+             record clears. Run 'lore ingest' to clear it."
+        );
+        assert_eq!(db.recorded_probe_mismatch().unwrap(), Some(-1.0));
     }
 
     #[test]
