@@ -11,19 +11,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Set `[ollama] dimensions` to make `lore init` and `lore ingest` exit 1 when the embedding model
   returns another number of dimensions. (#78)
 - An `[embedding]` table with `provider = "openai-compatible"` points lore at an OpenAI-compatible
-  embedding server, such as `llama-server` or LM Studio. (#N)
+  embedding server, such as `llama-server` or LM Studio. (#79)
 - `lore init --provider openai-compatible --url <url> --model <name>` sets lore up to use an
-  embedding server that is already running. (#N)
+  embedding server that is already running. (#79)
 - Set `[embedding] dimensions` to make `lore init` and `lore ingest` exit 1 when the server returns
-  another number of dimensions. (#N)
+  another number of dimensions. (#79)
 - Lore sends the embedding server the API key held in the environment variable that
-  `[embedding] api_key_environment_variable_name` names. (#N)
+  `[embedding] api_key_environment_variable_name` names. (#79)
 - Lore sends an OpenAI-compatible embedding server at most `[chunking] max_tokens × 3` characters of
-  each section. (#N)
+  each section. (#79)
 - `lore status` and the `lore_status` MCP tool show an OpenAI-compatible embedding server's address
-  and model, whether it answers, and whether its API key variable is set. (#N)
+  and model, whether it answers, and whether its API key variable is set. (#79)
 - Trace files record whether Ollama or an OpenAI-compatible embedding server produced the
-  embeddings. (#N)
+  embeddings. (#79)
 
 ### Changed
 
@@ -45,7 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - When the embedding model fails, `lore ingest --file` saves the file's text and tells you to run
   `lore ingest` once the model works again. (#78)
 - After an interrupted `lore ingest --force`, the next `lore ingest` rebuilds the whole index. (#78)
-- `lore search --json` writes nothing to stderr when the embedding model fails. (#N)
+- `lore search --json` writes nothing to stderr when the embedding model fails. (#79)
 
 ### Security
 
@@ -53,14 +53,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   authorities. (#77)
 - An attacker cannot downgrade an HTTPS connection to an embedding server to classical key exchange.
   (#77)
-- Trace files record the embedding server address without any user name or password in it. (#N)
+- Trace files record the embedding server address without any user name or password in it. (#79)
 
 ### Notes
 
 - After you upgrade, the first `lore ingest` rebuilds the whole index once, as `lore ingest --force`
   does. (#78)
 - Switching from Ollama to an OpenAI-compatible embedding server takes one `lore ingest --force`,
-  even with the same model. (#N)
+  even with the same model. (#79)
 
 ## [0.5.0] - 2026-06-04
 
