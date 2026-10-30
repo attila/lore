@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
+
 /// Trait for producing embedding vectors from text.
 pub trait Embedder {
     fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>>;
@@ -746,6 +748,45 @@ impl Embedder for OllamaClient {
     }
 }
 
+/// The embedding client the configuration names.
+pub enum EmbeddingBackend {
+    Ollama(OllamaClient),
+}
+
+impl EmbeddingBackend {
+    /// Build the configured client, holding it to the configured dimensions.
+    pub fn from_config(config: &Config) -> Self {
+        Self::Ollama(
+            OllamaClient::new(&config.ollama.host, &config.ollama.model)
+                .with_dimensions(config.ollama.dimensions.fixed()),
+        )
+    }
+
+    fn client(&self) -> &dyn Embedder {
+        match self {
+            Self::Ollama(client) => client,
+        }
+    }
+}
+
+impl Embedder for EmbeddingBackend {
+    fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        self.client().embed(input)
+    }
+
+    fn provider(&self) -> &str {
+        self.client().provider()
+    }
+
+    fn model(&self) -> &str {
+        self.client().model()
+    }
+
+    fn configured_dimensions(&self) -> Option<usize> {
+        self.client().configured_dimensions()
+    }
+}
+
 /// Model name the test fakes report. Matches `Config::default_with`'s
 /// default so a fake-built index carries the configured identity.
 #[cfg(any(test, feature = "test-support"))]
@@ -1053,10 +1094,16 @@ mod tests {
 
     #[test]
     fn configured_dimensions_are_checked_by_lore_and_never_sent_to_ollama() {
-        let client = OllamaClient::new("http://localhost:11434", "some-unlisted-model")
-            .with_dimensions(Some(1024));
-        assert_eq!(client.configured_dimensions(), Some(1024));
+        let mut config = Config::default_with(
+            "knowledge".into(),
+            "knowledge.db".into(),
+            "some-unlisted-model",
+        );
+        config.ollama.dimensions = crate::config::Dimensions::Fixed(1024);
+        let backend = EmbeddingBackend::from_config(&config);
+        assert_eq!(backend.configured_dimensions(), Some(1024));
 
+        let EmbeddingBackend::Ollama(client) = &backend;
         let request = serde_json::to_value(client.embed_request("hello")).unwrap();
         assert_eq!(
             request,

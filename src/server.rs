@@ -1364,8 +1364,8 @@ fn handle_lore_status(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let ollama_runtime = if probe_runtime {
-        let client =
-            crate::embeddings::OllamaClient::new(&ctx.config.ollama.host, &ctx.config.ollama.model);
+        let backend = crate::embeddings::EmbeddingBackend::from_config(ctx.config);
+        let crate::embeddings::EmbeddingBackend::Ollama(client) = &backend;
         if ollama_status.model_available {
             match client.probe(Some(30)) {
                 Ok(()) => ProbeOutcome::Ok,

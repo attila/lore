@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use lore::config::{Config, default_config_path, default_database_path};
 use lore::database::KnowledgeDB;
 use lore::embeddings::{
-    Embedder, EmbeddingIdentity, OllamaClient, VectorMismatch, render_failure, same_model,
+    Embedder, EmbeddingBackend, EmbeddingIdentity, VectorMismatch, render_failure, same_model,
 };
 use lore::hook;
 use lore::lockfile::{WriteLock, lock_path_for};
@@ -323,8 +323,7 @@ fn cmd_init(
     // run initial ingestion
     eprintln!("\n--- Ingesting knowledge directory ---\n");
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
+    let ollama = EmbeddingBackend::from_config(&config);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
@@ -510,8 +509,7 @@ fn cmd_ingest(config_path: &Path, force: bool, file: Option<&Path>) -> anyhow::R
         config.chunking.strategy,
     );
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
+    let ollama = EmbeddingBackend::from_config(&config);
     // `lore ingest --force` (without `--file`) is the documented remedy when
     // the schema-compatibility probe bails. It drops and recreates the
     // tables via `clear_all`, so the probe must not run first — otherwise
@@ -619,7 +617,7 @@ fn text_only_note(hybrid: bool, has_vectors: bool, mode: &ingest::IngestMode) ->
 /// flags passed to `cmd_ingest`.
 fn dispatch_ingest(
     db: &KnowledgeDB,
-    ollama: &OllamaClient,
+    ollama: &dyn Embedder,
     config: &Config,
     force: bool,
     file: Option<&Path>,
@@ -764,8 +762,7 @@ fn print_universal_advisories(result: &ingest::IngestResult) {
 
 fn cmd_serve(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
+    let ollama = EmbeddingBackend::from_config(&config);
     server::start_mcp_server(&config, &ollama)
 }
 
@@ -791,7 +788,7 @@ fn cmd_search(
         config.search.min_relevance,
     );
 
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = EmbeddingBackend::from_config(&config);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
@@ -887,7 +884,7 @@ fn cmd_hook_inner(config_path: &Path) -> anyhow::Result<()> {
     );
 
     let config = Config::load(config_path)?;
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model);
+    let ollama = EmbeddingBackend::from_config(&config);
     let db = KnowledgeDB::open(&config.database)?;
     db.init()?;
 
@@ -1011,8 +1008,7 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     // `lore status --full` invocation against a slow or hung Ollama would
     // show a blank terminal for up to 30 s before any output appears.
     let mut status = provision::check_status(&config.ollama.host, &config.ollama.model, false);
-    let ollama = OllamaClient::new(&config.ollama.host, &config.ollama.model)
-        .with_dimensions(config.ollama.dimensions.fixed());
+    let ollama = EmbeddingBackend::from_config(&config);
 
     eprintln!("=== lore status ===\n");
     eprintln!("  Config:       {}", config_path.display());
@@ -1055,7 +1051,8 @@ fn cmd_status(config_path: &Path, full: bool) -> anyhow::Result<()> {
     if full {
         if status.model_available {
             eprintln!("  Verifying inference runtime (may take a few seconds)…");
-            status.runtime = match ollama.probe(Some(30)) {
+            let EmbeddingBackend::Ollama(client) = &ollama;
+            status.runtime = match client.probe(Some(30)) {
                 Ok(()) => ProbeOutcome::Ok,
                 Err(err) => ProbeOutcome::Failed(err),
             };
