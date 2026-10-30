@@ -4,8 +4,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use lore::config::Config;
 use lore::database::KnowledgeDB;
@@ -1065,10 +1065,30 @@ fn every_ingest_names_the_setting_when_a_pinned_width_meets_a_wider_model() {
 /// with an empty success. Returns the base URL and a count of the embed
 /// requests served.
 fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
+    let (url, served, _) = serve_fake_ollama_answering(EmbedAnswer::Vector);
+    (url, served)
+}
+
+/// How the server from [`serve_fake_ollama_answering`] answers `/api/embed`.
+#[derive(Clone, Copy)]
+enum EmbedAnswer {
+    /// A [`FakeEmbedder`] vector.
+    Vector,
+    /// HTTP 500 with the body Ollama sends when its model runner has crashed.
+    RunnerCrash,
+}
+
+/// [`serve_fake_ollama`] with a choice of embed answer. Also returns every
+/// embed input received.
+fn serve_fake_ollama_answering(
+    answer: EmbedAnswer,
+) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let served = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&served);
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&inputs);
     std::thread::spawn(move || {
         let embedder = FakeEmbedder::new();
         for stream in listener.incoming() {
@@ -1090,24 +1110,34 @@ fn serve_fake_ollama() -> (String, Arc<AtomicUsize>) {
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let response = match request["input"][0].as_str() {
+            let (status, response) = match request["input"][0].as_str() {
                 Some(input) => {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    serde_json::json!({ "embeddings": [embedder.embed(input).unwrap()] })
+                    received.lock().unwrap().push(input.to_string());
+                    match answer {
+                        EmbedAnswer::Vector => (
+                            "200 OK",
+                            serde_json::json!({ "embeddings": [embedder.embed(input).unwrap()] }),
+                        ),
+                        EmbedAnswer::RunnerCrash => (
+                            "500 Internal Server Error",
+                            serde_json::json!({ "error": "llama runner process has terminated" }),
+                        ),
+                    }
                 }
-                None => serde_json::json!({}),
-            }
-            .to_string();
+                None => ("200 OK", serde_json::json!({})),
+            };
+            let response = response.to_string();
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
                 response.len()
             )
             .unwrap();
         }
     });
-    (url, served)
+    (url, served, inputs)
 }
 
 fn lore() -> assert_cmd::Command {
@@ -1755,4 +1785,308 @@ fn ingest_refuses_an_unreadable_recorded_probe_until_a_forced_rebuild() {
         .assert()
         .success()
         .stderr(predicate::str::contains("Already up to date"));
+}
+
+// -- Ollama output ------------------------------------------------------------
+
+/// A committed knowledge directory of the seed patterns and a saved config
+/// that points at Ollama on `host`.
+fn ollama_project(host: &str) -> (tempfile::TempDir, Config, PathBuf) {
+    let tmp = tempdir().unwrap();
+    let knowledge_dir = tmp.path().join("knowledge");
+    fs::create_dir_all(&knowledge_dir).unwrap();
+    seed_patterns(&knowledge_dir);
+    git_init(&knowledge_dir);
+    commit_all(&knowledge_dir);
+    let mut config = Config::default_with(
+        knowledge_dir,
+        tmp.path().join("knowledge.db"),
+        "nomic-embed-text",
+    );
+    config.ollama.host = host.to_string();
+    let config_path = tmp.path().join("lore.toml");
+    config.save(&config_path).unwrap();
+    (tmp, config, config_path)
+}
+
+fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8(assert.get_output().stderr.clone()).unwrap()
+}
+
+#[test]
+fn status_keeps_its_ollama_lines() {
+    let (url, _) = serve_fake_ollama();
+    let (_tmp, config, config_path) = ollama_project(&url);
+    let config_arg = config_path.to_str().unwrap();
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success();
+    let commit = KnowledgeDB::open(&config.database)
+        .unwrap()
+        .get_metadata("last_ingested_commit")
+        .unwrap()
+        .unwrap();
+
+    let status = lore()
+        .env("PATH", "")
+        .env_remove("LORE_TRACE")
+        .args(["status", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        stderr_of(&status),
+        format!(
+            "=== lore status ===\n\n\
+             \x20 Config:       {config}\n\
+             \x20 Knowledge:    {knowledge}\n\
+             \x20 Scan set:     ✓ populated\n\
+             \x20 Database:     {database}\n\
+             \x20 Bind:         localhost:3100\n\n\
+             \x20 Ollama:       ✗ not found\n\
+             \x20 Ollama svc:   ✓ running\n\
+             \x20 Model:        ✓ nomic-embed-text\n\
+             \x20 Runtime:      —  (run 'lore status --full' to verify inference)\n\
+             \x20 sqlite-vec:   ✓ bundled\n\n\
+             \x20 Chunks:       3\n\
+             \x20 Sources:      3\n\
+             \x20 Languages:    undeclared 3\n\
+             \x20 Last commit:  {short}\n\n",
+            config = config_arg,
+            knowledge = config.knowledge_dir.display(),
+            database = config.database.display(),
+            short = &commit[..7],
+        )
+    );
+}
+
+#[test]
+fn a_crashed_ollama_runner_keeps_its_status_search_and_ingest_output() {
+    let (url, _, _) = serve_fake_ollama_answering(EmbedAnswer::RunnerCrash);
+    let (_tmp, config, config_path) = ollama_project(&url);
+    let config_arg = config_path.to_str().unwrap();
+    let commit = {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        let (result, _) = ingest_logged(&db, &FakeEmbedder::new(), &config.knowledge_dir);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        db.get_metadata("last_ingested_commit").unwrap().unwrap()
+    };
+
+    let status = lore()
+        .env("PATH", "")
+        .env_remove("LORE_TRACE")
+        .args(["status", "--full", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        stderr_of(&status),
+        format!(
+            "=== lore status ===\n\n\
+             \x20 Config:       {config}\n\
+             \x20 Knowledge:    {knowledge}\n\
+             \x20 Scan set:     ✓ populated\n\
+             \x20 Database:     {database}\n\
+             \x20 Bind:         localhost:3100\n\n\
+             \x20 Ollama:       ✗ not found\n\
+             \x20 Ollama svc:   ✓ running\n\
+             \x20 Model:        ✓ nomic-embed-text\n\
+             \x20 Verifying inference runtime (may take a few seconds)…\n\
+             \x20 Runtime:      ✗ inference failed — llama runner process has terminated\n\
+             \x20 sqlite-vec:   ✓ bundled\n\n\
+             \x20 Chunks:       3\n\
+             \x20 Sources:      3\n\
+             \x20 Languages:    undeclared 3\n\
+             \x20 Last commit:  {short}\n\n",
+            config = config_arg,
+            knowledge = config.knowledge_dir.display(),
+            database = config.database.display(),
+            short = &commit[..7],
+        )
+    );
+
+    let search = lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success();
+    assert_eq!(
+        stderr_of(&search),
+        "Warning: Ollama embed failed (inference error); falling back to text search. \
+         Run 'lore status --full' for details.\n"
+    );
+
+    let draft = config.knowledge_dir.join("draft.md");
+    fs::write(
+        &draft,
+        "# Draft\n\nPrefer borrowed slices in function arguments.\n",
+    )
+    .unwrap();
+    let ingest = lore()
+        .env_remove("LORE_DEBUG")
+        .args([
+            "ingest",
+            "--config",
+            config_arg,
+            "--file",
+            draft.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout("");
+    assert_eq!(
+        stderr_of(&ingest),
+        "Single-file ingest: draft.md\n\
+         \x20 draft.md → 1 chunks\n\
+         Errors: 1\n\
+         \x20 ✗ 1 embedding failure(s) while indexing draft.md\n\
+         Error: single-file ingest saved the text of draft.md but not all of its vectors. \
+         Run 'lore ingest' once the embedding model answers to add them.\n"
+    );
+
+    commit_all(&config.knowledge_dir);
+    let walk = lore()
+        .env_remove("LORE_DEBUG")
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        stderr_of(&walk),
+        "Ingesting knowledge directory...\n\n\
+         Delta ingest: 1 file(s) changed\n\
+         \x20 draft.md → 1 chunks\n\
+         Patterns: 1 ingested; 0 declare a language, 1 relies on body keywords.\n\n\
+         Done (delta): 1 files changed, 4 unchanged\n\
+         Universal patterns: 0\n\
+         Errors: 2\n\
+         \x20 ✗ 1 embedding failure(s) while indexing draft.md\n\
+         \x20 ✗ 1 chunk(s) have no vector and the embedding model did not answer: \
+         Ollama reached the model but the inference call failed \
+         — llama runner process has terminated\n"
+    );
+}
+
+#[test]
+fn the_session_start_trace_records_the_ollama_host_and_model() {
+    let (_tmp, config, config_path) = ollama_project("http://127.0.0.1:1");
+    {
+        let db = KnowledgeDB::open(&config.database).unwrap();
+        db.init().unwrap();
+        ingest_logged(&db, &FakeEmbedder::new(), &config.knowledge_dir);
+    }
+    let trace_dir = config_path.with_file_name("trace");
+    lore()
+        .env("LORE_TRACE", "1")
+        .env("LORE_TRACE_DIR", &trace_dir)
+        .args(["hook", "--config", config_path.to_str().unwrap()])
+        .write_stdin(
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "ollama-trace",
+            })
+            .to_string(),
+        )
+        .assert()
+        .success();
+
+    let files: Vec<PathBuf> = fs::read_dir(&trace_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let record: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&files[0]).unwrap().trim()).unwrap();
+    let snapshot = &record["config"];
+    assert_eq!(snapshot["ollama_host"], "http://127.0.0.1:1", "{record}");
+    assert_eq!(snapshot["ollama_model"], "nomic-embed-text", "{record}");
+    assert!(snapshot.get("embedder_provider").is_none(), "{record}");
+}
+
+/// A config written by hand: no `dimensions` in `[ollama]`, no `[trace]` and
+/// no `min_relevance_universal`.
+const HAND_WRITTEN_OLLAMA_CONFIG: &str = r#"knowledge_dir = "KNOWLEDGE_DIR"
+database = "DATABASE"
+bind = "localhost:3100"
+
+[ollama]
+host = "HOST"
+model = "nomic-embed-text"
+
+[search]
+hybrid = true
+top_k = 5
+min_relevance = 0.5
+
+[chunking]
+strategy = "heading"
+max_tokens = 1024
+"#;
+
+#[test]
+fn a_hand_written_ollama_config_loads_ingests_and_searches() {
+    use predicates::prelude::*;
+
+    let (url, served) = serve_fake_ollama();
+    let (_tmp, config, config_path) = ollama_project(&url);
+    fs::write(
+        &config_path,
+        HAND_WRITTEN_OLLAMA_CONFIG
+            .replace("KNOWLEDGE_DIR", config.knowledge_dir.to_str().unwrap())
+            .replace("DATABASE", config.database.to_str().unwrap())
+            .replace("HOST", &url),
+    )
+    .unwrap();
+    let config_arg = config_path.to_str().unwrap();
+
+    lore()
+        .args(["ingest", "--config", config_arg])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Errors:").not())
+        .stderr(predicate::str::contains("Warning").not());
+    let db = KnowledgeDB::open(&config.database).unwrap();
+    assert_eq!(db.vector_dimensions().unwrap(), Some(768));
+    assert!(db.chunks_without_vectors().unwrap().is_empty());
+
+    let before_search = served.load(Ordering::SeqCst);
+    lore()
+        .env_remove("LORE_DEBUG")
+        .args(["search", "--config", config_arg, "error propagation"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Error Handling"))
+        .stderr("");
+    assert_eq!(served.load(Ordering::SeqCst), before_search + 1);
+}
+
+#[test]
+fn ingest_sends_ollama_a_long_section_whole() {
+    let (url, _, inputs) = serve_fake_ollama_answering(EmbedAnswer::Vector);
+    let (_tmp, config, config_path) = ollama_project(&url);
+    let body = "Keep each module to one purpose and name it after that purpose.\n".repeat(110);
+    assert!(body.chars().count() >= 7000);
+    fs::write(
+        config.knowledge_dir.join("long.md"),
+        format!("# Module Boundaries\n\n{body}"),
+    )
+    .unwrap();
+    commit_all(&config.knowledge_dir);
+
+    lore()
+        .args(["ingest", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let inputs = inputs.lock().unwrap();
+    assert!(
+        inputs.iter().any(|input| input.ends_with(body.trim_end())),
+        "input lengths in characters: {:?}",
+        inputs
+            .iter()
+            .map(|input| input.chars().count())
+            .collect::<Vec<_>>()
+    );
 }

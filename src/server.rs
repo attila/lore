@@ -3714,6 +3714,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lore_status_reports_the_ollama_object_for_a_crashed_runner() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                std::io::Read::read_exact(&mut reader, &mut vec![0; content_length]).unwrap();
+                let (status, body) = if request_line.contains("/api/embed") {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":"llama runner process has terminated"}"#,
+                    )
+                } else {
+                    ("200 OK", "{}")
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut h = TestHarness::new();
+        h.config.ollama.host = host;
+
+        let resp = h.request_value(
+            r#"{"jsonrpc":"2.0","id":82,"method":"tools/call",
+                "params":{"name":"lore_status",
+                          "arguments":{"include_metadata":true,"probe_runtime":true}}}"#,
+        );
+
+        // `installed` depends on whether the machine running the test has an
+        // `ollama` binary on its PATH.
+        let installed = Command::new("ollama")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        assert_eq!(
+            metadata_from_response(&resp)["ollama"],
+            json!({
+                "installed": installed,
+                "running": true,
+                "model_available": true,
+                "model": "test-model",
+                "runtime": {
+                    "state": "failed",
+                    "short_reason": "inference error",
+                    "status_line": "inference failed — llama runner process has terminated",
+                },
+            })
+        );
+    }
+
     /// When the caller does NOT pass `include_metadata: true`, `lore_status`
     /// must return the prose summary with no `lore-metadata` fence. Pins
     /// the opt-in contract: default callers pay no token cost for the
