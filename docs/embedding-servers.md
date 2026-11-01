@@ -7,17 +7,23 @@ some hosted services do.
 
 ## Start the Server
 
-Start the server with an embedding model loaded. For `llama-server`, pass `--embeddings`:
+If you run the server yourself, follow its own documentation to install it. Then start it with an
+embedding model loaded.
+
+`llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md)
+is one example. Start it with `--embeddings`. With `-hf`, it downloads the model from Hugging Face:
 
 ```sh
-llama-server --embeddings -m nomic-embed-text-v1.5.Q8_0.gguf --port 8080 -ub 1024 -b 1024
+llama-server --embeddings -hf nomic-ai/nomic-embed-text-v1.5-GGUF:Q8_0 --port 8080 -ub 1024 -b 1024
 ```
 
 A default `llama-server` takes at most 512 tokens per input. Set `-ub` and `-b` to at least
 `[chunking] max_tokens`, which is 1024 by default, so long sections fit.
 
-LM Studio drops any input beyond the model's loaded context without an error, so give the model a
-context of at least twice `[chunking] max_tokens`.
+In LM Studio, load the model and start the server, as
+[its documentation](https://lmstudio.ai/docs/developer/core/server) describes. LM Studio drops any
+input beyond the model's loaded context without an error, so give the model a context of at least
+twice `[chunking] max_tokens`.
 
 ## Set Up Lore
 
@@ -31,7 +37,7 @@ lore init --repo /path/to/your/patterns --provider openai-compatible \
 If the server needs a key, add `--api-key-environment-variable-name`, as
 [Add an API Key](#add-an-api-key) shows.
 
-For `llama-server` and LM Studio, the URL ends in `/v1`.
+For `llama-server` and LM Studio, the URL is the address the server listens on, followed by `/v1`.
 
 The model name is what lore sends with each request. `llama-server` answers with the model it
 loaded, whatever the name says, so pick a name that matches that model. LM Studio embeds with the
