@@ -19,6 +19,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  VALE_VERSION: 3.22.0
+  VALE_SHA256: 52f5cd0314a1b7384cac6aa102a68193977312f6ba9c9f3ae001b5deec8e3a10
 
 jobs:
   verify:
@@ -41,6 +43,12 @@ jobs:
       - uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
           tool: cargo-deny
+      - name: Install Vale
+        run: |
+          curl -fsSLo vale.tar.gz "https://github.com/vale-cli/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
+          echo "${VALE_SHA256}  vale.tar.gz" | sha256sum -c -
+          tar -xzf vale.tar.gz -C /usr/local/bin vale
+          vale --version
       - run: just ci
 
   build:
