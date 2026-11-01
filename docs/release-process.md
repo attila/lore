@@ -7,8 +7,9 @@ post-release verification, hotfixes, failure recovery, and yank/rollback.
 
 Releases are triggered by pushing a `v*` tag from `main`. The
 [`release.yml`](../.github/workflows/release.yml) workflow runs the project quality gates
-(`just ci`) and cross-compiles four binary targets via `cargo-zigbuild`. It then computes a
-`SHA256SUMS` file and publishes a GitHub Release with the matching CHANGELOG section as the body.
+(`just ci`) and cross-compiles every target in its build matrix via `cargo-zigbuild`. It then
+computes a `SHA256SUMS` file and publishes a GitHub Release with the matching CHANGELOG section as
+the body.
 
 The publish step is gated by a `release` GitHub Environment that requires owner approval. Push
 permission alone cannot ship a release.
@@ -291,19 +292,20 @@ git push origin :refs/tags/v0.1.0-alpha.1   # delete remote tag
 git tag -d v0.1.0-alpha.1                    # delete local tag
 ```
 
-### 3. One build target fails (e.g. 3 of 4 green)
+### 3. One build target fails
 
 Two recovery options, with the trade-off named:
 
-- **Ship a 3-target release**: edit the workflow `matrix.target` list on a follow-up commit to skip
-  the broken target. Document the gap in CHANGELOG (e.g. "macOS arm64 binary not available for
-  v0.1.0, see v0.1.1"), then bump to `vX.Y.Z+1` and re-cut. Affected users are steered to the next
-  release.
+- **Ship without the broken target**: edit the workflow `matrix.target` list on a follow-up commit
+  to skip the broken target. Document the gap in CHANGELOG (e.g. "macOS arm64 binary not available
+  for v0.1.0, see v0.1.1"), then bump to `vX.Y.Z+1` and re-cut. Affected users are steered to the
+  next release.
 - **Block the release until fixed**: delete the partial release + tag (commands below), fix the
   cross-compile in a PR, re-cut against the new patch version.
 
-**Decision rule**: if the broken target is `aarch64-apple-darwin` (Apple Silicon Mac users are a
-realistic install path), prefer blocking. Otherwise the 3-target ship is acceptable.
+**Decision rule**: block if the Homebrew formula installs the broken target. The tap bump would find
+no checksum for it and leave the formula on the previous release. Otherwise shipping without it is
+acceptable.
 
 ### 4. `gh release create` fails because release exists
 
@@ -370,9 +372,8 @@ history attributed to the tap App.
 
 Read these reasons before you change the workflow.
 
-- **One Linux runner builds all five targets with `cargo-zigbuild`.** A per-platform matrix adds
-  slower macOS runners and a second toolchain setup, and lore has no native dependency that needs
-  one.
+- **One Linux runner builds every target with `cargo-zigbuild`.** A per-platform matrix adds slower
+  macOS runners and a second toolchain setup, and lore has no native dependency that needs one.
 - **No GPG or Sigstore signing.** `SHA256SUMS` served over HTTPS from GitHub covers the current
   threat model. Signing adds key custody and rotation, and only helps against a compromised GitHub
   or release credential.
