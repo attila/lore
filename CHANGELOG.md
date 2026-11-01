@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Added
 
 - Set `[ollama] dimensions` to make `lore init` and `lore ingest` exit 1 when the embedding model

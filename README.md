@@ -68,7 +68,7 @@ integrity verification. Pick `VERSION` from the releases page. Set `TARGET` to o
 `x86_64-apple-darwin` (Intel Mac):
 
 ```sh
-VERSION=0.5.0
+VERSION=0.6.0
 TARGET=x86_64-unknown-linux-gnu
 
 curl -LO https://github.com/attila/lore/releases/download/v${VERSION}/lore-${VERSION}-${TARGET}.tar.gz
